@@ -361,6 +361,13 @@ pub struct Conversation {
     pub recipient_count: u32,
     #[serde(default, rename = "last_message_date")]
     pub last_message_date: i64,
+    /// When the conversation itself was started — XF emits this
+    /// (`ConversationMaster::setupApiResultData`, `start_date` marked
+    /// `api => true`). Distinct from `last_message_date`: the "started
+    /// <age>" header must read this, not the first message of whichever
+    /// page happens to be loaded (issue #582).
+    #[serde(default, rename = "start_date")]
+    pub start_date: i64,
     #[serde(default, rename = "last_message_username")]
     pub last_message_username: String,
     /// XF's `ConversationMaster::setupApiResultData` never emits this key —

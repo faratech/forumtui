@@ -5082,6 +5082,92 @@ mod tests {
         );
     }
 
+    /// Issue #581: the token recheck's `Bootstrap { Ok(user) }` used to be
+    /// adopted unconditionally — "Session restored." — even when `user_id`
+    /// differs from the identity the session was running as, meaning the
+    /// stored session on disk now belongs to a DIFFERENT account. Anything
+    /// screen- or write-shaped that belonged to the old identity (an open
+    /// screen, a write still waiting on the politeness gates) must not
+    /// carry over, and the user must be told they are now signed in as
+    /// someone else.
+    #[tokio::test]
+    async fn bootstrap_ok_with_a_different_user_tears_down_the_old_identity() {
+        let api = Arc::new(RecordingApi {
+            write_delay: Duration::from_millis(200),
+            ..Default::default()
+        });
+        let mut app = test_app();
+        app.api = api.clone();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.screens.push(screens::home_state(false));
+        app.screens.push(screens::search_state());
+        app.keep_thread_position = Some((42, 1, 0, 0));
+        app.open_palette();
+        assert!(app.palette.is_some(), "test setup: the palette must actually be open");
+
+        app.execute_action(Action::SubmitReply {
+            thread_id: 42,
+            message: "a draft written as the old identity".into(),
+        });
+        // Let the write start and park in the gate wait, exactly like
+        // `a_reply_abandoned_by_ctrl_l_is_never_sent`.
+        tokio::task::yield_now().await;
+        assert!(api.replies().is_empty(), "test setup: the write must still be gated");
+
+        let generation = app.bootstrap_generation;
+        app.handle_msg(Msg::Bootstrap {
+            generation,
+            result: Ok(User { user_id: 99, username: "someone-else".into(), ..Default::default() }),
+        });
+
+        assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(99));
+        assert_eq!(
+            app.screens.len(),
+            1,
+            "the old screen stack must be truncated to Home/ForumTree, not carried over"
+        );
+        assert!(matches!(app.screens.last(), Some(Screen::Home(_))));
+        assert!(app.keep_thread_position.is_none(), "a stale thread position must not survive");
+        assert!(app.palette.is_none(), "an open palette must not survive an identity change");
+        assert!(
+            app.status.contains("someone-else"),
+            "the hint must name the new identity: {:?}",
+            app.status
+        );
+        assert_ne!(app.status, "Session restored.");
+
+        // Well past the gate the old identity's write was waiting on.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            api.replies().is_empty(),
+            "a write started under the old identity must never reach the API: {:?}",
+            api.replies()
+        );
+    }
+
+    /// Same-user path: a token recheck that simply confirms the account
+    /// already signed in must behave exactly as before — no teardown, the
+    /// familiar "Session restored." status.
+    #[tokio::test]
+    async fn bootstrap_ok_with_the_same_user_is_unchanged() {
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.screens.push(screens::home_state(false));
+        app.screens.push(screens::search_state());
+        app.keep_thread_position = Some((42, 1, 0, 0));
+
+        let generation = app.bootstrap_generation;
+        app.handle_msg(Msg::Bootstrap {
+            generation,
+            result: Ok(User { user_id: 7, username: "kemical".into(), ..Default::default() }),
+        });
+
+        assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(7));
+        assert_eq!(app.screens.len(), 2, "the same-user path must not touch the screen stack");
+        assert!(app.keep_thread_position.is_some(), "same-user path must not clear this either");
+        assert_eq!(app.status, "Session restored.");
+    }
+
     /// Issue #557: `Error::NoToken` in a live session may only mean a second
     /// instance sharing `token.json` rotated the refresh token, so the store
     /// is re-read once before the session ends. With nothing new on disk the

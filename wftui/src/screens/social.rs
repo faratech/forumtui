@@ -510,7 +510,19 @@ fn render_inbox_view_panel(
     let [header_area, body_area] =
         Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(inner);
 
-    let started = view.messages.first().map(|m| m.message_date).unwrap_or(0);
+    // Issue #582: `view.messages` holds only the current page (replaced
+    // wholesale by `Msg::ConversationLoaded`), so on page 2+ its first
+    // message is NOT the conversation's start — it's whatever the pager
+    // landed on. XF's own `start_date` is the real answer; fall back to the
+    // first loaded message only on page 1 with no `start_date` at all (an
+    // older cached fixture, or a server that omitted the field).
+    let started = if view.conversation.start_date > 0 {
+        view.conversation.start_date
+    } else if view.page <= 1 {
+        view.messages.first().map(|m| m.message_date).unwrap_or(0)
+    } else {
+        0
+    };
     let total_messages = view.conversation.reply_count + 1;
     let mut meta = vec![
         Span::styled("with ", theme.dim()),
@@ -523,7 +535,13 @@ fn render_inbox_view_panel(
         // #578), the phrase must be "started on Jul 26" / "started on
         // 2025", not "started Jul 26 ago".
         let (age_text, is_relative) = fmt_age_parts(started);
-        if is_relative {
+        if age_text == "now" {
+            // "started now ago" is nonsense the same way "started Jul 26
+            // ago" is (issue #578) — the under-a-minute rung just needs its
+            // own phrasing rather than the generic "<rung> ago" tail
+            // (issue #583).
+            tail.push_str(" \u{00B7} started just now");
+        } else if is_relative {
             tail.push_str(&format!(" \u{00B7} started {age_text} ago"));
         } else {
             tail.push_str(&format!(" \u{00B7} started on {age_text}"));
@@ -1727,6 +1745,58 @@ mod tests {
         assert!(
             !text.contains(&format!("started {age_text} ago")),
             "must not say '... ago' once the ladder is past its relative rungs: {text}"
+        );
+
+        // Issue #583: the same "ago" tail is also wrong at the OTHER end of
+        // the ladder — the under-a-minute "now" rung produces "started now
+        // ago", reachable the moment a member opens a conversation created
+        // within the last minute.
+        let five_seconds_ago = now.unix_timestamp() - 5;
+        let (now_text, now_is_relative) = crate::theme::fmt_age_parts(five_seconds_ago);
+        assert_eq!(now_text, "now", "test setup: must land on the under-a-minute rung");
+        assert!(now_is_relative);
+
+        let mut s = sample_inbox_state();
+        if let Some(view) = &mut s.view {
+            view.messages[0].message_date = five_seconds_ago;
+        }
+        let rows = render_rows_inbox(&mut s, 120, 36);
+        let text = rows.join("\n");
+        assert!(text.contains("started just now"), "expected \"just now\" wording: {text}");
+        assert!(!text.contains("started now ago"), "\"started now ago\" is nonsense: {text}");
+    }
+
+    /// Issue #582: `Msg::ConversationLoaded` replaces `view.messages`
+    /// wholesale with whichever page was requested, so on page 2+ the first
+    /// loaded message is NOT when the conversation started — it's just
+    /// wherever the pager landed. The header must read XF's own
+    /// `start_date` instead of re-deriving "started" from the current
+    /// page's first message.
+    #[test]
+    fn inbox_view_header_uses_start_date_not_the_current_pages_first_message() {
+        let now = time::OffsetDateTime::now_utc();
+        let ninety_days_ago = now.unix_timestamp() - 90 * 86_400;
+        let five_seconds_ago = now.unix_timestamp() - 5;
+        let (age_text, _) = crate::theme::fmt_age_parts(ninety_days_ago);
+
+        let mut s = sample_inbox_state();
+        if let Some(view) = &mut s.view {
+            // The conversation really started 90 days ago...
+            view.conversation.start_date = ninety_days_ago;
+            // ...but page 2's first loaded message is recent — a year-old
+            // thread paged to its latest messages, exactly the repro.
+            view.page = 2;
+            view.messages[0].message_date = five_seconds_ago;
+        }
+        let rows = render_rows_inbox(&mut s, 120, 36);
+        let text = rows.join("\n");
+        assert!(
+            text.contains(&format!("started on {age_text}")),
+            "expected the header to read the conversation's start_date: {text}"
+        );
+        assert!(
+            !text.contains("started now ago") && !text.contains("started just now"),
+            "must not derive \"started\" from page 2's first message: {text}"
         );
     }
 
