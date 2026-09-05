@@ -288,7 +288,15 @@ pub struct NewConversationState {
     pub resolving: usize,
     pub resolved_ids: Vec<u32>,
     pub errors: Vec<String>,
+    /// True from `submit()` until `Msg::ConvoCreated` lands — the whole
+    /// lifecycle, resolution *and* the write behind the 30 s write gate
+    /// (issue #597). It is the only re-entry guard for Enter and the only
+    /// thing that blocks Esc while a write is in flight.
     pub busy: bool,
+    /// The second stage of that lifecycle: recipients are resolved and
+    /// `create_conversation` is spawned/awaiting its gate. Only changes what
+    /// the screen says ("Sending…" rather than "Resolving recipients…").
+    pub sending: bool,
     /// Same contract as `ComposeState`'s: the message pane's size stamped by
     /// the renderer, the caret-following scroll offset, and the sticky
     /// desired column for Up/Down.
@@ -558,13 +566,13 @@ impl Screen {
     /// panel: one bar, one place, always in the same row (DESIGN.md zone 3).
     pub fn hints(&self) -> Hints {
         match self {
-            Screen::Login(_) => misc::login_hints(),
+            Screen::Login(s) => misc::login_hints(s),
             Screen::Home(s) => browse::home_hints(s),
             Screen::ForumTree(_) => browse::forum_tree_hints(),
             Screen::ThreadList(s) => browse::thread_list_hints(s.node_id),
-            Screen::ThreadView(_) => browse::thread_view_hints(),
+            Screen::ThreadView(s) => browse::thread_view_hints(s),
             Screen::Compose(s) => misc::compose_hints(s),
-            Screen::Inbox(_) => social::inbox_hints(),
+            Screen::Inbox(s) => social::inbox_hints(s),
             Screen::ConversationView(_) => social::conversation_view_hints(),
             Screen::NewConversation(_) => social::new_conversation_hints(),
             Screen::Search(s) => misc::search_hints(s),
@@ -648,6 +656,12 @@ impl Screen {
             // onto a session-less Home stuck loading forever (issue #556).
             Screen::Login(_) => EscIntent::Blocked("Sign in first, or press q to quit."),
             Screen::Compose(c) if c.busy => EscIntent::Blocked(
+                "Sending\u{2026} Esc cannot cancel it \u{2014} wait for the result.",
+            ),
+            // Issue #597: `busy` now spans the create write too, so Esc is
+            // blocked for the whole lifecycle — it used to pop the screen out
+            // from under an in-flight `create_conversation`.
+            Screen::NewConversation(n) if n.sending => EscIntent::Blocked(
                 "Sending\u{2026} Esc cannot cancel it \u{2014} wait for the result.",
             ),
             Screen::NewConversation(n) if n.busy => EscIntent::Blocked(

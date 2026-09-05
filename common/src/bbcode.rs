@@ -301,6 +301,7 @@ fn emit_list_marker(out: &mut Vec<Chunk>, stack: &mut [Frame]) {
 pub fn render(src: &str) -> Vec<Chunk> {
     let mut out: Vec<Chunk> = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
+    let mut misses = CloseMisses::default();
     let mut rest = src;
 
     'outer: while !rest.is_empty() {
@@ -321,6 +322,16 @@ pub fn render(src: &str) -> Vec<Chunk> {
             Some(TagEvent::Open { name, value, len }) => {
                 let raw_tag = &rest[..len];
                 rest = &rest[len..];
+                // XF's parser caps nesting at 20 frames (Parser.php
+                // `$maxDepth`); past that an open tag is just text. Without a
+                // cap an unclosed `[B]` per 3 bytes kept the frame stack (and
+                // so every `Style::from_stack` walk) growing for the whole
+                // post — 312 ms for 80 KB, re-paid on every redraw of the
+                // thread view (issue #607).
+                if stack.len() >= MAX_FRAME_DEPTH {
+                    emit_text(&mut out, raw_tag, &stack);
+                    continue;
+                }
                 let tag_lower = name.to_ascii_lowercase();
                 match tag_lower.as_str() {
                     "b" => stack.push(Frame::Bold),
@@ -343,7 +354,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         // degrades the way it always has rather than
                         // swallowing the rest of the document like [CODE]'s
                         // unclosed fallback does.
-                        if let Some((inner, close_len)) = split_at_close(rest, &tag_lower) {
+                        if let Some((inner, close_len)) = misses.split(src, rest, &tag_lower) {
                             let mut st = Style::from_stack(&stack);
                             st.code = true;
                             out.push(Chunk::Text(decode_html_entities(inner), st));
@@ -468,7 +479,23 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             };
                             stack.push(Frame::Link(href));
                         }
-                        None => stack.push(Frame::Link(String::new())),
+                        None => {
+                            // XF's no-value form, `[email]addr[/email]`: the
+                            // address is the tag BODY, not an attribute.
+                            // Build the `mailto:` link the same way the
+                            // value form does instead of leaving an empty
+                            // href, which `emit_text` falls back to filling
+                            // with the raw address as both label and target
+                            // (issue #603).
+                            if let Some((inner, close_len)) = misses.split(src, rest, "email") {
+                                let st = Style::from_stack(&stack);
+                                let addr = decode_html_entities(inner.trim());
+                                out.push(Chunk::Link(addr.clone(), format!("mailto:{addr}"), st));
+                                rest = &rest[close_len..];
+                            } else {
+                                stack.push(Frame::Link(String::new()));
+                            }
+                        }
                     },
                     "post" => {
                         let id = value.as_deref().map(strip_quotes).unwrap_or("");
@@ -489,7 +516,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         stack.push(Frame::Link(url));
                     }
                     "img" => {
-                        if let Some((inner, close_len)) = split_at_close(rest, "img") {
+                        if let Some((inner, close_len)) = misses.split(src, rest, "img") {
                             let st = Style::from_stack(&stack);
                             let trimmed = strip_quotes(inner.trim());
                             if trimmed.is_empty() {
@@ -506,7 +533,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         }
                     }
                     "media" => {
-                        if let Some((inner, close_len)) = split_at_close(rest, "media") {
+                        if let Some((inner, close_len)) = misses.split(src, rest, "media") {
                             let st = Style::from_stack(&stack);
                             let site = value.as_deref().map(strip_quotes).unwrap_or("media");
                             let (label, url) = resolve_media(site, inner);
@@ -517,7 +544,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         }
                     }
                     "attach" => {
-                        if let Some((inner, close_len)) = split_at_close(rest, "attach") {
+                        if let Some((inner, close_len)) = misses.split(src, rest, "attach") {
                             let st = Style::from_stack(&stack);
                             let id = if inner.trim().is_empty() {
                                 value.as_deref().map(strip_quotes).unwrap_or("").trim()
@@ -535,13 +562,16 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         }
                     }
                     "user" => {
-                        if let Some((inner, close_len)) = split_at_close(rest, "user") {
+                        if let Some((inner, close_len)) = misses.split(src, rest, "user") {
                             let st = Style::from_stack(&stack);
-                            out.push(Chunk::Text(format!("@{}", inner.trim()), st));
+                            let name = inner.trim();
+                            let name = name.strip_prefix('@').unwrap_or(name);
+                            out.push(Chunk::Text(format!("@{name}"), st));
                             rest = &rest[close_len..];
                         } else if let Some(v) = &value {
                             let st = Style::from_stack(&stack);
                             let clean = strip_quotes(v);
+                            let clean = clean.strip_prefix('@').unwrap_or(clean);
                             out.push(Chunk::Text(format!("@{clean}"), st));
                         } else {
                             emit_text(&mut out, raw_tag, &stack);
@@ -641,6 +671,9 @@ pub fn to_plain(src: &str) -> String {
     s.replace('\n', " ").split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// XF's `Parser::$maxDepth`. Deeper open tags render as literal text.
+const MAX_FRAME_DEPTH: usize = 20;
+
 enum TagEvent {
     Open {
         name: String,
@@ -654,9 +687,56 @@ enum TagEvent {
     Star(usize),
 }
 
+/// Byte offset of the `]` that ends the tag starting at `s[0]`.
+///
+/// XF's rule for the value form is `[NAME="value"]` where the delimiter is
+/// `"]` (Parser.php: `strpos($text, "$delim]", $startPos)`), so a `]` INSIDE a
+/// quoted value is part of the value — `[url="…/computer[theverge.com]("]` and
+/// `[QUOTE="[hun]tobias88, post: 1, member: 2"]` are both legal and render
+/// correctly on the site. Ending the tag at the first `]` split them mid-value:
+/// the href kept its opening quote (so `o` opened a site-relative URL) and the
+/// rest of the value leaked into the body (issue #602).
+///
+/// Only the value form is special-cased; the attribute form (`[NAME attr="v"]`,
+/// a space before the `=`), the close form and the bare form keep the first
+/// `]` exactly as before. The scan for `"]` is capped so a hostile unterminated
+/// quote cannot make the parse quadratic; past the cap it falls back to the
+/// first `]`, which is what this function always used to return.
+fn tag_close(s: &str) -> Option<usize> {
+    /// Longest quoted option value we will look through for the closing `"]`.
+    const QUOTED_VALUE_SCAN: usize = 4096;
+    let bytes = s.as_bytes();
+    let mut i = 1;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'=' {
+            let Some(&delim) = bytes.get(i + 1) else { break };
+            if delim != b'"' && delim != b'\'' {
+                break;
+            }
+            let start = i + 2;
+            let limit = bytes.len().min(start + QUOTED_VALUE_SCAN);
+            // Byte scanning is safe: `"`, `'` and `]` are ASCII and never
+            // appear inside a multi-byte UTF-8 sequence.
+            if let Some(pos) = bytes
+                .get(start..limit)
+                .and_then(|hay| hay.windows(2).position(|w| w[0] == delim && w[1] == b']'))
+            {
+                return Some(start + pos + 1);
+            }
+            break;
+        }
+        if !(b.is_ascii_alphanumeric() || b == b'_') {
+            break;
+        }
+        i += 1;
+    }
+    s.find(']')
+}
+
 fn parse_tag(s: &str) -> Option<TagEvent> {
     debug_assert!(s.starts_with('['));
-    let close = s.find(']')?;
+    let close = tag_close(s)?;
     let inner = &s[1..close];
     if inner.is_empty() || inner.contains('\n') || inner.contains('\r') {
         return None;
@@ -762,6 +842,44 @@ fn find_close_tag(s: &str, name: &str) -> Option<usize> {
 /// first now ask this once and reuse the answer.
 fn split_at_close<'a>(s: &'a str, name: &str) -> Option<(&'a str, usize)> {
     find_close_tag(s, name).map(|pos| (&s[..pos], pos + name.len() + 3))
+}
+
+/// Per-render memo of close-tag MISSES, one entry per tag name.
+///
+/// `find_close_tag` walks to end-of-input when there is no `[/name]`, and an
+/// unclosed `[IMG]`/`[MEDIA]`/`[ATTACH]`/`[USER]`/`[EMAIL]`/`[ICODE]` does not
+/// consume anything, so `"[IMG]".repeat(n)` used to cost Σ(n−k) byte steps —
+/// 573 ms for a 100 KB post, re-paid on every resize and every `n`/`N`/`gg`/`G`
+/// because the parse runs on the UI thread (issue #607). A miss at offset `o`
+/// proves there is no `[/name]` at or after `o`, so every later query for that
+/// name (offsets only ever move forward within one render) is answered from
+/// here without a scan.
+#[derive(Default)]
+struct CloseMisses {
+    /// `(tag name, lowest offset from which no close tag exists)`.
+    entries: Vec<(String, usize)>,
+}
+
+impl CloseMisses {
+    /// `split_at_close(rest, name)` with the miss memo in front of it. `rest`
+    /// must be a suffix of `src` — it always is: `render` only ever advances
+    /// it forward inside the source it was handed.
+    fn split<'a>(&mut self, src: &str, rest: &'a str, name: &str) -> Option<(&'a str, usize)> {
+        let offset = src.len() - rest.len();
+        if let Some((_, from)) = self.entries.iter().find(|(n, _)| n == name)
+            && offset >= *from
+        {
+            return None;
+        }
+        let found = split_at_close(rest, name);
+        if found.is_none() {
+            match self.entries.iter_mut().find(|(n, _)| n == name) {
+                Some((_, from)) => *from = (*from).min(offset),
+                None => self.entries.push((name.to_string(), offset)),
+            }
+        }
+        found
+    }
 }
 
 /// Find the closing tag for `name` (case-insensitive) returning content end
@@ -913,6 +1031,56 @@ mod tests {
         assert!(ti < 400.0, "4 000 [IMG] tags took {ti:.1} ms");
     }
 
+    /// Issue #607: the same contract for UNCLOSED tags, which #522's fix did
+    /// not cover. `[IMG]` with no `[/IMG]` consumes nothing and rescans the
+    /// whole remainder (573 ms for 100 KB before the miss memo), and an
+    /// unclosed `[B]` left a frame on the stack forever so every
+    /// `Style::from_stack` walk grew with the post (312 ms for 80 KB before
+    /// the depth cap; the cap bounds that walk at 20 frames, so the style
+    /// itself needs no memo). Both re-run on every resize and every n/N/gg/G.
+    /// Measured unoptimized on the dev box: 31 ms and 36 ms respectively.
+    #[test]
+    fn render_is_linear_in_unclosed_tags() {
+        fn parse_ms(src: &str) -> f64 {
+            let t = std::time::Instant::now();
+            let out = render(src);
+            assert!(!out.is_empty());
+            t.elapsed().as_secs_f64() * 1000.0
+        }
+
+        let imgs = "[IMG]".repeat(20000); // 100 KB, accepted by XF verbatim
+        let ti = parse_ms(&imgs);
+        assert!(ti < 200.0, "20 000 unclosed [IMG] took {ti:.1} ms");
+
+        let bolds = "[B]x".repeat(20000); // 80 KB
+        let tb = parse_ms(&bolds);
+        assert!(tb < 200.0, "20 000 unclosed [B] took {tb:.1} ms");
+
+        // …and the growth is linear, not quadratic.
+        let half = parse_ms(&"[IMG]".repeat(10000));
+        assert!(
+            ti < 8.0 * half.max(1.0),
+            "2x the input cost {:.1}x the time ({half:.1} ms -> {ti:.1} ms): quadratic",
+            ti / half.max(0.001)
+        );
+    }
+
+    /// The depth cap must not change what a normally-nested post renders as.
+    #[test]
+    fn the_frame_depth_cap_leaves_closed_tags_alone() {
+        let src = "[QUOTE=\"a\"][B]bold [I]both[/I][/B] plain[/QUOTE]";
+        let all = texts(&render(src)).concat();
+        assert!(all.contains("a wrote:"), "{all:?}");
+        assert!(all.contains("bold"), "{all:?}");
+        assert!(all.contains("both"), "{all:?}");
+        assert!(all.contains("plain"), "{all:?}");
+        // Past the cap an open tag is literal text, exactly like XF.
+        let deep = "[B]".repeat(MAX_FRAME_DEPTH + 2) + "x";
+        let deep_text = texts(&render(&deep)).concat();
+        assert!(deep_text.contains("[B]"), "{deep_text:?}");
+        assert!(deep_text.ends_with('x'), "{deep_text:?}");
+    }
+
     use super::*;
 
     fn texts(chunks: &[Chunk]) -> Vec<&str> {
@@ -966,6 +1134,22 @@ mod tests {
         }
     }
 
+    /// Issue #603: XF's no-value form (`[email]addr[/email]`, 656 live
+    /// posts) must build a `mailto:` href, same as `[EMAIL=addr]addr[/EMAIL]`
+    /// — not leave an empty href that falls back to the raw address as both
+    /// label and target.
+    #[test]
+    fn email_no_value_form_gets_a_mailto_href() {
+        let chunks = render("[email]a@b.com[/email]");
+        match &chunks[0] {
+            Chunk::Link(label, url, _) => {
+                assert_eq!(label, "a@b.com");
+                assert_eq!(url, "mailto:a@b.com");
+            }
+            other => panic!("expected a link chunk, got {other:?}"),
+        }
+    }
+
     #[test]
     fn url_without_label_uses_url_as_label() {
         let chunks = render("[URL]https://example.com/x[/URL]");
@@ -1011,6 +1195,50 @@ mod tests {
             }
             other => panic!("expected link, got {other:?}"),
         }
+    }
+
+    /// Issue #602: XF ends a quoted option value at `"]`, so a `]` inside the
+    /// quotes belongs to the value. Live post 954836 stores exactly this URL;
+    /// the old first-`]` split kept the opening quote in the href (which made
+    /// `o` open a site-relative URL) and pushed the rest into the label.
+    #[test]
+    fn quoted_value_may_contain_a_closing_bracket() {
+        let chunks = render(
+            "[url=\"https://nexphone.com/blog/the-tale-of-nexphone-one-phone-every-computer[theverge.com](\"]nexphone.com[/url]",
+        );
+        match &chunks[0] {
+            Chunk::Link(label, url, _) => {
+                assert_eq!(label, "nexphone.com");
+                assert_eq!(
+                    url,
+                    "https://nexphone.com/blog/the-tale-of-nexphone-one-phone-every-computer[theverge.com]("
+                );
+            }
+            other => panic!("expected link, got {other:?}"),
+        }
+        assert!(
+            !texts(&chunks).concat().contains('"'),
+            "no part of the quoted value may leak into the body"
+        );
+    }
+
+    /// The same rule for a quote byline: four live usernames contain `]`.
+    #[test]
+    fn quoted_byline_may_contain_a_closing_bracket() {
+        let chunks = render(r#"[QUOTE="[hun]tobias88, post: 1, member: 2"]hi[/QUOTE]"#);
+        let all = texts(&chunks).concat();
+        assert!(all.contains("[hun]tobias88 wrote:"), "{all:?}");
+        assert!(all.contains("hi"), "{all:?}");
+        assert!(!all.contains("member: 2"), "the byline must not leak: {all:?}");
+    }
+
+    /// An unterminated quote must still parse the way it always did — the
+    /// first `]` ends the tag — rather than swallowing the rest of the post.
+    #[test]
+    fn an_unterminated_quoted_value_falls_back_to_the_first_bracket() {
+        let chunks = render("[URL=\"https://example.com]click[/URL] after");
+        let all = texts(&chunks).concat();
+        assert!(all.contains("after"), "{all:?}");
     }
 
     /// `[ATTACH type="full"]` is also the attribute form — must still resolve
@@ -1248,6 +1476,15 @@ mod tests {
         }
         assert!(texts(&chunks).concat().contains("@bob"));
         assert!(to_plain(r#"[ATTACH type="full"]1234[/ATTACH]"#).contains("[attachment 1234]"));
+    }
+
+    #[test]
+    fn user_tag_xf_at_form_is_not_doubled() {
+        // XF's MentionFormatter (userMentionKeepAt=1) stores the '@' inside the
+        // tag body: [USER=142771]@Pittzey[/USER]. The client must not prefix a
+        // second '@' on top of it.
+        let chunks = render("[USER=142771]@Pittzey[/USER]");
+        assert_eq!(texts(&chunks).concat(), "@Pittzey");
     }
 
     // ---------- image reference extraction ----------

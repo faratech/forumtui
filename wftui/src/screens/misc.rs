@@ -36,6 +36,13 @@ pub fn login_key(s: &mut super::LoginState, key: KeyEvent) -> Action {
         (_, KeyCode::Enter) => Action::LoginBegin,
         (LoginStage::Waiting, KeyCode::Char('c')) => Action::OscCopy(s.url.clone()),
         (LoginStage::Waiting, KeyCode::Char('o')) => Action::OpenUrl(s.url.clone()),
+        // Idle is a real resting state (`end_session` lands here, so does
+        // every poll/exchange failure) with no link yet to copy or open —
+        // say so instead of silently ignoring the keys the bar just
+        // advertised for `Waiting` (issue #605).
+        (LoginStage::Idle, KeyCode::Char('c') | KeyCode::Char('o')) => {
+            Action::Notice("No link yet \u{2014} press Enter to begin sign-in".into())
+        }
         // Advertised on the key bar (issue #561); a login task in flight, if
         // any, is simply aborted by process exit — there is nothing to clean
         // up first.
@@ -44,16 +51,19 @@ pub fn login_key(s: &mut super::LoginState, key: KeyEvent) -> Action {
     }
 }
 
-pub fn login_hints() -> Hints {
-    Hints::new(
-        &[
-            ("c", "copy link"),
-            ("o", "open here"),
-            ("Enter", "restart login"),
-            ("q", "quit"),
-        ],
-        0,
-    )
+pub fn login_hints(s: &super::LoginState) -> Hints {
+    match s.stage {
+        LoginStage::Idle => Hints::new(&[("Enter", "begin sign-in"), ("q", "quit")], 0),
+        LoginStage::Waiting => Hints::new(
+            &[
+                ("c", "copy link"),
+                ("o", "open here"),
+                ("Enter", "restart login"),
+                ("q", "quit"),
+            ],
+            0,
+        ),
+    }
 }
 
 /// Columns inside the login panel's inner area (DESIGN.md / `LoginText.dc.html`
@@ -490,13 +500,17 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
                 crate::editor::delete_word_back(&mut s.title, &mut s.title_cursor);
                 Action::None
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                crate::editor::kill_to_start(&mut s.title, &mut s.title_cursor);
-                Action::None
-            }
-            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                crate::editor::kill_to_end(&mut s.title, &mut s.title_cursor);
-                Action::None
+            // The always-drawn caps row (`caps_line`) advertises these as
+            // BBCode wrap actions (`^B` bold, `^I` italic, `^K` code, `^Q`
+            // quote, `^U` link) — that is a body-editor affordance the
+            // title has no use for, and `^K`/`^U` used to silently alias to
+            // kill-to-end/kill-to-start on the TITLE instead, destroying
+            // whatever was typed there (issue #605). No-op with a notice
+            // rather than either meaning.
+            KeyCode::Char('b' | 'i' | 'k' | 'q' | 'u')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::Notice("BBCode formatting isn't available in the title".into())
             }
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -625,12 +639,16 @@ pub fn compose_hints(s: &super::ComposeState) -> Hints {
     // a key and then do something else / refuse silently (the same rule
     // that dropped `N`/`m` from the Latest list). Drop the cap until upload
     // is wired; Ctrl+A stays bound to move-home, just not in this namespace.
+    // Issue #605: Tab only switches fields in the new-thread flow (Title <->
+    // body) — everywhere else (ThreadReply/ConversationReply) it inserts
+    // four spaces, so the cap must say "indent", not "field".
+    let tab_desc = if is_new_thread { "field" } else { "indent" };
     Hints::with_short(
         &[
             ("^S", primary),
             ("^O", "preview on/off"),
             ("^Y", "paste"),
-            ("Tab", "field"),
+            ("Tab", tab_desc),
             ("Esc", "discard"),
         ],
         &[
@@ -670,12 +688,25 @@ fn compose_header_rows(s: &super::ComposeState) -> u16 {
     if has_participants { 2 } else { 1 }
 }
 
-fn compose_header_lines(s: &super::ComposeState, theme: &Theme) -> Vec<Line<'static>> {
+/// The new-thread Title field's label — its width is also the caret's offset,
+/// measured rather than hand-counted (issue #535).
+const COMPOSE_TITLE_LABEL: &str = "Title: ";
+
+/// The visible slice of the Title field and the caret column inside it, for
+/// a header area `width` cells wide (issue #606). Both the line and the caret
+/// come from here so they can never disagree.
+fn compose_title_window(s: &super::ComposeState, width: u16) -> (String, u16) {
+    let room = (width as usize).saturating_sub(chrome::cell_width(COMPOSE_TITLE_LABEL));
+    chrome::field_window(&s.title, s.title_cursor, room)
+}
+
+fn compose_header_lines(s: &super::ComposeState, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     if compose_is_new_thread(&s.target) {
+        let (visible, _) = compose_title_window(s, width);
         return vec![
             Line::from(vec![
-                Span::styled("Title: ", theme.dim()),
-                Span::styled(s.title.clone(), theme.base()),
+                Span::styled(COMPOSE_TITLE_LABEL, theme.dim()),
+                Span::styled(visible, theme.base()),
             ]),
             Line::from(Span::styled("Message (Tab = switch field):", theme.dim())),
         ];
@@ -711,17 +742,30 @@ fn compose_header_lines(s: &super::ComposeState, theme: &Theme) -> Vec<Line<'sta
 
 /// The editor's bottom row: BBCode caps `^B ^I ^K ^Q ^U` on the left, the
 /// character count right-aligned against the panel width.
-fn caps_line(theme: &Theme, chars: usize, width: u16) -> Line<'static> {
+///
+/// `title_focused` (issue #605): these are body-editor chords — with the
+/// new-thread Title focused they used to stay drawn and live (`^K`/`^U`
+/// silently killed the title's text instead of wrapping BBCode), so the bar
+/// must say they don't apply here rather than advertise a body affordance
+/// over a field that no longer has one.
+fn caps_line(theme: &Theme, chars: usize, width: u16, title_focused: bool) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-    for (key, desc) in [
-        ("^B", "bold"),
-        ("^I", "italic"),
-        ("^K", "code"),
-        ("^Q", "quote"),
-        ("^U", "link"),
-    ] {
-        spans.push(chrome::keycap(theme, key, false));
-        spans.push(Span::styled(format!(" {desc}  "), theme.dim()));
+    if title_focused {
+        spans.push(Span::styled(
+            "BBCode formatting is not available in the title",
+            theme.dim(),
+        ));
+    } else {
+        for (key, desc) in [
+            ("^B", "bold"),
+            ("^I", "italic"),
+            ("^K", "code"),
+            ("^Q", "quote"),
+            ("^U", "link"),
+        ] {
+            spans.push(chrome::keycap(theme, key, false));
+            spans.push(Span::styled(format!(" {desc}  "), theme.dim()));
+        }
     }
     let label = format!("{chars} chars");
     let left_w: usize = spans.iter().map(Span::width).sum();
@@ -757,7 +801,10 @@ fn draw_editor_panel(
     ])
     .split(inner);
 
-    f.render_widget(Paragraph::new(compose_header_lines(s, theme)), chunks[0]);
+    f.render_widget(
+        Paragraph::new(compose_header_lines(s, theme, chunks[0].width)),
+        chunks[0],
+    );
 
     let rule = if g.ascii { "-" } else { "\u{2500}" };
     let rule_line = |w: u16| Line::from(Span::styled(rule.repeat(w as usize), theme.faint()));
@@ -816,13 +863,20 @@ fn draw_editor_panel(
 
     f.render_widget(rule_line(chunks[3].width), chunks[3]);
     f.render_widget(
-        caps_line(theme, s.body.chars().count(), chunks[4].width),
+        caps_line(
+            theme,
+            s.body.chars().count(),
+            chunks[4].width,
+            is_new_thread && s.title_field,
+        ),
         chunks[4],
     );
 
     if is_new_thread && s.title_field {
-        let cur_col = crate::editor::prefix_cells(&s.title, s.title_cursor) as u16;
-        let cur_x = (chunks[0].x + 7 + cur_col).min(chunks[0].x + chunks[0].width.saturating_sub(1));
+        let (_, cur_col) = compose_title_window(s, chunks[0].width);
+        let label_w = chrome::cell_width(COMPOSE_TITLE_LABEL) as u16;
+        let cur_x = (chunks[0].x + label_w + cur_col)
+            .min(chunks[0].x + chunks[0].width.saturating_sub(1));
         f.set_cursor_position((cur_x, chunks[0].y));
     } else {
         let cur_x =
@@ -1715,39 +1769,104 @@ fn clip_span_run(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
 }
 
 /// `/ query` on the left; `author x` / `in all forums` right-aligned. Returns
-/// the absolute column where the author's editable text begins, so the
-/// caller can place the terminal cursor there.
+/// the absolute column the caret belongs on for the field being edited, so
+/// the caller can place it without re-deriving the layout.
+///
+/// Both fields have a horizontal viewport (issue #606): the query used to be
+/// pushed onto the row whole, which clipped it at the pane edge with the caret
+/// stuck on the border, and — worse — the right-hand labels were only drawn
+/// when they still fitted *after* the whole query, so typing a long query made
+/// the author field the user was about to Tab into disappear. The right side
+/// is now reserved first, and the query scrolls inside what is left.
 fn render_query_row(s: &super::SearchState, f: &mut Frame, area: Rect, theme: &Theme) -> u16 {
-    let mut spans = vec![Span::styled(
-        "/ ",
-        Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
-    )];
-    if s.query.is_empty() && !s.input_mode {
-        spans.push(Span::styled("type to search", theme.dim()));
-    } else {
-        spans.push(Span::styled(
-            s.query.clone(),
-            theme.base().add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    let author_display = if s.author.is_empty() { "any" } else { &s.author };
-    let author_label = format!("author {author_display}");
-    let forum_label = "in all forums";
-    let right_w = author_label.chars().count() + 4 + forum_label.chars().count();
+    const PROMPT: &str = "/ ";
+    const AUTHOR_LABEL: &str = "author ";
+    const FORUM_LABEL: &str = "in all forums";
+    /// Gap between the author and forum labels.
+    const GAP: usize = 4;
+    /// Cells the query keeps even when the right-hand labels want the room.
+    const MIN_QUERY: usize = 10;
+    /// Widest the author's own text is ever drawn; it scrolls inside this.
+    const AUTHOR_VIEW: usize = 24;
 
     let w = area.width as usize;
-    let left_w: usize = spans.iter().map(Span::width).sum();
+    let prompt_w = chrome::cell_width(PROMPT);
+    let author_focused = s.input_mode && s.active_field == 1;
+
+    let (author_text, author_caret) = if s.author.is_empty() {
+        ("any".to_string(), 0)
+    } else {
+        chrome::field_window(&s.author, s.author_cursor, AUTHOR_VIEW)
+    };
+    let author_label = format!("{AUTHOR_LABEL}{author_text}");
+    let author_w = chrome::cell_width(&author_label);
+    let with_forum = author_w + GAP + chrome::cell_width(FORUM_LABEL);
+
+    // Ladder: everything → drop the forum label → drop the right side, unless
+    // the author field is the one being edited, in which case it stays.
+    // Each rung leaves the query at least `MIN_QUERY` cells plus the one-cell
+    // gap the layout below inserts before the right side.
+    let (right_w, show_forum) = if prompt_w + MIN_QUERY + with_forum < w {
+        (with_forum, true)
+    } else if prompt_w + MIN_QUERY + author_w < w || (author_focused && prompt_w + author_w < w) {
+        (author_w, false)
+    } else {
+        (0, false)
+    };
+    let query_room = w.saturating_sub(prompt_w + right_w + usize::from(right_w > 0));
+
+    let mut spans = vec![Span::styled(
+        PROMPT,
+        Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+    )];
+    let mut used = prompt_w;
+    let mut query_caret = 0u16;
+    if s.query.is_empty() && !s.input_mode {
+        let hint = chrome::take_cells("type to search", query_room);
+        used += chrome::cell_width(&hint);
+        spans.push(Span::styled(hint, theme.dim()));
+    } else {
+        let (visible, caret) = chrome::field_window(&s.query, s.query_cursor, query_room);
+        used += chrome::cell_width(&visible);
+        query_caret = caret;
+        spans.push(Span::styled(visible, theme.base().add_modifier(Modifier::BOLD)));
+    }
+
     let mut author_x = area.x + area.width;
-    if left_w + right_w < w {
-        spans.push(Span::raw(" ".repeat(w - left_w - right_w)));
-        author_x = area.x + (w - right_w) as u16 + "author ".len() as u16;
+    if right_w > 0 {
+        let pad = w.saturating_sub(used + right_w);
+        spans.push(Span::raw(" ".repeat(pad)));
+        author_x = area.x + (used + pad + chrome::cell_width(AUTHOR_LABEL)) as u16;
         spans.push(Span::styled(author_label, theme.dim()));
-        spans.push(Span::raw("    "));
-        spans.push(Span::styled(forum_label, theme.dim()));
+        if show_forum {
+            spans.push(Span::raw(" ".repeat(GAP)));
+            spans.push(Span::styled(FORUM_LABEL, theme.dim()));
+        }
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
-    author_x
+
+    let caret = if author_focused {
+        author_x + author_caret
+    } else {
+        area.x + prompt_w as u16 + query_caret
+    };
+    caret.min(area.x + area.width.saturating_sub(1))
+}
+
+/// The chip row's dim right-hand hint, derived from state (issue #605): the
+/// constant `"t type · o order · Tab author"` used to show regardless of
+/// mode — `Tab` only switches fields once already typing (there is no Tab
+/// arm in the browse-mode key match at all; `a` is the real way in from
+/// there), and member-content mode (issue #548) has neither an order toggle
+/// nor an author filter to reach.
+fn search_chip_hint(s: &super::SearchState) -> &'static str {
+    if s.input_mode {
+        "Tab switch field \u{b7} Esc done"
+    } else if s.member.is_some() {
+        "t threads/posts"
+    } else {
+        "t type \u{b7} o order \u{b7} a author"
+    }
 }
 
 /// Chip row: `All | Threads | Posts` then `Latest | Relevance`, the active
@@ -1772,7 +1891,7 @@ fn render_chip_row(s: &super::SearchState, f: &mut Frame, area: Rect, theme: &Th
         spans.push(Span::raw(" "));
     }
 
-    let hint = Span::styled("t type \u{b7} o order \u{b7} Tab author", theme.dim());
+    let hint = Span::styled(search_chip_hint(s), theme.dim());
     let w = area.width as usize;
     let left_w: usize = spans.iter().map(Span::width).sum();
     let right_w = hint.width();
@@ -1853,7 +1972,7 @@ pub fn render_search(
     ])
     .split(inner);
 
-    let author_x = render_query_row(s, f, sections[0], theme);
+    let caret_x = render_query_row(s, f, sections[0], theme);
     render_chip_row(s, f, sections[1], theme);
 
     let rule = if g.ascii { "-" } else { "\u{2500}" };
@@ -1881,21 +2000,18 @@ pub fn render_search(
     }
 
     if s.input_mode {
-        if s.active_field == 0 {
-            let cur_col = 2 + crate::editor::prefix_cells(&s.query, s.query_cursor) as u16;
-            let cur_x =
-                (sections[0].x + cur_col).min(sections[0].x + sections[0].width.saturating_sub(1));
-            f.set_cursor_position((cur_x, sections[0].y));
-        } else {
-            let cur_col = crate::editor::prefix_cells(&s.author, s.author_cursor) as u16;
-            let cur_x =
-                (author_x + cur_col).min(sections[0].x + sections[0].width.saturating_sub(1));
-            f.set_cursor_position((cur_x, sections[0].y));
-        }
+        // `render_query_row` already derived the caret from the same window it
+        // drew, so the two can never disagree (issue #606).
+        f.set_cursor_position((caret_x, sections[0].y));
     }
 
     if s.loading {
         f.render_widget(Paragraph::new(Span::styled("Searching\u{2026}", theme.dim())), sections[5]);
+    } else if let Some(err) = &s.error {
+        f.render_widget(
+            Paragraph::new(Span::styled(format!("Error: {err}"), Style::new().fg(theme.error))),
+            sections[5],
+        );
     } else if s.results.is_empty() {
         f.render_widget(
             Paragraph::new(Span::styled(
@@ -2327,6 +2443,44 @@ mod tests {
         );
     }
 
+    /// Issue #598: a failed search must not look like "no results" (or a
+    /// silently stale page) — `render_search` has to surface `s.error`.
+    #[test]
+    fn render_search_shows_the_error_instead_of_no_results() {
+        let mut s = super::super::SearchState {
+            query: "edge".into(),
+            error: Some("boom".into()),
+            ..Default::default()
+        };
+        let theme = Theme::truecolor();
+        let rows = render_rows(100, 20, |f, area| {
+            render_search(&mut s, f, area, &theme, &UNICODE)
+        });
+        let screen = rows.join("\n");
+        assert!(screen.contains("Error: boom"), "screen:\n{screen}");
+        assert!(!screen.contains("No results"), "screen:\n{screen}");
+    }
+
+    /// Issue #605: the chip row's right-hand hint was a constant
+    /// (`"t type · o order · Tab author"`) regardless of mode — `Tab` has no
+    /// arm at all in the browse-mode key match (`a` is the real way to reach
+    /// the author field there), and member-content mode (issue #548) has
+    /// neither an order toggle nor an author filter.
+    #[test]
+    fn search_chip_hint_matches_the_actual_mode() {
+        let browse = super::super::SearchState::default();
+        assert_eq!(search_chip_hint(&browse), "t type \u{b7} o order \u{b7} a author");
+
+        let input = super::super::SearchState { input_mode: true, ..Default::default() };
+        assert_eq!(search_chip_hint(&input), "Tab switch field \u{b7} Esc done");
+
+        let member = super::super::SearchState {
+            member: Some((42, "thread".into())),
+            ..Default::default()
+        };
+        assert_eq!(search_chip_hint(&member), "t threads/posts");
+    }
+
     /// `search_hit_lines` clips its left span run with `clip_span_run`, which
     /// used to clip by chars instead of cells (issue #545); once the right
     /// side (a CJK author name) fits, the clipped left+right row must never
@@ -2471,6 +2625,59 @@ mod tests {
         assert_eq!(s.body_cursor, 0, "Ctrl+A in the body field must still move home");
     }
 
+    /// Issue #605: `compose_hints` used to advertise `Tab field` for every
+    /// target, but Tab only switches fields in the new-thread flow — a
+    /// ThreadReply/ConversationReply Tab inserts four spaces. And with the
+    /// new-thread Title focused, the always-drawn BBCode caps row (`^K
+    /// code`/`^U link` etc.) used to alias to kill-to-end/kill-to-start on
+    /// the title instead — a destructive surprise behind an unrelated cap.
+    #[test]
+    fn compose_tab_label_matches_target_and_title_focus_disarms_the_bbcode_caps() {
+        let new_thread = ComposeState {
+            target: Some(ComposeTarget::NewThread { node_id: 4 }),
+            ..Default::default()
+        };
+        let hints = compose_hints(&new_thread);
+        assert_eq!(
+            hints.keys.iter().find(|(cap, _)| *cap == "Tab").map(|(_, d)| *d),
+            Some("field"),
+            "new-thread Tab really does switch field"
+        );
+
+        let reply = ComposeState {
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 1,
+                thread_title: "Thread".into(),
+            }),
+            ..Default::default()
+        };
+        let hints = compose_hints(&reply);
+        assert_eq!(
+            hints.keys.iter().find(|(cap, _)| *cap == "Tab").map(|(_, d)| *d),
+            Some("indent"),
+            "a reply's Tab really does insert spaces, not switch a field"
+        );
+
+        // With the Title focused, ^B/^I/^K/^Q/^U must no-op with a Notice —
+        // never wrap BBCode into the title, and never (issue #605's specific
+        // regression) silently kill the title's text via ^K/^U.
+        let mut s = ComposeState {
+            target: Some(ComposeTarget::NewThread { node_id: 4 }),
+            title_field: true,
+            title: "hello world".into(),
+            title_cursor: 11,
+            ..Default::default()
+        };
+        for c in ['b', 'i', 'k', 'q', 'u'] {
+            let act = compose_key(&mut s, KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+            assert!(matches!(act, Action::Notice(_)), "^{c} in the title must notice, not act");
+            assert_eq!(s.title, "hello world", "^{c} must never alter the title");
+        }
+        // Ctrl+A/E/W keep working in the title.
+        compose_key(&mut s, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(s.title_cursor, 0, "Ctrl+A in the title must still move home");
+    }
+
     #[test]
     fn compose_cursor_navigation_and_word_deletion() {
         let mut s = ComposeState {
@@ -2563,6 +2770,68 @@ mod tests {
             .position(|c| c == "\u{6f22}")
             .expect("author text on screen") as u16;
         assert_eq!(pos.x, text_start + 4, "author caret must move 4 cells, not 2");
+    }
+
+    /// Issue #606: the new-thread Title had no horizontal viewport. Past the
+    /// 63 cells the 72-column editor leaves it, the typing went on invisibly
+    /// and the caret sat pinned to the pane border.
+    #[test]
+    fn new_thread_title_scrolls_horizontally_and_keeps_the_caret_visible() {
+        let title: String = std::iter::repeat_n('x', 79).chain(['Z']).collect();
+        let mut s = ComposeState {
+            target: Some(ComposeTarget::NewThread { node_id: 4 }),
+            title,
+            title_field: true,
+            ..Default::default()
+        };
+        s.title_cursor = s.title.chars().count();
+
+        let (rows, (cx, cy)) = render_compose_probe(&mut s, 120, 24);
+        let row = &rows[cy as usize];
+        assert!(row.contains("Title: "), "{row}");
+        assert!(
+            row.contains('Z'),
+            "the character just typed must be on screen: {row}"
+        );
+        // The caret sits just past the last visible character, inside the pane.
+        // Char position, not byte: the panel border is a 3-byte box glyph.
+        let z = row.chars().position(|c| c == 'Z').expect("Z on screen") as u16;
+        assert_eq!(cx, z + 1, "caret must follow the text, not the border: {row}");
+        assert!(cx < 119, "caret must stay inside the panel: {cx}");
+    }
+
+    /// Issue #606, second half: the right-hand labels used to be drawn only if
+    /// they still fitted after the *whole* query, so a long query made the
+    /// author field vanish — including while it was the focused one.
+    #[test]
+    fn a_long_query_still_leaves_the_author_field_on_screen() {
+        let theme = Theme::truecolor();
+        let mut s = crate::screens::SearchState {
+            query: "windows update failure 0x800f0922 ".repeat(2),
+            author: "kemical".into(),
+            author_cursor: 7,
+            input_mode: true,
+            active_field: 1,
+            ..Default::default()
+        };
+        s.query_cursor = s.query.chars().count();
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            render_search(&mut s, f, area, &theme, &UNICODE);
+        })
+        .expect("draw");
+        let pos = term.get_cursor_position().expect("cursor");
+        let buf = term.backend().buffer().clone();
+        let row: String = (0..80).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
+        assert!(row.contains("author kemical"), "author field must be drawn: {row}");
+        let start = row
+            .char_indices()
+            .position(|(i, _)| row[i..].starts_with("kemical"))
+            .expect("author text") as u16;
+        assert_eq!(pos.x, start + 7, "caret must sit at the end of the author: {row}");
+        assert!(pos.x < 79, "caret must stay inside the panel: {}", pos.x);
     }
 
     #[test]
@@ -3121,6 +3390,30 @@ mod tests {
     }
 
     // ---------- Sign in ----------
+
+    /// Issue #605: `login_hints()` used to be stateless and always advertise
+    /// `c`/`o`, but `login_key` binds them only in `LoginStage::Waiting` —
+    /// Idle is a real resting state (`end_session` lands there, so does
+    /// every poll/exchange failure) with no link yet to copy or open.
+    #[test]
+    fn login_hints_hide_copy_and_open_while_idle_and_notice_instead_of_silently_ignoring() {
+        let idle = crate::screens::LoginState { stage: LoginStage::Idle, ..Default::default() };
+        let hints = login_hints(&idle);
+        for (cap, _) in hints.keys.iter().chain(hints.short.iter()) {
+            assert!(*cap != "c" && *cap != "o", "Idle must not advertise {cap}");
+        }
+
+        let mut s = idle;
+        let act = login_key(&mut s, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(matches!(act, Action::Notice(_)), "c in Idle must notice, not silently no-op");
+        let act = login_key(&mut s, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert!(matches!(act, Action::Notice(_)), "o in Idle must notice, not silently no-op");
+
+        let waiting = crate::screens::LoginState { stage: LoginStage::Waiting, ..Default::default() };
+        let hints = login_hints(&waiting);
+        assert!(hints.keys.iter().any(|(cap, _)| *cap == "c"), "Waiting must still advertise c");
+        assert!(hints.keys.iter().any(|(cap, _)| *cap == "o"), "Waiting must still advertise o");
+    }
 
     #[test]
     fn login_shows_the_mark_box_and_the_full_link_at_both_sizes() {

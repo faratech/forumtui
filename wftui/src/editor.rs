@@ -302,6 +302,44 @@ pub fn prefix_cells(text: &str, cursor: usize) -> usize {
     text.chars().take(cursor).map(char_cells).sum()
 }
 
+/// The horizontal viewport of a **single-line** field: which char the visible
+/// window starts at, and where the caret sits inside it (both in the field's
+/// own coordinates — chars in, cells out).
+///
+/// Single-line fields (the new-thread Title, the search query and author, the
+/// DM recipients and title) used to be drawn as one unwindowed `Line` with the
+/// caret clamped to the last column, so past the pane's width the typist was
+/// typing blind with the caret pinned to the border (issue #606). This is the
+/// single-line sibling of `follow_caret`: it is a pure function of the text,
+/// the caret and the room, deriving the window per frame rather than storing a
+/// scroll offset, and it prefers the tail — the caret keeps the last usable
+/// column while typing, and the window snaps back to the head as soon as the
+/// whole prefix fits again.
+pub fn hwindow(text: &str, cursor: usize, width: usize) -> (usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+    if width == 0 {
+        return (cursor, 0);
+    }
+    let head = span_cells(&chars, 0, cursor);
+    if head < width {
+        return (0, head);
+    }
+    // Reserve the caret's own cell so it is always inside the field.
+    let budget = width - 1;
+    let mut start = cursor;
+    let mut used = 0usize;
+    while start > 0 {
+        let w = char_cells(chars[start - 1]);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        start -= 1;
+    }
+    (start, used)
+}
+
 /// Move the caret `delta` visual rows, keeping the sticky desired column:
 /// a run of Up/Down keeps aiming at the column the caret started from, so
 /// passing through a short line does not shorten the next move (`desired` is
@@ -655,6 +693,33 @@ mod tests {
         assert_eq!(cursor_coords(s, 11), (5, 1));
         assert_eq!(cursor_coords(s, 12), (0, 2));
         assert_eq!(cursor_coords(s, 15), (3, 2));
+    }
+
+    /// Issue #606: the single-line viewport keeps the caret inside the field
+    /// and shows the text around it, at every width and for wide characters.
+    #[test]
+    fn hwindow_keeps_the_caret_inside_the_field() {
+        let text = "abcdefghij"; // 10 cells
+        // The whole prefix fits: the window stays at the head.
+        assert_eq!(hwindow(text, 4, 10), (0, 4));
+        assert_eq!(hwindow(text, 9, 10), (0, 9));
+        // Caret at the end of a full line: the window scrolls by one so the
+        // caret has a cell of its own.
+        assert_eq!(hwindow(text, 10, 10), (1, 9));
+        // A narrow field shows the tail.
+        assert_eq!(hwindow(text, 10, 4), (7, 3));
+        // Wide characters are billed in cells, never chars.
+        let cjk = "\u{6f22}\u{5b57}\u{6f22}\u{5b57}"; // 4 chars, 8 cells
+        let (start, caret) = hwindow(cjk, 4, 5);
+        assert_eq!((start, caret), (2, 4));
+        // Degenerate widths never panic and never place the caret outside.
+        for width in 0..12usize {
+            for cursor in 0..=text.chars().count() {
+                let (start, caret) = hwindow(text, cursor, width);
+                assert!(start <= cursor);
+                assert!(caret < width.max(1), "caret {caret} outside width {width}");
+            }
+        }
     }
 
     /// Issue #559: a tab expands to spaces up to the next 4-column stop, and

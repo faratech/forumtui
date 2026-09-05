@@ -27,7 +27,33 @@ const INBOX_PANE_COLS: u16 = 50;
 
 // ================= Inbox =================
 
-pub fn inbox_hints() -> Hints {
+pub fn inbox_hints(s: &InboxState) -> Hints {
+    // Issue #605: with the view pane focused, `inbox_key` routes everything
+    // but q/h/Left to `conversation_view_key_inner` — `n`/`m`/`Enter`/`R`
+    // (the list pane's own keys) do something else there or nothing at all,
+    // while the keys that DO work (`n/N` next/prev message, `p/P` profile,
+    // `[/]` page) went unadvertised.
+    if s.focus == InboxPane::View && s.view.is_some() {
+        return Hints::with_short(
+            &[
+                ("r", "reply"),
+                ("j/k", "scroll"),
+                ("n/N", "msg"),
+                ("p/P", "profile"),
+                ("[/]", "page"),
+                ("Tab/Esc", "list"),
+            ],
+            &[
+                ("r", "reply"),
+                ("j/k", ""),
+                ("n/N", "msg"),
+                ("p/P", "profile"),
+                ("[/]", "page"),
+                ("Tab/Esc", "list"),
+            ],
+            0,
+        );
+    }
     Hints::with_short(
         &[
             ("Enter", "open"),
@@ -437,19 +463,25 @@ fn render_alerts_rows(
                     theme.base().add_modifier(Modifier::BOLD),
                 )
             };
-            let kind = a.content_type.to_ascii_lowercase();
-            let kind_glyph = if kind.contains("quote") {
+            // XF carries the alert KIND in `action` (`quote`/`mention`/
+            // `reaction`/`insert`/`award`/…); `content_type` is the CONTENT's
+            // type (`post`/`trophy`/`user`/…) and never contains "quote" or
+            // "mention" (issue #601).
+            let action = a.action.to_ascii_lowercase();
+            let kind_glyph = if action.contains("quote") {
                 g.quote_alert
-            } else if kind.contains("mention") {
+            } else if action.contains("mention") {
                 g.mention
             } else {
+                // Reaction/insert/award/etc. share the reply glyph — the
+                // glyph set has no dedicated reaction mark.
                 g.reply_alert
             };
             // `alert_text` is the server-rendered human-readable body (built
-            // from the alert handler's push template); fall back to the raw
-            // content_type for a payload that hasn't populated it.
+            // from the alert handler's push template); fall back to
+            // `content_type action` for a payload that hasn't populated it.
             let body = if a.alert_text.is_empty() {
-                a.content_type.replace('_', " ")
+                format!("{} {}", a.content_type, a.action).trim().replace('_', " ")
             } else {
                 a.alert_text.clone()
             };
@@ -1116,10 +1148,13 @@ impl NewConversationState {
             .filter(|p| !p.is_empty())
             .collect();
         if names.is_empty() || self.title.trim().is_empty() || self.body.trim().is_empty() {
-            self.errors.push("Fill in recipients, title and message.".into());
+            // Replace, never stack: three Enters on an empty form used to pile
+            // three identical rows over the body (issue #597).
+            self.errors = vec!["Fill in recipients, title and message.".into()];
             return Action::None;
         }
         self.busy = true;
+        self.sending = false;
         self.resolved_ids.clear();
         self.errors.clear();
         self.resolving = names.len();
@@ -1159,17 +1194,28 @@ pub fn render_new_conversation(
 
     const TO_LABEL: &str = "To (usernames, comma-separated): ";
     const TITLE_LABEL: &str = "Title: ";
+    // Both single-line fields scroll horizontally inside the room their label
+    // leaves them, and the caret comes from the same window (issue #606) —
+    // they used to be drawn whole and clipped by the pane, so a long
+    // recipients list or title was typed blind against the border.
+    let to_room = (to_area.width as usize).saturating_sub(crate::chrome::cell_width(TO_LABEL));
+    let (to_visible, to_caret) =
+        crate::chrome::field_window(&s.recipients, s.recipients_cursor, to_room);
+    let title_room =
+        (title_area.width as usize).saturating_sub(crate::chrome::cell_width(TITLE_LABEL));
+    let (title_visible, title_caret) =
+        crate::chrome::field_window(&s.title, s.title_cursor, title_room);
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(TO_LABEL, theme.dim()),
-            Span::styled(s.recipients.clone(), theme.base()),
+            Span::styled(to_visible, theme.base()),
         ])),
         to_area,
     );
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(TITLE_LABEL, theme.dim()),
-            Span::styled(s.title.clone(), theme.base()),
+            Span::styled(title_visible, theme.base()),
         ])),
         title_area,
     );
@@ -1217,21 +1263,21 @@ pub fn render_new_conversation(
 
     let cur_pos = match s.field {
         0 => {
-            let col = crate::editor::prefix_cells(&s.recipients, s.recipients_cursor) as u16;
             // Measured from the label itself (cells, not a hand-counted
             // constant) so the caret can't drift off by however many cells
-            // someone gets wrong re-copying the string (issue #535).
+            // someone gets wrong re-copying the string (issue #535), and from
+            // the same window the field was drawn with (issue #606).
             let prefix_len = crate::chrome::cell_width(TO_LABEL) as u16;
             Some((
-                (to_area.x + prefix_len + col).min(to_area.x + to_area.width.saturating_sub(1)),
+                (to_area.x + prefix_len + to_caret)
+                    .min(to_area.x + to_area.width.saturating_sub(1)),
                 to_area.y,
             ))
         }
         1 => {
-            let col = crate::editor::prefix_cells(&s.title, s.title_cursor) as u16;
             let prefix_len = crate::chrome::cell_width(TITLE_LABEL) as u16;
             Some((
-                (title_area.x + prefix_len + col)
+                (title_area.x + prefix_len + title_caret)
                     .min(title_area.x + title_area.width.saturating_sub(1)),
                 title_area.y,
             ))
@@ -1253,7 +1299,9 @@ pub fn render_new_conversation(
     for e in &s.errors {
         status_lines.push(Line::from(Span::styled(e.clone(), Style::new().fg(theme.error))));
     }
-    if s.busy {
+    if s.sending {
+        status_lines.push(Line::from(Span::styled("Sending…", theme.dim())));
+    } else if s.busy {
         status_lines.push(Line::from(Span::styled("Resolving recipients…", theme.dim())));
     }
     if !status_lines.is_empty() {
@@ -1433,6 +1481,52 @@ mod tests {
             .position(|c| c == "\u{6f22}")
             .expect("title text on screen") as u16;
         assert_eq!(pos.x, text_start + 4, "title caret must move 4 cells, not 2");
+    }
+
+    /// Issue #606: the DM recipients field scrolls horizontally too — a long
+    /// comma-separated list used to run off the pane with the caret pinned to
+    /// the border.
+    #[test]
+    fn new_conversation_recipients_scroll_horizontally() {
+        let mut s = super::super::NewConversationState {
+            field: 0,
+            recipients: format!("{}, Zed", "someone_with_a_long_name, ".repeat(4)),
+            ..Default::default()
+        };
+        s.recipients_cursor = s.recipients.chars().count();
+
+        let theme = Theme::truecolor();
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE);
+        })
+        .expect("draw");
+        let pos = term.get_cursor_position().expect("cursor");
+        let buf = term.backend().buffer().clone();
+        let row: String = (0..80).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
+        assert!(row.contains("Zed"), "the tail being typed must be visible: {row}");
+        let z = row.chars().position(|c| c == 'Z').expect("Z on screen") as u16;
+        assert_eq!(pos.x, z + 3, "caret sits just past the text: {row}");
+        assert!(pos.x < 79, "caret must stay inside the panel: {}", pos.x);
+    }
+
+    /// Issue #597: the validation row used to be *pushed* on every Enter
+    /// while only the valid path cleared the list, so three Enters on an
+    /// empty form stacked three identical rows over the body.
+    #[test]
+    fn empty_form_enter_twice_leaves_one_validation_row() {
+        let mut s = super::super::NewConversationState { field: 2, ..Default::default() };
+        for _ in 0..3 {
+            let action = new_conversation_key(
+                &mut s,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            );
+            assert!(matches!(action, Action::None));
+        }
+        assert_eq!(s.errors.len(), 1, "{:?}", s.errors);
+        assert!(!s.busy, "an invalid form never goes busy");
     }
 
     /// Issue #519/#523 for the DM composer: the message body is pre-wrapped
@@ -1688,7 +1782,7 @@ mod tests {
         ));
 
         // The key bar advertises it.
-        assert!(inbox_hints().keys.iter().any(|(k, _)| *k == "R"));
+        assert!(inbox_hints(&s).keys.iter().any(|(k, _)| *k == "R"));
     }
 
     #[test]
@@ -1707,13 +1801,90 @@ mod tests {
         s.alerts.alerts = vec![Alert {
             alert_id: 1,
             username: "kemical".into(),
-            content_type: "post_quote".into(),
+            content_type: "post".into(),
+            action: "quote".into(),
             view_date: 0,
             ..Default::default()
         }];
         let rows = render_rows_inbox(&mut s, 120, 36);
         let text = rows.join("\n");
         assert!(text.contains("unread"), "alerts footer missing: {text}");
+    }
+
+    /// Issue #605: with the view pane focused, `inbox_key` routes `n`/`m`/
+    /// `Enter`/`R` to `conversation_view_key_inner`, where they either do
+    /// something else (`n` moves to the next message) or nothing (`m`/
+    /// `Enter`/`R` have no arm there) — the bar must advertise the keys that
+    /// actually work in that pane (`n/N` message, `p/P` profile, `[/]` page),
+    /// not the list pane's own bar.
+    #[test]
+    fn inbox_hints_show_the_view_pane_bar_once_it_has_focus() {
+        let mut s = sample_inbox_state();
+        let list_hints = inbox_hints(&s);
+        assert!(list_hints.keys.iter().any(|(_, d)| *d == "new message"));
+
+        s.focus = InboxPane::View;
+        assert!(s.view.is_some(), "test setup: sample state has a view open");
+        let view_hints = inbox_hints(&s);
+        let names: Vec<&str> = view_hints.keys.iter().map(|(k, _)| *k).collect();
+        assert!(names.contains(&"n/N"), "{names:?}");
+        assert!(names.contains(&"p/P"), "{names:?}");
+        assert!(names.contains(&"[/]"), "{names:?}");
+        assert!(
+            !view_hints.keys.iter().any(|(_, d)| *d == "new message"),
+            "the list pane's own bar must not show once the view has focus: {names:?}"
+        );
+    }
+
+    /// Issue #601: the alert kind glyph must come from `action` (XF's real
+    /// kind column), not `content_type` (the CONTENT's type, `post`/
+    /// `trophy`/`user`, which never contains "quote"/"mention" in real data)
+    /// — shapes taken straight from `xf_user_alert` live rows.
+    #[test]
+    fn alert_glyph_is_chosen_from_action_not_content_type() {
+        let g = crate::glyph::UNICODE;
+        let alert = |content_type: &str, action: &str| Alert {
+            alert_id: 1,
+            username: "kemical".into(),
+            content_type: content_type.into(),
+            action: action.into(),
+            view_date: 0,
+            ..Default::default()
+        };
+
+        let mut s = InboxState {
+            tab: InboxTab::Alerts,
+            alerts: AlertsState { alerts: vec![alert("post", "quote")], ..Default::default() },
+            ..Default::default()
+        };
+        let rows = render_rows_inbox(&mut s, 120, 36);
+        assert!(
+            rows.join("\n").contains(g.quote_alert),
+            "content_type=post, action=quote must render the quote glyph"
+        );
+
+        let mut s = InboxState {
+            tab: InboxTab::Alerts,
+            alerts: AlertsState { alerts: vec![alert("user", "mention")], ..Default::default() },
+            ..Default::default()
+        };
+        let rows = render_rows_inbox(&mut s, 120, 36);
+        assert!(
+            rows.join("\n").contains(g.mention),
+            "content_type=user, action=mention must render the mention glyph"
+        );
+
+        // A real "trophy award" row must NOT pick up the quote/mention
+        // glyph off `content_type` alone.
+        let mut s = InboxState {
+            tab: InboxTab::Alerts,
+            alerts: AlertsState { alerts: vec![alert("trophy", "award")], ..Default::default() },
+            ..Default::default()
+        };
+        let rows = render_rows_inbox(&mut s, 120, 36);
+        let text = rows.join("\n");
+        assert!(!text.contains(g.quote_alert), "trophy/award must not render the quote glyph");
+        assert!(!text.contains(g.mention), "trophy/award must not render the mention glyph");
     }
 
     /// Issue #578: the view panel's header used to append "ago"
@@ -1841,7 +2012,8 @@ mod tests {
         s.alerts.alerts = vec![Alert {
             alert_id: 9,
             username: "kemical".into(),
-            content_type: "post_quote".into(),
+            content_type: "post".into(),
+            action: "quote".into(),
             ..Default::default()
         }];
         let act = inbox_key(&mut s, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1869,7 +2041,8 @@ mod tests {
         s.alerts.alerts = vec![Alert {
             alert_id: 9,
             username: "kemical".into(),
-            content_type: "post_quote".into(),
+            content_type: "post".into(),
+            action: "quote".into(),
             ..Default::default()
         }];
         let act = inbox_key(&mut s, KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));

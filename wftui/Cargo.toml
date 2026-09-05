@@ -21,6 +21,13 @@ common = { path = "../common" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "signal"] }
 ratatui = "0.30"
 crossterm = "0.29"
+# Grapheme segmentation for the cell-width arithmetic in `chrome`/`browse`.
+# unicode-width bills an emoji presentation sequence (base + U+FE0F) as 2
+# cells for the whole string but 1+0 per char, so a per-char cut disagrees
+# with the width the buffer bills and rows overflow (issue #595). Cutting on
+# grapheme cluster boundaries makes the two measures agree. Already in the
+# graph via ratatui, so this adds no new package.
+unicode-segmentation = "1"
 time = { version = "0.3", features = ["formatting", "macros"] }
 tracing = "0.1"
 serde_json = "1"

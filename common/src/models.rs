@@ -522,6 +522,12 @@ pub struct Alert {
     pub view_date: i64,
     #[serde(default, rename = "content_type")]
     pub content_type: String,
+    /// The alert kind (`quote`, `mention`, `reaction`, `insert`, `award`,
+    /// `from_admin`, …) — XF's `xf_user_alert.action` column. `content_type`
+    /// is the CONTENT's type (`post`, `trophy`, `user`, …), not the kind of
+    /// alert, so glyph selection must key off this field, not that one.
+    #[serde(default)]
+    pub action: String,
     #[serde(default, rename = "content_id")]
     pub content_id: u64,
     /// The human-readable alert text, built server-side from the alert
@@ -967,6 +973,10 @@ mod tests {
         let a: Alert = serde_json::from_value(body).unwrap();
         assert_eq!(a.alert_id, 501);
         assert_eq!(a.event_date, 1_700_000_000);
+        // Issue #601: the alert KIND lives in `action`, not `content_type`
+        // (which is the CONTENT's type — `post` here, not `post_reply`).
+        assert_eq!(a.content_type, "post");
+        assert_eq!(a.action, "post_reply");
         assert!(!a.viewed(), "view_date == 0 means unread");
         assert_eq!(a.alert_text, "kemical replied to your thread Hello World");
         assert_eq!(

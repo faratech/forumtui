@@ -107,21 +107,10 @@ impl Grammar {
 fn rj(s: &str, w: usize) -> String {
     let n = cell_width(s);
     if n >= w {
-        // Keep the trailing `w` cells: walk from the back until the
-        // remaining suffix's width is within budget.
-        let chars: Vec<char> = s.chars().collect();
-        let mut start = chars.len();
-        let mut kept = 0usize;
-        for ch in chars.iter().rev() {
-            let mut buf = [0u8; 4];
-            let cw = cell_width(ch.encode_utf8(&mut buf));
-            if kept + cw > w {
-                break;
-            }
-            kept += cw;
-            start -= 1;
-        }
-        return chars[start..].iter().collect();
+        // Keep the trailing `w` cells. Cut on grapheme clusters, not chars:
+        // per-char widths do not add up to the string width the buffer bills
+        // for an emoji presentation sequence (issue #595).
+        return chrome::take_cells_end(s, w);
     }
     format!("{}{s}", " ".repeat(w - n))
 }
@@ -201,10 +190,13 @@ pub(crate) fn thread_row(
             used = cw + 1;
         }
     }
-    let title = truncate(&t.title, tw - used);
+    let title = truncate(&t.title, tw.saturating_sub(used));
     let tlen = cell_width(&title);
     spans.push(Span::styled(title, title_style));
-    spans.push(Span::raw(" ".repeat(tw - used - tlen)));
+    // Saturating on purpose: a future measure mismatch must clip the row, not
+    // panic inside `draw` (subtract-with-overflow in debug, a `repeat` capacity
+    // overflow in release — issue #595).
+    spans.push(Span::raw(" ".repeat(tw.saturating_sub(used + tlen))));
 
     spans.push(Span::raw("  "));
     spans.push(Span::styled(lj(&t.username, gram.author()), theme.dim()));
@@ -1663,6 +1655,20 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
             }
         }
         KeyCode::Char('r') => Action::StartReply(s.thread.clone()),
+        // `r` is taken by "reply", so retrying a failed load (or, while
+        // there is no error, a manual refresh of the current page) is
+        // `R`/F5 — same convention as the conversations list's refresh
+        // (issue #604: the panel used to advertise "[/] to change page" on
+        // the very first load's failure, when `last_page` is still 0 and
+        // both keys are inert, with no way to retry short of Esc).
+        KeyCode::Char('R') | KeyCode::F(5) => {
+            s.loading = true;
+            Action::LoadThread(s.thread.thread_id, s.page)
+        }
+        KeyCode::Enter if s.error.is_some() => {
+            s.loading = true;
+            Action::LoadThread(s.thread.thread_id, s.page)
+        }
         KeyCode::Char('p') => {
             if let Some(post) = s.posts.get(s.sel_post) {
                 Action::OpenProfile(post.user_id, post.username.clone())
@@ -1787,7 +1793,13 @@ fn link_popup_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
     }
 }
 
-pub fn thread_view_hints() -> Hints {
+pub fn thread_view_hints(s: &ThreadViewState) -> Hints {
+    // Issue #604: while an error is showing, the ordinary key bar (Reply,
+    // like/vote, page keys that may not even be live yet) describes actions
+    // over content that never loaded — advertise the one key that works.
+    if s.error.is_some() {
+        return Hints::with_short(&[("R", "retry"), ("Esc", "back")], &[("R", "retry"), ("Esc", "back")], 0);
+    }
     Hints::with_short(
         &[
             ("r", "reply"),
@@ -1868,9 +1880,17 @@ pub fn render_thread_view(
         return;
     }
     if let Some(err) = &s.error {
+        // `[`/`]` are only real once `last_page` is known — a failed FIRST
+        // load leaves it at its `Default` of 0, so advertising "[/] to
+        // change page" described two dead keys with no way to retry short
+        // of Esc (issue #604).
+        let hint = if s.last_page > 1 {
+            "\n\nPress R to retry \u{00B7} [/] to change page."
+        } else {
+            "\n\nPress R to retry."
+        };
         f.render_widget(
-            Paragraph::new(format!("Error: {err}\n\n[/] to change page."))
-                .style(Style::new().fg(theme.error)),
+            Paragraph::new(format!("Error: {err}{hint}")).style(Style::new().fg(theme.error)),
             inner,
         );
         return;
@@ -1958,18 +1978,11 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
         String::new()
     } else {
         // Cells, not chars: reserve exactly one cell for the ellipsis so a
-        // wide character never straddles it (issue #511).
-        let mut cut = String::new();
-        let mut used = 0usize;
-        for ch in s.chars() {
-            let mut buf = [0u8; 4];
-            let w = cell_width(ch.encode_utf8(&mut buf));
-            if used + w > max.saturating_sub(1) {
-                break;
-            }
-            cut.push(ch);
-            used += w;
-        }
+        // wide character never straddles it (issue #511). The cut walks
+        // grapheme clusters so its width agrees with `cell_width` of the
+        // whole result — a per-char walk under-measures an emoji presentation
+        // sequence and returns `max + 1` cells (issue #595).
+        let cut = chrome::take_cells(s, max - 1);
         format!("{cut}\u{2026}")
     }
 }
@@ -2141,6 +2154,62 @@ mod tests {
         // ...and it reaches the rendered row, dim, in the type column.
         let row = text(&thread_row(&closed, &theme, &UNICODE, Grammar::Wide, 81));
         assert_eq!(row.chars().nth(3), Some('\u{2298}'), "type column: {row}");
+    }
+
+    /// Live titles carrying an emoji presentation sequence (base + U+FE0F):
+    /// unicode-width bills `™\u{FE0F}` as 2 cells for the string but 1 + 0 per
+    /// char, so the old per-char cut returned `max + 1` cells and the row's
+    /// padding subtraction underflowed — a panic inside `draw` (issue #595).
+    #[test]
+    fn thread_row_keeps_exact_width_with_a_variation_selector_title() {
+        let theme = Theme::truecolor();
+        for title in [
+            "Mica\u{2122}\u{FE0F} App: The Beauty of Doing Nothing in Windows 11",
+            "\u{26A0}\u{FE0F}SEVERE Windows 11 bug corrupts data on write",
+            "\u{2139}\u{FE0F} BSOD AI Analyzer Tools",
+        ] {
+            let t = Thread {
+                title: title.into(),
+                username: "kemical".into(),
+                reply_count: 27,
+                is_unread: true,
+                discussion_open: true,
+                ..Default::default()
+            };
+            for inner in 40usize..=120 {
+                for gram in [Grammar::Wide, Grammar::Narrow] {
+                    let line = thread_row(&t, &theme, &UNICODE, gram, inner);
+                    if gram.title_width(inner) >= 4 {
+                        assert_eq!(line.width(), inner, "{title:?} {gram:?} at inner {inner}");
+                    } else {
+                        // Degenerate panel: the title-only row is never padded,
+                        // but must still never exceed the panel.
+                        assert!(line.width() <= inner, "{title:?} {gram:?} at inner {inner}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// `truncate` must never return more cells than it was given, for any cut
+    /// point, including one that lands inside an emoji presentation sequence.
+    #[test]
+    fn truncate_never_exceeds_its_cell_budget() {
+        for s in [
+            "x\u{26A0}\u{FE0F}yyyy",
+            "Mica\u{2122}\u{FE0F} App",
+            "\u{2139}\u{FE0F}\u{2139}\u{FE0F}\u{2139}\u{FE0F}",
+            "视频编辑软件",
+        ] {
+            for n in 0..=cell_width(s) + 2 {
+                let out = truncate(s, n);
+                assert!(
+                    cell_width(&out) <= n,
+                    "truncate({s:?}, {n}) = {out:?} is {} cells",
+                    cell_width(&out)
+                );
+            }
+        }
     }
 
     #[test]
@@ -3163,6 +3232,50 @@ mod tests {
         );
         assert!(matches!(act, Action::OpenUrl(url) if url == "https://example.com/2"));
         assert!(!state.link_popup);
+    }
+
+    /// Issue #604: a first-load failure leaves `last_page` at its `Default`
+    /// of 0, so `[`/`]` (both gated on `page`/`last_page`) must stay inert —
+    /// but a retry key must exist and must clear once a load starts, and the
+    /// hints must advertise it instead of the ordinary (dead) key bar.
+    #[test]
+    fn thread_view_error_state_has_a_working_retry_and_state_aware_hints() {
+        let mut state = ThreadViewState {
+            thread: Thread { thread_id: 42, ..Default::default() },
+            error: Some("connection reset".into()),
+            page: 1,
+            last_page: 0,
+            ..Default::default()
+        };
+
+        assert!(
+            matches!(thread_view_key(&mut state, key('[')), Action::None),
+            "`[` must stay inert before any page is known"
+        );
+        assert!(
+            matches!(thread_view_key(&mut state, key(']')), Action::None),
+            "`]` must stay inert before any page is known"
+        );
+
+        let act = thread_view_key(&mut state, key('R'));
+        assert!(
+            matches!(act, Action::LoadThread(id, page) if id == 42 && page == 1),
+            "R must retry the same page"
+        );
+        assert!(state.loading, "R must set loading so the spinner shows while it retries");
+
+        // Enter also retries while an error is showing.
+        state.loading = false;
+        let act = thread_view_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(act, Action::LoadThread(id, page) if id == 42 && page == 1));
+
+        let hints = thread_view_hints(&state);
+        let names: Vec<&str> = hints.keys.iter().map(|(k, _)| *k).collect();
+        assert!(names.contains(&"R"), "the error hint bar must advertise R: {names:?}");
+        assert!(!names.contains(&"r"), "the dead ordinary key bar must not show while erroring: {names:?}");
     }
 
     #[test]

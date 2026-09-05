@@ -12,6 +12,7 @@ use std::time::Duration;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::glyph::Glyphs;
 use crate::theme::{Theme, Tier};
@@ -464,19 +465,53 @@ pub(crate) fn cell_width(s: &str) -> usize {
 /// Take a prefix of `s` whose total display width does not exceed `max`
 /// cells — never characters — so a double-width character never straddles
 /// the boundary and gets counted as narrower than it renders.
+///
+/// The unit is the **grapheme cluster**, not the char: unicode-width bills an
+/// emoji presentation sequence (`™\u{FE0F}`, `⚠\u{FE0F}`) as 2 cells for the
+/// whole string but 1 + 0 per char, so a per-char cut measures one cell less
+/// than the buffer bills the result at and the row overflows — the thread list
+/// panicked on exactly that (issue #595). Cutting on cluster boundaries makes
+/// the growing prefix's width agree with `cell_width` of the whole cut.
 pub(crate) fn take_cells(s: &str, max: usize) -> String {
     let mut out = String::new();
     let mut used = 0usize;
-    for ch in s.chars() {
-        let mut buf = [0u8; 4];
-        let w = cell_width(ch.encode_utf8(&mut buf));
+    for gr in s.graphemes(true) {
+        let w = cell_width(gr);
         if used + w > max {
             break;
         }
-        out.push(ch);
+        out.push_str(gr);
         used += w;
     }
     out
+}
+
+/// The mirror of [`take_cells`]: the **suffix** of `s` that fits in `max`
+/// cells, cut on grapheme cluster boundaries for the same reason.
+pub(crate) fn take_cells_end(s: &str, max: usize) -> String {
+    let clusters: Vec<&str> = s.graphemes(true).collect();
+    let mut start = clusters.len();
+    let mut used = 0usize;
+    for gr in clusters.iter().rev() {
+        let w = cell_width(gr);
+        if used + w > max {
+            break;
+        }
+        used += w;
+        start -= 1;
+    }
+    clusters[start..].concat()
+}
+
+/// The visible slice of a **single-line** field and the caret's column inside
+/// it, both measured in cells (issue #606). `room` is the cells the field has
+/// after its label; the text scrolls horizontally so the caret is always drawn
+/// on a real column instead of being clamped to the pane border while the
+/// typing goes on invisibly past the edge.
+pub(crate) fn field_window(text: &str, cursor: usize, room: usize) -> (String, u16) {
+    let (start, caret) = crate::editor::hwindow(text, cursor, room);
+    let tail: String = text.chars().skip(start).collect();
+    (take_cells(&tail, room), caret as u16)
 }
 
 fn crumbs_width(g: &Glyphs, crumbs: &[String]) -> usize {
@@ -605,6 +640,51 @@ mod tests {
                 "CJK header at width {w} is {} cells",
                 line.width()
             );
+        }
+    }
+
+    /// The same contract for an emoji presentation sequence (base + U+FE0F),
+    /// which unicode-width bills as 2 cells for the string but 1 + 0 per char:
+    /// a per-char clip in rung 3 overfills the row by a cell (issue #595).
+    #[test]
+    fn header_fills_exactly_the_width_with_a_variation_selector_crumb() {
+        let t = Theme::truecolor();
+        let c = crumbs(&[
+            "Forums",
+            "Windows News",
+            "Mica\u{2122}\u{FE0F} App: The Beauty of Doing Nothing in Windows 11",
+        ]);
+        for w in 40u16..=200 {
+            let line = header_line(&t, &UNICODE, &c, Some("Mike"), 2, 5, Some(1384), w);
+            assert_eq!(
+                line.width(),
+                w as usize,
+                "VS16 header at width {w} is {} cells",
+                line.width()
+            );
+        }
+        // The right-hand side survives: badges are still on the row.
+        let line = header_line(&t, &UNICODE, &c, Some("Mike"), 2, 5, None, 100);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("Mike"), "{text}");
+    }
+
+    #[test]
+    fn take_cells_agrees_with_the_width_the_buffer_bills() {
+        for s in [
+            "Mica\u{2122}\u{FE0F} App",
+            "\u{26A0}\u{FE0F}SEVERE",
+            "视频编辑软件",
+            "plain ascii",
+        ] {
+            for n in 0..=cell_width(s) + 2 {
+                let head = take_cells(s, n);
+                let tail = take_cells_end(s, n);
+                assert!(cell_width(&head) <= n, "take_cells({s:?}, {n}) = {head:?}");
+                assert!(cell_width(&tail) <= n, "take_cells_end({s:?}, {n}) = {tail:?}");
+            }
+            assert_eq!(take_cells(s, cell_width(s)), s);
+            assert_eq!(take_cells_end(s, cell_width(s)), s);
         }
     }
 

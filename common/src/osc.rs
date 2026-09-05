@@ -34,16 +34,33 @@ pub fn is_remote_session() -> bool {
         || std::env::var_os("SSH_TTY").is_some()
 }
 
+/// Deliver `seq` to the terminal, dual-delivering (raw + DCS-wrapped) when
+/// the multiplexer is (or might be) GNU screen.
+///
+/// `TERM` starting with `screen` plus no `$TMUX` is also exactly what a local
+/// tmux reached over ssh looks like from here (ssh forwards `TERM`, never
+/// `TMUX`), and a bare, non-`tmux;`-prefixed DCS is invisible to tmux's
+/// `allow-passthrough` — so a real GNU screen instance, which passes an
+/// unrecognized raw OSC through harmlessly, and a tmux-behind-ssh instance,
+/// which forwards a raw OSC to the outer terminal, both need the raw
+/// sequence; only real screen also needs the DCS wrapper.
+fn deliver_dual_for_screen(seq: &str) -> String {
+    match detect_multiplexer() {
+        Multiplexer::Screen => format!("{seq}{}", deliver_in_mux(seq, Multiplexer::Screen)),
+        mux => deliver_in_mux(seq, mux),
+    }
+}
+
 /// Wrap `label` in an OSC 8 hyperlink pointing at `url`.
 pub fn hyperlink(url: &str, label: &str) -> String {
     let seq = format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\");
-    deliver_in_mux(&seq, detect_multiplexer())
+    deliver_dual_for_screen(&seq)
 }
 
 /// Set terminal window and tab title via OSC 0.
 pub fn set_title(title: &str) -> String {
     let seq = format!("\x1b]0;{title}\x07");
-    deliver_in_mux(&seq, detect_multiplexer())
+    deliver_dual_for_screen(&seq)
 }
 
 /// OSC 52 clipboard write (base64 payload, BEL terminator).
@@ -57,7 +74,7 @@ pub fn set_clipboard(value: &str) -> String {
             let dcs = deliver_in_mux(&raw, Multiplexer::Tmux);
             format!("{raw}{dcs}")
         }
-        Multiplexer::Screen => deliver_in_mux(&raw, Multiplexer::Screen),
+        Multiplexer::Screen => deliver_dual_for_screen(&raw),
         Multiplexer::None => raw,
     }
 }
@@ -75,11 +92,19 @@ pub fn deliver_in_mux(seq: &str, mux: Multiplexer) -> String {
             if escaped.len() <= CHUNK_SIZE {
                 format!("\x1bP{escaped}\x1b\\")
             } else {
-                let chunks: Vec<String> = escaped
-                    .as_bytes()
-                    .chunks(CHUNK_SIZE)
-                    .map(|c| String::from_utf8_lossy(c).to_string())
-                    .collect();
+                // Chunk on char boundaries (never split a multi-byte char in
+                // two) instead of raw bytes + `from_utf8_lossy`, which turned
+                // a straddling char into replacement characters.
+                let mut chunks: Vec<&str> = Vec::new();
+                let mut start = 0;
+                while start < escaped.len() {
+                    let mut end = (start + CHUNK_SIZE).min(escaped.len());
+                    while !escaped.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    chunks.push(&escaped[start..end]);
+                    start = end;
+                }
                 format!("\x1bP{}\x1b\\", chunks.join("\x1b\\\x1bP"))
             }
         }
@@ -270,6 +295,54 @@ mod tests {
         assert!(wrapped.starts_with("\x1bP"));
         assert!(wrapped.ends_with("\x1b\\"));
         assert!(wrapped.contains("\x1b\\\x1bP"));
+    }
+
+    /// Issue #599 (chunking half): a 3-byte char straddling the 76-byte chunk
+    /// boundary used to be split by `bytes.chunks()` + `from_utf8_lossy`,
+    /// turning it into replacement characters on both sides of the cut.
+    #[test]
+    fn screen_chunking_never_splits_a_multibyte_char() {
+        let payload = format!("{}{}{}", "A".repeat(74), '\u{2500}', "B".repeat(30));
+        let wrapped = deliver_in_mux(&payload, Multiplexer::Screen);
+        assert!(!wrapped.contains('\u{FFFD}'), "{wrapped:?}");
+        assert!(wrapped.contains('\u{2500}'), "{wrapped:?}");
+    }
+
+    /// Issue #599 (misdetection half): `TERM=screen*` with no `$TMUX` is also
+    /// exactly the shape of a local tmux reached over ssh (ssh forwards TERM,
+    /// never TMUX). Dual-deliver the raw sequence (which a tmux-behind-ssh
+    /// outer terminal forwards, and a real screen passes through harmlessly)
+    /// alongside the screen-wrapped DCS (which real screen needs).
+    #[test]
+    fn screen_like_term_over_ssh_dual_delivers_raw_plus_dcs() {
+        let _g = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_tmux = std::env::var_os("TMUX");
+        let prev_sty = std::env::var_os("STY");
+        let prev_term = std::env::var_os("TERM");
+        unsafe {
+            std::env::remove_var("TMUX");
+            std::env::remove_var("STY");
+            std::env::set_var("TERM", "screen-256color");
+        }
+
+        let out = set_clipboard("https://windowsforum.com/x");
+        assert!(out.starts_with("\x1b]52;c;"), "missing raw OSC 52: {out:?}");
+        assert!(out.contains("\x1bP"), "missing screen-wrapped DCS: {out:?}");
+
+        unsafe {
+            match prev_tmux {
+                Some(v) => std::env::set_var("TMUX", v),
+                None => std::env::remove_var("TMUX"),
+            }
+            match prev_sty {
+                Some(v) => std::env::set_var("STY", v),
+                None => std::env::remove_var("STY"),
+            }
+            match prev_term {
+                Some(v) => std::env::set_var("TERM", v),
+                None => std::env::remove_var("TERM"),
+            }
+        }
     }
 
     #[test]

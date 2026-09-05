@@ -267,8 +267,16 @@ pub enum Msg {
     },
     ConvoReplySent(TaskResult<()>),
     ConvoCreated(TaskResult<Conversation>),
-    ConversationMarked(TaskResult<()>),
-    RecipientResolved { name: String, id: Option<u32> },
+    /// The id travels with the result (issue #608) so a successful mark can
+    /// flip that one row's `is_unread` locally instead of reloading page 1 of
+    /// the conversations list — which used to throw the user back to page 1
+    /// (and a re-clamped selection) no matter which page they marked from.
+    ConversationMarked(u32, TaskResult<()>),
+    /// One recipient name resolved (or failed to). The payload is a
+    /// `TaskResult` so a transport/429/5xx/401 failure is not flattened into
+    /// "not found" — and so a session-ending one still reaches the boundary
+    /// (issue #597).
+    RecipientResolved { name: String, id: TaskResult<Option<u32>> },
     AlertsLoaded(TaskResult<AlertsReply>),
     AlertMarked(TaskResult<()>),
     SearchDone { page: u32, result: TaskResult<SearchResultsReply> },
@@ -938,6 +946,19 @@ impl App {
             .retain(|s| matches!(s, Screen::Home(_) | Screen::ForumTree(_) | Screen::Login(_)));
         if !matches!(self.screens.last(), Some(Screen::Login(_))) {
             self.screens.push(screens::login_state());
+        }
+        // Issue #600: like the #590 identity-change teardown, the next
+        // sign-in (same account or a different one) must not inherit this
+        // session's Home list — its threads/unread marks (from nodes the
+        // next account may not even be allowed to see), or a `loading` flag
+        // stuck true forever if a load was in flight when the session ended
+        // (its `ForumLoaded` arrives with nowhere to clear it — see the
+        // boundary's `mark_retryable` fallthrough below). Resetting to
+        // default also puts `prime_home_list`'s gate back to "empty, not
+        // loading, node 0", so the next sign-in reloads Latest.
+        if let Some(Screen::Home(h)) = self.screens.first_mut() {
+            h.list = screens::ThreadListState::default();
+            h.focus = screens::Pane::Tree;
         }
         self.set_hint(reason);
     }
@@ -1665,12 +1686,12 @@ impl App {
                     let tx = self.tx.clone();
                     let name_clone = name.clone();
                     tokio::spawn(async move {
-                        let id = api.find_user(&name_clone).await.unwrap_or(None);
-                        tx.send(Msg::RecipientResolved {
-                            name: name_clone,
-                            id: id.map(|u| u.user_id),
-                        })
-                        .ok();
+                        let id = api
+                            .find_user(&name_clone)
+                            .await
+                            .map(|u| u.map(|u| u.user_id))
+                            .map_err(|e| TaskError::of(&e));
+                        tx.send(Msg::RecipientResolved { name: name_clone, id }).ok();
                     });
                 }
             }
@@ -2364,7 +2385,7 @@ impl App {
                 .mark_conversation_read(id)
                 .await
                 .map_err(|e| TaskError::of(&e));
-            tx.send(Msg::ConversationMarked(result)).ok();
+            tx.send(Msg::ConversationMarked(id, result)).ok();
         });
     }
 
@@ -2758,7 +2779,18 @@ impl App {
                 mark_retryable(&mut msg);
             } else {
                 self.end_session(&format!("Session expired ({reason}); log in again."));
-                return;
+                // Issue #600: a load already in flight when the session
+                // ended (e.g. `ForumLoaded` for the Home list that `Screen`
+                // retain above just kept) still needs its `Err` arm to run
+                // so `loading` clears rather than sticking forever — same
+                // discipline as the recheckable branches above (issue #588).
+                // `Msg::Bootstrap` is the one exception: its `Err` arm is
+                // documented as unreachable once the session boundary has
+                // already handled a session-ending failure (issue #557).
+                if is_bootstrap {
+                    return;
+                }
+                mark_retryable(&mut msg);
             }
         }
         match msg {
@@ -3381,11 +3413,22 @@ impl App {
                     Screen::NewConversation(nc) => Some(nc),
                     _ => None,
                 });
-                let done = if let Some(nc) = nc {
+                let done = if let Some(nc) = nc.filter(|nc| nc.resolving > 0) {
+                    // `resolving == 0` means nobody is waiting on this answer
+                    // (the form was already handed back, or the write is
+                    // already in flight) — a stale report must never spawn a
+                    // second `create_conversation` (issue #597).
                     nc.resolving = nc.resolving.saturating_sub(1);
                     match id {
-                        Some(id) => nc.resolved_ids.push(id),
-                        None => nc.errors.push(format!("{name}: not found")),
+                        Ok(Some(id)) => nc.resolved_ids.push(id),
+                        Ok(None) => nc.errors.push(format!("{name}: not found")),
+                        // A failed lookup is not an absent member (issue
+                        // #597): saying "not found" for a 500 or a dropped
+                        // connection sends the user renaming a correct
+                        // recipient.
+                        Err(e) => nc
+                            .errors
+                            .push(format!("{name}: lookup failed \u{2014} {}", e.message)),
                     }
                     nc.resolving == 0
                 } else {
@@ -3397,10 +3440,20 @@ impl App {
                         _ => None,
                     });
                     let (ids, title, body) = if let Some(nc) = nc {
-                        nc.busy = false;
                         if nc.resolved_ids.is_empty() || !nc.errors.is_empty() {
+                            // Nothing will be spawned: the form is the user's
+                            // again.
+                            nc.busy = false;
+                            nc.sending = false;
                             (Vec::new(), String::new(), String::new())
                         } else {
+                            // `busy` stays set from `submit()` right through
+                            // the write (issue #597): the create waits on the
+                            // api + write gates (up to 30 s), and in that
+                            // window a second Enter used to queue a second
+                            // conversation and Esc used to pop the screen out
+                            // from under the in-flight write.
+                            nc.sending = true;
                             (
                                 nc.resolved_ids.clone(),
                                 nc.title.clone(),
@@ -3446,7 +3499,14 @@ impl App {
                     });
                     if let Some(new) = nc {
                         new.busy = false;
+                        new.sending = false;
                         new.errors.push(e.message);
+                    } else {
+                        // The screen is gone (Esc raced the write, or the
+                        // stack was unwound): the failure still has to be
+                        // said out loud — same discipline as `ReplySent` /
+                        // `ConvoReplySent` (issues #520/#597).
+                        self.set_status(format!("Conversation failed: {}", e.message));
                     }
                 }
             },
@@ -3481,9 +3541,24 @@ impl App {
                 }
                 Err(e) => self.set_status(format!("Mark failed: {e}")),
             },
-            Msg::ConversationMarked(result) => match result {
+            Msg::ConversationMarked(id, result) => match result {
                 Ok(()) => {
-                    self.load_conversations(1);
+                    // Flip the row in place and recount the badge, exactly
+                    // like the open-a-conversation path (issue #541) does —
+                    // reloading page 1 unconditionally (the old behavior)
+                    // threw the user back to page 1 (and a re-clamped
+                    // selection) no matter which page they marked from
+                    // (issue #608).
+                    if let Some(inbox) = self.inbox_mut() {
+                        if let Some(row) =
+                            inbox.convos.conversations.iter_mut().find(|c| c.conversation_id == id)
+                        {
+                            row.is_unread = false;
+                            row.conversation_unread = false;
+                        }
+                        self.convos_unread =
+                            common::models::count_unread_conversations(&inbox.convos.conversations);
+                    }
                     self.set_status("Conversation marked read.");
                 }
                 Err(e) => self.set_status(format!("Mark failed: {e}")),
@@ -3826,8 +3901,10 @@ async fn finish_login(
 /// call is listed; `Msg::LoginComplete` deliberately is not, because a
 /// failed sign-in belongs to the login screen that is already up (and its
 /// own generation check owns it), and neither are the local-only outcomes
-/// (`LoggedOut`, `ImageLoaded`, `Notice`, `PaletteMember`,
-/// `RecipientResolved`).
+/// (`LoggedOut`, `ImageLoaded`, `Notice`, `PaletteMember`).
+/// `RecipientResolved` joined the list in issue #597: its lookup is an API
+/// call like any other, so a `NoToken`/401 from it must end (or re-check)
+/// the session rather than reading as "no such member".
 fn session_error_of(msg: &Msg) -> Option<&TaskError> {
     // Only `Msg::Bootstrap` carries the answer to the bootstrap `/me` call
     // (`restore_session`/`recheck_stored_session`) — the one place a 403
@@ -3847,11 +3924,12 @@ fn session_error_of(msg: &Msg) -> Option<&TaskError> {
         | Msg::ConversationLoaded { result: Err(e), .. }
         | Msg::ConvoReplySent(Err(e))
         | Msg::ConvoCreated(Err(e))
-        | Msg::ConversationMarked(Err(e))
+        | Msg::ConversationMarked(_, Err(e))
         | Msg::AlertsLoaded(Err(e))
         | Msg::AlertMarked(Err(e))
         | Msg::SearchDone { result: Err(e), .. }
         | Msg::ProfileLoaded(Err(e))
+        | Msg::RecipientResolved { id: Err(e), .. }
         | Msg::PostToggled { result: Err(e), .. } => e,
         _ => return None,
     };
@@ -3887,11 +3965,12 @@ fn mark_retryable(msg: &mut Msg) {
         | Msg::ConversationLoaded { result: Err(e), .. }
         | Msg::ConvoReplySent(Err(e))
         | Msg::ConvoCreated(Err(e))
-        | Msg::ConversationMarked(Err(e))
+        | Msg::ConversationMarked(_, Err(e))
         | Msg::AlertsLoaded(Err(e))
         | Msg::AlertMarked(Err(e))
         | Msg::SearchDone { result: Err(e), .. }
         | Msg::ProfileLoaded(Err(e))
+        | Msg::RecipientResolved { id: Err(e), .. }
         | Msg::PostToggled { result: Err(e), .. } => e,
         _ => return,
     };
@@ -4319,6 +4398,50 @@ mod tests {
         assert_eq!(known_conversation_last_page(&screens, 7), 1);
     }
 
+    /// Issue #608: `Msg::ConversationMarked` used to reload page 1 of the
+    /// conversations list unconditionally, throwing the user back to page 1
+    /// (with a re-clamped selection) no matter which page they marked read
+    /// from. It must instead flip that one row in place and recount the
+    /// unread badge — the list (and its page) must not move at all.
+    #[tokio::test]
+    async fn conversation_marked_flips_the_row_in_place_and_keeps_the_current_page() {
+        let mut app = test_app();
+        let convo = |id: u32, unread: bool| Conversation {
+            conversation_id: id,
+            is_unread: unread,
+            ..Default::default()
+        };
+        app.push_screen(Screen::Inbox(screens::InboxState {
+            convos: screens::ConversationsState {
+                conversations: vec![convo(21, true), convo(22, true)],
+                page: 2,
+                last_page: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        app.convos_unread = 5;
+
+        app.handle_msg(Msg::ConversationMarked(22, Ok(())));
+
+        let Some(Screen::Inbox(ib)) = app.screens.last() else {
+            panic!("expected the Inbox screen to survive");
+        };
+        assert_eq!(ib.convos.page, 2, "the list must not jump back to page 1");
+        let row = ib.convos.conversations.iter().find(|c| c.conversation_id == 22).unwrap();
+        assert!(!row.is_unread, "the marked row must flip locally");
+        let other = ib.convos.conversations.iter().find(|c| c.conversation_id == 21).unwrap();
+        assert!(other.is_unread, "an unrelated row must be untouched");
+        assert_eq!(
+            app.convos_unread, 1,
+            "the badge must be recounted from the (now one-less-unread) list, not left stale"
+        );
+
+        // No API call escaped besides the one this test already accounted
+        // for — no reload was spawned.
+        tokio::task::yield_now().await;
+    }
+
     /// Issue #553: `open_url` used to test only for a lower-case
     /// `http://`/`https://` prefix, so every other scheme (a `mailto:` link
     /// from `[EMAIL]`, an upper-case `HTTPS://` auto-link, `ftp://`) fell
@@ -4396,6 +4519,10 @@ mod tests {
         /// waits on `api_gate`/`write_gate` before it even looks at the
         /// token. Zero by default, so every other test is unaffected.
         write_delay: Duration,
+        /// `(ids, title, body)` per `create_conversation` call that reached
+        /// the stub. Issue #597 is "Enter twice started two conversations",
+        /// so the LENGTH of this is the assertion.
+        conversations_created: std::sync::Mutex<Vec<(Vec<u32>, String, String)>>,
         /// Overrides `me()`'s default `NoToken` so a test can make the
         /// bootstrap/recheck `/me` call succeed — issue #580's pinning test
         /// needs the recheck to actually answer `Bootstrap { Ok }` so it can
@@ -4412,6 +4539,9 @@ mod tests {
         }
         fn keyword_searches(&self) -> Vec<String> {
             self.keyword_searches.lock().expect("lock").clone()
+        }
+        fn conversations_created(&self) -> Vec<(Vec<u32>, String, String)> {
+            self.conversations_created.lock().expect("lock").clone()
         }
         fn replies(&self) -> Vec<(u32, String)> {
             self.replies.lock().expect("lock").clone()
@@ -4467,10 +4597,14 @@ mod tests {
         }
         async fn create_conversation(
             &self,
-            _: &[u32],
-            _: &str,
-            _: &str,
+            ids: &[u32],
+            title: &str,
+            body: &str,
         ) -> common::error::Result<Conversation> {
+            self.conversations_created
+                .lock()
+                .expect("lock")
+                .push((ids.to_vec(), title.to_string(), body.to_string()));
             Err(common::error::Error::NoToken)
         }
         async fn delete_conversation(&self, _: u32) -> common::error::Result<()> {
@@ -4664,6 +4798,105 @@ mod tests {
             "member content must never be requested as a keyword search: {:?}",
             api.keyword_searches()
         );
+    }
+
+    /// Issue #597: `NewConversationState::busy` used to be dropped the moment
+    /// the last recipient resolved — *before* `create_conversation` was
+    /// spawned behind the api + write gates (up to 30 s). In that window a
+    /// second Enter started a second resolve + create (two identical
+    /// conversations) and Esc popped the screen out from under the in-flight
+    /// write. `busy` now spans the whole lifecycle.
+    #[tokio::test]
+    async fn a_second_enter_after_recipients_resolve_cannot_start_a_second_conversation() {
+        let api = std::sync::Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+        app.push_screen(Screen::NewConversation(screens::NewConversationState {
+            recipients: "kemical".into(),
+            title: "hi".into(),
+            body: "hello".into(),
+            field: 2,
+            ..Default::default()
+        }));
+
+        // Enter in the message field submits: resolution starts.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        tokio::task::yield_now().await;
+        // The one recipient resolves.
+        app.handle_msg(Msg::RecipientResolved { name: "kemical".into(), id: Ok(Some(9)) });
+        tokio::task::yield_now().await;
+        assert_eq!(api.conversations_created().len(), 1, "one create was spawned");
+
+        let Some(Screen::NewConversation(nc)) = app.screens.last() else {
+            panic!("the screen must still be up while the write is in flight");
+        };
+        assert!(nc.busy, "busy must span the write, not just the resolution");
+        assert!(nc.sending, "the screen says Sending… once the write is spawned");
+
+        // Enter again, then let a resolution answer land: no second create.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        tokio::task::yield_now().await;
+        app.handle_msg(Msg::RecipientResolved { name: "kemical".into(), id: Ok(Some(9)) });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            api.conversations_created().len(),
+            1,
+            "a second Enter must not queue a duplicate conversation"
+        );
+
+        // Esc cannot pop the screen the write is going to report back to.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            matches!(app.screens.last(), Some(Screen::NewConversation(_))),
+            "Esc must be blocked while the create is in flight"
+        );
+    }
+
+    /// Issue #597, second defect on the same path: `find_user(..).unwrap_or(None)`
+    /// turned every transport/429/5xx error into "<name>: not found", sending
+    /// the user off to rename a perfectly good recipient.
+    #[tokio::test]
+    async fn a_failed_recipient_lookup_does_not_read_as_not_found() {
+        let mut app = test_app();
+        app.push_screen(Screen::NewConversation(screens::NewConversationState {
+            recipients: "kemical".into(),
+            title: "hi".into(),
+            body: "hello".into(),
+            busy: true,
+            resolving: 1,
+            ..Default::default()
+        }));
+        app.handle_msg(Msg::RecipientResolved {
+            name: "kemical".into(),
+            id: Err(TaskError {
+                message: "server error".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::Api(500),
+            }),
+        });
+        let Some(Screen::NewConversation(nc)) = app.screens.last() else {
+            panic!("expected the NewConversation screen");
+        };
+        assert_eq!(nc.errors.len(), 1, "{:?}", nc.errors);
+        assert!(nc.errors[0].contains("lookup failed"), "{:?}", nc.errors);
+        assert!(!nc.errors[0].contains("not found"), "{:?}", nc.errors);
+        assert!(!nc.busy, "a failed resolution hands the form back");
+        assert!(!nc.sending);
+    }
+
+    /// Issue #597: `ConvoCreated(Err)` with the screen already gone used to
+    /// drop the failure on the floor — every other write arm says it out loud.
+    #[test]
+    fn a_create_failure_with_the_screen_gone_still_reaches_the_status_line() {
+        let mut app = test_app();
+        app.handle_msg(Msg::ConvoCreated(Err(TaskError {
+            message: "flooding".into(),
+            code: None,
+            max_page: None,
+            kind: TaskErrorKind::Other,
+        })));
+        assert!(app.status.contains("flooding"), "status was {:?}", app.status);
     }
 
     /// Issue #541: a dual-pane Inbox primes its view pane with the newest
@@ -6065,6 +6298,90 @@ mod tests {
             api.replies().is_empty(),
             "a write started under the old identity must never reach the API: {:?}",
             api.replies()
+        );
+    }
+
+    /// Issue #600: unlike the #590 identity-change teardown above,
+    /// `end_session` used to leave Home's list/focus untouched — the next
+    /// sign-in (same account or a different one) inherited the previous
+    /// session's forum list, unread marks and pane focus. `end_session` must
+    /// reset it exactly like the identity-change path does, and a sign-in
+    /// right after must re-prime it.
+    #[tokio::test]
+    async fn end_session_resets_homes_list_like_the_identity_change_teardown() {
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.screens.push(screens::home_state(false));
+        if let Some(Screen::Home(h)) = app.screens.first_mut() {
+            h.list.node_id = 4; // a forum the old session had open
+            h.list.title = "News".into();
+            h.list.threads =
+                vec![Thread { thread_id: 1, title: "old session's thread".into(), ..Default::default() }];
+            h.focus = screens::Pane::List;
+        }
+
+        app.end_session("Session expired; log in again.");
+
+        {
+            let Some(Screen::Home(h)) = app.screens.first() else {
+                panic!("expected the retained Home screen");
+            };
+            assert!(
+                h.list.threads.is_empty(),
+                "the old session's Home list must not survive end_session: {:?}",
+                h.list.threads.iter().map(|t| &t.title).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                h.list.node_id, 0,
+                "must be back to the priming state so prime_home_list reloads it"
+            );
+            assert!(
+                matches!(h.focus, screens::Pane::Tree),
+                "focus must not stay pinned on the old list pane"
+            );
+        }
+
+        // The next sign-in must actually reload Latest into the reset pane,
+        // not sit on the (now-empty) old state forever.
+        app.handle_msg(Msg::LoginComplete {
+            generation: app.login_generation,
+            result: Ok(User { user_id: 99, username: "someone-else".into(), ..Default::default() }),
+        });
+        let Some(Screen::Home(h)) = app.screens.first() else {
+            panic!("expected the retained Home screen");
+        };
+        assert!(h.list.loading, "the next sign-in must have re-primed Home's list");
+    }
+
+    /// Issue #600 (boundary half): a load already in flight when the session
+    /// ended must still reach its own `Err` arm so `loading` clears, rather
+    /// than being swallowed whole by the boundary's `end_session; return`
+    /// branch — `end_session` cannot reset every retained screen's every
+    /// loading flag (here, `ForumTreeState::loading`, which the #600 Home
+    /// list reset above deliberately leaves alone).
+    #[test]
+    fn boundary_end_session_branch_lets_a_retained_screens_spinner_clear() {
+        let mut app = test_app();
+        app.me = None; // already signed out by the time this stale reply lands
+        app.screens.push(screens::home_state(false));
+        if let Some(Screen::Home(h)) = app.screens.first_mut() {
+            h.tree.loading = true;
+        }
+
+        app.handle_msg(Msg::NodesLoaded(Err(TaskError {
+            message: "not logged in".into(),
+            code: None,
+            max_page: None,
+            kind: TaskErrorKind::NoToken,
+        })));
+
+        let Some(Screen::Home(h)) = app.screens.first() else {
+            panic!("expected the retained Home screen");
+        };
+        assert!(
+            !h.tree.loading,
+            "the boundary's end_session branch must mark the message retryable and let it \
+             fall through, not strand a retained screen's spinner"
         );
     }
 
