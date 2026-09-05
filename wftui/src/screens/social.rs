@@ -1190,7 +1190,7 @@ pub fn render_new_conversation(
 
     let cur_pos = match s.field {
         0 => {
-            let col = s.recipients.chars().take(s.recipients_cursor).count() as u16;
+            let col = crate::editor::prefix_cells(&s.recipients, s.recipients_cursor) as u16;
             // Measured from the label itself (cells, not a hand-counted
             // constant) so the caret can't drift off by however many cells
             // someone gets wrong re-copying the string (issue #535).
@@ -1201,7 +1201,7 @@ pub fn render_new_conversation(
             ))
         }
         1 => {
-            let col = s.title.chars().take(s.title_cursor).count() as u16;
+            let col = crate::editor::prefix_cells(&s.title, s.title_cursor) as u16;
             let prefix_len = crate::chrome::cell_width(TITLE_LABEL) as u16;
             Some((
                 (title_area.x + prefix_len + col)
@@ -1353,6 +1353,59 @@ mod tests {
             text_start + 3,
             "caret must land right after the typed text, not one cell short"
         );
+    }
+
+    /// Issue #569: both single-line fields on this screen placed their
+    /// caret with `chars().take(cursor).count()` — one column per
+    /// *character*, not per cell — so a CJK recipient list or title drifted
+    /// the caret left by however many double-width characters preceded it.
+    #[test]
+    fn recipients_and_title_carets_measure_cjk_in_cells_not_chars() {
+        let theme = Theme::truecolor();
+
+        let mut s = super::super::NewConversationState {
+            field: 0,
+            recipients: "\u{6f22}\u{5b57}".into(), // 漢字, two double-width chars
+            recipients_cursor: 2,
+            ..Default::default()
+        };
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE);
+        })
+        .expect("draw");
+        let pos = term.get_cursor_position().expect("cursor");
+        let buf = term.backend().buffer().clone();
+        let cells: Vec<String> = (0..80).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
+        let text_start = cells
+            .iter()
+            .position(|c| c == "\u{6f22}")
+            .expect("recipients text on screen") as u16;
+        assert_eq!(pos.x, text_start + 4, "recipients caret must move 4 cells, not 2");
+
+        let mut s = super::super::NewConversationState {
+            field: 1,
+            title: "\u{6f22}\u{5b57}".into(),
+            title_cursor: 2,
+            ..Default::default()
+        };
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE);
+        })
+        .expect("draw");
+        let pos = term.get_cursor_position().expect("cursor");
+        let buf = term.backend().buffer().clone();
+        let cells: Vec<String> = (0..80).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
+        let text_start = cells
+            .iter()
+            .position(|c| c == "\u{6f22}")
+            .expect("title text on screen") as u16;
+        assert_eq!(pos.x, text_start + 4, "title caret must move 4 cells, not 2");
     }
 
     /// Issue #519/#523 for the DM composer: the message body is pre-wrapped

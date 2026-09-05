@@ -11,7 +11,7 @@ deployed.
 ```bash
 cd /web/wftui_app
 cargo build --release                 # release binary
-cargo test --workspace                # unit + wiremock (206 tests; 203 with --no-default-features)
+cargo test --workspace                # unit + wiremock (321 tests; 318 with --no-default-features)
 cargo clippy --all-targets --release -- -D warnings   # gate — must stay at 0
 cp target/release/wftui bin/wftui     # stable artifact location
 cp bin/wftui /usr/local/bin/wftui     # deploy on the server (also on PATH)
@@ -115,8 +115,29 @@ set -g mouse on                # forward mouse events to the TUI (drag-select, w
 
 ## Testing without touching production
 
+- **No test may resolve the real config dir or the live site** (issue #565:
+  the suite used to read the operator's own `~/.config/wftui/token.json`,
+  really `GET /api/me`'d windowsforum.com with that bearer, and overwrote the
+  store with a fixture). A test client is built with
+  `WfApiClient::with_store(token::Store::with_path(<scratch>), <unreachable
+  base>)` — never `WfApiClient::new()`, which reads `WFTUI_CONFIG_DIR` /
+  `WFTUI_BASE_URL`. The store and the origin are captured once at
+  construction, and every OAuth call (`register_link`, `poll_link`,
+  `exchange_code`, `refresh`, `revoke`) takes the origin as an argument, so a
+  client can never disagree with itself about which site it is talking to.
+  `wftui`'s `test_app()` also stubs `App::api` (`RecordingApi`, everything
+  `NoToken`) so no handler that spawns a call can reach the network, and
+  points the image disk cache at the scratch dir.
+  The two guard tests are the contract:
+  `common::api::tests::guard_no_test_can_reach_the_real_config_dir_or_the_live_site`
+  and `wftui::app::tests::guard_no_test_touches_the_real_config_dir_or_the_live_site`
+  (plus the assertion inside `EnvGuard::hold`/`offline_client`, which fires in
+  every test, not just those two).
 - Unit/wiremock tests: `cargo test`. Mock-server tests serialize on
-  `common::config::ENV_LOCK` because `WFTUI_BASE_URL` is process-global.
+  `common::config::ENV_LOCK` because `WFTUI_BASE_URL` is process-global —
+  **every** test that mutates a `WFTUI_*` variable must hold it (`logging`'s
+  did not, and its `remove_var` is what let an `api` test's client resolve the
+  real store).
 - Real PTY verification (how the render bugs above were found): run the binary
   under a Python `pty` + `pyte` screen, inject SGR mouse sequences
   (`\x1b[<0;x;yM` / `m`) and keys, and assert on the rendered screen. A raw

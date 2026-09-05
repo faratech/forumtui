@@ -614,6 +614,23 @@ impl Images {
         }
     }
 
+    /// Tier 5 with the disk cache pointed somewhere explicit. Test-only:
+    /// the default cache dir is derived from `config::token_path()`, i.e.
+    /// the machine owner's real config dir, and no test may write there
+    /// (issue #565).
+    #[cfg(test)]
+    pub fn text_only_at(dir: PathBuf) -> Self {
+        let mut images = Self::text_only();
+        images.disk = DiskCache::with_dir(dir, DISK_CAP_BYTES);
+        images
+    }
+
+    /// Where this instance's disk cache lives (test guard).
+    #[cfg(test)]
+    pub fn disk_dir(&self) -> &Path {
+        self.disk.dir()
+    }
+
     /// Query the terminal for its graphics protocol and cell size.
     ///
     /// **On the `DetectPlan::Query` path this reads stdin directly** (it writes

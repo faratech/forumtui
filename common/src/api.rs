@@ -23,6 +23,11 @@ pub struct WfApiClient {
     http: reqwest::Client,
     tokens: Mutex<Option<TokenSet>>,
     store: token::Store,
+    /// Site origin, captured at construction rather than read from the
+    /// process environment per call (issue #565): a client can then be
+    /// pointed somewhere harmless for a whole test regardless of what any
+    /// other thread is doing to `WFTUI_BASE_URL`.
+    base: String,
     pub api_gate: Arc<Gate>,
     pub search_gate: Arc<Gate>,
     pub write_gate: Arc<Gate>,
@@ -33,8 +38,22 @@ pub struct WfApiClient {
 }
 
 impl WfApiClient {
+    /// The production client: the user's own token store and the configured
+    /// site origin.
     pub fn new() -> Result<Self> {
-        let store = token::Store::new();
+        Self::with_store(token::Store::new(), config::base_url())
+    }
+
+    /// A client bound to an explicit token store and origin.
+    ///
+    /// Both are resolved here, once, instead of from `WFTUI_CONFIG_DIR` /
+    /// `WFTUI_BASE_URL` on every call. That is what lets a test build a
+    /// client that provably cannot read the machine owner's
+    /// `~/.config/wftui/token.json` or send a request to the live site —
+    /// issue #565, where `test_app()` built a real `WfApiClient::new()`, one
+    /// test really `GET /api/me`'d windowsforum.com with the operator's own
+    /// bearer, and the fixture store overwrote the real `token.json`.
+    pub fn with_store(store: token::Store, base_url: impl Into<String>) -> Result<Self> {
         // A store that fails to *parse* (hand-edited, truncated, or written
         // by a build whose `TokenSet` shape has since changed) is not a
         // reason to refuse to start: quarantine it and begin as if there
@@ -54,11 +73,29 @@ impl WfApiClient {
             http: crate::http::build()?,
             tokens: Mutex::new(tokens),
             store,
+            base: base_url.into(),
             api_gate: Arc::new(Gate::new(config::GLOBAL_MIN_INTERVAL_MS)),
             search_gate: Arc::new(Gate::new(config::SEARCH_MIN_INTERVAL_MS)),
             write_gate: Arc::new(Gate::new(config::WRITE_COOLDOWN_MS)),
             image_gate: Arc::new(Gate::new(config::IMAGE_MIN_INTERVAL_MS)),
         })
+    }
+
+    /// The origin this client talks to (`https://windowsforum.com` in
+    /// production). Callers that need the OAuth endpoints — the login flow
+    /// and logout's revoke — take it from here so they can never disagree
+    /// with the client about which site the session belongs to.
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
+    /// The file this client's session is persisted in.
+    pub fn store_path(&self) -> &std::path::Path {
+        self.store.path()
+    }
+
+    fn api_base(&self) -> String {
+        format!("{}/api", self.base)
     }
 
     /// Adopt a freshly obtained token set (login/refresh) and persist it.
@@ -108,6 +145,19 @@ impl WfApiClient {
 
     /// Current token, refreshed silently if expired. Refreshes under the lock
     /// so concurrent calls collapse into one network round-trip.
+    ///
+    /// A refresh rejected with `invalid_grant` is not automatically the end
+    /// of the session: XF rotates the refresh token on every refresh, so a
+    /// sibling instance sharing the config dir (a tmux session on the
+    /// server plus a local one) invalidates this process's in-memory grant
+    /// while leaving a perfectly good token set on disk. When the store
+    /// holds a *different* refresh token than the one the server just
+    /// rejected, that set is adopted and the call retried once — the
+    /// recovery `adopt_stored_tokens` was written for, which the app could
+    /// never reach because the first error a rotated refresh produces is
+    /// this `OAuth` one, not the `NoToken` the recheck listens for
+    /// (issue #568). Only when there is nothing newer to adopt (or the
+    /// sibling's token is dead too) does the session end.
     pub async fn valid_token(&self) -> Result<String> {
         let mut guard = self.tokens.lock().await;
         let existing = guard.as_ref().ok_or(Error::NoToken)?.clone();
@@ -120,37 +170,80 @@ impl WfApiClient {
             return Err(Error::NoToken);
         }
         let refresh_token = existing.refresh_token.clone();
-        let refreshed = oauth::refresh(&self.http, &refresh_token).await.inspect_err(|e| {
-            if matches!(e, Error::OAuth { code, .. } if code == "invalid_grant") {
-                // Refresh token expired/revoked: force a clean re-login. Only
-                // wipe the store if it still holds this refresh token (the
-                // user may have re-logged in from another code path).
-                if self
-                    .store
-                    .load()
-                    .ok()
-                    .flatten()
-                    .is_some_and(|t| t.refresh_token == refresh_token)
-                {
-                    let _ = self.store.erase();
+        let err = match oauth::refresh(&self.http, &self.base, &refresh_token).await {
+            Ok(refreshed) => return Ok(self.keep_refreshed(&mut guard, refreshed)),
+            Err(e) => e,
+        };
+        if !matches!(&err, Error::OAuth { code, .. } if code == "invalid_grant") {
+            return Err(err);
+        }
+        // Rejected. Before ending the session, look on disk: a sibling may
+        // have rotated the shared token set out from under this process.
+        let sibling = self
+            .store
+            .load()
+            .ok()
+            .flatten()
+            .filter(|t| t.refresh_token != refresh_token && !t.refresh_token.is_empty());
+        let Some(sibling) = sibling else {
+            // Nothing newer to adopt: force a clean re-login. Only wipe the
+            // store if it still holds this refresh token (the user may have
+            // re-logged in from another code path).
+            self.forget_rejected(&mut guard, &refresh_token);
+            return Err(err);
+        };
+        *guard = Some(sibling.clone());
+        if !sibling.access_expired(OffsetDateTime::now_utc()) {
+            return Ok(sibling.access_token);
+        }
+        // The sibling's access token is expired too — one retry with ITS
+        // refresh token, then give up for real.
+        match oauth::refresh(&self.http, &self.base, &sibling.refresh_token).await {
+            Ok(refreshed) => Ok(self.keep_refreshed(&mut guard, refreshed)),
+            Err(e) => {
+                if matches!(&e, Error::OAuth { code, .. } if code == "invalid_grant") {
+                    self.forget_rejected(&mut guard, &sibling.refresh_token);
                 }
-                *guard = None;
+                Err(e)
             }
-        })?;
-        // Update the live session first: XF's refresh grant rotates the
-        // refresh token (revokes the old one server-side in the same
-        // request), so once `oauth::refresh` above has succeeded the old
-        // token set is already dead. If persisting the new one to disk then
-        // fails (ENOSPC, a permission change, a read-only remount), that
-        // must cost only durability across a restart, not the live session —
-        // demoting it to a warning avoids stranding the revoked refresh
-        // token in `*guard`/the store, which would otherwise force a full
-        // browser re-login on the very next call (see issue #513).
+        }
+    }
+
+    /// Install a freshly refreshed token set as the live session and hand
+    /// back its access token.
+    ///
+    /// The live session is updated first: XF's refresh grant rotates the
+    /// refresh token (revokes the old one server-side in the same request),
+    /// so once `oauth::refresh` has succeeded the old token set is already
+    /// dead. If persisting the new one to disk then fails (ENOSPC, a
+    /// permission change, a read-only remount), that must cost only
+    /// durability across a restart, not the live session — demoting it to a
+    /// warning avoids stranding the revoked refresh token in the guard/the
+    /// store, which would otherwise force a full browser re-login on the
+    /// very next call (see issue #513).
+    fn keep_refreshed(&self, guard: &mut Option<TokenSet>, refreshed: TokenSet) -> String {
+        let access = refreshed.access_token.clone();
         *guard = Some(refreshed.clone());
         if let Err(e) = self.store.save(&refreshed) {
             tracing::warn!("token refresh persisted in memory but not to disk: {e}");
         }
-        Ok(refreshed.access_token)
+        access
+    }
+
+    /// Drop a refresh token the server has rejected for good: clear the live
+    /// session, and erase the store only if it still holds that very token
+    /// (never a set some other code path has since written).
+    fn forget_rejected(&self, guard: &mut Option<TokenSet>, rejected: &str) {
+        if self
+            .store
+            .load()
+            .ok()
+            .flatten()
+            .is_some_and(|t| t.refresh_token == rejected)
+        {
+            let _ = self.store.erase();
+        }
+        *guard = None;
     }
 
     /// A 429's `Retry-After` (or, absent one, a conservative fallback) must
@@ -172,7 +265,7 @@ impl WfApiClient {
     async fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, String)]) -> Result<T> {
         self.api_gate.wait().await;
         let token = self.valid_token().await?;
-        let url = format!("{}{path}", config::api_base());
+        let url = format!("{}{path}", self.api_base());
         let resp = self.http.get(url).query(query).bearer_auth(&token).send().await?;
         decode(resp).await.inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate]))
     }
@@ -188,7 +281,7 @@ impl WfApiClient {
         self.api_gate.wait().await;
         self.write_gate.wait().await;
         let token = self.valid_token().await?;
-        let url = format!("{}{path}", config::api_base());
+        let url = format!("{}{path}", self.api_base());
         let resp = self.http.post(url).form(form).bearer_auth(&token).send().await?;
         let out = decode(resp).await;
         if out.is_ok() {
@@ -206,7 +299,7 @@ impl WfApiClient {
     async fn post_unit(&self, path: &str, form: &[(&str, String)]) -> Result<()> {
         self.api_gate.wait().await;
         let token = self.valid_token().await?;
-        let url = format!("{}{path}", config::api_base());
+        let url = format!("{}{path}", self.api_base());
         let resp = self.http.post(url).form(form).bearer_auth(&token).send().await?;
         check_status(resp)
             .await
@@ -224,7 +317,7 @@ impl WfApiClient {
         }
         self.api_gate.wait().await;
         let token = self.valid_token().await?;
-        let url = format!("{}{path}", config::api_base());
+        let url = format!("{}{path}", self.api_base());
         let resp = self.http.post(url).form(form).bearer_auth(&token).send().await?;
         let reply: ToggleReply = decode(resp)
             .await
@@ -254,7 +347,7 @@ impl WfApiClient {
         for (k, v) in context {
             form.push((k, v.clone()));
         }
-        let key_url = format!("{}/attachments/new-key", config::api_base());
+        let key_url = format!("{}/attachments/new-key", self.api_base());
         let key_resp = self
             .http
             .post(key_url)
@@ -270,7 +363,7 @@ impl WfApiClient {
         let new_key: NewKey = decode(key_resp).await?;
 
         self.api_gate.wait().await;
-        let upload_url = format!("{}/attachments/", config::api_base());
+        let upload_url = format!("{}/attachments/", self.api_base());
         let file_part =
             reqwest::multipart::Part::bytes(bytes).file_name(filename).mime_str(mime)?;
         let form = reqwest::multipart::Form::new()
@@ -291,7 +384,7 @@ impl WfApiClient {
     pub async fn attachment_data(&self, attachment_id: u32) -> Result<Vec<u8>> {
         self.api_gate.wait().await;
         let token = self.valid_token().await?;
-        let url = format!("{}/attachments/{attachment_id}/data", config::api_base());
+        let url = format!("{}/attachments/{attachment_id}/data", self.api_base());
         let resp = self.http.get(url).bearer_auth(&token).send().await?.error_for_status()?;
         Ok(resp.bytes().await?.to_vec())
     }
@@ -642,7 +735,7 @@ impl WfApi for WfApiClient {
     async fn delete_conversation(&self, id: u32) -> Result<()> {
         self.api_gate.wait().await;
         let token = self.valid_token().await?;
-        let url = format!("{}/conversations/{id}", config::api_base());
+        let url = format!("{}/conversations/{id}", self.api_base());
         let resp = self.http.delete(url).bearer_auth(&token).send().await?;
         check_status(resp).await
     }
@@ -679,7 +772,7 @@ impl WfApi for WfApiClient {
         }
         self.api_gate.wait().await;
         let token = self.valid_token().await?;
-        let url = format!("{}/search", config::api_base());
+        let url = format!("{}/search", self.api_base());
         let mut form: Vec<(&str, String)> = Vec::new();
         if !query.keywords.trim().is_empty() {
             form.push(("keywords", query.keywords.trim().to_string()));
@@ -741,7 +834,7 @@ impl WfApi for WfApiClient {
         }
         self.api_gate.wait().await;
         let token = self.valid_token().await?;
-        let url = format!("{}/search/member", config::api_base());
+        let url = format!("{}/search/member", self.api_base());
         let mut form: Vec<(&str, String)> = vec![("user_id", user_id.to_string())];
         if !content.is_empty() && content != "all" {
             form.push(("content", content.to_string()));
@@ -823,6 +916,22 @@ mod tests {
             unsafe { std::env::set_var("WFTUI_BASE_URL", base) };
             unsafe { std::env::set_var("WFTUI_OAUTH_CLIENT_ID", "test-client") };
             unsafe { std::env::set_var("WFTUI_CONFIG_DIR", dir) };
+            // The whole point of the guard: from here on, every path this
+            // process resolves must be inside the fixture dir. Asserting it
+            // *before* any client is built (and so before any `save()`) is
+            // what turns a lost race on the process-global variable into a
+            // loud test failure instead of a silent write to the machine
+            // owner's real `~/.config/wftui/token.json` — issue #565, where
+            // exactly that happened and destroyed the operator's session.
+            let path = config::token_path();
+            assert!(
+                path.starts_with(dir),
+                "token store escaped the fixture dir: {path:?} is not under {dir}"
+            );
+            assert!(
+                !path.starts_with(config::default_config_root()),
+                "a test resolved the real config dir: {path:?}"
+            );
             let _ = std::fs::remove_dir_all(dir);
             EnvGuard {
                 _lock: lock,
@@ -841,6 +950,14 @@ mod tests {
     /// Caller must already hold `EnvGuard` (the env is process-global).
     async fn logged_in_client(token: &str) -> WfApiClient {
         let c = WfApiClient::new().unwrap();
+        // Re-checked here because the very next line SAVES a token set: if
+        // the store were the real one, this fixture would overwrite the
+        // machine owner's session (issue #565).
+        assert!(
+            !c.store_path().starts_with(config::default_config_root()),
+            "refusing to write a fixture token set into the real config dir: {:?}",
+            c.store_path()
+        );
         c.set_tokens(TokenSet {
             access_token: token.into(),
             refresh_token: "refresh-1".into(),
@@ -850,6 +967,67 @@ mod tests {
         .await
         .unwrap();
         c
+    }
+
+    /// GUARD (issue #565). The suite must never read or write the machine
+    /// owner's real config dir, and must never send a request to the live
+    /// site. It once did both: `WfApiClient::new()` resolved
+    /// `~/.config/wftui/token.json`, a `wftui` test really `GET /api/me`'d
+    /// windowsforum.com with the operator's bearer, and this crate's own
+    /// fixture (`tok-1`/`refresh-1`/`test`) was found written into the real
+    /// store. This test pins the two properties that make that impossible:
+    /// the fixture env resolves every path inside the scratch dir, and a
+    /// *poisoned* config dir (one that cannot hold a store at all) yields no
+    /// session and fails a save loudly instead of falling back to anything
+    /// real.
+    #[tokio::test]
+    async fn guard_no_test_can_reach_the_real_config_dir_or_the_live_site() {
+        let real = config::default_config_root();
+        let dir = "/tmp/wftui-t-guard";
+        {
+            let _env = EnvGuard::hold("http://127.0.0.1:1", dir);
+            for path in [config::token_path(), config::log_path()] {
+                assert!(path.starts_with(dir), "escaped the scratch dir: {path:?}");
+                assert!(!path.starts_with(&real), "resolved the real config dir: {path:?}");
+            }
+            let c = WfApiClient::new().unwrap();
+            assert!(c.store_path().starts_with(dir), "{:?}", c.store_path());
+            assert_eq!(c.base_url(), "http://127.0.0.1:1");
+            assert!(
+                !c.base_url().contains("windowsforum.com"),
+                "a test client must never be pointed at the live site"
+            );
+            assert!(!c.has_tokens().await, "a scratch config dir holds no session");
+        }
+
+        // Poisoned: the config dir is a plain FILE, so a store under it can
+        // neither be read nor created. Nothing may quietly fall back to a
+        // usable (i.e. real) location.
+        let poison = "/tmp/wftui-t-guard-poison";
+        let _ = std::fs::remove_dir_all(poison);
+        let _ = std::fs::remove_file(poison);
+        std::fs::write(poison, b"poison").unwrap();
+        {
+            let _env = EnvGuard::hold("http://127.0.0.1:1", poison);
+            let store = token::Store::new();
+            assert!(store.path().starts_with(poison), "{:?}", store.path());
+            assert!(
+                !matches!(store.load(), Ok(Some(_))),
+                "a poisoned config dir must never yield a session"
+            );
+            assert!(
+                store
+                    .save(&TokenSet {
+                        access_token: "guard".into(),
+                        refresh_token: "guard".into(),
+                        expires_at: 0,
+                        scope: "guard".into(),
+                    })
+                    .is_err(),
+                "a stray save must fail loudly, not land in the real store"
+            );
+        }
+        let _ = std::fs::remove_file(poison);
     }
 
     /// Issue #557: two instances sharing one config dir rotate each other's
@@ -1139,10 +1317,10 @@ mod tests {
             .await;
 
         let http = crate::http::build().unwrap();
-        crate::oauth::revoke(&http, "refresh-1", Some("refresh_token"))
+        crate::oauth::revoke(&http, &server.uri(), "refresh-1", Some("refresh_token"))
             .await
             .expect("refresh-token revoke");
-        crate::oauth::revoke(&http, "tok-1", Some("access_token"))
+        crate::oauth::revoke(&http, &server.uri(), "tok-1", Some("access_token"))
             .await
             .expect("access-token revoke");
     }
@@ -1264,6 +1442,120 @@ mod tests {
         assert_eq!(token2, "tok-2");
 
         let _ = std::fs::remove_file(dir);
+    }
+
+    /// Issue #568: two clients sharing one `token.json` (a tmux session on
+    /// the server plus a local one) invalidate each other's in-memory grant,
+    /// because XF rotates the refresh token on every refresh. The instance
+    /// that lost the race asks the token endpoint with its now-revoked
+    /// refresh token and is told `invalid_grant` — which used to end the
+    /// session outright, kicking the member to sign-in with a perfectly good
+    /// token set sitting on disk. (`adopt_stored_tokens` existed for exactly
+    /// this, but the app only ran it for `NoToken`, which this path never
+    /// produces.) The rejection is now checked against the store first: a
+    /// *different* refresh token there means a sibling rotated it, so that
+    /// set is adopted and the call goes through.
+    #[tokio::test]
+    async fn a_refresh_rejected_after_a_sibling_rotated_the_store_adopts_the_sibling_token() {
+        let server = MockServer::start().await;
+        let dir = "/tmp/wftui-t-sibling-rotation";
+        let _env = EnvGuard::hold(&server.uri(), dir);
+        // This process's refresh token is the one the sibling consumed.
+        Mock::given(method("POST"))
+            .and(path("/api/oauth2/token"))
+            .and(wiremock::matchers::body_string_contains("refresh_token=refresh-1"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "errors": [{"code": "invalid_grant", "message": "Invalid refresh token"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The sibling's access token is still good, so no second refresh is
+        // needed — and the request must carry it, not the dead one.
+        Mock::given(method("GET"))
+            .and(path("/api/nodes"))
+            .and(header("Authorization", "Bearer access-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "nodes": [{"node_id": 4, "title": "Windows News", "node_type_id": "Forum"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let c = WfApiClient::new().unwrap();
+        c.set_tokens(TokenSet {
+            access_token: "expired".into(),
+            refresh_token: "refresh-1".into(),
+            expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
+            scope: "test".into(),
+        })
+        .await
+        .unwrap();
+        // The sibling instance refreshed and wrote the rotated set to the
+        // shared store; this process still holds the old one in memory.
+        let store = token::Store::with_path(std::path::PathBuf::from(dir).join("token.json"));
+        store
+            .save(&TokenSet {
+                access_token: "access-2".into(),
+                refresh_token: "refresh-2".into(),
+                expires_at: OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                scope: "test".into(),
+            })
+            .unwrap();
+
+        let nodes = c
+            .nodes()
+            .await
+            .expect("the sibling's token set must carry the call through");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].title, "Windows News");
+        // Adopted in memory, and the sibling's set is still on disk (an
+        // `invalid_grant` for a token the store no longer holds must never
+        // erase someone else's session).
+        assert_eq!(c.valid_token().await.unwrap(), "access-2");
+        assert_eq!(
+            store.load().unwrap().expect("the store must survive").refresh_token,
+            "refresh-2"
+        );
+    }
+
+    /// The other half of #568: when the store holds the *same* refresh token
+    /// the server just rejected, there is no sibling to recover from and the
+    /// session really is over — the error propagates and the store is wiped
+    /// so the next start goes straight to sign-in.
+    #[tokio::test]
+    async fn a_refresh_rejected_with_nothing_newer_on_disk_still_ends_the_session() {
+        let server = MockServer::start().await;
+        let dir = "/tmp/wftui-t-sibling-none";
+        let _env = EnvGuard::hold(&server.uri(), dir);
+        Mock::given(method("POST"))
+            .and(path("/api/oauth2/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "errors": [{"code": "invalid_grant", "message": "Invalid refresh token"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = WfApiClient::new().unwrap();
+        c.set_tokens(TokenSet {
+            access_token: "expired".into(),
+            refresh_token: "refresh-1".into(),
+            expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
+            scope: "test".into(),
+        })
+        .await
+        .unwrap();
+
+        match c.nodes().await.unwrap_err() {
+            Error::OAuth { code, .. } => assert_eq!(code, "invalid_grant"),
+            other => panic!("expected the OAuth rejection, got {other:?}"),
+        }
+        assert!(!c.has_tokens().await, "the dead session must be cleared");
+        let store = token::Store::with_path(std::path::PathBuf::from(dir).join("token.json"));
+        assert!(
+            matches!(store.load(), Ok(None)),
+            "the store held the rejected token, so it must be erased"
+        );
     }
 
     #[tokio::test]

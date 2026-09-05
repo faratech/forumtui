@@ -180,8 +180,13 @@ pub fn code_from_pasted(input: &str, expected_state: &str) -> Result<String> {
         .ok_or_else(|| Error::Handshake("pasted value carries no code".into()))
 }
 
+/// `base` is the site origin (`https://windowsforum.com`, or a mock server in
+/// tests). Every network call in this module takes it explicitly instead of
+/// reading `config::base_url()` per call, so a caller — notably a test — can
+/// prove which host it is about to talk to (issue #565).
 pub async fn exchange_code(
     client: &reqwest::Client,
+    base: &str,
     code: &str,
     redirect_uri: &str,
     verifier: &str,
@@ -194,16 +199,20 @@ pub async fn exchange_code(
         ("redirect_uri", redirect_uri),
         ("code_verifier", verifier),
     ];
-    token_request(client, &form).await
+    token_request(client, base, &form).await
 }
 
-pub async fn refresh(client: &reqwest::Client, refresh_token: &str) -> Result<TokenSet> {
+pub async fn refresh(
+    client: &reqwest::Client,
+    base: &str,
+    refresh_token: &str,
+) -> Result<TokenSet> {
     let form = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
         ("client_id", &config::oauth_client_id()?),
     ];
-    token_request(client, &form).await
+    token_request(client, base, &form).await
 }
 
 /// Revoke one token at the OAuth server.
@@ -218,13 +227,18 @@ pub async fn refresh(client: &reqwest::Client, refresh_token: &str) -> Result<To
 /// hold), and that gap has to be visible rather than silent. Closing it for
 /// real needs a relay in the `WindowsForum/TuiLink` add-on, which is
 /// server-side work and out of this client's scope.
-pub async fn revoke(client: &reqwest::Client, token: &str, hint: Option<&str>) -> Result<()> {
+pub async fn revoke(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    hint: Option<&str>,
+) -> Result<()> {
     let client_id = config::oauth_client_id()?;
     let mut form: Vec<(&str, &str)> = vec![("token", token), ("client_id", &client_id)];
     if let Some(hint) = hint {
         form.push(("token_type_hint", hint));
     }
-    let url = format!("{}{}", config::base_url(), config::OAUTH_REVOKE_PATH);
+    let url = format!("{base}{}", config::OAUTH_REVOKE_PATH);
     client.post(url).form(&form).send().await?.error_for_status()?;
     Ok(())
 }
@@ -239,10 +253,11 @@ pub struct LoginLink {
 
 pub async fn register_link(
     client: &reqwest::Client,
+    base: &str,
     state: &str,
     challenge: &str,
 ) -> Result<LoginLink> {
-    let url = format!("{}/wf-tuilink/register", config::api_base());
+    let url = format!("{base}/api/wf-tuilink/register");
     let resp = client
         .post(url)
         .json(&serde_json::json!({"state": state, "challenge": challenge}))
@@ -299,8 +314,8 @@ pub enum PollStatus {
     Expired,
 }
 
-pub async fn poll_link(client: &reqwest::Client, id: &str) -> Result<PollStatus> {
-    let url = format!("{}/wf-tuilink/poll", config::api_base());
+pub async fn poll_link(client: &reqwest::Client, base: &str, id: &str) -> Result<PollStatus> {
+    let url = format!("{base}/api/wf-tuilink/poll");
     let resp = client
         .post(url)
         .json(&serde_json::json!({"id": id}))
@@ -322,8 +337,12 @@ pub async fn poll_link(client: &reqwest::Client, id: &str) -> Result<PollStatus>
     }
 }
 
-async fn token_request(client: &reqwest::Client, form: &[(&str, &str)]) -> Result<TokenSet> {
-    let url = format!("{}{}", config::base_url(), config::OAUTH_TOKEN_PATH);
+async fn token_request(
+    client: &reqwest::Client,
+    base: &str,
+    form: &[(&str, &str)],
+) -> Result<TokenSet> {
+    let url = format!("{base}{}", config::OAUTH_TOKEN_PATH);
     let resp = client.post(url).form(form).send().await?;
     let status = resp.status().as_u16();
     let body = resp.bytes().await?;
@@ -636,25 +655,9 @@ mod tests {
         assert!(err.to_string().contains("state mismatch"));
     }
 
-    /// Env overrides are process-global (`config::base_url`); hold the lock
-    /// for the whole test, mirroring `api::tests::EnvGuard`.
-    struct BaseUrlGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl BaseUrlGuard {
-        fn hold(base: &str) -> Self {
-            let lock = config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            unsafe { std::env::set_var("WFTUI_BASE_URL", base) };
-            BaseUrlGuard { _lock: lock }
-        }
-    }
-
-    impl Drop for BaseUrlGuard {
-        fn drop(&mut self) {
-            unsafe { std::env::remove_var("WFTUI_BASE_URL") };
-        }
-    }
+    // These token-endpoint tests take the mock server's origin as an
+    // argument (issue #565), so they neither read nor write the
+    // process-global `WFTUI_BASE_URL` and need no `ENV_LOCK`.
 
     /// A stale/rotated refresh token is rejected by XenForo's own API
     /// envelope (`{"errors":[{"code":"invalid_grant",...}]}`), not RFC
@@ -666,7 +669,6 @@ mod tests {
     #[tokio::test]
     async fn token_request_parses_the_xf_api_error_envelope() {
         let server = wiremock::MockServer::start().await;
-        let _env = BaseUrlGuard::hold(&server.uri());
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(config::OAUTH_TOKEN_PATH))
             .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
@@ -679,7 +681,7 @@ mod tests {
             .await;
 
         let client = crate::http::build().unwrap();
-        let err = refresh(&client, "stale-refresh-token").await.unwrap_err();
+        let err = refresh(&client, &server.uri(), "stale-refresh-token").await.unwrap_err();
         match err {
             Error::OAuth { code, message, status } => {
                 assert_eq!(code, "invalid_grant");
@@ -696,7 +698,6 @@ mod tests {
     #[tokio::test]
     async fn token_request_still_parses_the_rfc_error_shape() {
         let server = wiremock::MockServer::start().await;
-        let _env = BaseUrlGuard::hold(&server.uri());
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(config::OAUTH_TOKEN_PATH))
             .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
@@ -707,7 +708,7 @@ mod tests {
             .await;
 
         let client = crate::http::build().unwrap();
-        let err = refresh(&client, "stale-refresh-token").await.unwrap_err();
+        let err = refresh(&client, &server.uri(), "stale-refresh-token").await.unwrap_err();
         match err {
             Error::OAuth { code, message, status } => {
                 assert_eq!(code, "invalid_grant");
@@ -725,7 +726,6 @@ mod tests {
     #[tokio::test]
     async fn token_request_falls_back_to_http_error_for_non_json_bodies() {
         let server = wiremock::MockServer::start().await;
-        let _env = BaseUrlGuard::hold(&server.uri());
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(config::OAUTH_TOKEN_PATH))
             .respond_with(
@@ -737,7 +737,7 @@ mod tests {
             .await;
 
         let client = crate::http::build().unwrap();
-        let err = refresh(&client, "whatever").await.unwrap_err();
+        let err = refresh(&client, &server.uri(), "whatever").await.unwrap_err();
         match err {
             Error::OAuth { code, status, .. } => {
                 assert_eq!(code, "http_error");

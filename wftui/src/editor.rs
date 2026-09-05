@@ -291,6 +291,17 @@ pub fn caret_position(text: &str, width: usize, cursor: usize) -> (usize, usize)
     caret_in_rows(&chars, &rows, cursor)
 }
 
+/// Cell width of `text`'s first `cursor` *characters* — the caret column
+/// for a single-line field (a title, a search query, a recipients list).
+/// `cursor` is a char index, same as every other cursor in this module;
+/// billing it in `chars().count()` instead of cells put the caret one
+/// column off per CJK/emoji character already typed, since those draw two
+/// cells wide (issue #569 — the single-line sibling of `caret_in_rows`,
+/// which multi-line editors already measure this way).
+pub fn prefix_cells(text: &str, cursor: usize) -> usize {
+    text.chars().take(cursor).map(char_cells).sum()
+}
+
 /// Move the caret `delta` visual rows, keeping the sticky desired column:
 /// a run of Up/Down keeps aiming at the column the caret started from, so
 /// passing through a short line does not shorten the next move (`desired` is

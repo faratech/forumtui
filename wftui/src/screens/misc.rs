@@ -816,7 +816,7 @@ fn draw_editor_panel(
     );
 
     if is_new_thread && s.title_field {
-        let cur_col = s.title.chars().take(s.title_cursor).count() as u16;
+        let cur_col = crate::editor::prefix_cells(&s.title, s.title_cursor) as u16;
         let cur_x = (chunks[0].x + 7 + cur_col).min(chunks[0].x + chunks[0].width.saturating_sub(1));
         f.set_cursor_position((cur_x, chunks[0].y));
     } else {
@@ -1877,12 +1877,12 @@ pub fn render_search(
 
     if s.input_mode {
         if s.active_field == 0 {
-            let cur_col = 2 + s.query.chars().take(s.query_cursor).count() as u16;
+            let cur_col = 2 + crate::editor::prefix_cells(&s.query, s.query_cursor) as u16;
             let cur_x =
                 (sections[0].x + cur_col).min(sections[0].x + sections[0].width.saturating_sub(1));
             f.set_cursor_position((cur_x, sections[0].y));
         } else {
-            let cur_col = s.author.chars().take(s.author_cursor).count() as u16;
+            let cur_col = crate::editor::prefix_cells(&s.author, s.author_cursor) as u16;
             let cur_x =
                 (author_x + cur_col).min(sections[0].x + sections[0].width.saturating_sub(1));
             f.set_cursor_position((cur_x, sections[0].y));
@@ -2349,6 +2349,41 @@ mod tests {
         }
     }
 
+    /// Issue #569: the new-thread Title field placed its caret with
+    /// `chars().take(cursor).count()` — one column per *character* rather
+    /// than per cell — so a CJK title's caret drifted left by however many
+    /// double-width characters had already been typed.
+    #[test]
+    fn new_thread_title_caret_measures_cjk_in_cells_not_chars() {
+        let theme = Theme::truecolor();
+        let mut s = ComposeState {
+            target: Some(ComposeTarget::NewThread { node_id: 4 }),
+            title_field: true,
+            title: "\u{6f22}\u{5b57}".into(), // 漢字, two double-width chars
+            title_cursor: 2,
+            body: String::new(),
+            ..Default::default()
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            render_compose(&mut s, f, area, &theme, &UNICODE);
+        })
+        .expect("draw");
+        let pos = term.get_cursor_position().expect("cursor");
+        let buf = term.backend().buffer().clone();
+        let cells: Vec<String> = (0..80).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
+        let text_start = cells
+            .iter()
+            .position(|c| c == "\u{6f22}")
+            .expect("title text on screen") as u16;
+        assert_eq!(
+            pos.x,
+            text_start + 4,
+            "caret must move 4 cells for two double-width characters, not 2"
+        );
+    }
+
     #[test]
     fn new_thread_enter_in_title_advances_to_body() {
         let mut s = ComposeState {
@@ -2421,6 +2456,59 @@ mod tests {
         // End key
         compose_key(&mut s, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
         assert_eq!(s.body_cursor, 7);
+    }
+
+    /// Issue #569: the search query and author fields placed their carets
+    /// with `chars().take(cursor).count()` — cell-blind, same class of bug
+    /// as the new-thread title.
+    #[test]
+    fn search_query_and_author_carets_measure_cjk_in_cells_not_chars() {
+        let theme = Theme::truecolor();
+
+        let mut s = crate::screens::SearchState {
+            query: "\u{6f22}\u{5b57}".into(),
+            query_cursor: 2,
+            input_mode: true,
+            active_field: 0,
+            ..Default::default()
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            render_search(&mut s, f, area, &theme, &UNICODE);
+        })
+        .expect("draw");
+        let pos = term.get_cursor_position().expect("cursor");
+        let buf = term.backend().buffer().clone();
+        let cells: Vec<String> = (0..80).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
+        let text_start = cells
+            .iter()
+            .position(|c| c == "\u{6f22}")
+            .expect("query text on screen") as u16;
+        assert_eq!(pos.x, text_start + 4, "query caret must move 4 cells, not 2");
+
+        let mut s = crate::screens::SearchState {
+            query: "x".into(),
+            author: "\u{6f22}\u{5b57}".into(),
+            author_cursor: 2,
+            input_mode: true,
+            active_field: 1,
+            ..Default::default()
+        };
+        let mut term = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            render_search(&mut s, f, area, &theme, &UNICODE);
+        })
+        .expect("draw");
+        let pos = term.get_cursor_position().expect("cursor");
+        let buf = term.backend().buffer().clone();
+        let cells: Vec<String> = (0..120).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
+        let text_start = cells
+            .iter()
+            .position(|c| c == "\u{6f22}")
+            .expect("author text on screen") as u16;
+        assert_eq!(pos.x, text_start + 4, "author caret must move 4 cells, not 2");
     }
 
     #[test]
@@ -2690,6 +2778,33 @@ mod tests {
         assert!(rows[0].contains(" Preview "), "{}", rows[0]);
         assert!(!rows[0].contains(" Reply "), "{}", rows[0]);
         assert!(rows.join("\n").contains("as it will appear"));
+    }
+
+    /// Issue #566: the Preview panel renders the draft through
+    /// `common::bbcode` + `wrap_spans` (`push_wrapped`), while the editor
+    /// panel shows the raw typed body — so a `wrap_spans` bug that ate a
+    /// line's own leading whitespace desynced the two: the editor kept a
+    /// `[CODE]` block's indentation, the preview flattened it. Both panels
+    /// must show the same indentation once wrapped.
+    #[test]
+    fn compose_preview_keeps_the_same_indentation_the_editor_shows() {
+        let theme = Theme::truecolor();
+        let mut s = reply_state("[CODE]def f():\n    return 1[/CODE]");
+        let rows = render_rows(120, 24, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE));
+        assert!(rows[0].contains(" Reply "), "{}", rows[0]);
+        assert!(rows[0].contains(" Preview "), "{}", rows[0]);
+        assert!(
+            rows.iter().any(|r| r.contains("    return 1")),
+            "the editor's own draft must still show the indentation:\n{}",
+            rows.join("\n")
+        );
+        // Everything left of the editor/preview divider (column 72) is the
+        // Reply panel; everything from the divider on is the Preview panel.
+        assert!(
+            rows.iter().any(|r| r.get(72..).is_some_and(|right| right.contains("return 1"))),
+            "the preview must show the same body, indentation included:\n{}",
+            rows.join("\n")
+        );
     }
 
     // ---------- Reply / compose: inline images ----------

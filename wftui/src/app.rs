@@ -26,6 +26,11 @@ use crate::theme::Theme;
 /// spawns one task per visible image slot the moment a thread opens.
 const IMAGE_LOAD_CONCURRENCY: usize = 3;
 
+/// How long a status *toast* (`App::set_status`) stays on the status row
+/// before the event loop clears it (DESIGN.md: "Toasts (success/error)
+/// replace the left text and clear after 4 s" — issue #571).
+const STATUS_TOAST_SECS: u64 = 4;
+
 /// What kind of failure a `TaskError` carries — just enough for a caller to
 /// decide whether the stored session itself is the problem, as opposed to
 /// the network or the server having a bad moment (issue #551).
@@ -52,14 +57,17 @@ impl TaskErrorKind {
     /// check; `TaskError::ends_session()` refines it further by also
     /// inspecting `code` (issue #555) and is what callers should actually
     /// use.
+    ///
+    /// `Api(403)` is deliberately NOT here (issue #564): XenForo answers
+    /// ordinary permission refusals with HTTP 403 too — reacting to your own
+    /// post, replying to a closed thread, a missing OAuth scope, viewing a
+    /// forum/thread you can't — and none of those means the *token* is bad.
+    /// The only 403s that really mean "this account/session is over" are the
+    /// bootstrap `/me` path's account-gone codes, which
+    /// `TaskError::is_account_gone()` recognizes by `code` for the one
+    /// caller (`Msg::Bootstrap`) that needs them.
     pub fn ends_session(self) -> bool {
-        matches!(
-            self,
-            TaskErrorKind::NoToken
-                | TaskErrorKind::OAuth
-                | TaskErrorKind::Api(401)
-                | TaskErrorKind::Api(403)
-        )
+        matches!(self, TaskErrorKind::NoToken | TaskErrorKind::OAuth | TaskErrorKind::Api(401))
     }
 }
 
@@ -98,7 +106,7 @@ impl TaskError {
     /// True only when the failure means the stored session itself is
     /// invalid. This refines `TaskErrorKind::ends_session()` (which only
     /// looks at status/variant) with the wire-level `code`: an OAuth or
-    /// Api(401|403) failure whose `code` is the synthetic `"http_error"` —
+    /// Api(401) failure whose `code` is the synthetic `"http_error"` —
     /// meaning the body wasn't JSON at all, e.g. a Cloudflare 5xx/429 page
     /// or a WAF challenge HTML response — is never a genuine "this token/
     /// grant is bad" rejection, so it must not end the session (issue #555;
@@ -107,11 +115,45 @@ impl TaskError {
         self.kind.ends_session() && self.code.as_deref() != Some("http_error")
     }
 
+    /// True for the small set of HTTP 403s that mean "there is no account to
+    /// restore", not "you lack permission for this one action": XenForo's
+    /// bootstrap `/me` call (`App::restore_session`/`recheck_stored_session`,
+    /// answered as `Msg::Bootstrap`) can 403 with `you_have_been_banned`,
+    /// `your_account_has_been_rejected`/`your_account_has_been_disabled`
+    /// (`XF\Api\Controller\AbstractController::assertUserState`), or
+    /// `api_error.api_key_inactive` (`XF\Api\App::validateUserFromApiHeader`)
+    /// — every one of those really does mean the session is over. Every
+    /// other 403 (permission refusals on an ordinary content call,
+    /// `missing_scope`) must NOT end the session — see
+    /// `TaskErrorKind::ends_session` (issue #564). Only `session_error_of`
+    /// calls this, and only for `Msg::Bootstrap`.
+    fn is_account_gone(&self) -> bool {
+        if !matches!(self.kind, TaskErrorKind::Api(403)) {
+            return false;
+        }
+        let Some(code) = self.code.as_deref() else { return false };
+        let code = code.strip_prefix("api_error.").unwrap_or(code);
+        matches!(
+            code,
+            "you_have_been_banned"
+                | "your_account_has_been_rejected"
+                | "your_account_has_been_disabled"
+                | "api_key_inactive"
+        )
+    }
+
     pub fn of(e: &Error) -> Self {
         match e {
             Error::Api { code, message, status, max_page } => TaskError {
                 message: if code == "http_error" {
                     cap_message(message, RAW_MESSAGE_CAP)
+                } else if code.strip_prefix("api_error.").unwrap_or(code) == "missing_scope" {
+                    // A missing OAuth scope is this client's own
+                    // registration being out of date, not something a retry
+                    // or a fresh login fixes on its own — say so plainly
+                    // instead of surfacing it as a generic failure (issue
+                    // #564).
+                    format!("Configuration error: {message}")
                 } else {
                     message.clone()
                 },
@@ -280,6 +322,14 @@ pub struct App {
     pub alerts_unread: u32,
     pub convos_unread: u32,
     pub status: String,
+    /// When the current `status` was shown as a toast (`Some`) — cleared by
+    /// the event loop's tick once `STATUS_TOAST_SECS` have passed, at which
+    /// point the status row goes blank rather than keep showing whatever
+    /// last happened to succeed or fail (DESIGN.md: "Toasts (success/error)
+    /// replace the left text and clear after 4 s" — unimplemented until
+    /// issue #571). `None` means `status` is a persistent hint/progress
+    /// message (`set_hint`) that stays until something else overwrites it.
+    status_set_at: Option<std::time::Instant>,
     /// Set just before a reload whose only purpose is to refresh a thread page
     /// in place (`thread_id`, `page`, `sel_post`, `scroll`); consumed by the
     /// matching `Msg::ThreadLoaded` (issue #538).
@@ -309,6 +359,16 @@ pub struct App {
     /// running (and doubled by the next login's `start_pollers` call) —
     /// issue #524.
     poller_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Abort handles for the in-flight *writes* (post a reply, start a
+    /// thread, send/reply to a DM) spawned by `spawn_write`. A write waits
+    /// on `api_gate`/`write_gate` (up to 30 s after a previous post, 180 s
+    /// after a new thread) before `valid_token()` is even consulted, so a
+    /// write spawned by `^S` and then abandoned by `Ctrl+L` used to go out
+    /// *after* sign-out — under whatever token was in memory by then,
+    /// possibly the next account's on a shared machine — and announce
+    /// "Reply posted." over the sign-in screen. `end_session` aborts them:
+    /// a write belongs to the session that started it (issue #567).
+    write_handles: Vec<tokio::task::AbortHandle>,
     /// True after a transient (transport/5xx) failure to restore a stored
     /// session — cleared on a successful restore or a session-ending error.
     /// While true, `r` re-runs the session check instead of whatever the top
@@ -324,6 +384,14 @@ pub struct App {
     /// `token.json`, so the store is re-read once before the session is
     /// ended. Cleared whenever a session begins or ends (issue #557).
     session_recovery_tried: bool,
+    /// True while that recheck is actually in flight (set with
+    /// `session_recovery_tried`, cleared by the outcome it reports back:
+    /// `Msg::Bootstrap` or `Msg::SessionLost`). Any OAuth rejection that
+    /// lands inside that window belongs to the grant the recheck is already
+    /// replacing — every caller queued behind the failed refresh reports the
+    /// same one — so it is stale and must not end the session out from
+    /// under the recovery (issue #568).
+    session_recovery_pending: bool,
     /// Which login flow is the live one. Bumped by every `begin_login`, and
     /// stamped on the flow's messages so a superseded flow's `LoginReady` /
     /// `LoginFailed` / `LoginComplete` is ignored (issue #547).
@@ -514,6 +582,7 @@ pub async fn run(images: crate::images::Images) -> u8 {
         alerts_unread: 0,
         convos_unread: 0,
         status: "Starting…".into(),
+        status_set_at: None,
         keep_thread_position: None,
         show_help: false,
         palette: None,
@@ -528,9 +597,11 @@ pub async fn run(images: crate::images::Images) -> u8 {
         last_title: String::new(),
         should_quit: false,
         poller_handles: Vec::new(),
+        write_handles: Vec::new(),
         bootstrap_retry_needed: false,
         bootstrap_generation: 0,
         session_recovery_tried: false,
+        session_recovery_pending: false,
         login_generation: 0,
         login_task: None,
         body_rect: ratatui::layout::Rect::default(),
@@ -589,7 +660,7 @@ impl App {
     /// to retry" (issue #551) can re-run exactly this step without pushing a
     /// second Home screen.
     fn restore_session(&mut self) {
-        self.status = "Restoring session…".into();
+        self.set_hint("Restoring session…");
         let api = self.api.clone();
         let tx = self.tx.clone();
         let generation = self.bootstrap_generation;
@@ -607,7 +678,8 @@ impl App {
     /// `Msg::SessionLost` and the session ends (issue #557).
     fn recheck_stored_session(&mut self, reason: String) {
         self.session_recovery_tried = true;
-        self.status = "Session token changed elsewhere — re-checking…".into();
+        self.session_recovery_pending = true;
+        self.set_hint("Session token changed elsewhere — re-checking…");
         let client = self.client.clone();
         let api = self.api.clone();
         let tx = self.tx.clone();
@@ -628,12 +700,53 @@ impl App {
         });
     }
 
+    /// Show a status *toast* — a one-off success/failure notice ("Reply
+    /// posted.", "Like removed.", "Copied 12 chars…") — that the event
+    /// loop's tick clears on its own after `STATUS_TOAST_SECS` (DESIGN.md;
+    /// issue #571). Use this for anything that reports what an action just
+    /// did; use `set_hint` for an ongoing or persistent message instead.
+    fn set_status(&mut self, s: impl Into<String>) {
+        self.status = s.into();
+        self.status_set_at = Some(std::time::Instant::now());
+    }
+
+    /// Show a persistent status line — a hint ("Sign in first, or press q
+    /// to quit."), an in-progress notice ("Restoring session…"), or a gate
+    /// explanation ("Session expired (...); log in again.") — that stays
+    /// until something else overwrites it rather than auto-clearing like a
+    /// toast (`set_status`). Also the right call whenever a *stale* toast
+    /// timer must not linger on a status write that isn't one.
+    fn set_hint(&mut self, s: impl Into<String>) {
+        self.status = s.into();
+        self.status_set_at = None;
+    }
+
+    /// Clears a status toast once `STATUS_TOAST_SECS` have passed since
+    /// `set_status` showed it — the event loop calls this once per tick,
+    /// before `draw`, so a stale "Reply posted." doesn't sit on the status
+    /// row through everything the reader does next (issue #571). A no-op
+    /// for a persistent hint (`status_set_at` is `None`) or a toast that
+    /// hasn't aged out yet.
+    fn expire_status_toast(&mut self) {
+        if let Some(at) = self.status_set_at
+            && at.elapsed() >= Duration::from_secs(STATUS_TOAST_SECS)
+        {
+            self.status.clear();
+            self.status_set_at = None;
+        }
+    }
+
     /// The single place a session ends. Every session-ending failure routes
     /// here from the message pump's boundary (and `logout` calls it too), so
     /// a client that has lost its grant can never keep rendering a signed-in
     /// header over panels that all say "not logged in" (issue #557).
     fn end_session(&mut self, reason: &str) {
         self.stop_pollers();
+        // A write (reply/thread/DM) still waiting on the politeness gates
+        // belongs to the session that started it: it must never be sent
+        // once that session is over — least of all with the *next*
+        // account's token (issue #567).
+        self.abort_writes();
         // Anything already in flight belongs to the session being ended.
         self.bootstrap_generation = self.bootstrap_generation.wrapping_add(1);
         self.me = None;
@@ -652,10 +765,22 @@ impl App {
         self.keep_thread_position = None;
         self.bootstrap_retry_needed = false;
         self.session_recovery_tried = false;
+        self.session_recovery_pending = false;
+        // A `Screen::Login` already on top survives instead of being
+        // dropped and replaced with a fresh Idle one (issue #570): a late
+        // session-ending message can arrive while the sign-in screen is
+        // already up mid-flow (a link showing, or a poll in flight), and
+        // that flow's own link/stage must not be reset out from under the
+        // user. Login can only ever be the top of the stack (the gate
+        // invariant — nothing pushes over a session-less Login), so keeping
+        // whichever one is already there is enough; only push a new one
+        // when none survived.
         self.screens
-            .retain(|s| matches!(s, Screen::Home(_) | Screen::ForumTree(_)));
-        self.screens.push(screens::login_state());
-        self.status = reason.to_string();
+            .retain(|s| matches!(s, Screen::Home(_) | Screen::ForumTree(_) | Screen::Login(_)));
+        if !matches!(self.screens.last(), Some(Screen::Login(_))) {
+            self.screens.push(screens::login_state());
+        }
+        self.set_hint(reason);
     }
 
     fn start_pollers(&mut self) {
@@ -719,6 +844,29 @@ impl App {
         }));
     }
 
+    /// Spawn a write (reply, new thread, DM) tied to the current session.
+    ///
+    /// The handle is kept so `end_session` can abort the task: a write sits
+    /// in `api_gate`/`write_gate` long before it touches the token, so
+    /// without this a `^S` abandoned by `Ctrl+L` still posted the draft the
+    /// user believed discarded — under whatever token the client held by
+    /// the time the gate opened (issue #567). Finished handles are pruned
+    /// on the way in so the list cannot grow across a long session.
+    fn spawn_write<F>(&mut self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.write_handles.retain(|h| !h.is_finished());
+        self.write_handles.push(tokio::spawn(fut).abort_handle());
+    }
+
+    /// Abort every in-flight write and forget its handle (issue #567).
+    fn abort_writes(&mut self) {
+        for h in self.write_handles.drain(..) {
+            h.abort();
+        }
+    }
+
     /// Abort every poller spawned by `start_pollers` and forget its handles.
     /// Called on logout so a signed-out session stops hitting `/alerts` and
     /// `/conversations` — and so the next login's `start_pollers` starts a
@@ -736,6 +884,7 @@ impl App {
         reader: std::sync::mpsc::Receiver<crate::event::Input>,
     ) -> u8 {
         loop {
+            self.expire_status_toast();
             let _ = terminal.draw(|f| self.draw(f));
             // Drain background messages.
             while let Ok(msg) = self.rx.try_recv() {
@@ -1001,6 +1150,15 @@ impl App {
 
     fn handle_key(&mut self, k: KeyEvent) {
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('l') {
+            // The sign-in screen is a gate, not a session to end (issue
+            // #570): with no session already, Ctrl+L on the Login screen
+            // has nothing to sign out of. `logout()` -> `end_session()`
+            // used to tear the screen down and push a brand-new Idle one
+            // anyway, discarding a short link the user was about to open on
+            // their phone and leaving the still-running poll orphaned.
+            if self.me.is_none() && matches!(self.screens.last(), Some(Screen::Login(_))) {
+                return;
+            }
             self.logout();
             return;
         }
@@ -1105,7 +1263,7 @@ impl App {
             // edit mode, the composers' discard) runs it.
             match self.screens.last().map(Screen::esc_intent) {
                 Some(screens::EscIntent::Blocked(hint)) => {
-                    self.status = hint.to_string();
+                    self.set_hint(hint);
                     return;
                 }
                 Some(screens::EscIntent::Screen) => {
@@ -1154,7 +1312,7 @@ impl App {
     fn execute_action(&mut self, action: Action) {
         match action {
             Action::None => {}
-            Action::Notice(msg) => self.status = msg,
+            Action::Notice(msg) => self.set_status(msg),
             Action::PopScreen => {
                 if self.screens.len() > 1 {
                     self.screens.pop();
@@ -1206,7 +1364,7 @@ impl App {
                 };
                 self.push_screen(Screen::Search(s));
                 self.load_member_content(user_id, content, 1);
-                self.status = format!("Searching {display_title}…");
+                self.set_hint(format!("Searching {display_title}…"));
             }
             Action::OpenConversation(conv) => self.open_conversation(conv),
             Action::LoadForum(node_id, page) => self.load_forum(node_id, page),
@@ -1280,7 +1438,7 @@ impl App {
             Action::SubmitReply { thread_id, message } => {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
-                tokio::spawn(async move {
+                self.spawn_write(async move {
                     let result = api.reply(thread_id, &message).await.map_err(|e| TaskError::of(&e));
                     tx.send(Msg::ReplySent(result)).ok();
                 });
@@ -1288,7 +1446,7 @@ impl App {
             Action::SubmitThread { node_id, title, message } => {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
-                tokio::spawn(async move {
+                self.spawn_write(async move {
                     let result = api
                         .create_thread(node_id, &title, &message)
                         .await
@@ -1299,7 +1457,7 @@ impl App {
             Action::SubmitConvoReply { id, message } => {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
-                tokio::spawn(async move {
+                self.spawn_write(async move {
                     let result = api
                         .reply_conversation(id, &message)
                         .await
@@ -1333,14 +1491,14 @@ impl App {
                     text = sys;
                 }
                 if text.is_empty() {
-                    self.status = "Nothing copied yet — drag, double-click, or use system clipboard.".into();
+                    self.set_status("Nothing copied yet — drag, double-click, or use system clipboard.");
                     return;
                 }
                 self.handle_paste(text);
             }
             Action::OscCopy(value) => {
                 self.copy_text(&value);
-                self.status = "Copied to your clipboard (OSC 52 + system clipboard).".into();
+                self.set_status("Copied to your clipboard (OSC 52 + system clipboard).");
             }
             Action::OpenUrl(url) => self.open_url(&url),
         }
@@ -1565,7 +1723,7 @@ impl App {
                         let sanitized = crate::editor::normalize_control_chars(&text.replace('\r', ""));
                         crate::editor::insert_str(&mut cs.body, &mut cs.body_cursor, &sanitized);
                     }
-                    self.status = format!("Pasted {} characters", text.chars().count());
+                    self.set_status(format!("Pasted {} characters", text.chars().count()));
                 }
                 Screen::Search(ss) => {
                     let sanitized = crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], " "));
@@ -1574,7 +1732,7 @@ impl App {
                     } else {
                         crate::editor::insert_str(&mut ss.query, &mut ss.query_cursor, &sanitized);
                     }
-                    self.status = format!("Pasted {} characters into search", text.chars().count());
+                    self.set_status(format!("Pasted {} characters into search", text.chars().count()));
                 }
                 Screen::NewConversation(ncs) => {
                     match ncs.field {
@@ -1608,13 +1766,13 @@ impl App {
                             );
                         }
                     }
-                    self.status = format!("Pasted {} characters", text.chars().count());
+                    self.set_status(format!("Pasted {} characters", text.chars().count()));
                 }
                 _ => {
-                    self.status = format!(
+                    self.set_status(format!(
                         "Pasted {} characters into clipboard (press Ctrl+Y to insert)",
                         text.chars().count()
-                    );
+                    ));
                 }
             }
         }
@@ -2276,7 +2434,10 @@ impl App {
                             if token.is_empty() {
                                 continue;
                             }
-                            if let Err(e) = common::oauth::revoke(&http, token, Some(hint)).await {
+                            let base = client.base_url();
+                            if let Err(e) =
+                                common::oauth::revoke(&http, base, token, Some(hint)).await
+                            {
                                 tracing::warn!("logout: {hint} was not revoked server-side: {e}");
                                 failed.push(hint);
                             }
@@ -2316,6 +2477,14 @@ impl App {
         {
             return;
         }
+        // A token recheck reports back with exactly one of these two
+        // messages, so both close the window it opened. Cleared *before*
+        // the boundary below, so the recheck's own `SessionLost` (nothing
+        // to adopt — the session really is over) is not mistaken for one of
+        // the stale errors that window swallows.
+        if matches!(msg, Msg::Bootstrap { .. } | Msg::SessionLost(_)) {
+            self.session_recovery_pending = false;
+        }
         // The one session boundary: any background failure that means the
         // stored session itself is gone ends it here, rather than each
         // handler stashing "not logged in" in its own panel while the header
@@ -2332,6 +2501,16 @@ impl App {
                 self.recheck_stored_session(reason);
                 return;
             }
+            // Every caller that was queued behind the refresh which failed
+            // reports the same rejection, so an OAuth error arriving while
+            // the recheck is still in flight describes the grant that
+            // recheck is already replacing — stale. Ending the session on
+            // it would kick a member whose sibling instance merely rotated
+            // the shared `token.json` (issue #568); the recheck's own
+            // outcome decides, one way or the other.
+            if self.session_recovery_pending && err.kind == TaskErrorKind::OAuth {
+                return;
+            }
             self.end_session(&format!("Session expired ({reason}); log in again."));
             return;
         }
@@ -2344,9 +2523,12 @@ impl App {
                 // screen (rendered by the login screen), OSC 52 clipboard,
                 // and a file for plain `cat`.
                 emit_raw(&common::osc::set_clipboard(&url));
-                let path = common::config::token_path().with_file_name("login-url.txt");
+                // Beside the client's own store, not `config::token_path()`:
+                // a test client is pinned to a scratch dir and must not be
+                // able to write into the real config dir (issue #565).
+                let path = self.client.store_path().with_file_name("login-url.txt");
                 let _ = std::fs::write(&path, &url);
-                self.status = "Login link → clipboard + login-url.txt".into();
+                self.set_hint("Login link → clipboard + login-url.txt");
                 if let Some(Screen::Login(ls)) = self.screens.last_mut() {
                     ls.busy = false;
                     ls.url = url;
@@ -2382,10 +2564,10 @@ impl App {
                         {
                             self.screens.pop();
                         }
-                        self.status = format!(
+                        self.set_status(format!(
                             "Welcome, {}.",
                             self.me.as_ref().map(|u| u.username.as_str()).unwrap_or("")
-                        );
+                        ));
                         self.start_pollers();
                         self.load_nodes();
                         self.prime_home_list();
@@ -2405,7 +2587,7 @@ impl App {
             Msg::PostToggled { verb, result } => {
                 match result {
                     Ok(toggle) => {
-                        self.status = verb.notice(toggle).to_string();
+                        self.set_status(verb.notice(toggle));
                         // The ♡/▲ counts live in the baked post lines, so the
                         // page has to come back from the server; keep the
                         // reader where they were while it does (issue #538).
@@ -2417,7 +2599,7 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.status = format!("{}: {}", verb.failure(), e.message);
+                        self.set_status(format!("{}: {}", verb.failure(), e.message));
                     }
                 }
             }
@@ -2429,7 +2611,7 @@ impl App {
                 } else if let Some(v) = n.strip_prefix("convos:") {
                     self.convos_unread = v.parse().unwrap_or(0);
                 } else {
-                    self.status = n;
+                    self.set_status(n);
                 }
             }
             Msg::SessionLost(_) => {
@@ -2440,8 +2622,9 @@ impl App {
             Msg::Bootstrap { result: Ok(user), .. } => {
                 self.bootstrap_retry_needed = false;
                 self.session_recovery_tried = false;
+                self.session_recovery_pending = false;
                 self.me = Some(user);
-                self.status = "Session restored.".into();
+                self.set_status("Session restored.");
                 self.start_pollers();
                 if matches!(self.screens.last(), Some(Screen::Login(_))) {
                     self.screens.pop();
@@ -2482,10 +2665,10 @@ impl App {
                 // load-bearing and must survive regardless of how the
                 // `TaskError` was built.
                 const BOOTSTRAP_STATUS_MSG_CAP: usize = 30;
-                self.status = format!(
+                self.set_hint(format!(
                     "Can't reach windowsforum.com ({}) — press r to retry.",
                     cap_message(&e.message, BOOTSTRAP_STATUS_MSG_CAP)
-                );
+                ));
             }
             Msg::NodesLoaded(result) => {
                 let tree = self.tree_mut();
@@ -2615,7 +2798,7 @@ impl App {
                         if let Some(idx) = compose_idx {
                             self.screens.remove(idx);
                         }
-                        self.status = "Reply posted.".into();
+                        self.set_status("Reply posted.");
                         if thread_id > 0 {
                             // Land on the page the new reply actually lands
                             // on, not page 1 (issue #529). The API gives no
@@ -2642,7 +2825,7 @@ impl App {
                             // stack moved on): the failure has nowhere to
                             // render, so say it in the status line instead of
                             // dropping it (issue #520).
-                            self.status = format!("Reply failed: {}", e.message);
+                            self.set_status(format!("Reply failed: {}", e.message));
                         }
                     }
                 }
@@ -2657,7 +2840,7 @@ impl App {
                         if let Some(idx) = compose_idx {
                             self.screens.remove(idx);
                         }
-                        self.status = "Thread created.".into();
+                        self.set_status("Thread created.");
                         // The list we are about to refresh may be showing a
                         // different forum (Home's pane, say) — point it at the
                         // new thread's forum before the reply lands in it.
@@ -2678,13 +2861,13 @@ impl App {
                             compose.busy = false;
                             compose.error = Some(e.message);
                         } else {
-                            self.status = format!("Thread failed: {}", e.message);
+                            self.set_status(format!("Thread failed: {}", e.message));
                         }
                     }
                 }
             }
-            Msg::MarkedRead(Ok(())) => self.status = "Marked read.".into(),
-            Msg::MarkedRead(Err(e)) => self.status = format!("Mark-read failed: {e}"),
+            Msg::MarkedRead(Ok(())) => self.set_status("Marked read."),
+            Msg::MarkedRead(Err(e)) => self.set_status(format!("Mark-read failed: {e}")),
             Msg::ConversationsLoaded { page, result } => {
                 let mut new_unread: Option<u32> = None;
                 let mut auto_load: Option<u32> = None;
@@ -2835,7 +3018,7 @@ impl App {
                         if let Some(idx) = compose_idx {
                             self.screens.remove(idx);
                         }
-                        self.status = "Message sent.".into();
+                        self.set_status("Message sent.");
                         if cid > 0 {
                             // Mirror the thread-reply reload (issue #529): a
                             // conversation with more than one page of
@@ -2855,7 +3038,7 @@ impl App {
                             compose.busy = false;
                             compose.error = Some(e.message);
                         } else {
-                            self.status = format!("Message failed: {}", e.message);
+                            self.set_status(format!("Message failed: {}", e.message));
                         }
                     }
                 }
@@ -2897,7 +3080,7 @@ impl App {
                     if !ids.is_empty() {
                         let api = self.api.clone();
                         let tx = self.tx.clone();
-                        tokio::spawn(async move {
+                        self.spawn_write(async move {
                             let result = api
                                 .create_conversation(&ids, &title, &body)
                                 .await
@@ -2917,7 +3100,7 @@ impl App {
                     {
                         self.screens.pop();
                     }
-                    self.status = "Conversation started.".into();
+                    self.set_status("Conversation started.");
                     if let Some(inbox) = self.inbox_mut() {
                         inbox.tab = screens::InboxTab::Conversations;
                     }
@@ -2961,16 +3144,16 @@ impl App {
             Msg::AlertMarked(result) => match result {
                 Ok(()) => {
                     self.load_alerts();
-                    self.status = "Alert marked read.".into();
+                    self.set_status("Alert marked read.");
                 }
-                Err(e) => self.status = format!("Mark failed: {e}"),
+                Err(e) => self.set_status(format!("Mark failed: {e}")),
             },
             Msg::ConversationMarked(result) => match result {
                 Ok(()) => {
                     self.load_conversations(1);
-                    self.status = "Conversation marked read.".into();
+                    self.set_status("Conversation marked read.");
                 }
-                Err(e) => self.status = format!("Mark failed: {e}"),
+                Err(e) => self.set_status(format!("Mark failed: {e}")),
             },
             Msg::SearchDone { page, result } => {
                 let search = self.screens.iter_mut().rev().find_map(|s| match s {
@@ -3032,7 +3215,7 @@ impl App {
                     // The local token file is gone either way; say what did
                     // not happen instead of leaving "Logged out." standing.
                     tracing::warn!("logout error: {e}");
-                    self.status = format!("Logged out locally, but {e}.");
+                    self.set_status(format!("Logged out locally, but {e}."));
                 }
             },
         }
@@ -3067,7 +3250,7 @@ impl App {
     /// directly — the Search screen's `query` there is a display label, not a
     /// search term, so it must never be sent as one.
     pub fn load_member_content(&mut self, user_id: u32, content: String, page: u32) {
-        self.status = "Searching…".into();
+        self.set_hint("Searching…");
         let api = self.api.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -3083,7 +3266,7 @@ impl App {
         let api = self.api.clone();
         let tx = self.tx.clone();
         let page = query.page;
-        self.status = "Searching…".into();
+        self.set_hint("Searching…");
         tokio::spawn(async move {
             let result = api
                 .search_advanced(&query)
@@ -3126,14 +3309,14 @@ impl App {
         let target = match resolve_open_url(url, &common::config::base_url()) {
             Ok(target) => target,
             Err(scheme) => {
-                self.status = format!("Refused to open \"{scheme}:\" link.");
+                self.set_status(format!("Refused to open \"{scheme}:\" link."));
                 return;
             }
         };
         // Remote sessions: even if the opener targets the wrong machine, the
         // URL is now in the user's local clipboard.
         self.copy_text(&target);
-        self.status = format!("Opening {target} (also copied to clipboard)");
+        self.set_status(format!("Opening {target} (also copied to clipboard)"));
         let _ = common::oauth::open_browser(&target);
     }
 }
@@ -3227,7 +3410,12 @@ async fn run_login_flow(
     let pkce = common::oauth::generate_pkce();
     let state = common::oauth::generate_state();
 
-    let link = common::oauth::register_link(&http, &state, &pkce.challenge)
+    // The origin comes from the client, not `config::base_url()`: the flow
+    // must talk to the same site the session will be stored for, and a test
+    // that ever polls this task can only reach the client's harmless base
+    // (issue #565).
+    let base = client.base_url().to_string();
+    let link = common::oauth::register_link(&http, &base, &state, &pkce.challenge)
         .await
         .map_err(|e| e.to_string())?;
     tx.send(Msg::LoginReady { generation, url: link.url.clone() }).ok();
@@ -3235,10 +3423,11 @@ async fn run_login_flow(
 
     for _ in 0..300 {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        match common::oauth::poll_link(&http, &link.id).await {
+        match common::oauth::poll_link(&http, &base, &link.id).await {
             Ok(common::oauth::PollStatus::Authorized(code)) => {
                 let tokens = common::oauth::exchange_code(
                     &http,
+                    &base,
                     &code,
                     &common::config::tui_done_url(),
                     &pkce.verifier,
@@ -3292,6 +3481,11 @@ async fn finish_login(
 /// (`LoggedOut`, `ImageLoaded`, `Notice`, `PaletteMember`,
 /// `RecipientResolved`).
 fn session_error_of(msg: &Msg) -> Option<&TaskError> {
+    // Only `Msg::Bootstrap` carries the answer to the bootstrap `/me` call
+    // (`restore_session`/`recheck_stored_session`) — the one place a 403
+    // can mean "there is no account", not merely "no permission for this
+    // action" (issue #564).
+    let is_bootstrap = matches!(msg, Msg::Bootstrap { .. });
     let err = match msg {
         Msg::SessionLost(e) => e,
         Msg::Bootstrap { result: Err(e), .. }
@@ -3313,7 +3507,7 @@ fn session_error_of(msg: &Msg) -> Option<&TaskError> {
         | Msg::PostToggled { result: Err(e), .. } => e,
         _ => return None,
     };
-    err.ends_session().then_some(err)
+    (err.ends_session() || (is_bootstrap && err.is_account_gone())).then_some(err)
 }
 
 /// The last page this client already believed `thread_id` had, found the
@@ -3769,6 +3963,15 @@ mod tests {
         /// "the member list asked the keyword search instead".
         member_searches: std::sync::Mutex<Vec<(u32, String, u32)>>,
         keyword_searches: std::sync::Mutex<Vec<String>>,
+        /// `(thread_id, message)` per `reply` call that actually reached the
+        /// stub — issue #567 is "the write went out after sign-out", so the
+        /// absence of an entry here is the assertion.
+        replies: std::sync::Mutex<Vec<(u32, String)>>,
+        /// Stands in for the politeness gates: `reply` waits this long
+        /// *before* recording anything, the way `WfApiClient::post_form`
+        /// waits on `api_gate`/`write_gate` before it even looks at the
+        /// token. Zero by default, so every other test is unaffected.
+        write_delay: Duration,
     }
 
     impl RecordingApi {
@@ -3780,6 +3983,9 @@ mod tests {
         }
         fn keyword_searches(&self) -> Vec<String> {
             self.keyword_searches.lock().expect("lock").clone()
+        }
+        fn replies(&self) -> Vec<(u32, String)> {
+            self.replies.lock().expect("lock").clone()
         }
     }
 
@@ -3804,7 +4010,12 @@ mod tests {
         async fn thread_posts(&self, _: u32, _: u32) -> common::error::Result<common::models::PostsReply> {
             Err(common::error::Error::NoToken)
         }
-        async fn reply(&self, _: u32, _: &str) -> common::error::Result<common::models::Post> {
+        async fn reply(&self, thread_id: u32, message: &str) -> common::error::Result<common::models::Post> {
+            tokio::time::sleep(self.write_delay).await;
+            self.replies
+                .lock()
+                .expect("lock")
+                .push((thread_id, message.to_string()));
             Err(common::error::Error::NoToken)
         }
         async fn create_thread(&self, _: u32, _: &str, _: &str) -> common::error::Result<Thread> {
@@ -4231,7 +4442,14 @@ mod tests {
         assert_eq!(TaskError::of(&Error::Throttled).kind, TaskErrorKind::Other);
 
         assert!(TaskErrorKind::Api(401).ends_session());
-        assert!(TaskErrorKind::Api(403).ends_session());
+        // Issue #564: XenForo answers ordinary permission refusals with
+        // HTTP 403 too (reacting to your own post, replying to a closed
+        // thread, a missing OAuth scope, viewing content you can't) — none
+        // of those means the token is bad, so `Api(403)` must NOT be
+        // coarse-classified as session-ending; only the bootstrap `/me`
+        // path's account-gone codes are (`TaskError::is_account_gone`, used
+        // by `session_error_of` for `Msg::Bootstrap` alone).
+        assert!(!TaskErrorKind::Api(403).ends_session());
         assert!(TaskErrorKind::OAuth.ends_session());
         assert!(TaskErrorKind::NoToken.ends_session());
         assert!(!TaskErrorKind::Api(500).ends_session(), "a server 5xx must not end the session");
@@ -4526,6 +4744,74 @@ mod tests {
         assert!(app.me.is_some(), "the current generation's answer must still land");
     }
 
+    /// Issue #568: while the store recheck is in flight, every other caller
+    /// that was queued behind the refresh which just failed reports the same
+    /// `invalid_grant`. Those describe the grant the recheck is already
+    /// replacing, so the boundary must treat them as stale: one arriving
+    /// mid-recovery used to end the session anyway, undoing the recovery a
+    /// sibling-rotated `token.json` was about to provide. The recheck's own
+    /// outcome still decides — including when it reports the session lost.
+    #[tokio::test]
+    async fn an_oauth_error_arriving_mid_recheck_is_stale_and_the_recheck_still_decides() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+
+        // A NoToken opens the recovery window.
+        app.handle_msg(Msg::NodesLoaded(Err(TaskError {
+            message: "not logged in".into(),
+            code: None,
+            max_page: None,
+            kind: TaskErrorKind::NoToken,
+        })));
+        assert!(app.session_recovery_pending, "test setup: the recheck must be in flight");
+
+        // A queued caller now reports the refresh rejection that started all
+        // of this. It must not end the session.
+        app.handle_msg(Msg::ThreadLoaded {
+            id: 42,
+            page: 1,
+            result: Err(TaskError {
+                message: "oauth error [invalid_grant]".into(),
+                code: Some("invalid_grant".into()),
+                max_page: None,
+                kind: TaskErrorKind::OAuth,
+            }),
+        });
+        assert!(
+            app.me.is_some(),
+            "a rejection of the grant being replaced must not end the session"
+        );
+        assert!(!matches!(app.screens.last(), Some(Screen::Login(_))));
+
+        // The recheck answers: nothing on disk to adopt, so the session ends
+        // here — the window must not have swallowed its verdict too.
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(1), app.rx.recv())
+            .await
+            .expect("the recheck must report back")
+            .expect("channel open");
+        assert!(matches!(sent, Msg::SessionLost(_)), "expected SessionLost");
+        app.handle_msg(sent);
+        assert!(app.me.is_none(), "the recheck's own verdict still ends the session");
+        assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
+        assert!(!app.session_recovery_pending);
+
+        // Outside that window an OAuth rejection ends the session as before.
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.handle_msg(Msg::ThreadLoaded {
+            id: 42,
+            page: 1,
+            result: Err(TaskError {
+                message: "oauth error [invalid_grant]".into(),
+                code: Some("invalid_grant".into()),
+                max_page: None,
+                kind: TaskErrorKind::OAuth,
+            }),
+        });
+        assert!(app.me.is_none());
+        assert!(app.status.contains("Session expired"), "status: {:?}", app.status);
+    }
+
     /// Issue #557: `Error::NoToken` in a live session may only mean a second
     /// instance sharing `token.json` rotated the refresh token, so the store
     /// is re-read once before the session ends. With nothing new on disk the
@@ -4570,6 +4856,137 @@ mod tests {
         })));
         assert!(app.me.is_none());
         assert!(app.status.contains("Session expired"));
+    }
+
+    /// Issue #564: XenForo answers ordinary permission refusals with HTTP
+    /// 403 too (liking your own post, replying to a closed thread, viewing a
+    /// forum you can't) — none of those means the token is bad, so unlike
+    /// `Api(401)` an `Api(403)` on an ordinary content call must NOT end the
+    /// session. `PostToggled`/`ReplySent`/`ThreadLoaded` must each route the
+    /// failure to their own handler (status line / view/compose error)
+    /// instead, leaving `me`, the pollers and a busy `Compose` screen alone.
+    #[tokio::test]
+    async fn permission_refusal_403s_on_ordinary_calls_do_not_end_the_session() {
+        let phrase_error = |code: &str| TaskError {
+            message: "some phrase text".into(),
+            code: Some(code.into()),
+            max_page: None,
+            kind: TaskErrorKind::Api(403),
+        };
+
+        // PostToggled: reacting to your own content.
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.start_pollers();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 42, ..Default::default() },
+            ..Default::default()
+        }));
+        app.handle_msg(Msg::PostToggled {
+            verb: PostVerb::Like,
+            result: Err(phrase_error("reacting_to_your_own_content_is_considered_cheating")),
+        });
+        assert!(app.me.is_some(), "a 403 permission refusal must not sign the user out");
+        assert!(!app.poller_handles.is_empty(), "the pollers must keep running");
+        assert!(
+            matches!(app.screens.last(), Some(Screen::ThreadView(_))),
+            "the thread view must not be replaced by Login"
+        );
+        assert!(app.status.contains("Like failed"), "status: {:?}", app.status);
+
+        // ReplySent: replying to a closed thread, with a busy Compose whose
+        // draft must survive.
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.start_pollers();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply { thread_id: 1, thread_title: "A thread".into() }),
+            body: "my draft".into(),
+            busy: true,
+            ..Default::default()
+        }));
+        app.handle_msg(Msg::ReplySent(Err(phrase_error(
+            "you_may_not_perform_this_action_because_discussion_is_closed",
+        ))));
+        assert!(app.me.is_some(), "a 403 permission refusal must not sign the user out");
+        assert!(!app.poller_handles.is_empty(), "the pollers must keep running");
+        match app.screens.last() {
+            Some(Screen::Compose(cs)) => {
+                assert_eq!(cs.body, "my draft", "the draft must survive");
+                assert!(!cs.busy, "the composer must stop showing a spinner");
+                assert!(cs.error.is_some(), "the refusal must show on the composer");
+            }
+            _ => panic!("expected the Compose screen to survive"),
+        }
+
+        // ThreadLoaded: viewing a thread/forum the user lacks permission for.
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.start_pollers();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 42, ..Default::default() },
+            ..Default::default()
+        }));
+        app.handle_msg(Msg::ThreadLoaded { id: 42, page: 1, result: Err(phrase_error("no_permission")) });
+        assert!(app.me.is_some(), "a 403 permission refusal must not sign the user out");
+        assert!(!app.poller_handles.is_empty(), "the pollers must keep running");
+        match app.screens.last() {
+            Some(Screen::ThreadView(v)) => {
+                assert!(v.error.is_some(), "the refusal must show in the thread view, not sign out");
+            }
+            _ => panic!("expected the ThreadView screen to survive"),
+        }
+    }
+
+    /// Issue #564: the bootstrap `/me` check is the one caller allowed to
+    /// treat certain 403s as "the account is gone" — but only those exact
+    /// codes, and `missing_scope` is reworded as a configuration error
+    /// rather than either signing out or showing a raw phrase.
+    #[tokio::test]
+    async fn bootstrap_403s_end_the_session_only_for_account_gone_codes() {
+        for code in [
+            "you_have_been_banned",
+            "your_account_has_been_rejected",
+            "your_account_has_been_disabled",
+            "api_error.api_key_inactive",
+        ] {
+            let mut app = test_app();
+            app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+            app.start_pollers();
+            app.screens.push(screens::home_state(false));
+            app.handle_msg(Msg::Bootstrap {
+                generation: app.bootstrap_generation,
+                result: Err(TaskError {
+                    message: "account gone".into(),
+                    code: Some(code.into()),
+                    max_page: None,
+                    kind: TaskErrorKind::Api(403),
+                }),
+            });
+            assert!(app.me.is_none(), "code {code:?} must end the session");
+            assert!(matches!(app.screens.last(), Some(Screen::Login(_))), "code {code:?}");
+            assert!(app.poller_handles.is_empty(), "code {code:?} must stop the pollers");
+        }
+
+        // missing_scope on bootstrap must not end the session, and its
+        // message must read as a configuration problem, not a raw phrase.
+        let err = TaskError::of(&Error::Api {
+            code: "api_error.missing_scope".into(),
+            message: "You are missing the required OAuth scope.".into(),
+            status: 403,
+            max_page: None,
+        });
+        assert!(err.message.starts_with("Configuration error:"), "message: {:?}", err.message);
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.start_pollers();
+        app.screens.push(screens::home_state(false));
+        app.handle_msg(Msg::Bootstrap { generation: app.bootstrap_generation, result: Err(err) });
+        assert!(app.me.is_some(), "missing_scope must not sign the user out");
+        assert!(!app.poller_handles.is_empty());
     }
 
     /// Issue #538: XF's react/vote endpoints are toggles, so the notice has to
@@ -4643,28 +5060,127 @@ mod tests {
         assert_eq!((view.sel_post, view.scroll), (0, 0));
     }
 
-    /// Builds an `App` for poller bookkeeping tests. `start_pollers` spawns
-    /// loops that hold `Arc<dyn WfApi>`, but both loops `sleep` for their
-    /// full interval before ever calling the API, so a real `WfApiClient`
-    /// (reading whatever token store is on this machine, same as any other
-    /// cold start) never actually makes a network call within the test.
+    /// The scratch config dir every test's client, disk cache and
+    /// `login-url.txt` are pinned to. Nothing under `dirs::config_dir()`
+    /// (the operator's real `~/.config/wftui`) may ever be opened by a test.
+    fn scratch_config_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("wftui-test-app-{}", std::process::id()))
+    }
+
+    /// An origin no test can actually reach: port 1 on loopback refuses
+    /// instantly, so a request that escapes a stub fails fast instead of
+    /// travelling to windowsforum.com.
+    const OFFLINE_BASE: &str = "http://127.0.0.1:1";
+
+    /// The `WfApiClient` every test's `App` owns: a token store in the
+    /// scratch dir (so it starts with NO session and can never read, rewrite
+    /// or erase the machine owner's `token.json`) and an unreachable origin.
+    fn offline_client() -> Arc<WfApiClient> {
+        let store = common::token::Store::with_path(scratch_config_dir().join("token.json"));
+        let client = WfApiClient::with_store(store, OFFLINE_BASE).expect("client init");
+        // Checked on every single `test_app()`, not just in the guard test:
+        // if someone ever swaps this back to `WfApiClient::new()`, every
+        // test in the crate fails loudly instead of quietly reading (and
+        // revoking) the operator's session.
+        assert!(
+            !client.store_path().starts_with(common::config::default_config_root()),
+            "a test client resolved the real config dir: {:?}",
+            client.store_path()
+        );
+        Arc::new(client)
+    }
+
+    /// GUARD (issue #565). No test may read or write the machine owner's
+    /// real config dir, and none may reach the live site. Both happened:
+    /// `test_app()` built a real `WfApiClient::new()`, so
+    /// `bootstrap_transient_error_keeps_the_session_and_r_retries` sent a
+    /// live `GET /api/me` with the operator's own bearer, and a test that
+    /// awaited past `logout()` sent two `POST /api/oauth2/revoke` and erased
+    /// the real `token.json`. This pins every path and origin the test `App`
+    /// can reach.
+    #[tokio::test]
+    async fn guard_no_test_touches_the_real_config_dir_or_the_live_site() {
+        let real = common::config::default_config_root();
+        let scratch = scratch_config_dir();
+        let app = test_app();
+
+        // 1. The session store is scratch, and it holds nothing — so no
+        //    handler that spawns a call can ever authenticate one.
+        let store = app.client.store_path();
+        assert!(store.starts_with(&scratch), "store escaped the scratch dir: {store:?}");
+        assert!(!store.starts_with(&real), "store resolved the real config dir: {store:?}");
+        assert!(
+            !app.client.has_tokens().await,
+            "a test client must never see a stored session"
+        );
+
+        // 2. Every other file the app writes hangs off that same store path.
+        let login_url = app.client.store_path().with_file_name("login-url.txt");
+        assert!(login_url.starts_with(&scratch), "{login_url:?}");
+        assert!(app.images.disk_dir().starts_with(&scratch), "{:?}", app.images.disk_dir());
+        assert!(!app.images.disk_dir().starts_with(&real), "{:?}", app.images.disk_dir());
+
+        // 3. The origin is unreachable, and the API seam is a stub, not the
+        //    network client (`me()` answers without a request).
+        assert_eq!(app.client.base_url(), OFFLINE_BASE);
+        assert!(!app.client.base_url().contains("windowsforum.com"));
+        assert!(matches!(app.api.me().await, Err(common::error::Error::NoToken)));
+
+        // 4. Poisoned: a config dir that is a plain FILE cannot hold a
+        //    store, and nothing may quietly fall back to one that can.
+        let poison = scratch.join("poison");
+        let _ = std::fs::remove_dir_all(&poison);
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(&poison, b"poison").unwrap();
+        let poisoned = common::token::Store::with_path(poison.join("token.json"));
+        assert!(
+            !matches!(poisoned.load(), Ok(Some(_))),
+            "a poisoned config dir must never yield a session"
+        );
+        assert!(
+            poisoned
+                .save(&common::token::TokenSet {
+                    access_token: "guard".into(),
+                    refresh_token: "guard".into(),
+                    expires_at: 0,
+                    scope: "guard".into(),
+                })
+                .is_err(),
+            "a stray save must fail loudly, not land in the real store"
+        );
+        let _ = std::fs::remove_file(&poison);
+    }
+
+    /// Builds an `App` for handler and poller bookkeeping tests.
+    ///
+    /// Issue #565: this used to build a real `WfApiClient::new()`, which
+    /// reads the machine owner's `~/.config/wftui/token.json` — a test that
+    /// pressed `r` then really sent `GET /api/me` to windowsforum.com with
+    /// the operator's bearer, and one that awaited past `logout()` revoked
+    /// that session and deleted the store. Now `App::api` is a stub that
+    /// answers `NoToken` for everything (no request can leave the process
+    /// even if a handler spawns one) and `App::client` is pinned to a
+    /// scratch store and an unreachable origin.
     fn test_app() -> App {
-        let client = Arc::new(WfApiClient::new().expect("client init"));
+        let client = offline_client();
         let (tx, rx) = mpsc::unbounded_channel();
         App {
-            api: client.clone(),
+            api: Arc::new(RecordingApi::default()),
             client,
             tx,
             rx,
             theme: Theme::detect(),
             glyphs: glyph::detect(),
-            images: crate::images::Images::default(),
+            images: crate::images::Images::text_only_at(
+                scratch_config_dir().join("cache").join("img"),
+            ),
             image_slots: Arc::new(tokio::sync::Semaphore::new(IMAGE_LOAD_CONCURRENCY)),
             screens: Vec::new(),
             me: None,
             alerts_unread: 3,
             convos_unread: 5,
             status: String::new(),
+            status_set_at: None,
             keep_thread_position: None,
             show_help: false,
             palette: None,
@@ -4679,13 +5195,54 @@ mod tests {
             last_title: String::new(),
             should_quit: false,
             poller_handles: Vec::new(),
+            write_handles: Vec::new(),
             bootstrap_retry_needed: false,
             bootstrap_generation: 0,
             session_recovery_tried: false,
+            session_recovery_pending: false,
             login_generation: 0,
             login_task: None,
             body_rect: ratatui::layout::Rect::default(),
         }
+    }
+
+    /// Issue #571: DESIGN.md says a status toast ("Reply posted.", "Like
+    /// removed.", "Copied N chars…") replaces the left status text and
+    /// clears after 4 s — `App::status` had no timer at all, so a toast sat
+    /// there indefinitely. `set_status` stamps it; `expire_status_toast`
+    /// (the event loop's per-tick check) clears it once the stamp is old
+    /// enough. A persistent hint (`set_hint`) — an ongoing state or a
+    /// "why didn't that work" explanation — must never auto-clear. The
+    /// clock is simulated by backdating the stamp rather than sleeping.
+    #[test]
+    fn status_toasts_clear_after_four_seconds_but_hints_never_do() {
+        let mut app = test_app();
+
+        app.set_status("Reply posted.");
+        assert_eq!(app.status, "Reply posted.");
+        assert!(app.status_set_at.is_some());
+
+        // Not old enough yet: a fresh toast must survive a tick.
+        app.expire_status_toast();
+        assert_eq!(app.status, "Reply posted.", "must not clear before 4 s");
+
+        // Simulated clock: backdate the toast past the 4 s mark instead of
+        // actually sleeping.
+        app.status_set_at = Some(std::time::Instant::now() - Duration::from_secs(5));
+        app.expire_status_toast();
+        assert_eq!(app.status, "", "a stale toast must clear");
+        assert!(app.status_set_at.is_none());
+
+        // A persistent hint carries no stamp at all, so it survives any
+        // number of ticks.
+        app.set_hint("Sign in first, or press q to quit.");
+        assert!(app.status_set_at.is_none(), "a hint must not be a toast");
+        app.expire_status_toast();
+        app.expire_status_toast();
+        assert_eq!(
+            app.status, "Sign in first, or press q to quit.",
+            "a persistent hint must never auto-clear"
+        );
     }
 
     /// Issue #556: the sign-in screen is a gate, not a place. With no
@@ -4743,6 +5300,96 @@ mod tests {
 
         assert!(app.palette.is_none(), "logout must close the palette");
         assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
+    }
+
+    /// Issue #567: a write spawned by `^S` waits on the politeness gates
+    /// (`api_gate`, then `write_gate` — 30 s after a previous post, 180 s
+    /// after a new thread) *before* `valid_token()` is ever consulted, and
+    /// `handle_key` routes `Ctrl+L` to `logout()` ahead of any busy check
+    /// (unlike `Esc`, blocked on a busy composer since #520). So the
+    /// composer was torn down while the request still went out afterwards —
+    /// with whatever token was in memory once the gate opened, which on a
+    /// shared machine is the *next* account's — and the client announced
+    /// "Reply posted." over the sign-in screen, publishing the draft the
+    /// user believed discarded. A write now belongs to the session that
+    /// started it: `end_session` aborts every in-flight one.
+    #[tokio::test]
+    async fn a_reply_abandoned_by_ctrl_l_is_never_sent() {
+        // The stub stands in for the gate: it waits before recording, so a
+        // recorded call means the request really would have left.
+        let api = Arc::new(RecordingApi {
+            write_delay: Duration::from_millis(200),
+            ..Default::default()
+        });
+        let mut app = test_app();
+        app.api = api.clone();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.screens.push(screens::home_state(false));
+
+        app.execute_action(Action::SubmitReply {
+            thread_id: 42,
+            message: "a draft the user then abandoned".into(),
+        });
+        // Let the write task start and park in the gate wait.
+        tokio::task::yield_now().await;
+        assert!(
+            api.replies().is_empty(),
+            "test setup: the write must still be waiting on the gate"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert!(app.me.is_none(), "test setup: Ctrl+L must have ended the session");
+
+        // Well past the gate the abandoned write was waiting on.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        assert!(
+            api.replies().is_empty(),
+            "a write abandoned by Ctrl+L must never reach the API: {:?}",
+            api.replies()
+        );
+        let mut msgs = Vec::new();
+        while let Ok(m) = app.rx.try_recv() {
+            msgs.push(m);
+        }
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Msg::ReplySent(_))),
+            "no ReplySent may land on the sign-in screen"
+        );
+    }
+
+    /// Issue #570: Ctrl+L on the sign-in screen with no session is not a
+    /// sign-out — there is nothing to sign out of. It used to tear the
+    /// screen down and push a fresh Idle one anyway, discarding the short
+    /// link the user was about to open on their phone.
+    #[test]
+    fn ctrl_l_on_a_waiting_login_screen_leaves_it_untouched() {
+        let mut app = test_app();
+        app.screens.push(screens::login_state());
+        if let Some(Screen::Login(ls)) = app.screens.last_mut() {
+            ls.stage = screens::LoginStage::Waiting;
+            ls.url = "https://windowsforum.com/tui-start/abc123".into();
+        }
+        app.status = "Login link \u{2192} clipboard + login-url.txt".into();
+        assert!(app.me.is_none());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.screens.len(), 1, "Ctrl+L must not push a second screen");
+        match app.screens.last() {
+            Some(Screen::Login(ls)) => {
+                assert!(
+                    matches!(ls.stage, screens::LoginStage::Waiting),
+                    "the stage must survive"
+                );
+                assert_eq!(
+                    ls.url, "https://windowsforum.com/tui-start/abc123",
+                    "the link must survive"
+                );
+            }
+            _ => panic!("expected the Login screen to survive untouched"),
+        }
+        assert_ne!(app.status, "Logged out.", "no sign-out happened, so no such status");
     }
 
     /// Issue #559: a pasted tab must not desync the caret from the drawn

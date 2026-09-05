@@ -48,6 +48,14 @@ impl Store {
         Store { path }
     }
 
+    /// Where this store reads and writes. Exposed so a caller can prove which
+    /// file it is about to touch — the test suites of both crates assert it
+    /// is their own scratch dir and never the operator's real config dir
+    /// (issue #565).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn load(&self) -> Result<Option<TokenSet>> {
         let bytes = match std::fs::read(&self.path) {
             Ok(b) => b,
@@ -169,7 +177,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::with_path(dir.join("token.json"));
         store.save(&sample()).unwrap();
-        let mode = std::fs::metadata(store.path.clone()).unwrap().permissions().mode();
+        let mode = std::fs::metadata(store.path()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         let _ = std::fs::remove_dir_all(&dir);
     }

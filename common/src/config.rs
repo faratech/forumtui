@@ -120,6 +120,14 @@ fn config_root() -> PathBuf {
         && !dir.trim().is_empty() {
             return PathBuf::from(dir);
         }
+    default_config_root()
+}
+
+/// The config dir used when `WFTUI_CONFIG_DIR` is unset — i.e. the machine
+/// owner's real one. Exposed so both crates' test suites can assert that
+/// nothing they build ever resolves to it (issue #565: the suite used to read
+/// and overwrite the operator's own `token.json`).
+pub fn default_config_root() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("wftui")

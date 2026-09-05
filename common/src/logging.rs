@@ -53,10 +53,37 @@ pub fn init() {
 
 #[cfg(test)]
 mod tests {
+    /// `WFTUI_CONFIG_DIR` is process-global, so this test has to hold
+    /// `config::ENV_LOCK` like every other env-mutating test does. It used
+    /// not to, and it *removed* the variable afterwards: an `api` test that
+    /// had already taken the lock and pointed the config dir at its temp
+    /// fixture could then build a `WfApiClient` that resolved the machine
+    /// owner's real `~/.config/wftui/token.json` and overwrite it with a
+    /// test token set — which is exactly what happened on the dev box
+    /// (issue #565). The variable is also restored, never removed, so no
+    /// window exists in which the real config dir is what resolves.
     #[test]
     fn init_does_not_panic_without_config_dir() {
-        unsafe { std::env::set_var("WFTUI_CONFIG_DIR", "/tmp/wftui-test-logging") };
+        let _lock = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("WFTUI_CONFIG_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("wftui-test-logging-{}", std::process::id()));
+        unsafe { std::env::set_var("WFTUI_CONFIG_DIR", &dir) };
+        assert!(
+            crate::config::log_path().starts_with(&dir),
+            "the log must be written to the scratch dir, not {:?}",
+            crate::config::log_path()
+        );
+
         super::init();
-        unsafe { std::env::remove_var("WFTUI_CONFIG_DIR") };
+
+        // With no previous value the scratch dir is left in place rather
+        // than unset, so no window exists in which the real config dir is
+        // what `config::config_root()` resolves.
+        if let Some(prev) = previous {
+            unsafe { std::env::set_var("WFTUI_CONFIG_DIR", prev) };
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

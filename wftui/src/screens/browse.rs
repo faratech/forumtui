@@ -1072,6 +1072,17 @@ pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
     let mut line: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
+    // True only right after this function itself forced a wrap (a row
+    // filled up and the rest overflowed onto the next one) — the row that
+    // follows must not open with the whitespace run that overflowed past
+    // it. `used == 0` used to stand in for this and was wrong: it is also
+    // true at the very start of the call, on every logical line, so a
+    // line's OWN leading whitespace — a `[CODE]` block's indentation, e.g. —
+    // was silently dropped the moment the line got wrapped at all (issue
+    // #566). Cleared the instant real content lands on the new row, so a
+    // later, genuine inter-word space on that same row is never mistaken
+    // for wrap runoff.
+    let mut just_wrapped = false;
     for sp in spans {
         let style = sp.style;
         for tok in tokens(sp.content.as_ref()) {
@@ -1080,26 +1091,30 @@ pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<
             loop {
                 let len = cell_width(rest);
                 if is_space {
-                    if used == 0 {
-                        break; // a wrapped line never starts with the old space
+                    if just_wrapped {
+                        break; // swallow the run that wrap runoff already dropped
                     }
                     if used + len > width {
                         out.push(std::mem::take(&mut line));
                         used = 0;
+                        just_wrapped = true;
                     } else {
                         line.push(Span::styled(rest.to_string(), style));
                         used += len;
+                        just_wrapped = false;
                     }
                     break;
                 }
                 if used + len <= width {
                     line.push(Span::styled(rest.to_string(), style));
                     used += len;
+                    just_wrapped = false;
                     break;
                 }
                 if len <= width && used > 0 {
                     out.push(std::mem::take(&mut line));
                     used = 0;
+                    just_wrapped = true;
                     continue;
                 }
                 // Longer than a whole line (a bare URL, say): hard-split it.
@@ -1107,6 +1122,7 @@ pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<
                 if room == 0 {
                     out.push(std::mem::take(&mut line));
                     used = 0;
+                    just_wrapped = true;
                     continue;
                 }
                 // Take characters while they still fit in `room` *cells*, so
@@ -1130,6 +1146,7 @@ pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<
                     if used > 0 {
                         out.push(std::mem::take(&mut line));
                         used = 0;
+                        just_wrapped = true;
                         continue;
                     }
                     match rest.chars().next() {
@@ -1141,6 +1158,7 @@ pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<
                 line.push(Span::styled(head, style));
                 out.push(std::mem::take(&mut line));
                 used = 0;
+                just_wrapped = true;
                 rest = &rest[bytes..];
             }
         }
@@ -2965,6 +2983,45 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let drawn: String = (0..20).map(|x| buf[(x, 0)].symbol().to_string()).collect();
         assert!(drawn.starts_with("Name    Value"), "drawn: {drawn:?}");
+    }
+
+    /// Issue #566: `wrap_spans` used `used == 0` as a stand-in for "a wrap
+    /// just happened, drop the runoff whitespace" — but `used` also starts
+    /// at 0 on every fresh call, so a line's OWN leading whitespace (a
+    /// `[CODE]` block's indentation) was silently eaten the moment the line
+    /// went through the wrapper at all, even when it was nowhere near the
+    /// wrap width.
+    #[test]
+    fn wrap_spans_keeps_a_lines_own_leading_whitespace() {
+        let out = wrap_spans(&[Span::raw("    if x:")], 40);
+        assert_eq!(out.len(), 1);
+        let joined: String = out[0].iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "    if x:", "the four leading spaces must survive");
+
+        // A genuine wrap must still drop the separating space at the break,
+        // not carry it onto the next row — that half of the old behaviour
+        // must not regress.
+        let out = wrap_spans(&[Span::raw("aaaaa bbbbb")], 5);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].iter().map(|s| s.content.as_ref()).collect::<String>(), "aaaaa");
+        assert_eq!(out[1].iter().map(|s| s.content.as_ref()).collect::<String>(), "bbbbb");
+    }
+
+    /// Issue #566: a `[CODE]` block's indentation must round-trip through
+    /// `rebuild_lines` — the thread view's main reading surface — not just
+    /// through `wrap_spans` in isolation.
+    #[test]
+    fn code_block_indentation_survives_rebuild_lines() {
+        let theme = Theme::truecolor();
+        let mut s = thread_view_fixture();
+        s.posts[0].message = "[CODE]def f():\n    return 1[/CODE]".into();
+        s.rebuild_lines(&theme, &UNICODE);
+        let text = |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        assert!(
+            s.lines.iter().any(|l| text(l).contains("    return 1")),
+            "the four-space indentation must survive: {:?}",
+            s.lines.iter().map(text).collect::<Vec<_>>()
+        );
     }
 
     #[test]
