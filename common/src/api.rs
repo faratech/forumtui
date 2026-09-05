@@ -423,11 +423,13 @@ impl WfApi for WfApiClient {
         self.search_gate.wait().await;
         #[derive(serde::Deserialize)]
         struct SearchInfo {
+            #[serde(default)]
             search_id: u32,
         }
         #[derive(serde::Deserialize)]
         struct SearchCreated {
-            search: SearchInfo,
+            #[serde(default)]
+            search: Option<SearchInfo>,
         }
         self.api_gate.wait().await;
         let token = self.valid_token().await?;
@@ -440,7 +442,10 @@ impl WfApi for WfApiClient {
             .send()
             .await?;
         let created: SearchCreated = decode(resp).await?;
-        let search_id = created.search.search_id;
+        let Some(search) = created.search else {
+            return Ok(SearchResultsReply::default());
+        };
+        let search_id = search.search_id;
         self.get(&format!("/search/{search_id}"), &[("page", page.to_string())])
             .await
     }
@@ -600,6 +605,25 @@ mod tests {
         let out = c.search("rust", 1).await.unwrap();
         assert_eq!(out.results.len(), 1);
         assert_eq!(out.results[0].title, "Rust hits");
+    }
+
+    #[tokio::test]
+    async fn search_zero_hits_returns_empty_results() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-searchzero");
+        Mock::given(method("POST"))
+            .and(path("/api/search"))
+            .and(wiremock::matchers::body_string_contains("keywords=nomatch"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": "No results found."})),
+            )
+            .mount(&server)
+            .await;
+        let c = logged_in_client("tok-1").await;
+        let out = c.search("nomatch", 1).await.unwrap();
+        assert!(out.results.is_empty());
+        assert_eq!(out.pagination.total, 0);
     }
 
     #[tokio::test]
