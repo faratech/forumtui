@@ -275,6 +275,22 @@ impl Screen {
             _ => false,
         }
     }
+
+    pub fn title(&self) -> &str {
+        match self {
+            Screen::Login(_) => "Login",
+            Screen::ForumTree(_) => "Forums",
+            Screen::ThreadList(s) => &s.title,
+            Screen::ThreadView(s) => &s.thread.title,
+            Screen::Compose(_) => "Compose",
+            Screen::Conversations(_) => "Conversations",
+            Screen::ConversationView(s) => &s.conversation.title,
+            Screen::NewConversation(_) => "New Conversation",
+            Screen::Alerts(_) => "Alerts",
+            Screen::Search(_) => "Search",
+            Screen::Profile(s) => &s.title,
+        }
+    }
 }
 
 // ---------- shared render helpers ----------

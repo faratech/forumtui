@@ -102,6 +102,7 @@ pub struct App {
     last_click_instant: Option<std::time::Instant>,
     last_click_pos: (u16, u16),
     click_count: u8,
+    last_title: String,
     should_quit: bool,
 }
 
@@ -162,6 +163,7 @@ impl Drop for TerminalGuard {
             ratatui::crossterm::cursor::Show
         );
         let _ = disable_raw_mode();
+        emit_raw(&common::osc::set_title(""));
     }
 }
 
@@ -210,6 +212,7 @@ pub async fn run() -> u8 {
         last_click_instant: None,
         last_click_pos: (0, 0),
         click_count: 0,
+        last_title: String::new(),
         should_quit: false,
     };
     #[cfg(unix)]
@@ -225,11 +228,18 @@ pub async fn run() -> u8 {
                 Ok(s) => s,
                 Err(_) => return,
             };
+            let mut int = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
             tokio::select! {
                 _ = term.recv() => {
                     tx.send(Msg::Notice("quit".into())).ok();
                 }
                 _ = hup.recv() => {
+                    tx.send(Msg::Notice("quit".into())).ok();
+                }
+                _ = int.recv() => {
                     tx.send(Msg::Notice("quit".into())).ok();
                 }
             }
@@ -314,26 +324,46 @@ impl App {
             if self.should_quit {
                 return 0;
             }
-            // Block on the reader thread briefly so draws stay responsive.
-            // Drain everything pending before the next draw.
-            while let Some(input) = crate::event::next(&reader, Duration::from_millis(80)) {
-                match input {
-                    crate::event::Input::Resize => {}
-                    crate::event::Input::Mouse(me) => {
-                        self.handle_mouse(me);
-                    }
-                    crate::event::Input::Paste(text) => {
-                        self.handle_paste(text);
-                    }
-                    crate::event::Input::Key(k) => {
-                        if event::is_ctrl_c(k) {
-                            return 0;
-                        }
-                        self.handle_key(k);
-                    }
+            // Wait up to 50ms for input; yields periodically to allow background tasks / pollers to refresh status.
+            if let Some(first) = crate::event::next(&reader, Duration::from_millis(50)) {
+                let mut inputs = vec![first];
+                // Non-blocking drain of any remaining pending events in the queue
+                while let Some(extra) = crate::event::next(&reader, Duration::ZERO) {
+                    inputs.push(extra);
                 }
-                if self.should_quit {
-                    return 0;
+                for input in inputs {
+                    match input {
+                        crate::event::Input::Resize => {
+                            let _ = terminal.clear();
+                        }
+                        crate::event::Input::Mouse(me) => {
+                            self.handle_mouse(me);
+                        }
+                        crate::event::Input::Paste(text) => {
+                            self.handle_paste(text);
+                        }
+                        crate::event::Input::Key(k) => {
+                            if event::is_ctrl_c(k) {
+                                if let Some(sel) = self.selection.take() {
+                                    let (x0, y0, x1, y1) = sel.rect();
+                                    let text = self.extract_selection_text(x0, y0, x1, y1);
+                                    if !text.is_empty() {
+                                        let n = text.chars().count();
+                                        self.copy_text(&text);
+                                        self.status =
+                                            format!("Copied {n} chars to clipboard (selection cleared)");
+                                    }
+                                } else {
+                                    return 0;
+                                }
+                            } else {
+                                self.handle_key(k);
+                            }
+                        }
+                    }
+                    if self.should_quit {
+                        return 0;
+                    }
                 }
             }
         }
@@ -367,7 +397,21 @@ impl App {
 
         // Render the top screen; popups handled inside renderers.
         let screen = self.screens.last_mut().expect("screen stack never empty");
+        let screen_title = screen.title().to_string();
         screen.render(f, body, &self.theme);
+
+        let new_title = if self.alerts_unread > 0 || self.convos_unread > 0 {
+            format!(
+                "wftui · {screen_title} [✉ {} · 🔔 {}]",
+                self.convos_unread, self.alerts_unread
+            )
+        } else {
+            format!("wftui · {screen_title}")
+        };
+        if new_title != self.last_title {
+            emit_raw(&common::osc::set_title(&new_title));
+            self.last_title = new_title;
+        }
 
         let status_line = Line::from(Span::styled(
             format!(" {} ", self.status),
@@ -376,7 +420,7 @@ impl App {
         f.render_widget(Paragraph::new(status_line), status);
 
         if self.show_help {
-            let area = crate::screens::centered_box(f.area(), 58, 17);
+            let area = crate::screens::centered_box(f.area(), 64, 17);
             f.render_widget(ratatui::widgets::Clear, area);
             let block = ratatui::widgets::Block::default()
                 .borders(ratatui::widgets::Borders::ALL)
@@ -395,6 +439,8 @@ impl App {
                 "Ctrl+S send (compose)        Tab next field",
                 "Esc back     q quit          Ctrl+L logout",
                 "drag mouse   select + copy   wheel scroll  Ctrl+Y paste",
+                "Ctrl+C copy selection (quits if none selected)",
+                "Shift/Option+drag bypass capture for native select",
             ];
             let lines: Vec<Line> = keys
                 .iter()
@@ -617,22 +663,31 @@ impl App {
             }
             Action::LoginBegin => self.begin_login(),
             Action::PasteClipboard => {
-                let text = self.clipboard.clone();
+                let mut text = self.clipboard.clone();
+                if text.is_empty()
+                    && let Some(sys) = common::osc::read_from_system_clipboard()
+                {
+                    text = sys;
+                }
                 if text.is_empty() {
-                    self.status = "Nothing copied yet — drag or double-click to select text.".into();
+                    self.status = "Nothing copied yet — drag, double-click, or use system clipboard.".into();
                     return;
                 }
                 self.handle_paste(text);
             }
             Action::OscCopy(value) => {
-                emit_raw(&common::osc::set_clipboard(&value));
-                self.status =
-                    "Copied to your clipboard (OSC 52 — enable clipboard access in your \
-                     terminal if it did not arrive)."
-                        .into();
+                self.copy_text(&value);
+                self.status = "Copied to your clipboard (OSC 52 + system clipboard).".into();
             }
             Action::OpenUrl(url) => self.open_url(&url),
         }
+    }
+
+    /// Copy text via OSC 52 (remote terminal), local system clipboard tools, and in-app clipboard.
+    pub fn copy_text(&mut self, text: &str) {
+        emit_raw(&common::osc::set_clipboard(text));
+        common::osc::copy_to_system_clipboard(text);
+        self.clipboard = text.to_string();
     }
 
     // ---- login orchestration ----
@@ -745,9 +800,8 @@ impl App {
                         });
                         let text = self.extract_selection_text(start_col, pos.1, end_col, pos.1);
                         if !text.is_empty() {
-                            emit_raw(&common::osc::set_clipboard(&text));
-                            self.clipboard = text;
-                            let n = self.clipboard.chars().count();
+                            let n = text.chars().count();
+                            self.copy_text(&text);
                             self.status =
                                 format!("Copied word ({n} chars) to clipboard (and Ctrl+Y)");
                         }
@@ -761,9 +815,8 @@ impl App {
                         });
                         let text = self.extract_selection_text(start_col, pos.1, end_col, pos.1);
                         if !text.is_empty() {
-                            emit_raw(&common::osc::set_clipboard(&text));
-                            self.clipboard = text;
-                            let n = self.clipboard.chars().count();
+                            let n = text.chars().count();
+                            self.copy_text(&text);
                             self.status =
                                 format!("Copied line ({n} chars) to clipboard (and Ctrl+Y)");
                         }
@@ -791,9 +844,8 @@ impl App {
                     }
                     let text = self.extract_selection_text(x0, y0, x1, y1);
                     if !text.is_empty() {
-                        emit_raw(&common::osc::set_clipboard(&text));
-                        self.clipboard = text;
-                        let n = self.clipboard.chars().count();
+                        let n = text.chars().count();
+                        self.copy_text(&text);
                         self.status =
                             format!("Copied {n} chars to your clipboard (and Ctrl+Y)");
                     }
@@ -1589,7 +1641,7 @@ impl App {
         };
         // Remote sessions: even if the opener targets the wrong machine, the
         // URL is now in the user's local clipboard.
-        emit_raw(&common::osc::set_clipboard(&target));
+        self.copy_text(&target);
         self.status = format!("Opening {target} (also copied to clipboard)");
         let _ = common::oauth::open_browser(&target);
     }

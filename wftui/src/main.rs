@@ -12,6 +12,23 @@ mod theme;
 
 fn main() -> std::process::ExitCode {
     common::logging::init();
+
+    // Panic hook: ensure raw mode, mouse capture, and alternate screen are reset
+    // before the default panic hook prints backtrace/errors to stdout/stderr.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::PopKeyboardEnhancementFlags,
+            ratatui::crossterm::event::DisableBracketedPaste,
+            ratatui::crossterm::terminal::LeaveAlternateScreen,
+            ratatui::crossterm::event::DisableMouseCapture,
+            ratatui::crossterm::cursor::Show
+        );
+        let _ = ratatui::crossterm::terminal::disable_raw_mode();
+        original_hook(panic_info);
+    }));
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

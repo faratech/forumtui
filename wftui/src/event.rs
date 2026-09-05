@@ -27,6 +27,9 @@ pub fn spawn_reader() -> Receiver<Input> {
         loop {
             match event::read() {
                 Ok(TEvent::Key(k)) => {
+                    if !should_process_key(&k) {
+                        continue;
+                    }
                     if tx.send(Input::Key(k)).is_err() {
                         break;
                     }
@@ -55,6 +58,11 @@ pub fn spawn_reader() -> Receiver<Input> {
     rx
 }
 
+/// Discard key release events emitted by modern terminals with enhanced keyboard support.
+pub fn should_process_key(k: &KeyEvent) -> bool {
+    k.kind != event::KeyEventKind::Release
+}
+
 /// Wait up to `timeout` for the next input from the reader thread.
 pub fn next(rx: &Receiver<Input>, timeout: Duration) -> Option<Input> {
     match rx.recv_timeout(timeout) {
@@ -68,4 +76,36 @@ pub fn next(rx: &Receiver<Input>, timeout: Duration) -> Option<Input> {
 /// (Ctrl+C). Normal quit is `q` at the root screen.
 pub fn is_ctrl_c(k: KeyEvent) -> bool {
     k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyEventKind, KeyEventState};
+
+    #[test]
+    fn filters_key_release_events() {
+        let press = KeyEvent {
+            code: KeyCode::Char('j'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        let release = KeyEvent {
+            code: KeyCode::Char('j'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: KeyEventState::empty(),
+        };
+        let repeat = KeyEvent {
+            code: KeyCode::Char('j'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Repeat,
+            state: KeyEventState::empty(),
+        };
+
+        assert!(should_process_key(&press));
+        assert!(!should_process_key(&release));
+        assert!(should_process_key(&repeat));
+    }
 }
