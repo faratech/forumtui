@@ -1175,6 +1175,11 @@ pub(crate) fn chunk_lines(
                 if t.is_empty() {
                     continue;
                 }
+                // Expand tabs / drop other C0 controls at the boundary
+                // (issue #559): ratatui's grapheme filter drops a raw tab
+                // outright when drawing a span, so a `[CODE]` block's
+                // tab-separated columns would otherwise fuse together.
+                let t = crate::editor::normalize_control_chars(&t);
                 for (i, seg) in t.split('\n').enumerate() {
                     if i > 0 {
                         out.push(std::mem::take(&mut current));
@@ -1668,7 +1673,7 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
                 // while the footer/l/v/p/1-9 all act on the new one (issue #542).
                 s.width = 0;
                 if let Some(&line) = s.post_line_offsets.get(s.sel_post) {
-                    s.scroll = line as u16;
+                    s.scroll = line;
                 }
             }
             Action::None
@@ -1678,7 +1683,7 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
                 s.sel_post -= 1;
                 s.width = 0;
                 if let Some(&line) = s.post_line_offsets.get(s.sel_post) {
-                    s.scroll = line as u16;
+                    s.scroll = line;
                 }
             }
             Action::None
@@ -1846,12 +1851,14 @@ pub fn render_thread_view(
         s.rebuild_lines(theme, g);
     }
 
-    let max_scroll = (s.lines.len() as u16).saturating_sub(inner.height);
+    let max_scroll = s.lines.len().saturating_sub(inner.height as usize);
     if s.scroll > max_scroll {
         s.scroll = max_scroll;
     }
+    // Sliced, not `Paragraph::scroll`: that offset is a `u16`, and a post on
+    // this site can wrap past 65,536 rows (issue #558).
     f.render_widget(
-        Paragraph::new(s.lines.clone()).scroll((s.scroll, 0)),
+        Paragraph::new(crate::editor::visible_window(&s.lines, s.scroll, inner.height)),
         inner,
     );
 
@@ -1860,7 +1867,7 @@ pub fn render_thread_view(
     // clipped: kitty and sixel paint pixels, not cells, and half an image
     // would spill over the panel border.
     if s.images.inline() {
-        let scroll = s.scroll as usize;
+        let scroll = s.scroll;
         let mut reqs: Vec<images::Request> = Vec::with_capacity(s.image_slots.len());
         for slot in &s.image_slots {
             if slot.line < scroll {
@@ -2930,6 +2937,34 @@ mod tests {
             assert!(l.width() <= 60, "wrapped line overflows: {}", text(l));
             assert_eq!(l.spans[1].content.as_ref(), "\u{2503}");
         }
+    }
+
+    /// Issue #559: a tab must not vanish. Ratatui's own grapheme filter
+    /// drops a raw control byte outright when it draws a span, so a
+    /// `[CODE]` block's tab-separated columns ("Name\tValue") fused into
+    /// "NameValue" until the boundary (`chunk_lines`) expanded the tab to
+    /// spaces before it ever became span content.
+    #[test]
+    fn chunk_lines_expands_tabs_instead_of_dropping_them() {
+        let theme = Theme::truecolor();
+        let mut links = Vec::new();
+        let lines = bbcode_lines("[CODE]Name\tValue[/CODE]", &mut links, &theme);
+        assert_eq!(lines.len(), 1);
+        let rendered: String = lines[0].iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rendered, "Name    Value", "a tab must expand to spaces, not disappear");
+
+        // Prove it actually paints that way, not just that the string looks
+        // right — this is what would have caught the regression even if
+        // `chunk_lines`' own output happened to look correct.
+        let mut term = Terminal::new(TestBackend::new(20, 1)).expect("terminal");
+        term.draw(|f| {
+            let line = Line::from(lines[0].clone());
+            f.render_widget(Paragraph::new(line), f.area());
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let drawn: String = (0..20).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert!(drawn.starts_with("Name    Value"), "drawn: {drawn:?}");
     }
 
     #[test]

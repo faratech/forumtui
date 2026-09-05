@@ -346,17 +346,77 @@ pub fn move_vertical(
 
 /// Follow the caret with a viewport `height` rows tall: the smallest scroll
 /// offset that keeps `caret_row` on screen, never past the last row.
-pub fn follow_caret(scroll: u16, caret_row: usize, rows: usize, height: u16) -> u16 {
+///
+/// Everything here is `usize`, deliberately (issue #558). This site's
+/// `messageMaxLength` is 0 — unlimited — so a pasted CBS.log/DISM log is a
+/// draft the client both accepts and can post; past 65,536 visual rows the
+/// old `u16` cast wrapped and scrolled the composer to `n mod 65536`,
+/// leaving the typist looking at the wrong window with the caret drawn in
+/// it. The row model is `usize` end to end now, and the only narrowing to
+/// `u16` happens at the terminal-coordinate boundary, after subtraction.
+pub fn follow_caret(scroll: usize, caret_row: usize, rows: usize, height: usize) -> usize {
     let height = height.max(1);
-    let caret = caret_row as u16;
     let mut top = scroll;
-    if caret < top {
-        top = caret;
-    } else if caret >= top.saturating_add(height) {
-        top = caret + 1 - height;
+    if caret_row < top {
+        top = caret_row;
+    } else if caret_row >= top.saturating_add(height) {
+        top = caret_row + 1 - height;
     }
-    let max_top = (rows as u16).saturating_sub(height);
+    let max_top = rows.saturating_sub(height);
     top.min(max_top)
+}
+
+/// The slice of pre-wrapped lines a viewport shows — what every scrolled
+/// pane hands to `Paragraph` instead of using `Paragraph::scroll` (issue
+/// #558). `scroll` is a `usize` row offset (`Paragraph`'s is a `u16`, which
+/// is exactly the truncation this avoids), and slicing also drops ratatui's
+/// per-frame walk over every skipped line.
+pub fn visible_window<T: Clone>(lines: &[T], scroll: usize, height: u16) -> Vec<T> {
+    let start = scroll.min(lines.len());
+    let end = start.saturating_add(height as usize).min(lines.len());
+    lines[start..end].to_vec()
+}
+
+/// Normalise control characters before they ever reach the buffer (issue
+/// #559): expand `\t` to spaces up to the next 4-column stop (column tracked
+/// across embedded newlines) and drop every other C0 control character.
+/// Nothing between the API and the terminal handles a raw tab — ratatui's
+/// own grapheme filter drops the byte outright when it draws a span — so
+/// leaving one in the buffer both fuses adjacent text together on screen
+/// (`"a\tb"` renders `"ab"`) and, because the wrap/caret math still bills it
+/// one cell, desyncs the caret from the drawn text by one column per tab.
+/// Used both for received text (`chunk_lines`) and pasted composer input
+/// (`App::handle_paste`) — the two places raw text crosses into a span or a
+/// text buffer.
+pub fn normalize_control_chars(s: &str) -> String {
+    if !s.bytes().any(|b| b < 0x20 && b != b'\n') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut col = 0usize;
+    for c in s.chars() {
+        match c {
+            '\n' => {
+                out.push('\n');
+                col = 0;
+            }
+            '\t' => {
+                let next_stop = (col / 4 + 1) * 4;
+                for _ in col..next_stop {
+                    out.push(' ');
+                }
+                col = next_stop;
+            }
+            c if (c as u32) < 0x20 => {
+                // Drop every other C0 control character (issue #559).
+            }
+            c => {
+                out.push(c);
+                col += 1;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -511,6 +571,32 @@ mod tests {
         assert_eq!(follow_caret(9, 0, 3, 10), 0, "never scrolls past the last row");
     }
 
+    /// Issue #558: the row model must be `usize` end to end. A pasted
+    /// CBS.log is a legal post here (`messageMaxLength` is 0), and with the
+    /// old `caret_row as u16` the 70,001st row scrolled to 70_000 mod
+    /// 65_536 = 4_464 — the typist looked at the wrong window while the
+    /// caret was drawn 18 rows into it.
+    #[test]
+    fn follow_caret_survives_a_draft_past_the_u16_row_ceiling() {
+        assert_eq!(follow_caret(0, 70_000, 70_001, 18), 70_000 + 1 - 18);
+        // Already scrolled there: no further movement, and never past the end.
+        assert_eq!(follow_caret(69_983, 70_000, 70_001, 18), 69_983);
+        assert_eq!(follow_caret(usize::MAX, 70_000, 70_001, 18), 70_001 - 18);
+        // Scrolling back up to the top of the same draft still works.
+        assert_eq!(follow_caret(69_983, 0, 70_001, 18), 0);
+
+        // And the window handed to `Paragraph` is the caret's, not row
+        // 4_464's: `visible_window` slices in `usize`.
+        let lines: Vec<usize> = (0..70_001).collect();
+        let scroll = follow_caret(0, 70_000, lines.len(), 18);
+        let window = visible_window(&lines, scroll, 18);
+        assert_eq!(window.len(), 18);
+        assert_eq!(*window.first().expect("window"), 69_983);
+        assert_eq!(*window.last().expect("window"), 70_000);
+        // A scroll past the end yields an empty window rather than panicking.
+        assert!(visible_window(&lines, 999_999, 18).is_empty());
+    }
+
     /// Issue #544: a vertical move that lands exactly on a soft-wrapped
     /// (continuation) row's `end` used to leave the caret one row down and
     /// at column 0 instead of at the end of the target row — and because
@@ -558,5 +644,22 @@ mod tests {
         assert_eq!(cursor_coords(s, 11), (5, 1));
         assert_eq!(cursor_coords(s, 12), (0, 2));
         assert_eq!(cursor_coords(s, 15), (3, 2));
+    }
+
+    /// Issue #559: a tab expands to spaces up to the next 4-column stop, and
+    /// every other C0 control character is dropped outright.
+    #[test]
+    fn normalize_control_chars_expands_tabs_and_drops_other_controls() {
+        assert_eq!(normalize_control_chars("a\tb"), "a   b");
+        assert_eq!(normalize_control_chars("ab\tcd\te"), "ab  cd  e");
+        // A tab already sitting on a 4-column stop takes a full stop.
+        assert_eq!(normalize_control_chars("abcd\te"), "abcd    e");
+        // Column tracking resets at each embedded newline.
+        assert_eq!(normalize_control_chars("ab\tc\nd\te"), "ab  c\nd   e");
+        // Other C0 controls (e.g. a stray bell/backspace byte) vanish; `\n`
+        // itself is preserved.
+        assert_eq!(normalize_control_chars("a\u{7}b\u{8}c"), "abc");
+        // The common case (nothing to normalise) is untouched.
+        assert_eq!(normalize_control_chars("plain text"), "plain text");
     }
 }

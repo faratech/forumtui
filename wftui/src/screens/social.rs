@@ -532,13 +532,14 @@ fn render_inbox_view_panel(
     );
 
     view.rebuild_message_lines(theme, g, body_area.width);
-    let total = view.lines.len() as u16;
-    let max_scroll = total.saturating_sub(body_area.height);
+    let max_scroll = view.lines.len().saturating_sub(body_area.height as usize);
     if view.scroll > max_scroll {
         view.scroll = max_scroll;
     }
+    // Sliced rather than `Paragraph::scroll`, whose offset is a `u16`
+    // (issue #558).
     f.render_widget(
-        Paragraph::new(view.lines.clone()).scroll((view.scroll, 0)),
+        Paragraph::new(crate::editor::visible_window(&view.lines, view.scroll, body_area.height)),
         body_area,
     );
 }
@@ -675,9 +676,9 @@ impl ConversationViewState {
         let width = width.max(1) as usize;
         let body_w = width.saturating_sub(3).max(4);
         let mut lines: Vec<Line<'static>> = Vec::new();
-        let mut offsets: Vec<u16> = Vec::new();
+        let mut offsets: Vec<usize> = Vec::new();
         for (i, msg) in self.messages.iter().enumerate() {
-            offsets.push(lines.len() as u16);
+            offsets.push(lines.len());
             let header_left = vec![
                 chrome::initials_chip(theme, &msg.username),
                 Span::raw("  "),
@@ -895,13 +896,15 @@ pub fn render_conversation_view(
     // the `n`/`N` offsets pointed at the wrong rows. Rebuilt only when the
     // width or the selected message changes.
     s.rebuild_message_lines(theme, g, view.width);
-    let total = s.lines.len() as u16;
-    let max_scroll = total.saturating_sub(view.height);
+    let max_scroll = s.lines.len().saturating_sub(view.height as usize);
     if s.scroll > max_scroll {
         s.scroll = max_scroll;
     }
 
-    f.render_widget(Paragraph::new(s.lines.clone()).scroll((s.scroll, 0)), view);
+    f.render_widget(
+        Paragraph::new(crate::editor::visible_window(&s.lines, s.scroll, view.height)),
+        view,
+    );
 }
 
 // ================= new conversation =================
@@ -1161,8 +1164,12 @@ pub fn render_new_conversation(
     let body_chars: Vec<char> = s.body.chars().collect();
     let rows = crate::editor::visual_rows_of(&body_chars, body_area.width as usize);
     let (caret_row, caret_col) = crate::editor::caret_in_rows(&body_chars, &rows, s.body_cursor);
-    s.body_scroll =
-        crate::editor::follow_caret(s.body_scroll, caret_row, rows.len(), body_area.height);
+    s.body_scroll = crate::editor::follow_caret(
+        s.body_scroll,
+        caret_row,
+        rows.len(),
+        body_area.height as usize,
+    );
     let body_lines: Vec<Line<'static>> = rows
         .iter()
         .map(|r| {
@@ -1173,7 +1180,11 @@ pub fn render_new_conversation(
         })
         .collect();
     f.render_widget(
-        Paragraph::new(body_lines).scroll((s.body_scroll, 0)),
+        Paragraph::new(crate::editor::visible_window(
+            &body_lines,
+            s.body_scroll,
+            body_area.height,
+        )),
         body_area,
     );
 
@@ -1200,7 +1211,9 @@ pub fn render_new_conversation(
         }
         2 => Some((
             (body_area.x + caret_col as u16).min(body_area.x + body_area.width.saturating_sub(1)),
-            (body_area.y + (caret_row as u16).saturating_sub(s.body_scroll))
+            // Subtract in `usize`, narrow afterwards: the difference is at
+            // most one pane height, however many rows the draft has (#558).
+            (body_area.y + caret_row.saturating_sub(s.body_scroll).min(u16::MAX as usize) as u16)
                 .min(body_area.y + body_area.height.saturating_sub(1)),
         )),
         _ => None,
@@ -1411,7 +1424,7 @@ mod tests {
             messages,
             page: 1,
             last_page: 1,
-            scroll: u16::MAX, // `G` / a long run of `j`
+            scroll: usize::MAX, // `G` / a long run of `j`
             ..Default::default()
         };
 

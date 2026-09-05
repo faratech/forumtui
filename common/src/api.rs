@@ -79,6 +79,28 @@ impl WfApiClient {
         self.tokens.lock().await.clone()
     }
 
+    /// Re-read the token store and adopt a token set some *other* instance
+    /// wrote. XF rotates the refresh token on every refresh, so two clients
+    /// sharing one config dir (a tmux session on the server plus a local
+    /// one) invalidate each other's in-memory grant; the surviving token is
+    /// the one on disk. Returns `true` only when the file genuinely holds
+    /// something this process does not already have — so a caller can use it
+    /// as "is there a session to recover?" without ever looping (issue #557).
+    pub async fn adopt_stored_tokens(&self) -> bool {
+        let stored = match self.store.load() {
+            Ok(Some(t)) => t,
+            _ => return false,
+        };
+        let mut guard = self.tokens.lock().await;
+        if guard.as_ref().is_some_and(|cur| {
+            cur.refresh_token == stored.refresh_token && cur.access_token == stored.access_token
+        }) {
+            return false;
+        }
+        *guard = Some(stored);
+        true
+    }
+
     pub async fn forget_tokens(&self) -> Result<()> {
         self.tokens.lock().await.take();
         self.store.erase()
@@ -828,6 +850,39 @@ mod tests {
         .await
         .unwrap();
         c
+    }
+
+    /// Issue #557: two instances sharing one config dir rotate each other's
+    /// refresh token out from under themselves. `adopt_stored_tokens` must
+    /// pick up what the sibling wrote — and must report `false` (nothing to
+    /// recover) when the file is missing or already the token set in memory,
+    /// so the caller can end the session instead of looping.
+    #[tokio::test]
+    async fn adopt_stored_tokens_takes_a_siblings_rotated_token_only_once() {
+        let _env = EnvGuard::hold("http://127.0.0.1:1", "/tmp/wftui-test-adopt");
+        let client = logged_in_client("access-1").await;
+
+        // Same token set on disk as in memory: nothing to adopt.
+        assert!(!client.adopt_stored_tokens().await);
+
+        // A sibling instance refreshes and rewrites the store.
+        let store = token::Store::new();
+        store
+            .save(&TokenSet {
+                access_token: "access-2".into(),
+                refresh_token: "refresh-2".into(),
+                expires_at: OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                scope: "test".into(),
+            })
+            .unwrap();
+        assert!(client.adopt_stored_tokens().await, "the sibling's token must be adopted");
+        assert_eq!(client.valid_token().await.unwrap(), "access-2");
+        // Idempotent: the same file is no longer news.
+        assert!(!client.adopt_stored_tokens().await);
+
+        // No store at all is not something to recover from either.
+        client.forget_tokens().await.unwrap();
+        assert!(!client.adopt_stored_tokens().await);
     }
 
     #[test]

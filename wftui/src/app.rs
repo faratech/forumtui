@@ -48,7 +48,10 @@ impl TaskErrorKind {
     /// True only for the failures that mean the stored session itself is
     /// invalid — the sole cases that should ever send the user back to the
     /// login screen. A transient transport error or a server 5xx must never
-    /// discard a working token (issue #551).
+    /// discard a working token (issue #551). This is a coarse, variant-only
+    /// check; `TaskError::ends_session()` refines it further by also
+    /// inspecting `code` (issue #555) and is what callers should actually
+    /// use.
     pub fn ends_session(self) -> bool {
         matches!(
             self,
@@ -71,6 +74,18 @@ pub struct TaskError {
 }
 
 impl TaskError {
+    /// True only when the failure means the stored session itself is
+    /// invalid. This refines `TaskErrorKind::ends_session()` (which only
+    /// looks at status/variant) with the wire-level `code`: an OAuth or
+    /// Api(401|403) failure whose `code` is the synthetic `"http_error"` —
+    /// meaning the body wasn't JSON at all, e.g. a Cloudflare 5xx/429 page
+    /// or a WAF challenge HTML response — is never a genuine "this token/
+    /// grant is bad" rejection, so it must not end the session (issue #555;
+    /// sibling of #551, which handled the coarse status classification).
+    pub fn ends_session(&self) -> bool {
+        self.kind.ends_session() && self.code.as_deref() != Some("http_error")
+    }
+
     pub fn of(e: &Error) -> Self {
         match e {
             Error::Api { code, message, status, max_page } => TaskError {
@@ -79,9 +94,9 @@ impl TaskError {
                 max_page: *max_page,
                 kind: TaskErrorKind::Api(*status),
             },
-            Error::OAuth { message, .. } => TaskError {
+            Error::OAuth { code, message, .. } => TaskError {
                 message: message.clone(),
-                code: None,
+                code: Some(code.clone()),
                 max_page: None,
                 kind: TaskErrorKind::OAuth,
             },
@@ -110,7 +125,16 @@ impl std::fmt::Display for TaskError {
 type TaskResult<T> = Result<T, TaskError>;
 
 pub enum Msg {
-    Bootstrap(Result<User, TaskError>),
+    /// The stored-session check came back. `generation` is the
+    /// `App::bootstrap_generation` the check was started under: `end_session`
+    /// (and so `logout`) bumps it, so a restore that was already in flight
+    /// when the user pressed Ctrl+L can never sign them back in against an
+    /// erased token store (issue #557).
+    Bootstrap { generation: u64, result: Result<User, TaskError> },
+    /// A background task decided the session itself is over — the pollers
+    /// (which otherwise drop their errors) and the token-store recheck send
+    /// this so the pump's one session boundary can end it (issue #557).
+    SessionLost(TaskError),
     /// The three login messages carry the `generation` of the flow that sent
     /// them. `begin_login` bumps `App::login_generation` on every restart, so
     /// a message from a superseded flow (the user pressed Enter again after a
@@ -230,7 +254,7 @@ pub struct App {
     /// Set just before a reload whose only purpose is to refresh a thread page
     /// in place (`thread_id`, `page`, `sel_post`, `scroll`); consumed by the
     /// matching `Msg::ThreadLoaded` (issue #538).
-    keep_thread_position: Option<(u32, u32, usize, u16)>,
+    keep_thread_position: Option<(u32, u32, usize, usize)>,
     show_help: bool,
     /// The go-to palette, when it is open. It owns the keyboard while it is.
     palette: Option<Palette>,
@@ -261,6 +285,16 @@ pub struct App {
     /// While true, `r` re-runs the session check instead of whatever the top
     /// screen would otherwise do with it (issue #551).
     bootstrap_retry_needed: bool,
+    /// Which stored-session check is the live one. Bumped by `end_session`
+    /// (hence by `logout`), and stamped on `Msg::Bootstrap`, so a restore
+    /// still in flight when the session ends is dropped instead of reviving
+    /// a signed-out client (issue #557).
+    bootstrap_generation: u64,
+    /// One-shot guard for the mid-session token recheck: a `NoToken` in a
+    /// live session may just mean a sibling instance rotated the shared
+    /// `token.json`, so the store is re-read once before the session is
+    /// ended. Cleared whenever a session begins or ends (issue #557).
+    session_recovery_tried: bool,
     /// Which login flow is the live one. Bumped by every `begin_login`, and
     /// stamped on the flow's messages so a superseded flow's `LoginReady` /
     /// `LoginFailed` / `LoginComplete` is ignored (issue #547).
@@ -466,6 +500,8 @@ pub async fn run(images: crate::images::Images) -> u8 {
         should_quit: false,
         poller_handles: Vec::new(),
         bootstrap_retry_needed: false,
+        bootstrap_generation: 0,
+        session_recovery_tried: false,
         login_generation: 0,
         login_task: None,
         body_rect: ratatui::layout::Rect::default(),
@@ -527,10 +563,70 @@ impl App {
         self.status = "Restoring session…".into();
         let api = self.api.clone();
         let tx = self.tx.clone();
+        let generation = self.bootstrap_generation;
         tokio::spawn(async move {
             let result = api.me().await.map_err(|e| TaskError::of(&e));
-            tx.send(Msg::Bootstrap(result)).ok();
+            tx.send(Msg::Bootstrap { generation, result }).ok();
         });
+    }
+
+    /// A live session lost its token (`Error::NoToken`). Before ending it,
+    /// re-read `token.json` once: XF rotates the refresh token on every
+    /// refresh, so a second instance sharing the config dir invalidates this
+    /// one's in-memory grant while leaving a perfectly good token set on
+    /// disk. If there is nothing new to adopt the task reports back with
+    /// `Msg::SessionLost` and the session ends (issue #557).
+    fn recheck_stored_session(&mut self, reason: String) {
+        self.session_recovery_tried = true;
+        self.status = "Session token changed elsewhere — re-checking…".into();
+        let client = self.client.clone();
+        let api = self.api.clone();
+        let tx = self.tx.clone();
+        let generation = self.bootstrap_generation;
+        tokio::spawn(async move {
+            if client.adopt_stored_tokens().await {
+                let result = api.me().await.map_err(|e| TaskError::of(&e));
+                tx.send(Msg::Bootstrap { generation, result }).ok();
+            } else {
+                tx.send(Msg::SessionLost(TaskError {
+                    message: reason,
+                    code: None,
+                    max_page: None,
+                    kind: TaskErrorKind::NoToken,
+                }))
+                .ok();
+            }
+        });
+    }
+
+    /// The single place a session ends. Every session-ending failure routes
+    /// here from the message pump's boundary (and `logout` calls it too), so
+    /// a client that has lost its grant can never keep rendering a signed-in
+    /// header over panels that all say "not logged in" (issue #557).
+    fn end_session(&mut self, reason: &str) {
+        self.stop_pollers();
+        // Anything already in flight belongs to the session being ended.
+        self.bootstrap_generation = self.bootstrap_generation.wrapping_add(1);
+        self.me = None;
+        self.alerts_unread = 0;
+        self.convos_unread = 0;
+        // Every overlay/chord layer that owns the keyboard ahead of the
+        // screen stack must be torn down too — otherwise it stays armed over
+        // the freshly-pushed Login screen and can still act (issue #560):
+        // the palette's `Enter` still runs `run_palette_target` with no
+        // session, and an armed `g` chord still resolves on whatever key
+        // follows.
+        self.palette = None;
+        self.show_help = false;
+        self.prefix = Prefix::default();
+        self.selection = None;
+        self.keep_thread_position = None;
+        self.bootstrap_retry_needed = false;
+        self.session_recovery_tried = false;
+        self.screens
+            .retain(|s| matches!(s, Screen::Home(_) | Screen::ForumTree(_)));
+        self.screens.push(screens::login_state());
+        self.status = reason.to_string();
     }
 
     fn start_pollers(&mut self) {
@@ -545,9 +641,24 @@ impl App {
         self.poller_handles.push(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(common::config::ALERT_POLL_SECS)).await;
-                if let Ok(page) = api.alerts(1).await {
-                    let unread = page.alerts.iter().filter(|a| !a.viewed()).count() as u32;
-                    tx.send(Msg::Notice(format!("alerts:{unread}"))).ok();
+                match api.alerts(1).await {
+                    Ok(page) => {
+                        let unread = page.alerts.iter().filter(|a| !a.viewed()).count() as u32;
+                        tx.send(Msg::Notice(format!("alerts:{unread}"))).ok();
+                    }
+                    // A poller is the first thing to notice a session that
+                    // has quietly ended (the user is reading, nothing else
+                    // is calling the API). Report that instead of dropping
+                    // it, and stop — `end_session` aborts us anyway, but a
+                    // send failure must not leave this loop spinning
+                    // (issue #557).
+                    Err(e) => {
+                        let err = TaskError::of(&e);
+                        if err.ends_session() {
+                            tx.send(Msg::SessionLost(err)).ok();
+                            return;
+                        }
+                    }
                 }
             }
         }));
@@ -560,9 +671,20 @@ impl App {
                     common::config::CONVERSATION_POLL_SECS,
                 ))
                 .await;
-                if let Ok(page) = api.conversations(1).await {
-                    let unread = common::models::count_unread_conversations(&page.conversations);
-                    tx.send(Msg::Notice(format!("convos:{unread}"))).ok();
+                match api.conversations(1).await {
+                    Ok(page) => {
+                        let unread =
+                            common::models::count_unread_conversations(&page.conversations);
+                        tx.send(Msg::Notice(format!("convos:{unread}"))).ok();
+                    }
+                    // See the alerts poller above (issue #557).
+                    Err(e) => {
+                        let err = TaskError::of(&e);
+                        if err.ends_session() {
+                            tx.send(Msg::SessionLost(err)).ok();
+                            return;
+                        }
+                    }
                 }
             }
         }));
@@ -927,8 +1049,10 @@ impl App {
                 return;
             }
         }
-        // Global navigation only when no input field owns the keyboard.
-        if k.modifiers.is_empty() && !capture && !self.input_active() {
+        // Global navigation only when no input field owns the keyboard, and
+        // only once there is a session — the sign-in screen is a gate, not a
+        // place these can push screens over (issue #556).
+        if self.me.is_some() && k.modifiers.is_empty() && !capture && !self.input_active() {
             match k.code {
                 KeyCode::Char('c') => {
                     self.open_inbox(screens::InboxTab::Conversations);
@@ -1396,7 +1520,7 @@ impl App {
         self.clipboard = text.clone();
         // The palette owns the keyboard while it is up, so it owns pastes too.
         if let Some(palette) = self.palette.as_mut() {
-            let sanitized = text.replace(['\r', '\n'], " ");
+            let sanitized = crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], " "));
             crate::editor::insert_str(&mut palette.query, &mut palette.cursor, &sanitized);
             palette.after_paste();
             return;
@@ -1405,16 +1529,17 @@ impl App {
             match screen {
                 Screen::Compose(cs) => {
                     if cs.title_field {
-                        let sanitized = text.replace(['\r', '\n'], " ");
+                        let sanitized =
+                            crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], " "));
                         crate::editor::insert_str(&mut cs.title, &mut cs.title_cursor, &sanitized);
                     } else {
-                        let sanitized = text.replace('\r', "");
+                        let sanitized = crate::editor::normalize_control_chars(&text.replace('\r', ""));
                         crate::editor::insert_str(&mut cs.body, &mut cs.body_cursor, &sanitized);
                     }
                     self.status = format!("Pasted {} characters", text.chars().count());
                 }
                 Screen::Search(ss) => {
-                    let sanitized = text.replace(['\r', '\n'], " ");
+                    let sanitized = crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], " "));
                     if ss.active_field == 1 {
                         crate::editor::insert_str(&mut ss.author, &mut ss.author_cursor, &sanitized);
                     } else {
@@ -1425,7 +1550,9 @@ impl App {
                 Screen::NewConversation(ncs) => {
                     match ncs.field {
                         0 => {
-                            let sanitized = text.replace(['\r', '\n'], " ");
+                            let sanitized = crate::editor::normalize_control_chars(
+                                &text.replace(['\r', '\n'], " "),
+                            );
                             crate::editor::insert_str(
                                 &mut ncs.recipients,
                                 &mut ncs.recipients_cursor,
@@ -1433,7 +1560,9 @@ impl App {
                             );
                         }
                         1 => {
-                            let sanitized = text.replace(['\r', '\n'], " ");
+                            let sanitized = crate::editor::normalize_control_chars(
+                                &text.replace(['\r', '\n'], " "),
+                            );
                             crate::editor::insert_str(
                                 &mut ncs.title,
                                 &mut ncs.title_cursor,
@@ -1441,7 +1570,8 @@ impl App {
                             );
                         }
                         _ => {
-                            let sanitized = text.replace('\r', "");
+                            let sanitized =
+                                crate::editor::normalize_control_chars(&text.replace('\r', ""));
                             crate::editor::insert_str(
                                 &mut ncs.body,
                                 &mut ncs.body_cursor,
@@ -1709,13 +1839,17 @@ impl App {
 
     /// Paint the live selection highlight over the finished frame.
     fn paint_selection(&self, f: &mut Frame) {
-        use ratatui::style::{Color, Style};
         let Some(sel) = &self.selection else {
             return;
         };
         let (x0, y0, x1, y1) = sel.rect();
         let area = f.area();
-        let style = Style::new().fg(Color::Black).bg(Color::LightBlue);
+        // Same band every other selected/focused row in the client uses
+        // (issue #562): `Theme::selected()` already knows to reverse instead
+        // of tint on Ansi16/Mono, where a hard-coded colour would paint
+        // regardless of `NO_COLOR` — the one place this client violated
+        // that contract.
+        let style = self.theme.selected();
         for y in y0..=y1.min(area.height.saturating_sub(1)) {
             for x in x0..=x1.min(area.width.saturating_sub(1)) {
                 let cell = &mut f.buffer_mut()[(x, y)];
@@ -2135,19 +2269,43 @@ impl App {
             };
             tx.send(Msg::LoggedOut(result)).ok();
         });
-        self.stop_pollers();
-        self.me = None;
-        self.alerts_unread = 0;
-        self.convos_unread = 0;
-        self.screens
-            .retain(|s| matches!(s, Screen::Home(_) | Screen::ForumTree(_)));
-        self.screens.push(screens::login_state());
-        self.status = "Logged out.".into();
+        // Same teardown as any other session end — including the generation
+        // bump that drops a `Msg::Bootstrap` still in flight from a restore
+        // the user just signed out of (issue #557).
+        self.end_session("Logged out.");
     }
 
     // ---- message handling ----
 
     fn handle_msg(&mut self, msg: Msg) {
+        // A stored-session check from a session that has since ended (the
+        // user pressed Ctrl+L while "Restoring session…" was in flight) must
+        // not sign anyone back in against an erased token store — issue #557,
+        // the same generation discipline the Login* messages use.
+        if let Msg::Bootstrap { generation, .. } = &msg
+            && *generation != self.bootstrap_generation
+        {
+            return;
+        }
+        // The one session boundary: any background failure that means the
+        // stored session itself is gone ends it here, rather than each
+        // handler stashing "not logged in" in its own panel while the header
+        // keeps showing a user who is no longer signed in (issue #557).
+        if let Some(err) = session_error_of(&msg) {
+            let reason = err.message.clone();
+            // A live session that lost its token may just be sharing
+            // `token.json` with a second instance that rotated it: re-read
+            // the store once before giving up on the session.
+            if err.kind == TaskErrorKind::NoToken
+                && self.me.is_some()
+                && !self.session_recovery_tried
+            {
+                self.recheck_stored_session(reason);
+                return;
+            }
+            self.end_session(&format!("Session expired ({reason}); log in again."));
+            return;
+        }
         match msg {
             Msg::LoginReady { generation, url } => {
                 if generation != self.login_generation {
@@ -2245,8 +2403,14 @@ impl App {
                     self.status = n;
                 }
             }
-            Msg::Bootstrap(Ok(user)) => {
+            Msg::SessionLost(_) => {
+                // A non-session-ending `SessionLost` cannot happen (the
+                // boundary above consumes every session-ending one, and the
+                // senders only send those), so there is nothing left to do.
+            }
+            Msg::Bootstrap { result: Ok(user), .. } => {
                 self.bootstrap_retry_needed = false;
+                self.session_recovery_tried = false;
                 self.me = Some(user);
                 self.status = "Session restored.".into();
                 self.start_pollers();
@@ -2256,22 +2420,16 @@ impl App {
                 self.load_nodes();
                 self.prime_home_list();
             }
-            Msg::Bootstrap(Err(e)) => {
+            Msg::Bootstrap { result: Err(e), .. } => {
                 // Only a failure that means the stored session itself is
                 // invalid (no token, OAuth refused, 401/403) may send the
-                // user to the login screen. A transport failure or a server
-                // 5xx must not throw away a token that would work the
-                // moment the network/server recovers (issue #551).
-                if e.kind.ends_session() {
-                    self.bootstrap_retry_needed = false;
-                    if !self.screens.iter().any(|s| matches!(s, Screen::Login(_))) {
-                        self.screens.push(screens::login_state());
-                    }
-                    self.status = format!("Session expired ({e}); log in again.");
-                } else {
-                    self.bootstrap_retry_needed = true;
-                    self.status = format!("Can't reach windowsforum.com ({e}) — press r to retry.");
-                }
+                // user to the login screen — and that case never reaches
+                // here, the session boundary at the top of `handle_msg` took
+                // it (issue #557). What is left is transport failures and
+                // server 5xx, which must not throw away a token that would
+                // work the moment the network/server recovers (issue #551).
+                self.bootstrap_retry_needed = true;
+                self.status = format!("Can't reach windowsforum.com ({e}) — press r to retry.");
             }
             Msg::NodesLoaded(result) => {
                 let tree = self.tree_mut();
@@ -3069,6 +3227,39 @@ async fn finish_login(
     }
 }
 
+/// The session-ending failure a message carries, if it carries one — the
+/// whole reason `App::handle_msg` can have a single session boundary
+/// (issue #557). Every message whose `Err` arm can only come from an API
+/// call is listed; `Msg::LoginComplete` deliberately is not, because a
+/// failed sign-in belongs to the login screen that is already up (and its
+/// own generation check owns it), and neither are the local-only outcomes
+/// (`LoggedOut`, `ImageLoaded`, `Notice`, `PaletteMember`,
+/// `RecipientResolved`).
+fn session_error_of(msg: &Msg) -> Option<&TaskError> {
+    let err = match msg {
+        Msg::SessionLost(e) => e,
+        Msg::Bootstrap { result: Err(e), .. }
+        | Msg::NodesLoaded(Err(e))
+        | Msg::ForumLoaded { result: Err(e), .. }
+        | Msg::ThreadLoaded { result: Err(e), .. }
+        | Msg::ReplySent(Err(e))
+        | Msg::ThreadCreated(Err(e))
+        | Msg::MarkedRead(Err(e))
+        | Msg::ConversationsLoaded { result: Err(e), .. }
+        | Msg::ConversationLoaded { result: Err(e), .. }
+        | Msg::ConvoReplySent(Err(e))
+        | Msg::ConvoCreated(Err(e))
+        | Msg::ConversationMarked(Err(e))
+        | Msg::AlertsLoaded(Err(e))
+        | Msg::AlertMarked(Err(e))
+        | Msg::SearchDone { result: Err(e), .. }
+        | Msg::ProfileLoaded(Err(e))
+        | Msg::PostToggled { result: Err(e), .. } => e,
+        _ => return None,
+    };
+    err.ends_session().then_some(err)
+}
+
 /// The last page this client already believed `thread_id` had, found the
 /// same way `list_showing` locates a forum's list: scan the screen stack for
 /// an open `ThreadView` on that thread. `1` when none is open — reply is
@@ -3078,7 +3269,7 @@ async fn finish_login(
 /// The topmost open thread view as (`thread_id`, `page`, `sel_post`,
 /// `scroll`) — what a like/vote needs to refresh the page it acted on without
 /// losing the reader's place.
-fn open_thread_position(screens: &[Screen]) -> Option<(u32, u32, usize, u16)> {
+fn open_thread_position(screens: &[Screen]) -> Option<(u32, u32, usize, usize)> {
     screens.iter().rev().find_map(|s| match s {
         Screen::ThreadView(v) if v.thread.thread_id > 0 => {
             Some((v.thread.thread_id, v.page.max(1), v.sel_post, v.scroll))
@@ -3357,6 +3548,34 @@ mod tests {
         assert_eq!(app.find_word_bounds(5, 0), Some((5, 6)));
         assert_eq!(app.extract_selection_text(0, 0, 6, 0), "\u{6f22}\u{5b57} ok");
         assert_eq!(app.find_word_bounds(4, 0), None, "a space is not a word");
+    }
+
+    /// Issue #562: `paint_selection` used to hard-code Black-on-LightBlue,
+    /// the one place in the client that ignored the theme — every other
+    /// selected/focused band goes through `Theme::selected()`, which reverses
+    /// instead of tinting on `NO_COLOR`/16-colour terminals. With
+    /// `Theme::mono()` (what `NO_COLOR` selects) the selection band must
+    /// paint no colour at all, same as `theme::tests::mono_paints_nothing`
+    /// asserts for every other role.
+    #[test]
+    fn mono_selection_band_paints_no_colour() {
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Color;
+
+        let mut app = test_app();
+        app.theme = crate::theme::Theme::mono();
+        app.selection = Some(Selection {
+            anchor: (0, 0),
+            end: (3, 0),
+        });
+        let mut term = ratatui::Terminal::new(TestBackend::new(12, 1)).expect("terminal");
+        term.draw(|f| app.paint_selection(f)).expect("draw");
+        let buf = term.backend().buffer().clone();
+        for x in 0..=3u16 {
+            let cell = &buf[(x, 0)];
+            assert_eq!(cell.fg, Color::Reset, "mono selection painted a foreground at col {x}");
+            assert_eq!(cell.bg, Color::Reset, "mono selection painted a background at col {x}");
+        }
     }
 
     /// Issue #529: after posting a reply the client must ask for one page
@@ -3962,6 +4181,41 @@ mod tests {
         assert!(!TaskErrorKind::Api(500).ends_session(), "a server 5xx must not end the session");
         assert!(!TaskErrorKind::Api(200).ends_session());
         assert!(!TaskErrorKind::Other.ends_session(), "a transport failure must not end the session");
+
+        // Issue #555: a synthetic `"http_error"` code means the body wasn't
+        // JSON at all — a Cloudflare 5xx/429/HTML page, not a real OAuth/API
+        // rejection — so `TaskError::ends_session()` must override the
+        // coarse kind-only classification and keep the session alive.
+        let oauth_http_error = TaskError::of(&Error::OAuth {
+            code: "http_error".into(),
+            message: "<html>bad gateway</html>".into(),
+            status: 502,
+        });
+        assert_eq!(oauth_http_error.kind, TaskErrorKind::OAuth);
+        assert!(
+            !oauth_http_error.ends_session(),
+            "an opaque 502 wrapped as OAuth must not end the session"
+        );
+
+        let api_http_error = TaskError::of(&Error::Api {
+            code: "http_error".into(),
+            message: "<html>forbidden</html>".into(),
+            status: 403,
+            max_page: None,
+        });
+        assert_eq!(api_http_error.kind, TaskErrorKind::Api(403));
+        assert!(
+            !api_http_error.ends_session(),
+            "a non-JSON 403 (e.g. a WAF challenge page) must not end the session"
+        );
+
+        // A genuine structured rejection still ends the session.
+        let real_invalid_grant = TaskError::of(&Error::OAuth {
+            code: "invalid_grant".into(),
+            message: "expired".into(),
+            status: 400,
+        });
+        assert!(real_invalid_grant.ends_session());
     }
 
     /// Issue #551: a transient (transport/5xx) bootstrap failure must keep
@@ -3973,12 +4227,15 @@ mod tests {
         let mut app = test_app();
         app.screens.push(screens::home_state(true));
 
-        app.handle_msg(Msg::Bootstrap(Err(TaskError {
-            message: "http error: connection reset".into(),
-            code: None,
-            max_page: None,
-            kind: TaskErrorKind::Other,
-        })));
+        app.handle_msg(Msg::Bootstrap {
+            generation: app.bootstrap_generation,
+            result: Err(TaskError {
+                message: "http error: connection reset".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::Other,
+            }),
+        });
 
         assert!(
             !app.screens.iter().any(|s| matches!(s, Screen::Login(_))),
@@ -3998,7 +4255,7 @@ mod tests {
             .await
             .expect("r must re-run the session check")
             .expect("channel open");
-        assert!(matches!(sent, Msg::Bootstrap(_)), "expected a fresh Bootstrap check");
+        assert!(matches!(sent, Msg::Bootstrap { .. }), "expected a fresh Bootstrap check");
     }
 
     /// Issue #551: the converse — a session-ending error (NoToken, OAuth,
@@ -4009,15 +4266,160 @@ mod tests {
         let mut app = test_app();
         app.screens.push(screens::home_state(true));
 
-        app.handle_msg(Msg::Bootstrap(Err(TaskError {
+        app.handle_msg(Msg::Bootstrap {
+            generation: app.bootstrap_generation,
+            result: Err(TaskError {
+                message: "not logged in".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::NoToken,
+            }),
+        });
+
+        assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
+        assert!(!app.bootstrap_retry_needed);
+        assert!(app.status.contains("Session expired"));
+    }
+
+    /// Issue #557: a refresh rejected with `invalid_grant` mid-session (XF
+    /// rotated the refresh token under a second instance, or the 90-day
+    /// grant simply ran out) used to leave a zombie client — `me` still set,
+    /// pollers silent, every panel saying "not logged in". Whichever message
+    /// carries the failure, the pump's session boundary must end the session
+    /// once: pollers stopped, `me` cleared, the stack back to Home + Login.
+    #[tokio::test]
+    async fn in_session_invalid_grant_ends_the_session_from_any_message() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.keep_thread_position = Some((42, 1, 0, 0));
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 42, ..Default::default() },
+            ..Default::default()
+        }));
+        app.start_pollers();
+        assert_eq!(app.poller_handles.len(), 2);
+        let generation_before = app.bootstrap_generation;
+
+        // The failure arrives on an ordinary content load, not on Bootstrap.
+        app.handle_msg(Msg::ThreadLoaded {
+            id: 42,
+            page: 1,
+            result: Err(TaskError {
+                message: "oauth error [invalid_grant]".into(),
+                code: Some("invalid_grant".into()),
+                max_page: None,
+                kind: TaskErrorKind::OAuth,
+            }),
+        });
+
+        assert!(app.me.is_none(), "the header must stop showing a signed-out user");
+        assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
+        assert!(
+            !app.screens.iter().any(|s| matches!(s, Screen::ThreadView(_))),
+            "the stack must be truncated back to Home"
+        );
+        assert!(app.keep_thread_position.is_none());
+        assert!(app.poller_handles.is_empty(), "the pollers must be stopped");
+        assert!(app.status.contains("Session expired"), "status: {:?}", app.status);
+        assert_ne!(
+            app.bootstrap_generation, generation_before,
+            "ending a session must invalidate any restore already in flight"
+        );
+
+        // A poller reporting the same failure (issue #557: it used to drop
+        // the error) routes to exactly the same place.
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.handle_msg(Msg::SessionLost(TaskError {
+            message: "unauthorized".into(),
+            code: Some("api_error".into()),
+            max_page: None,
+            kind: TaskErrorKind::Api(401),
+        }));
+        assert!(app.me.is_none());
+        assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
+    }
+
+    /// Issue #557: `Ctrl+L` while "Restoring session…" is still in flight
+    /// erased the token store and then let the late `Msg::Bootstrap(Ok)`
+    /// sign the user back in — pollers and all — against no tokens at all.
+    /// The generation stamp must drop that answer.
+    #[tokio::test]
+    async fn logout_during_restore_drops_the_late_bootstrap() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(true));
+        app.restore_session();
+        let in_flight = app.bootstrap_generation;
+
+        app.logout();
+        assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
+        assert_eq!(app.status, "Logged out.");
+
+        // The restore that was already running finally answers.
+        app.handle_msg(Msg::Bootstrap {
+            generation: in_flight,
+            result: Ok(User { user_id: 7, username: "kemical".into(), ..Default::default() }),
+        });
+
+        assert!(app.me.is_none(), "a superseded restore must not sign anyone back in");
+        assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
+        assert!(app.poller_handles.is_empty(), "no pollers may be started for a dead session");
+        assert_eq!(app.status, "Logged out.");
+
+        // The restore started *after* the logout is still the live one.
+        app.restore_session();
+        app.handle_msg(Msg::Bootstrap {
+            generation: app.bootstrap_generation,
+            result: Ok(User { user_id: 7, username: "kemical".into(), ..Default::default() }),
+        });
+        assert!(app.me.is_some(), "the current generation's answer must still land");
+    }
+
+    /// Issue #557: `Error::NoToken` in a live session may only mean a second
+    /// instance sharing `token.json` rotated the refresh token, so the store
+    /// is re-read once before the session ends. With nothing new on disk the
+    /// recheck reports back and the session ends exactly as before.
+    #[tokio::test]
+    async fn no_token_mid_session_rechecks_the_store_once_before_ending() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+
+        app.handle_msg(Msg::NodesLoaded(Err(TaskError {
             message: "not logged in".into(),
             code: None,
             max_page: None,
             kind: TaskErrorKind::NoToken,
         })));
 
+        assert!(app.me.is_some(), "the session survives until the store has been re-read");
+        assert!(app.session_recovery_tried);
+        assert!(app.status.contains("re-checking"), "status: {:?}", app.status);
+
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(1), app.rx.recv())
+            .await
+            .expect("the recheck must report back")
+            .expect("channel open");
+        // Nothing new on disk (this process already holds whatever is there),
+        // so the recheck reports the session lost rather than a fresh `me()`.
+        assert!(matches!(sent, Msg::SessionLost(_)), "expected SessionLost");
+        app.handle_msg(sent);
+        assert!(app.me.is_none());
         assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
-        assert!(!app.bootstrap_retry_needed);
+
+        // And the recheck is one-shot: the next NoToken ends the session
+        // straight away instead of looping on the store.
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.session_recovery_tried = true;
+        app.handle_msg(Msg::NodesLoaded(Err(TaskError {
+            message: "not logged in".into(),
+            code: None,
+            max_page: None,
+            kind: TaskErrorKind::NoToken,
+        })));
+        assert!(app.me.is_none());
         assert!(app.status.contains("Session expired"));
     }
 
@@ -4129,10 +4531,92 @@ mod tests {
             should_quit: false,
             poller_handles: Vec::new(),
             bootstrap_retry_needed: false,
+            bootstrap_generation: 0,
+            session_recovery_tried: false,
             login_generation: 0,
             login_task: None,
             body_rect: ratatui::layout::Rect::default(),
         }
+    }
+
+    /// Issue #556: the sign-in screen is a gate, not a place. With no
+    /// session, the global `c`/`a`/`s`/`/` navigation block must not push an
+    /// authenticated screen over Login (it must instead let `on_key` handle
+    /// `c` as "copy link"), and Esc must not pop the gate onto a
+    /// session-less Home.
+    #[test]
+    fn sign_in_screen_blocks_global_nav_and_esc_while_logged_out() {
+        let mut app = test_app();
+        app.screens.push(screens::login_state());
+        if let Some(Screen::Login(ls)) = app.screens.last_mut() {
+            ls.stage = screens::LoginStage::Waiting;
+            ls.url = "https://windowsforum.com/tui-start/abc123".into();
+        }
+        assert!(app.me.is_none());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(app.screens.len(), 1, "c must not push the Inbox over a session-less Login screen");
+        assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
+        assert_eq!(
+            app.clipboard, "https://windowsforum.com/tui-start/abc123",
+            "the login screen's own 'c' handling must still fire"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(app.screens.len(), 1, "a/s// must not push screens while logged out");
+        assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            app.screens.len(),
+            1,
+            "Esc must not pop the sign-in gate onto a session-less Home"
+        );
+        assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
+        assert!(app.status.contains("Sign in first"));
+    }
+
+    /// Issue #560: Ctrl+L (sign out) is handled before the palette/help/`g`
+    /// prefix layers ever see it, so `logout()` itself must tear them down —
+    /// otherwise the palette stays armed over the freshly-pushed Login
+    /// screen and its `Enter` can still push an authenticated screen with no
+    /// session.
+    #[tokio::test]
+    async fn ctrl_l_with_the_palette_open_clears_it_and_leaves_login_on_top() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.open_palette();
+        assert!(app.palette.is_some(), "test setup: the palette must actually be open");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+
+        assert!(app.palette.is_none(), "logout must close the palette");
+        assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
+    }
+
+    /// Issue #559: a pasted tab must not desync the caret from the drawn
+    /// text. `cell_width("\t") == 1` but ratatui's grapheme filter draws a
+    /// raw tab as zero cells, so leaving it in the buffer put the caret one
+    /// column right of where the text actually ended.
+    #[test]
+    fn pasting_a_tab_into_the_composer_keeps_the_caret_at_the_drawn_text_end() {
+        let mut app = test_app();
+        app.screens.push(Screen::Compose(screens::ComposeState::default()));
+
+        app.handle_paste("a\tb".into());
+
+        let Some(Screen::Compose(cs)) = app.screens.last() else {
+            panic!("expected the Compose screen");
+        };
+        assert_eq!(cs.body, "a   b", "the tab must expand to spaces, not stay raw");
+        let (_, col) = crate::editor::caret_position(&cs.body, 80, cs.body_cursor);
+        assert_eq!(
+            col,
+            cs.body.chars().count(),
+            "the caret column must equal where the drawn text actually ends"
+        );
     }
 
     /// Issue #547: `Enter` is advertised as "restart login" for the whole

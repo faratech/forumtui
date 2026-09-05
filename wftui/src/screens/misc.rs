@@ -36,6 +36,10 @@ pub fn login_key(s: &mut super::LoginState, key: KeyEvent) -> Action {
         (_, KeyCode::Enter) => Action::LoginBegin,
         (LoginStage::Waiting, KeyCode::Char('c')) => Action::OscCopy(s.url.clone()),
         (LoginStage::Waiting, KeyCode::Char('o')) => Action::OpenUrl(s.url.clone()),
+        // Advertised on the key bar (issue #561); a login task in flight, if
+        // any, is simply aborted by process exit — there is nothing to clean
+        // up first.
+        (_, KeyCode::Char('q')) => Action::Quit,
         _ => Action::None,
     }
 }
@@ -787,10 +791,21 @@ fn draw_editor_panel(
         body_lines.push(Line::from(Span::styled("Sending\u{2026}", theme.dim())));
         total_rows += 1;
     }
-    s.body_scroll =
-        crate::editor::follow_caret(s.body_scroll, caret_row, total_rows, body_area.height);
+    s.body_scroll = crate::editor::follow_caret(
+        s.body_scroll,
+        caret_row,
+        total_rows,
+        body_area.height as usize,
+    );
+    // Sliced rather than `Paragraph::scroll` (a `u16` offset) — this site
+    // takes unlimited-length posts, so a draft really can pass 65,536
+    // visual rows (issue #558).
     f.render_widget(
-        Paragraph::new(body_lines).scroll((s.body_scroll, 0)),
+        Paragraph::new(crate::editor::visible_window(
+            &body_lines,
+            s.body_scroll,
+            body_area.height,
+        )),
         body_area,
     );
 
@@ -807,7 +822,9 @@ fn draw_editor_panel(
     } else {
         let cur_x =
             (body_area.x + caret_col as u16).min(body_area.x + body_area.width.saturating_sub(1));
-        let screen_row = (caret_row as u16).saturating_sub(s.body_scroll);
+        // Subtract in `usize` and narrow after: the result is at most one
+        // pane height even for a 70,000-row draft (issue #558).
+        let screen_row = caret_row.saturating_sub(s.body_scroll).min(u16::MAX as usize) as u16;
         let cur_y = (body_area.y + screen_row).min(body_area.y + body_area.height.saturating_sub(1));
         f.set_cursor_position((cur_x, cur_y));
     }
@@ -2177,6 +2194,8 @@ mod tests {
         // x = panel border (1) + the 7 cells of "line 39".
         assert_eq!((cx, cy), (1 + 7, caret_row), "caret is not at the end of the last line");
 
+        // Same probe, past the u16 row ceiling — see the #558 test below.
+
         // One long paragraph: the caret belongs on the *wrapped* row, not on
         // row 0 with a column of 200.
         let para = "w".repeat(200);
@@ -2189,6 +2208,33 @@ mod tests {
         // 200 cells over a 78-cell body = rows 0,1,2 with 44 cells on the last.
         assert_eq!(cy, body_top + 2, "caret is not on the third wrapped row");
         assert_eq!(cx, 1 + 44, "caret column ignores the wrap");
+    }
+
+    /// Issue #558: `messageMaxLength` is 0 on this site, so pasting a
+    /// 70,000-line CBS.log into a reply is something a member really does.
+    /// With the old `u16` row model the editor scrolled to row 70_000 mod
+    /// 65_536 and drew the caret in that wrong window; typing was blind.
+    /// The window on screen must be the caret's own.
+    #[test]
+    fn compose_editor_follows_the_caret_past_the_u16_row_ceiling() {
+        let body: String = (0..70_001).map(|i| format!("line {i:05}\n")).collect();
+        let mut s = reply_state(body.trim_end_matches('\n'));
+        let (rows, (cx, cy)) = render_compose_probe(&mut s, 80, 24);
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains("line 70000"),
+            "the caret's own line is off screen — the offset wrapped:\n{screen}"
+        );
+        assert!(
+            !screen.contains("line 04464") && !screen.contains("line 00000"),
+            "the pane is showing the wrapped-offset window:\n{screen}"
+        );
+        let caret_row = rows
+            .iter()
+            .position(|r| r.contains("line 70000"))
+            .expect("last line on screen") as u16;
+        // x = panel border (1) + the 10 cells of "line 70000".
+        assert_eq!((cx, cy), (1 + 10, caret_row), "caret is not at the end of the last line");
     }
 
     /// Issue #523: Up/Down did not exist in the body branch at all, and a run

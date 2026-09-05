@@ -112,7 +112,10 @@ pub struct ThreadViewState {
     pub lines: Vec<ratatui::text::Line<'static>>,
     /// Inner width the current `lines` were wrapped for; a resize rebuilds.
     pub width: u16,
-    pub scroll: u16,
+    /// First visual row on screen. `usize`, not `u16`: a single post can
+    /// wrap past 65,536 rows on this site (`messageMaxLength` is 0), and a
+    /// truncated offset makes the tail of it unreachable (issue #558).
+    pub scroll: usize,
     pub links: Vec<String>,
     pub link_popup: bool,
     pub sel_local: usize,
@@ -228,8 +231,9 @@ pub struct ComposeState {
     pub body_height: u16,
     /// First visual row of the body on screen. Follows the caret, so text
     /// typed past the bottom of the pane scrolls into view instead of being
-    /// written blind (issue #519).
-    pub body_scroll: u16,
+    /// written blind (issue #519). `usize`: a multi-MB paste is a draft this
+    /// client accepts, and a `u16` offset wrapped past 65,536 rows (#558).
+    pub body_scroll: usize,
     /// The column a run of Up/Down is aiming at, in cells. Set by the first
     /// vertical move and cleared by every other key, so crossing a short
     /// line does not clip the caret's column permanently (issue #523).
@@ -257,9 +261,11 @@ pub struct ConversationViewState {
     pub page: u32,
     pub last_page: u32,
     pub lines: Vec<ratatui::text::Line<'static>>,
-    pub scroll: u16,
+    /// First visual row on screen — `usize` for the same reason as
+    /// `ThreadViewState::scroll` (issue #558).
+    pub scroll: usize,
     pub sel_msg: usize,
-    pub msg_line_offsets: Vec<u16>,
+    pub msg_line_offsets: Vec<usize>,
     /// What `lines`/`msg_line_offsets` were last built for: the pane width
     /// and the selected message (the only two things the layout depends on).
     /// `None` forces a rebuild — every writer of `messages` clears it. Both
@@ -288,7 +294,7 @@ pub struct NewConversationState {
     /// desired column for Up/Down.
     pub body_width: u16,
     pub body_height: u16,
-    pub body_scroll: u16,
+    pub body_scroll: usize,
     pub body_desired_col: Option<usize>,
 }
 
@@ -638,6 +644,9 @@ impl Screen {
     /// that would have shown a failure was gone, and the error was dropped.
     pub fn esc_intent(&self) -> EscIntent {
         match self {
+            // The sign-in screen is a gate, not a place: Esc must not pop it
+            // onto a session-less Home stuck loading forever (issue #556).
+            Screen::Login(_) => EscIntent::Blocked("Sign in first, or press q to quit."),
             Screen::Compose(c) if c.busy => EscIntent::Blocked(
                 "Sending\u{2026} Esc cannot cancel it \u{2014} wait for the result.",
             ),
@@ -700,7 +709,7 @@ impl Screen {
             Screen::ForumTree(t) => t.sel = t.nodes.len().saturating_sub(1),
             Screen::ThreadList(l) => l.sel = l.threads.len().saturating_sub(1),
             Screen::ThreadView(v) => {
-                v.scroll = v.lines.len() as u16;
+                v.scroll = v.lines.len();
                 v.sel_post = v.posts.len().saturating_sub(1);
                 v.width = 0;
             }
@@ -711,7 +720,7 @@ impl Screen {
                 InboxTab::Alerts => ib.alerts.sel = ib.alerts.alerts.len().saturating_sub(1),
             },
             Screen::ConversationView(v) => {
-                v.scroll = v.lines.len() as u16;
+                v.scroll = v.lines.len();
                 v.sel_msg = v.messages.len().saturating_sub(1);
             }
             Screen::Search(s) => s.sel = s.results.len().saturating_sub(1),
@@ -827,8 +836,9 @@ fn _keep_imports(u: &User, n: &Node, t: &Thread, p: &Post) {
 mod dispatch_tests {
     use super::*;
     use crate::glyph::{ASCII, UNICODE};
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     /// One of every screen, with just enough state to render.
     fn all_screens() -> Vec<Screen> {
@@ -1054,6 +1064,314 @@ mod dispatch_tests {
         assert!(matches!(&list, Screen::ThreadList(l) if l.sel == 2));
         list.goto_top();
         assert!(matches!(&list, Screen::ThreadList(l) if l.sel == 0));
+    }
+
+    /// A key-bar label's literal key(s), or `None` for a label with no
+    /// single key to press: a compound/movement pair (`j/k`, `n/N`, `[/]`,
+    /// `1/2/3`, `1-9`, ...) or `Tab`, which is a within-screen focus/field
+    /// switch that deliberately returns `Action::None` everywhere (its own
+    /// screens pin that directly, e.g.
+    /// `social::tab_key_switches_tabs_from_the_list_and_returns_from_the_view`).
+    fn key_for_label(label: &str) -> Option<KeyEvent> {
+        match label {
+            "j/k" | "h/l" | "n/N" | "[/]" | "[ ]" | "1/2/3" | "1-9" | "Tab" => None,
+            "Enter" => Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            "Esc" => Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            _ if label.len() == 2 && label.starts_with('^') => Some(KeyEvent::new(
+                KeyCode::Char(label.chars().nth(1).unwrap().to_ascii_lowercase()),
+                KeyModifiers::CONTROL,
+            )),
+            _ if label.chars().count() == 1 => Some(KeyEvent::new(
+                label.chars().next().map(KeyCode::Char).unwrap(),
+                KeyModifiers::NONE,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Issue #561: `q` was advertised on the Login key bar but `login_key`
+    /// never handled it, so it silently did nothing. Rather than pin that
+    /// one key, press every key each screen's own key bar advertises and
+    /// check the dispatch actually does something — the same class of bug
+    /// (a hint promising a key its screen's `on_key` never handles) can
+    /// recur for any other cap.
+    ///
+    /// Each screen below is built with just enough state for its non-skipped
+    /// keys to produce a real `Action`. A key is skipped, with a reason,
+    /// only when it is: compound/movement (`key_for_label` returns `None`),
+    /// routed by `App::handle_key`'s global nav before `Screen::on_key` ever
+    /// sees it (`c`/`a`/`s`/`/`/`g`/`?`), or a deliberate screen-internal
+    /// toggle with no `Action` of its own (documented inline at the arm that
+    /// handles it, e.g. `w`/`o` in `thread_view_key`, `^O` in `compose_key`).
+    #[test]
+    fn every_advertised_key_dispatches_to_something() {
+        // Global keys `App::handle_key` intercepts before a screen's
+        // `on_key` ever runs (app.rs's `c`/`a`/`s`//`` block and the `g`/`?`
+        // arms) — a screen's own dispatch has nothing to check for these.
+        const GLOBAL_NAV: &[&str] = &["c", "a", "s", "/", "g", "?"];
+
+        struct Case {
+            name: &'static str,
+            // A factory rather than one instance: pressing an earlier key
+            // (e.g. Compose's `^S`) mutates state (`busy = true`) that would
+            // make a later key's check spurious if the screen were shared,
+            // so every key gets its own fresh instance.
+            factory: fn() -> Screen,
+            /// Extra labels to skip on top of `GLOBAL_NAV`, each with the
+            /// reason inlined at its call site below.
+            skip: &'static [&'static str],
+        }
+
+        fn login_waiting() -> Screen {
+            let login = LoginState {
+                stage: LoginStage::Waiting,
+                url: "https://windowsforum.com/tui-start/abc123".into(),
+                ..Default::default()
+            };
+            Screen::Login(login)
+        }
+
+        let cases = vec![
+            Case {
+                name: "Login",
+                factory: login_waiting,
+                skip: &[],
+            },
+            Case {
+                name: "Home",
+                factory: || Screen::Home(HomeState {
+                    tree: ForumTreeState {
+                        nodes: vec![Node {
+                            node_id: 4,
+                            title: "Windows News".into(),
+                            node_type: "Forum".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    list: ThreadListState {
+                        node_id: 4,
+                        title: "Windows News".into(),
+                        threads: vec![Thread {
+                            thread_id: 1,
+                            title: "A thread".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    focus: Pane::List,
+                    ..Default::default()
+                }),
+                // `j/k` is a compound label; `Tab` switches panes in place.
+                skip: &["j/k", "Tab"],
+            },
+            Case {
+                name: "ForumTree",
+                factory: || Screen::ForumTree(ForumTreeState {
+                    nodes: vec![Node {
+                        node_id: 4,
+                        title: "Windows News".into(),
+                        node_type: "Forum".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                skip: &["j/k", "h/l", "1/2/3"],
+            },
+            Case {
+                name: "ThreadList",
+                factory: || Screen::ThreadList(ThreadListState {
+                    node_id: 4,
+                    title: "Windows News".into(),
+                    threads: vec![Thread {
+                        thread_id: 1,
+                        title: "A thread".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                skip: &["j/k", "[/]"],
+            },
+            Case {
+                name: "ThreadView",
+                factory: || Screen::ThreadView(ThreadViewState {
+                    thread: Thread {
+                        thread_id: 1,
+                        title: "A thread".into(),
+                        view_url: Some("https://windowsforum.com/threads/1/".into()),
+                        ..Default::default()
+                    },
+                    posts: vec![Post {
+                        post_id: 9,
+                        username: "HItest".into(),
+                        message: "hello".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                skip: &[
+                    "j/k", "n/N", "1-9",
+                    // `w` (watch) is deliberately always `Action::None`:
+                    // XenForo's REST API has no thread-watch endpoint (see
+                    // the comment on its arm in `thread_view_key`).
+                    "w",
+                    // `o` (links) opens a local popup overlay — a screen
+                    // state change, not an `Action` — so it too always
+                    // returns `Action::None` by design.
+                    "o",
+                ],
+            },
+            Case {
+                name: "Compose",
+                factory: || Screen::Compose(ComposeState {
+                    target: Some(ComposeTarget::ThreadReply {
+                        thread_id: 1,
+                        thread_title: "A thread".into(),
+                    }),
+                    body: "draft".into(),
+                    ..Default::default()
+                }),
+                skip: &[
+                    "Tab",
+                    // `^O` only flips the narrow-layout preview toggle —
+                    // screen state, no `Action` (see its arm in
+                    // `compose_key`).
+                    "^O",
+                    // `^A` (attach) is shadowed: attachment upload is
+                    // implemented in `common` but not wired into compose
+                    // (CLAUDE.md "Known gaps"), so `Ctrl+A` in the body
+                    // falls through to the readline `move_home` binding a
+                    // few lines below it and always returns `Action::None`.
+                    "^A",
+                ],
+            },
+            Case {
+                name: "Inbox",
+                factory: || Screen::Inbox(InboxState {
+                    convos: ConversationsState {
+                        conversations: vec![Conversation {
+                            conversation_id: 3,
+                            title: "A DM".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    alerts: AlertsState {
+                        alerts: vec![Alert {
+                            alert_id: 1,
+                            username: "kemical".into(),
+                            content_type: "post_quote".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    view: Some(ConversationViewState {
+                        conversation: Conversation {
+                            conversation_id: 3,
+                            title: "A DM".into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                skip: &[
+                    "Tab",
+                    // The List pane's own `on_key` has no `Esc` arm at all
+                    // (only `q`/`h`/`Left` pop); "back" for `Esc` is
+                    // delivered entirely by `App::handle_key`'s
+                    // `EscIntent::App` handling (it pops the screen before
+                    // `Screen::on_key` is ever called for it), so there is
+                    // nothing for this screen-level dispatch check to see.
+                    "Esc",
+                ],
+            },
+            Case {
+                name: "ConversationView",
+                factory: || Screen::ConversationView(ConversationViewState {
+                    conversation: Conversation {
+                        conversation_id: 3,
+                        title: "A DM".into(),
+                        username: "HItest".into(),
+                        ..Default::default()
+                    },
+                    messages: vec![ConversationMessage {
+                        message_id: 1,
+                        user_id: 7,
+                        username: "kemical".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                skip: &["j/k", "n/N", "[/]"],
+            },
+            Case {
+                name: "NewConversation",
+                factory: || Screen::NewConversation(NewConversationState {
+                    field: 2,
+                    recipients: "kemical".into(),
+                    title: "hi".into(),
+                    body: "hello".into(),
+                    ..Default::default()
+                }),
+                skip: &["Tab"],
+            },
+            Case {
+                name: "Search",
+                factory: || Screen::Search(SearchState {
+                    query: "edge update".into(),
+                    results: vec![SearchHit {
+                        content_type: "thread".into(),
+                        content_id: 1,
+                        title: "A hit".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                skip: &[
+                    "[ ]",
+                    // `i` only flips into query-edit mode — screen state,
+                    // no `Action` (see its arm in `search_key`).
+                    "i",
+                ],
+            },
+            Case {
+                name: "Profile",
+                factory: || Screen::Profile(ProfileState {
+                    title: "HItest".into(),
+                    user: Some(User {
+                        user_id: 7,
+                        username: "HItest".into(),
+                        view_url: Some("https://windowsforum.com/members/hitest.7/".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                skip: &[],
+            },
+        ];
+
+        for Case { name, factory, skip } in cases {
+            let hints = factory().hints();
+            for (label, _desc) in &hints.keys {
+                if GLOBAL_NAV.contains(label) || skip.contains(label) {
+                    continue;
+                }
+                let Some(key) = key_for_label(label) else {
+                    continue;
+                };
+                // A fresh instance per key: pressing an earlier one may have
+                // mutated state (e.g. Compose's `^S` sets `busy = true`,
+                // which makes every later key return `Action::None`) that
+                // would make this check spurious if screens were shared.
+                let mut screen = factory();
+                let action = screen.on_key(key);
+                assert!(
+                    !matches!(action, Action::None),
+                    "{name}: advertised key {label:?} dispatched to nothing"
+                );
+            }
+        }
     }
 
     /// Renders every screen headless. This catches panics from arithmetic on
