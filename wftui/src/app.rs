@@ -492,15 +492,37 @@ impl App {
                 }
             }
             Action::Quit => self.should_quit = true,
-            Action::OpenThreadList(node_id, title) => {
-                self.push_screen(Screen::ThreadList(screens::ThreadListState {
-                    node_id,
-                    title,
-                    page: 1,
-                    loading: true,
-                    ..Default::default()
-                }));
-                self.load_forum(node_id, 1);
+            Action::OpenThreadList(mut node_id, mut title) => {
+                let mut target_url = None;
+                if let Some(tree) = self.screens.iter().find_map(|s| match s {
+                    Screen::ForumTree(tree) => Some(tree),
+                    _ => None,
+                }) && let Some(node) = tree.nodes.iter().find(|n| n.node_id == node_id)
+                {
+                    if node.node_type == "Category" {
+                        if let Some(child) = tree.nodes.iter().find(|c| {
+                            (c.parent_node_id == node.node_id || c.depth > node.depth)
+                                && c.node_type == "Forum"
+                        }) {
+                            node_id = child.node_id;
+                            title = child.title.clone();
+                        }
+                    } else if matches!(node.node_type.as_str(), "LinkForum" | "Page") {
+                        target_url = node.view_url.clone();
+                    }
+                }
+                if let Some(url) = target_url {
+                    self.open_url(&url);
+                } else {
+                    self.push_screen(Screen::ThreadList(screens::ThreadListState {
+                        node_id,
+                        title,
+                        page: 1,
+                        loading: true,
+                        ..Default::default()
+                    }));
+                    self.load_forum(node_id, 1);
+                }
             }
             Action::OpenThread(thread) => self.open_thread(&thread),
             Action::OpenProfile(user_id, name) => self.open_profile(user_id, &name),
@@ -1146,6 +1168,12 @@ impl App {
                 if let Some(tree) = tree {
                     match result {
                         Ok(nodes) => {
+                            if tree.sel == 0
+                                && !nodes.is_empty()
+                                && let Some(idx) = nodes.iter().position(|n| n.node_type == "Forum")
+                            {
+                                tree.sel = idx;
+                            }
                             tree.nodes = nodes;
                             tree.loading = false;
                         }

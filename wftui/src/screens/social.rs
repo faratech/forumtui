@@ -16,6 +16,9 @@ use crate::theme::{fmt_time, Theme};
 
 pub fn conversations_key(s: &mut super::ConversationsState, key: KeyEvent) -> Action {
     match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => {
+            Action::PopScreen
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             if s.sel > 0 {
                 s.sel -= 1;
@@ -156,6 +159,9 @@ impl ConversationViewState {
 
 pub fn conversation_view_key(s: &mut ConversationViewState, key: KeyEvent) -> Action {
     match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => {
+            Action::PopScreen
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             s.scroll = s.scroll.saturating_sub(1);
             Action::None
@@ -527,6 +533,7 @@ pub fn alerts_key(s: &mut super::AlertsState, key: KeyEvent) -> Action {
             s.loading = true;
             Action::LoadAlerts
         }
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => Action::PopScreen,
         _ => Action::None,
     }
 }

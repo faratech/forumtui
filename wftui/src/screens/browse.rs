@@ -33,8 +33,64 @@ pub fn forum_tree_key(s: &mut super::ForumTreeState, key: KeyEvent) -> Action {
             }
             Action::None
         }
+        KeyCode::Left | KeyCode::Char('h') => {
+            // Path up to parent node in tree hierarchy
+            if let Some(node) = s.nodes.get(s.sel)
+                && node.parent_node_id > 0
+                && let Some(parent_idx) =
+                    s.nodes.iter().position(|n| n.node_id == node.parent_node_id)
+            {
+                s.sel = parent_idx;
+            }
+            Action::None
+        }
+        KeyCode::Right => {
+            // Path into category: jump to first child node
+            if let Some(node) = s.nodes.get(s.sel)
+                && node.node_type == "Category"
+                && let Some((child_idx, _)) = s
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .skip(s.sel + 1)
+                    .find(|(_, c)| c.parent_node_id == node.node_id || c.depth > node.depth)
+            {
+                s.sel = child_idx;
+            }
+            Action::None
+        }
         KeyCode::Enter | KeyCode::Char('l') => match s.nodes.get(s.sel) {
-            Some(node) => Action::OpenThreadList(node.node_id, node.title.clone()),
+            Some(node) => match node.node_type.as_str() {
+                "Category" => {
+                    // Categories do not have threads (/forums/{category_id} 404s).
+                    // Path down into the first child forum of this category.
+                    if let Some((child_idx, _)) = s.nodes.iter().enumerate().skip(s.sel + 1).find(
+                        |(_, c)| {
+                            (c.parent_node_id == node.node_id || c.depth > node.depth)
+                                && c.node_type == "Forum"
+                        },
+                    ) {
+                        s.sel = child_idx;
+                    } else if let Some((child_idx, _)) = s
+                        .nodes
+                        .iter()
+                        .enumerate()
+                        .skip(s.sel + 1)
+                        .find(|(_, c)| c.parent_node_id == node.node_id || c.depth > node.depth)
+                    {
+                        s.sel = child_idx;
+                    }
+                    Action::None
+                }
+                "LinkForum" | "Page" => {
+                    if let Some(url) = &node.view_url {
+                        Action::OpenUrl(url.clone())
+                    } else {
+                        Action::None
+                    }
+                }
+                _ => Action::OpenThreadList(node.node_id, node.title.clone()),
+            },
             None => Action::None,
         },
         KeyCode::Char('1') => open_node_action(&s.nodes, NEWS_NODE, "Windows News"),
@@ -45,8 +101,18 @@ pub fn forum_tree_key(s: &mut super::ForumTreeState, key: KeyEvent) -> Action {
             Action::LoadNodes
         }
         KeyCode::Char('N') => match s.nodes.get(s.sel) {
-            Some(node) => Action::StartNewThread(node.node_id),
-            None => Action::None,
+            Some(node) if node.node_type == "Forum" => Action::StartNewThread(node.node_id),
+            Some(node) if node.node_type == "Category" => {
+                if let Some(child) = s.nodes.iter().skip(s.sel + 1).find(|c| {
+                    (c.parent_node_id == node.node_id || c.depth > node.depth)
+                        && c.node_type == "Forum"
+                }) {
+                    Action::StartNewThread(child.node_id)
+                } else {
+                    Action::None
+                }
+            }
+            _ => Action::None,
         },
         KeyCode::Char('q') => Action::Quit,
         _ => Action::None,
@@ -55,6 +121,18 @@ pub fn forum_tree_key(s: &mut super::ForumTreeState, key: KeyEvent) -> Action {
 
 fn open_node_action(nodes: &[Node], id: u32, fallback_title: &str) -> Action {
     if let Some(node) = nodes.iter().find(|n| n.node_id == id) {
+        if node.node_type == "Category" {
+            if let Some(child) = nodes.iter().find(|c| {
+                (c.parent_node_id == node.node_id || c.depth > node.depth)
+                    && c.node_type == "Forum"
+            }) {
+                return Action::OpenThreadList(child.node_id, child.title.clone());
+            }
+        } else if matches!(node.node_type.as_str(), "LinkForum" | "Page")
+            && let Some(url) = &node.view_url
+        {
+            return Action::OpenUrl(url.clone());
+        }
         Action::OpenThreadList(node.node_id, node.title.clone())
     } else {
         Action::OpenThreadList(id, fallback_title.to_string())
@@ -91,11 +169,30 @@ pub fn render_forum_tree(
         .iter()
         .map(|n| {
             let indent = "  ".repeat(n.depth.min(6) as usize);
-            ListItem::new(Line::from(vec![
+            let (icon, tag_style, tag_label) = match n.node_type.as_str() {
+                "Category" => ("📁 ", Style::new().fg(theme.accent), " [Category]"),
+                "LinkForum" => ("🔗 ", theme.dim(), " [Link]"),
+                "Page" => ("📄 ", theme.dim(), " [Page]"),
+                _ => ("💬 ", theme.dim(), ""),
+            };
+            let mut spans = vec![
                 Span::styled(indent, theme.dim()),
-                Span::raw(n.title.clone()),
-                Span::styled(format!("  #{}", n.node_id), theme.dim()),
-            ]))
+                Span::styled(icon, tag_style),
+            ];
+            if n.node_type == "Category" {
+                spans.push(Span::styled(
+                    n.title.clone(),
+                    theme.title().add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::raw(n.title.clone()));
+            }
+            if !tag_label.is_empty() {
+                spans.push(Span::styled(tag_label, tag_style));
+            } else {
+                spans.push(Span::styled(format!("  #{}", n.node_id), theme.dim()));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let mut state = ListState::default().with_selected(Some(s.sel));
@@ -110,6 +207,7 @@ pub fn render_forum_tree(
         &[
             ("↑↓", "move"),
             ("Enter", "open"),
+            ("←→", "tree in/out"),
             ("1/2/3", "news/security/tutorials"),
             ("N", "new thread"),
             ("r", "refresh"),
@@ -132,6 +230,9 @@ pub fn render_forum_tree(
 
 pub fn thread_list_key(s: &mut ThreadListState, key: KeyEvent) -> Action {
     match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => {
+            Action::PopScreen
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             if s.sel > 0 {
                 s.sel -= 1;
@@ -343,6 +444,9 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
         return link_popup_key(s, key);
     }
     match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => {
+            Action::PopScreen
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             s.scroll = s.scroll.saturating_sub(1);
             Action::None
@@ -583,5 +687,81 @@ mod tests {
         );
         assert!(matches!(act, Action::OpenUrl(url) if url == "https://example.com/2"));
         assert!(!state.link_popup);
+    }
+
+    #[test]
+    fn forum_tree_category_navigation_and_actions() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use common::models::Node;
+        use crate::screens::ForumTreeState;
+
+        let nodes = vec![
+            Node {
+                node_id: 301,
+                title: "Windows Forums".into(),
+                description: "Category root".into(),
+                node_type: "Category".into(),
+                parent_node_id: 0,
+                depth: 0,
+                view_url: None,
+            },
+            Node {
+                node_id: 302,
+                title: "Windows Help and Support".into(),
+                description: "Help forum".into(),
+                node_type: "Forum".into(),
+                parent_node_id: 301,
+                depth: 1,
+                view_url: None,
+            },
+            Node {
+                node_id: 400,
+                title: "Documentation Link".into(),
+                description: "External docs".into(),
+                node_type: "LinkForum".into(),
+                parent_node_id: 301,
+                depth: 1,
+                view_url: Some("https://example.com/docs".into()),
+            },
+        ];
+
+        let mut state = ForumTreeState {
+            nodes: nodes.clone(),
+            sel: 0, // Points to Category 301
+            ..Default::default()
+        };
+
+        // Pressing Enter on Category should NOT open thread list for category; it should step into child forum
+        let act = forum_tree_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(act, Action::None));
+        assert_eq!(state.sel, 1, "Enter on Category should advance sel to child forum (idx 1)");
+
+        // Pressing Left / h on child forum should step back to parent Category (idx 0)
+        let act = forum_tree_key(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(matches!(act, Action::None));
+        assert_eq!(state.sel, 0, "Left on child should step up to parent Category (idx 0)");
+
+        // Pressing Right on Category should step into child forum
+        let act = forum_tree_key(&mut state, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(act, Action::None));
+        assert_eq!(state.sel, 1, "Right on Category should advance sel to child forum");
+
+        // Pressing Enter on Forum should open thread list
+        let act = forum_tree_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(act, Action::OpenThreadList(id, _) if id == 302));
+
+        // Moving to LinkForum and pressing Enter should open URL
+        state.sel = 2;
+        let act = forum_tree_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(act, Action::OpenUrl(url) if url == "https://example.com/docs"));
+
+        // Pressing 'N' on Category should resolve child forum for thread creation
+        state.sel = 0;
+        let act = forum_tree_key(&mut state, KeyEvent::new(KeyCode::Char('N'), KeyModifiers::NONE));
+        assert!(matches!(act, Action::StartNewThread(id) if id == 302));
+
+        // open_node_action on Category should resolve to child forum
+        let act = open_node_action(&nodes, 301, "Windows Forums");
+        assert!(matches!(act, Action::OpenThreadList(id, _) if id == 302));
     }
 }
