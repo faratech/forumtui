@@ -55,9 +55,21 @@ impl Gate {
 
     /// Impose a cool-down floor starting now (Retry-After, post-write flood
     /// mirror). Repeated calls extend to the max.
+    ///
+    /// `Instant + Duration` panics on overflow (issue #554: a hostile or
+    /// broken origin sending a 19-20 digit `Retry-After` reached this before
+    /// `error_from_response` clamped it). `checked_add` makes that
+    /// impossible here too, defense in depth — a `dur` too large for the
+    /// clock to represent falls back to a generous but safe 24h penalty
+    /// rather than ever panicking.
     pub fn penalize(&self, dur: Duration) {
         let mut s = self.state.lock().unwrap();
-        let until = Instant::now() + dur;
+        let now = Instant::now();
+        const FALLBACK: Duration = Duration::from_secs(24 * 3600);
+        let until = now
+            .checked_add(dur)
+            .or_else(|| now.checked_add(FALLBACK))
+            .unwrap_or(now);
         s.penalty_until = Some(match s.penalty_until {
             Some(existing) => existing.max(until),
             None => until,
@@ -109,5 +121,20 @@ mod tests {
         gate.penalize(Duration::from_secs(10));
         let wait = gate.pending_wait();
         assert!(wait <= Duration::from_secs(31) && wait >= Duration::from_secs(28));
+    }
+
+    /// Issue #554: a hostile or broken origin's `Retry-After` could reach
+    /// `penalize` unclamped (before `error_from_response` grew its own
+    /// clamp) and `Instant::now() + Duration::from_secs(u64::MAX)` panics
+    /// ("overflow when adding duration to instant"). `penalize` must survive
+    /// the largest possible `Duration` without panicking, on top of
+    /// `error_from_response`'s clamp — defense in depth, not either/or.
+    #[tokio::test(start_paused = true)]
+    async fn penalize_with_a_duration_too_large_for_the_clock_does_not_panic() {
+        let gate = Gate::new(1);
+        gate.penalize(Duration::from_secs(u64::MAX));
+        // Must land on *some* future wait, not panic and not silently do
+        // nothing.
+        assert!(gate.pending_wait() > Duration::ZERO);
     }
 }

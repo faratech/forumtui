@@ -537,7 +537,32 @@ pub(crate) fn render_thread_panel(
 
 // ================= Home =================
 
-pub fn home_hints() -> Hints {
+/// `N`/`m` are hidden when the List pane is focused and showing the
+/// synthetic "Latest posts" list (node 0) — there is no real forum there to
+/// post into or mark read (issue #552). In the Tree pane (or on a real
+/// forum) both keys still work exactly as before.
+pub fn home_hints(s: &HomeState) -> Hints {
+    if s.focus == Pane::List && s.list.node_id == 0 {
+        return Hints::with_short(
+            &[
+                ("Enter", "open"),
+                ("j/k", "move"),
+                ("Tab", "pane"),
+                ("/", "search"),
+                ("g", "go to\u{2026}"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            &[
+                ("Enter", "open"),
+                ("j/k", ""),
+                ("/", ""),
+                ("g", ""),
+                ("?", "more"),
+            ],
+            0,
+        );
+    }
     Hints::with_short(
         &[
             ("Enter", "open"),
@@ -623,25 +648,35 @@ pub fn render_home(
     let dual = area.width >= DUAL_PANE_MIN_COLS;
     s.dual = dual;
     if !dual {
-        // One panel, showing whichever half has the keyboard.
+        // One panel, showing whichever half has the keyboard. The other half
+        // is off screen, so it gets no rect for the wheel to find (#549).
+        s.tree_rect = Rect::default();
+        s.list_rect = Rect::default();
         match s.focus {
             Pane::Tree => {
+                s.tree_rect = area;
                 render_forum_panel(&mut s.tree, s.list.node_id, f, area, theme, g, true)
             }
-            Pane::List => render_thread_panel(
-                &mut s.list,
-                f,
-                area,
-                theme,
-                g,
-                true,
-                Grammar::for_width(area.width),
-            ),
+            Pane::List => {
+                s.list_rect = area;
+                render_thread_panel(
+                    &mut s.list,
+                    f,
+                    area,
+                    theme,
+                    g,
+                    true,
+                    Grammar::for_width(area.width),
+                )
+            }
         }
         return;
     }
     let [left, right] =
         Layout::horizontal([Constraint::Length(TREE_PANE_COLS), Constraint::Min(0)]).areas(area);
+    // What the wheel routes by (issue #549).
+    s.tree_rect = left;
+    s.list_rect = right;
     render_forum_panel(
         &mut s.tree,
         s.list.node_id,
@@ -868,7 +903,15 @@ pub fn thread_list_key(s: &mut ThreadListState, key: KeyEvent) -> Action {
             Some(t) => Action::OpenThread(t.clone()),
             None => Action::None,
         },
+        // node 0 is the synthetic "Latest posts" list: there is no real
+        // forum to mark read or post a new thread into (issue #552).
+        KeyCode::Char('m') if s.node_id == 0 => {
+            Action::Notice("Pick a forum first.".into())
+        }
         KeyCode::Char('m') => Action::MarkForumRead(s.node_id),
+        KeyCode::Char('N') if s.node_id == 0 => {
+            Action::Notice("Pick a forum first.".into())
+        }
         KeyCode::Char('N') => Action::StartNewThread(s.node_id),
         KeyCode::Char('r') => {
             s.loading = true;
@@ -878,7 +921,31 @@ pub fn thread_list_key(s: &mut ThreadListState, key: KeyEvent) -> Action {
     }
 }
 
-pub fn thread_list_hints() -> Hints {
+/// `node_id` is the list's forum: 0 is the synthetic "Latest posts" list,
+/// which has no real forum to post into or mark read, so `N`/`m` are hidden
+/// there rather than advertised and then refused (issue #552).
+pub fn thread_list_hints(node_id: u32) -> Hints {
+    if node_id == 0 {
+        return Hints::with_short(
+            &[
+                ("Enter", "read"),
+                ("j/k", "move"),
+                ("[/]", "page"),
+                ("/", "search"),
+                ("r", "refresh"),
+                ("?", "help"),
+                ("Esc", "back"),
+            ],
+            &[
+                ("Enter", "read"),
+                ("j/k", ""),
+                ("[/]", "page"),
+                ("/", ""),
+                ("Esc", "back"),
+            ],
+            0,
+        );
+    }
     Hints::with_short(
         &[
             ("Enter", "read"),
@@ -1492,7 +1559,7 @@ fn justify(
     if rw + 2 <= width {
         let mut spans = clip_to(left, width - rw - 1);
         let used: usize = spans.iter().map(Span::width).sum();
-        spans.push(Span::raw(" ".repeat(width - rw - used)));
+        spans.push(Span::raw(" ".repeat((width - rw).saturating_sub(used))));
         spans.extend(right);
         return Line::from(spans);
     }
@@ -1511,7 +1578,7 @@ fn clip_to(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
         }
         let room = max - used;
         if room > 0 {
-            let text: String = s.content.chars().take(room).collect();
+            let text = chrome::take_cells(&s.content, room);
             out.push(Span::styled(text, s.style));
         }
         break;
@@ -2215,7 +2282,34 @@ mod tests {
             },
             focus: Pane::List,
             dual: true,
+            ..Default::default()
         }
+    }
+
+    /// Issue #549: the wheel aims by the rects the last frame drew, so
+    /// `render_home` has to record them — both halves when the layout is
+    /// dual, and only the visible half when it is not (a zero-area `Rect`
+    /// contains no point, so the off-screen pane can never take a wheel).
+    #[test]
+    fn render_home_records_the_pane_rects_the_wheel_routes_by() {
+        let theme = Theme::truecolor();
+        let mut s = home_with_data();
+
+        let mut wide = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
+        wide.draw(|f| render_home(&mut s, f, f.area(), &theme, &UNICODE))
+            .expect("draw");
+        assert!(s.dual);
+        assert_eq!(s.tree_rect, Rect::new(0, 0, TREE_PANE_COLS, 24));
+        assert_eq!(s.list_rect, Rect::new(TREE_PANE_COLS, 0, 120 - TREE_PANE_COLS, 24));
+
+        // Narrow: one panel, the focused one (List here).
+        let mut narrow = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        narrow
+            .draw(|f| render_home(&mut s, f, f.area(), &theme, &UNICODE))
+            .expect("draw");
+        assert!(!s.dual);
+        assert_eq!(s.list_rect, Rect::new(0, 0, 80, 24));
+        assert_eq!(s.tree_rect, Rect::default(), "the hidden pane takes no wheel");
     }
 
     /// Render a screen headless and return the rows as strings.
@@ -2389,6 +2483,46 @@ mod tests {
         h.focus = Pane::Tree;
         assert!(matches!(home_key(&mut h, key('r')), Action::LoadNodes));
         assert!(matches!(home_key(&mut h, key('N')), Action::StartNewThread(302)));
+    }
+
+    /// Issue #552: "Latest posts" (node 0) has no real forum behind it — `N`
+    /// and `m` must refuse with a status hint instead of opening a composer
+    /// or firing a mark-read that 404s, and the key bar must not advertise
+    /// either cap while node 0 is showing.
+    #[test]
+    fn n_and_m_on_latest_posts_refuse_with_a_hint_and_hide_from_the_bar() {
+        let mut list = ThreadListState { node_id: 0, title: "Latest posts".into(), ..Default::default() };
+        assert!(matches!(thread_list_key(&mut list, key('N')), Action::Notice(msg) if msg.contains("forum")));
+        assert!(matches!(thread_list_key(&mut list, key('m')), Action::Notice(msg) if msg.contains("forum")));
+
+        let hints = thread_list_hints(0);
+        assert!(!hints.keys.iter().any(|(k, _)| *k == "N" || *k == "m"), "{:?}", hints.keys);
+        assert!(!hints.short.iter().any(|(k, _)| *k == "N" || *k == "m"), "{:?}", hints.short);
+
+        // A real forum keeps both keys, in the bar and in behavior.
+        let mut real = ThreadListState { node_id: 302, ..Default::default() };
+        assert!(matches!(thread_list_key(&mut real, key('N')), Action::StartNewThread(302)));
+        assert!(matches!(thread_list_key(&mut real, key('m')), Action::MarkForumRead(302)));
+        let hints = thread_list_hints(302);
+        assert!(hints.keys.iter().any(|(k, _)| *k == "N"));
+        assert!(hints.keys.iter().any(|(k, _)| *k == "m"));
+
+        // Home's List pane forwards to the same guard (browse.rs:611).
+        let mut h = home_with_data();
+        h.focus = Pane::List;
+        h.list.node_id = 0;
+        assert!(matches!(home_key(&mut h, key('N')), Action::Notice(_)));
+        assert!(matches!(home_key(&mut h, key('m')), Action::Notice(_)));
+        let hints = home_hints(&h);
+        assert!(!hints.keys.iter().any(|(k, _)| *k == "N" || *k == "m"));
+
+        // The Tree pane's `N`/`m` are about the tree cursor, not the list's
+        // node — they must stay advertised and functional regardless of
+        // what node 0's list is showing.
+        h.focus = Pane::Tree;
+        let hints = home_hints(&h);
+        assert!(hints.keys.iter().any(|(k, _)| *k == "N"));
+        assert!(hints.keys.iter().any(|(k, _)| *k == "m"));
     }
 
     #[test]
@@ -3060,6 +3194,45 @@ mod tests {
         // Advertised-but-inert keys must stay inert, not fall through to a verb.
         assert!(matches!(thread_view_key(&mut state, key('w')), Action::None));
         assert!(matches!(thread_view_key(&mut state, key('1')), Action::None));
+    }
+
+    /// `post_header_line`'s `justify` used to clip the username by chars, not
+    /// cells (`clip_to` -> `chars().take(room)`), so a CJK username came back
+    /// wider than the room it was clipped to and the later
+    /// `width - rw - used` subtraction underflowed (issue #545). Every width
+    /// in this sweep must render without panicking and stay within `width`.
+    #[test]
+    fn post_header_line_wide_username_narrow_panel_does_not_panic() {
+        let theme = Theme::truecolor();
+        let post = Post {
+            username: "\u{6f22}".repeat(10),
+            post_date: 1_700_000_000,
+            ..Default::default()
+        };
+        for width in [36usize, 40, 48, 58, 78] {
+            let l = post_header_line(&post, 1, &theme, width);
+            assert!(l.width() <= width, "width {width}: {}", text(&l));
+        }
+    }
+
+    /// Same underflow, reached via `thread_summary_line`'s `is_watching`
+    /// right-hand side (issue #545).
+    #[test]
+    fn thread_summary_line_wide_username_narrow_panel_does_not_panic() {
+        let theme = Theme::truecolor();
+        let g = &UNICODE;
+        let state = ThreadViewState {
+            thread: Thread {
+                username: "\u{6f22}".repeat(12),
+                is_watching: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for width in [60usize, 70, 80, 90, 100] {
+            let l = thread_summary_line(&state, &theme, g, width);
+            assert!(l.width() <= width, "width {width}: {}", text(&l));
+        }
     }
 }
 

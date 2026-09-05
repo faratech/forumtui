@@ -34,10 +34,26 @@ pub struct WfApiClient {
 
 impl WfApiClient {
     pub fn new() -> Result<Self> {
+        let store = token::Store::new();
+        // A store that fails to *parse* (hand-edited, truncated, or written
+        // by a build whose `TokenSet` shape has since changed) is not a
+        // reason to refuse to start: quarantine it and begin as if there
+        // were no session, rather than bricking every existing install on a
+        // schema change (issue #546). Any other error (I/O, permissions)
+        // still propagates.
+        let tokens = match store.load() {
+            Ok(t) => t,
+            Err(Error::TokenStore(msg)) => {
+                tracing::warn!("{msg} — starting a fresh session");
+                store.quarantine_corrupt();
+                None
+            }
+            Err(e) => return Err(e),
+        };
         Ok(WfApiClient {
             http: crate::http::build()?,
-            tokens: Mutex::new(token::Store::new().load()?),
-            store: token::Store::new(),
+            tokens: Mutex::new(tokens),
+            store,
             api_gate: Arc::new(Gate::new(config::GLOBAL_MIN_INTERVAL_MS)),
             search_gate: Arc::new(Gate::new(config::SEARCH_MIN_INTERVAL_MS)),
             write_gate: Arc::new(Gate::new(config::WRITE_COOLDOWN_MS)),
@@ -344,12 +360,18 @@ pub(crate) async fn decode<T: DeserializeOwned>(resp: reqwest::Response) -> Resu
 async fn error_from_response(resp: reqwest::Response) -> Error {
     let status = resp.status().as_u16();
     if status == 429 {
+        // A hostile or broken origin can send an arbitrarily large
+        // `Retry-After` (up to 20 digits); clamp it to a sane ceiling so it
+        // can never overflow `Instant + Duration` downstream in
+        // `Gate::penalize` (issue #554) — only a real origin misbehaving
+        // this badly would ever hit the clamp at all.
+        const MAX_RETRY_AFTER_SECS: u64 = 3600;
         let retry_after = resp
             .headers()
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(Duration::from_secs);
+            .map(|secs| Duration::from_secs(secs.min(MAX_RETRY_AFTER_SECS)));
         let _ = resp.bytes().await; // drain politely; shape not needed
         return Error::RateLimited { retry_after };
     }
@@ -917,6 +939,33 @@ mod tests {
         let c = logged_in_client("tok-1").await;
         match c.nodes().await.unwrap_err() {
             Error::RateLimited { retry_after: Some(d) } => assert_eq!(d.as_secs(), 7),
+            other => panic!("wrong error: {other}"),
+        }
+    }
+
+    /// Issue #554: a hostile or broken origin's `Retry-After` can be a
+    /// 19-20 digit number that overflows `Instant + Duration` once it
+    /// reaches `Gate::penalize`. `error_from_response` must clamp it to a
+    /// sane ceiling (an hour) before it ever gets that far — this pins the
+    /// clamp itself, independent of `Gate::penalize`'s own `checked_add`
+    /// defense in depth.
+    #[tokio::test]
+    async fn rate_limit_retry_after_is_clamped_to_an_hour() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-429-huge");
+        Mock::given(method("GET"))
+            .and(path("/api/nodes"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "18446744073709551615"),
+            )
+            .mount(&server)
+            .await;
+        let c = logged_in_client("tok-1").await;
+        match c.nodes().await.unwrap_err() {
+            Error::RateLimited { retry_after: Some(d) } => {
+                assert_eq!(d, Duration::from_secs(3600), "must clamp, not pass the raw value through")
+            }
             other => panic!("wrong error: {other}"),
         }
     }

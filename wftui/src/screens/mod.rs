@@ -153,6 +153,12 @@ pub struct HomeState {
     /// reads it (Enter fills the pane instead of pushing a screen), and the
     /// draw always precedes the keys it is asked about in the event loop.
     pub dual: bool,
+    /// Where the last frame drew each half, in absolute screen coordinates, so
+    /// a mouse wheel can act on the pane the pointer is over instead of the
+    /// one that happens to have the keyboard (issue #549). Zero-sized when
+    /// that half was not on screen — a `Rect` of no area contains nothing.
+    pub tree_rect: Rect,
+    pub list_rect: Rect,
 }
 
 pub fn home_state(loading: bool) -> Screen {
@@ -337,6 +343,9 @@ pub struct InboxState {
     pub focus: InboxPane,
     /// Set by the renderer: true when both panes are on screen.
     pub dual: bool,
+    /// The panes' last-drawn rects — see `HomeState::tree_rect` (issue #549).
+    pub list_rect: Rect,
+    pub view_rect: Rect,
 }
 
 #[derive(Default)]
@@ -349,6 +358,13 @@ pub struct SearchState {
     pub content_type: u8,
     pub order: u8,
     pub input_mode: bool,
+    /// Member-content mode: this screen is showing one member's threads or
+    /// posts (profile `t`/`p`) as `(user_id, content)` — fetched with
+    /// `search_member`, not a keyword search. `query` is only a display label
+    /// there ("by: name (thread)"), so paging and the `t` toggle have to
+    /// re-issue `search_member`; feeding the label back into `search_advanced`
+    /// searched the site for that literal string (issue #548).
+    pub member: Option<(u32, String)>,
     pub results: Vec<SearchHit>,
     /// One pre-rendered dim snippet per result, parallel to `results`.
     ///
@@ -445,6 +461,13 @@ pub enum Action {
     LoadAlerts,
     LoadNodes,
     RunSearchQuery(SearchQuery),
+    /// One page of a member's threads/posts (issue #548). `content` is
+    /// XenForo's `content` parameter for `/search/member`: "thread" or "post".
+    LoadMemberContent {
+        user_id: u32,
+        content: String,
+        page: u32,
+    },
     MarkThreadRead(u32),
     MarkForumRead(u32),
     MarkAlertRead(u32),
@@ -462,6 +485,11 @@ pub enum Action {
     LoginBegin,
     OpenUrl(String),
     OscCopy(String),
+    /// A screen-level refusal that still needs to say something — unlike
+    /// `Action::None`, which is silent. E.g. `N`/`m` on the synthetic
+    /// "Latest posts" list (node 0), which has no real forum to post into or
+    /// mark read (issue #552).
+    Notice(String),
     PasteClipboard,
     Quit,
 }
@@ -525,15 +553,15 @@ impl Screen {
     pub fn hints(&self) -> Hints {
         match self {
             Screen::Login(_) => misc::login_hints(),
-            Screen::Home(_) => browse::home_hints(),
+            Screen::Home(s) => browse::home_hints(s),
             Screen::ForumTree(_) => browse::forum_tree_hints(),
-            Screen::ThreadList(_) => browse::thread_list_hints(),
+            Screen::ThreadList(s) => browse::thread_list_hints(s.node_id),
             Screen::ThreadView(_) => browse::thread_view_hints(),
             Screen::Compose(s) => misc::compose_hints(s),
             Screen::Inbox(_) => social::inbox_hints(),
             Screen::ConversationView(_) => social::conversation_view_hints(),
             Screen::NewConversation(_) => social::new_conversation_hints(),
-            Screen::Search(_) => misc::search_hints(),
+            Screen::Search(s) => misc::search_hints(s),
             Screen::Profile(_) => misc::profile_hints(),
         }
     }
@@ -569,6 +597,34 @@ impl Screen {
             Screen::NewConversation(s) => social::new_conversation_key(s, key),
             Screen::Search(s) => misc::search_key(s, key),
             Screen::Profile(s) => misc::profile_key(s, key),
+        }
+    }
+
+    /// Give the keyboard to the pane under `(col, row)`, if this screen has
+    /// two of them and the point is inside one.
+    ///
+    /// The mouse wheel calls this before it scrolls: with the dual-pane Home
+    /// and Inbox layouts the pointer is usually over the pane that does NOT
+    /// have focus, and the wheel used to move the focused one instead
+    /// (issue #549). The rects are whatever the last frame drew.
+    pub fn focus_pane_at(&mut self, col: u16, row: u16) {
+        let at = ratatui::layout::Position::new(col, row);
+        match self {
+            Screen::Home(h) => {
+                if h.tree_rect.contains(at) {
+                    h.focus = Pane::Tree;
+                } else if h.list_rect.contains(at) {
+                    h.focus = Pane::List;
+                }
+            }
+            Screen::Inbox(ib) => {
+                if ib.list_rect.contains(at) {
+                    ib.focus = InboxPane::List;
+                } else if ib.view_rect.contains(at) && ib.view.is_some() {
+                    ib.focus = InboxPane::View;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -806,6 +862,7 @@ mod dispatch_tests {
                 },
                 focus: Pane::List,
                 dual: false,
+                ..Default::default()
             }),
             Screen::ForumTree(ForumTreeState {
                 nodes: vec![Node {

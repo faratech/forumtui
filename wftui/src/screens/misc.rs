@@ -28,7 +28,12 @@ pub fn login_key(s: &mut super::LoginState, key: KeyEvent) -> Action {
         return Action::None;
     }
     match (&s.stage, key.code) {
-        (LoginStage::Idle, KeyCode::Enter) => Action::LoginBegin,
+        // The key bar advertises "restart login" on the whole screen, so Enter
+        // has to restart from `Waiting` too: a denied approval, a failed
+        // Turnstile/2FA or a closed tab leaves the poll running for the link's
+        // full 10-minute TTL with no other way out (issue #547). `begin_login`
+        // aborts the superseded flow.
+        (_, KeyCode::Enter) => Action::LoginBegin,
         (LoginStage::Waiting, KeyCode::Char('c')) => Action::OscCopy(s.url.clone()),
         (LoginStage::Waiting, KeyCode::Char('o')) => Action::OpenUrl(s.url.clone()),
         _ => Action::None,
@@ -1228,6 +1233,9 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
                 }
                 s.input_mode = false;
                 s.loading = true;
+                // A typed query is a real keyword search: this screen stops
+                // being a member's content list (issue #548).
+                s.member = None;
                 let ct = match s.content_type {
                     1 => Some("thread".into()),
                     2 => Some("post".into()),
@@ -1318,18 +1326,46 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Esc => Action::PopScreen,
             KeyCode::Char('i') => {
+                // `query` is a display label in member mode, not a search
+                // term — start from an empty field so Enter cannot submit it
+                // as one (issue #548).
+                if s.member.is_some() {
+                    s.query.clear();
+                }
                 s.input_mode = true;
                 s.active_field = 0;
                 s.query_cursor = s.query.chars().count();
                 Action::None
             }
             KeyCode::Char('a') => {
+                // The author field is a keyword-search filter; a member's own
+                // threads/posts are already one member's (issue #548).
+                if s.member.is_some() {
+                    return Action::Notice(
+                        "This list is already one member's — press i to search instead.".into(),
+                    );
+                }
                 s.input_mode = true;
                 s.active_field = 1;
                 s.author_cursor = s.author.chars().count();
                 Action::None
             }
             KeyCode::Char('t') => {
+                // In member mode `t` flips between the member's threads and
+                // their posts, through `search_member` (issue #548).
+                if let Some((user_id, content)) = &s.member {
+                    let user_id = *user_id;
+                    let content = if content == "thread" { "post" } else { "thread" };
+                    s.member = Some((user_id, content.to_string()));
+                    s.content_type = if content == "thread" { 1 } else { 2 };
+                    s.query = member_label(&s.query, content);
+                    s.loading = true;
+                    return Action::LoadMemberContent {
+                        user_id,
+                        content: content.to_string(),
+                        page: 1,
+                    };
+                }
                 s.content_type = (s.content_type + 1) % 3;
                 let q = s.query.trim().to_string();
                 let a = s.author.trim().to_string();
@@ -1357,6 +1393,13 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
                 }
             }
             KeyCode::Char('o') => {
+                // `/search/member` has no order parameter — re-running the
+                // label as a keyword search is what #548 was.
+                if s.member.is_some() {
+                    return Action::Notice(
+                        "Newest first is the only order for a member's content.".into(),
+                    );
+                }
                 s.order = (s.order + 1) % 2;
                 let q = s.query.trim().to_string();
                 let a = s.author.trim().to_string();
@@ -1409,6 +1452,13 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
             KeyCode::Char('[') | KeyCode::PageUp => {
                 if s.page > 1 {
                     s.loading = true;
+                    if let Some((user_id, content)) = &s.member {
+                        return Action::LoadMemberContent {
+                            user_id: *user_id,
+                            content: content.clone(),
+                            page: s.page - 1,
+                        };
+                    }
                     let ct = match s.content_type {
                         1 => Some("thread".into()),
                         2 => Some("post".into()),
@@ -1434,6 +1484,13 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
             KeyCode::Char(']') | KeyCode::PageDown => {
                 if s.page < s.last_page {
                     s.loading = true;
+                    if let Some((user_id, content)) = &s.member {
+                        return Action::LoadMemberContent {
+                            user_id: *user_id,
+                            content: content.clone(),
+                            page: s.page + 1,
+                        };
+                    }
                     let ct = match s.content_type {
                         1 => Some("thread".into()),
                         2 => Some("post".into()),
@@ -1484,7 +1541,31 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
     }
 }
 
-pub fn search_hints() -> Hints {
+/// The member-content screen's display label with its content word swapped:
+/// `by: kemical (thread)` -> `by: kemical (post)`. Falls back to rebuilding
+/// nothing when the label is not in that shape (issue #548).
+fn member_label(current: &str, content: &str) -> String {
+    match current.rfind(" (") {
+        Some(at) if current.ends_with(')') => format!("{} ({content})", &current[..at]),
+        _ => current.to_string(),
+    }
+}
+
+pub fn search_hints(s: &super::SearchState) -> Hints {
+    // Member content has no order and no author filter (issue #548), so the
+    // bar must not advertise them there — `t` still flips threads/posts.
+    if s.member.is_some() {
+        return Hints::new(
+            &[
+                ("Enter", "open"),
+                ("t", "threads/posts"),
+                ("[ ]", "page"),
+                ("i", "new search"),
+                ("Esc", "back"),
+            ],
+            0,
+        );
+    }
     Hints::new(
         &[
             ("Enter", "open"),
@@ -1603,7 +1684,7 @@ fn clip_span_run(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
         }
         let room = max - used;
         if room > 0 {
-            let text: String = s.content.chars().take(room).collect();
+            let text = chrome::take_cells(&s.content, room);
             out.push(Span::styled(text, s.style));
         }
         break;
@@ -2195,6 +2276,33 @@ mod tests {
         );
     }
 
+    /// `search_hit_lines` clips its left span run with `clip_span_run`, which
+    /// used to clip by chars instead of cells (issue #545); once the right
+    /// side (a CJK author name) fits, the clipped left+right row must never
+    /// come out wider than the panel.
+    #[test]
+    fn search_hit_lines_keeps_exact_width_with_a_cjk_username() {
+        let theme = Theme::truecolor();
+        let hit = SearchHit {
+            content_type: "post".into(),
+            title: "How do I control MS edge update schedule?".into(),
+            username: "\u{6f22}\u{6f22}\u{6f22}".into(), // 3 ideographs = 6 cells
+            ..Default::default()
+        };
+        // Widths from "right side alone barely fits" up to "no clipping
+        // needed at all" — every width where clip_span_run's cell math runs.
+        for width in [10u16, 14, 20, 30, 60, 80] {
+            let lines = search_hit_lines(&theme, &hit, "", &[], width);
+            for line in &lines {
+                assert!(
+                    line.width() <= width as usize,
+                    "width {width}: {:?}",
+                    line.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+                );
+            }
+        }
+    }
+
     #[test]
     fn new_thread_enter_in_title_advances_to_body() {
         let mut s = ComposeState {
@@ -2336,6 +2444,85 @@ mod tests {
         let initial_order = s.order;
         search_key(&mut s, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
         assert_eq!(s.order, 1 - initial_order);
+    }
+
+    /// Issue #548: a Search screen opened from a profile (`t`/`p`) is showing
+    /// one member's content, and `query` is only the label "by: name (kind)".
+    /// Every key that re-fetches has to go back to `search_member` — the old
+    /// code posted that label as `keywords` to the keyword search, so page 2
+    /// of a member's threads was a search for the literal string.
+    #[test]
+    fn member_content_paging_and_toggles_route_to_search_member_not_keywords() {
+        let mut s = crate::screens::SearchState {
+            query: "by: kemical (thread)".into(),
+            member: Some((42, "thread".into())),
+            content_type: 1,
+            page: 2,
+            last_page: 5,
+            input_mode: false,
+            ..Default::default()
+        };
+
+        // ']' / '[' page the member's content, not a keyword search.
+        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        assert!(
+            matches!(&act, Action::LoadMemberContent { user_id, content, page }
+                if *user_id == 42 && content == "thread" && *page == 3),
+            "] must ask for the member's next page"
+        );
+        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        assert!(
+            matches!(&act, Action::LoadMemberContent { user_id, content, page }
+                if *user_id == 42 && content == "thread" && *page == 1),
+            "[ must ask for the member's previous page"
+        );
+
+        // 't' flips threads <-> posts through the same endpoint, from page 1,
+        // and relabels the screen.
+        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(
+            matches!(&act, Action::LoadMemberContent { user_id, content, page }
+                if *user_id == 42 && content == "post" && *page == 1),
+            "t must switch the member's content type, not cycle the search filter"
+        );
+        assert_eq!(s.member.as_ref().map(|m| m.1.as_str()), Some("post"));
+        assert_eq!(s.query, "by: kemical (post)");
+        assert_eq!(s.content_type, 2, "the chip row must follow the real mode");
+        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(
+            matches!(&act, Action::LoadMemberContent { content, .. } if content == "thread")
+        );
+
+        // 'o' (order) and 'a' (author) do not exist for member content: they
+        // must refuse out loud, never re-run the label as a keyword search.
+        let order = s.order;
+        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert!(matches!(act, Action::Notice(_)), "o must refuse in member mode");
+        assert_eq!(s.order, order, "the order flag must not move either");
+        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(matches!(act, Action::Notice(_)), "a must refuse in member mode");
+        assert!(!s.input_mode, "author editing stays closed in member mode");
+        assert!(!search_hints(&s).keys.iter().any(|(k, _)| *k == "o"));
+
+        // 'i' starts a genuine keyword search: the label is cleared and, once
+        // submitted, the screen leaves member mode for good.
+        search_key(&mut s, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(s.input_mode);
+        assert!(s.query.is_empty(), "the label must never become the query");
+        for c in "wsl".chars() {
+            search_key(&mut s, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let act = search_key(&mut s, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&act, Action::RunSearchQuery(q) if q.keywords == "wsl"),
+            "a typed query is a keyword search again"
+        );
+        assert!(s.member.is_none(), "submitting a query leaves member mode");
+        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert!(
+            matches!(act, Action::RunSearchQuery(_)),
+            "and the ordinary search keys work again"
+        );
     }
 
     #[test]

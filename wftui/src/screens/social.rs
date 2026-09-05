@@ -198,17 +198,32 @@ pub fn render_inbox(
     let dual = area.width >= INBOX_DUAL_MIN_COLS;
     s.dual = dual;
     if !dual {
+        // Only one pane is on screen, so only it gets a rect (issue #549).
+        s.list_rect = Rect::default();
+        s.view_rect = Rect::default();
         match s.focus {
-            InboxPane::List => render_inbox_list(s, f, area, theme, g, true),
+            InboxPane::List => {
+                s.list_rect = area;
+                render_inbox_list(s, f, area, theme, g, true)
+            }
             InboxPane::View => match &mut s.view {
-                Some(view) => render_inbox_view_panel(view, f, area, theme, g, true),
-                None => render_inbox_list(s, f, area, theme, g, true),
+                Some(view) => {
+                    s.view_rect = area;
+                    render_inbox_view_panel(view, f, area, theme, g, true)
+                }
+                None => {
+                    s.list_rect = area;
+                    render_inbox_list(s, f, area, theme, g, true)
+                }
             },
         }
         return;
     }
     let [left, right] =
         Layout::horizontal([Constraint::Length(INBOX_PANE_COLS), Constraint::Min(0)]).areas(area);
+    // What the wheel routes by (issue #549).
+    s.list_rect = left;
+    s.view_rect = right;
     render_inbox_list(s, f, left, theme, g, s.focus == InboxPane::List);
     match &mut s.view {
         Some(view) => render_inbox_view_panel(view, f, right, theme, g, s.focus == InboxPane::View),

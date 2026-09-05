@@ -99,13 +99,26 @@ impl Store {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Move an unparseable (corrupt or old-schema) store out of the way so a
+    /// future `save()` never fights it, and a curious user can inspect what
+    /// was there. Best-effort: if the rename itself fails there is nothing
+    /// better to do than proceed as if there were no session.
+    pub fn quarantine_corrupt(&self) {
+        let dest = sibling_with_suffix(&self.path, "corrupt");
+        let _ = std::fs::rename(&self.path, &dest);
+    }
 }
 
 fn tmp_sibling(path: &Path) -> PathBuf {
+    sibling_with_suffix(path, "tmp")
+}
+
+fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let name = path
         .file_name()
-        .map(|n| format!("{}.tmp", n.to_string_lossy()))
-        .unwrap_or_else(|| ".wftui-token.tmp".to_string());
+        .map(|n| format!("{}.{suffix}", n.to_string_lossy()))
+        .unwrap_or_else(|| format!(".wftui-token.{suffix}"));
     path.with_file_name(name)
 }
 
@@ -158,6 +171,45 @@ mod tests {
         store.save(&sample()).unwrap();
         let mode = std::fs::metadata(store.path.clone()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A body from an older/incompatible schema (missing `scope`, added
+    /// after this fixture's TokenSet shipped) must surface as a
+    /// `TokenStore` error, never panic or silently coerce — this is exactly
+    /// what `WfApiClient::new()` (issue #546) has to catch and treat as "no
+    /// session".
+    #[test]
+    fn load_reports_a_body_missing_a_field_as_corrupt() {
+        let dir = std::env::temp_dir().join(format!("wftui-token-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token.json");
+        std::fs::write(&path, br#"{"access_token":"a","refresh_token":"b","expires_at":1}"#).unwrap();
+        let store = Store::with_path(path);
+
+        let err = store.load().unwrap_err();
+        match err {
+            Error::TokenStore(msg) => assert!(msg.contains("corrupt"), "{msg}"),
+            other => panic!("expected TokenStore, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quarantine_corrupt_renames_the_file_and_load_then_sees_no_session() {
+        let dir = std::env::temp_dir().join(format!("wftui-token-quarantine-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token.json");
+        std::fs::write(&path, b"not json at all").unwrap();
+        let store = Store::with_path(path.clone());
+
+        assert!(store.load().is_err());
+        store.quarantine_corrupt();
+        assert!(!path.exists());
+        assert!(dir.join("token.json.corrupt").exists());
+        assert!(store.load().unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

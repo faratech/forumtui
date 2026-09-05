@@ -26,6 +26,40 @@ use crate::theme::Theme;
 /// spawns one task per visible image slot the moment a thread opens.
 const IMAGE_LOAD_CONCURRENCY: usize = 3;
 
+/// What kind of failure a `TaskError` carries — just enough for a caller to
+/// decide whether the stored session itself is the problem, as opposed to
+/// the network or the server having a bad moment (issue #551).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskErrorKind {
+    /// `Error::NoToken` — there was never a session to restore.
+    NoToken,
+    /// The OAuth token endpoint refused the grant/refresh outright.
+    OAuth,
+    /// The API answered with a structured error; carries its HTTP status.
+    Api(u16),
+    /// Everything else: transport failures (DNS/connect/timeout/TLS/5xx
+    /// bundled as `Error::Http`), the client's own throttle gate, I/O, etc.
+    /// The token may still be perfectly valid — this is "try again", not
+    /// "log in again".
+    Other,
+}
+
+impl TaskErrorKind {
+    /// True only for the failures that mean the stored session itself is
+    /// invalid — the sole cases that should ever send the user back to the
+    /// login screen. A transient transport error or a server 5xx must never
+    /// discard a working token (issue #551).
+    pub fn ends_session(self) -> bool {
+        matches!(
+            self,
+            TaskErrorKind::NoToken
+                | TaskErrorKind::OAuth
+                | TaskErrorKind::Api(401)
+                | TaskErrorKind::Api(403)
+        )
+    }
+}
+
 /// Serializable error payload crossing from background tasks into the UI.
 #[derive(Debug, Clone)]
 pub struct TaskError {
@@ -33,20 +67,35 @@ pub struct TaskError {
     #[allow(dead_code)]
     pub code: Option<String>,
     pub max_page: Option<u32>,
+    pub kind: TaskErrorKind,
 }
 
 impl TaskError {
     pub fn of(e: &Error) -> Self {
         match e {
-            Error::Api { code, message, max_page, .. } => TaskError {
+            Error::Api { code, message, status, max_page } => TaskError {
                 message: message.clone(),
                 code: Some(code.clone()),
                 max_page: *max_page,
+                kind: TaskErrorKind::Api(*status),
+            },
+            Error::OAuth { message, .. } => TaskError {
+                message: message.clone(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::OAuth,
+            },
+            Error::NoToken => TaskError {
+                message: e.to_string(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::NoToken,
             },
             other => TaskError {
                 message: other.to_string(),
                 code: None,
                 max_page: None,
+                kind: TaskErrorKind::Other,
             },
         }
     }
@@ -62,9 +111,14 @@ type TaskResult<T> = Result<T, TaskError>;
 
 pub enum Msg {
     Bootstrap(Result<User, TaskError>),
-    LoginReady { url: String },
-    LoginFailed(String),
-    LoginComplete(Result<User, TaskError>),
+    /// The three login messages carry the `generation` of the flow that sent
+    /// them. `begin_login` bumps `App::login_generation` on every restart, so
+    /// a message from a superseded flow (the user pressed Enter again after a
+    /// denied approval) is dropped instead of overwriting the live one —
+    /// issue #547.
+    LoginReady { generation: u64, url: String },
+    LoginFailed { generation: u64, message: String },
+    LoginComplete { generation: u64, result: Result<User, TaskError> },
     NodesLoaded(TaskResult<Vec<Node>>),
     /// A forum page came back. `node_id` is the forum that was asked for, so
     /// a reply that outraced a newer request is dropped instead of landing in
@@ -202,6 +256,22 @@ pub struct App {
     /// running (and doubled by the next login's `start_pollers` call) —
     /// issue #524.
     poller_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// True after a transient (transport/5xx) failure to restore a stored
+    /// session — cleared on a successful restore or a session-ending error.
+    /// While true, `r` re-runs the session check instead of whatever the top
+    /// screen would otherwise do with it (issue #551).
+    bootstrap_retry_needed: bool,
+    /// Which login flow is the live one. Bumped by every `begin_login`, and
+    /// stamped on the flow's messages so a superseded flow's `LoginReady` /
+    /// `LoginFailed` / `LoginComplete` is ignored (issue #547).
+    login_generation: u64,
+    /// Abort handle for the in-flight login task, so pressing Enter while the
+    /// client is still polling stops that poll loop instead of leaving two
+    /// flows racing for the same screen.
+    login_task: Option<tokio::task::AbortHandle>,
+    /// The body zone of the last frame (between the header band and the key
+    /// bar). The wheel scrolls what is inside it and nothing else (#549).
+    body_rect: ratatui::layout::Rect,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -337,10 +407,15 @@ mod terminal_guard_tests {
 }
 
 pub async fn run(images: crate::images::Images) -> u8 {
-    let _guard = match TerminalGuard::new() {
-        Ok(g) => g,
+    // Every fallible step that can be done on the normal screen happens
+    // BEFORE `TerminalGuard::new()` enters the alternate screen. Once the
+    // guard exists, an `eprintln!` here would land on the alt screen and be
+    // erased the instant `_guard` drops and issues `LeaveAlternateScreen` —
+    // the same tty, so the message never reaches the user (issue #546).
+    let client = match WfApiClient::new() {
+        Ok(c) => Arc::new(c),
         Err(e) => {
-            eprintln!("terminal setup failed: {e}");
+            eprintln!("client init failed: {e}");
             return 1;
         }
     };
@@ -354,10 +429,10 @@ pub async fn run(images: crate::images::Images) -> u8 {
         }
     };
 
-    let client = match WfApiClient::new() {
-        Ok(c) => Arc::new(c),
+    let _guard = match TerminalGuard::new() {
+        Ok(g) => g,
         Err(e) => {
-            eprintln!("client init failed: {e}");
+            eprintln!("terminal setup failed: {e}");
             return 1;
         }
     };
@@ -390,6 +465,10 @@ pub async fn run(images: crate::images::Images) -> u8 {
         last_title: String::new(),
         should_quit: false,
         poller_handles: Vec::new(),
+        bootstrap_retry_needed: false,
+        login_generation: 0,
+        login_task: None,
+        body_rect: ratatui::layout::Rect::default(),
     };
     #[cfg(unix)]
     {
@@ -432,18 +511,26 @@ impl App {
     async fn bootstrap(&mut self) {
         self.screens.push(screens::home_state(true));
         if self.client.has_tokens().await {
-            self.status = "Restoring session…".into();
-            let api = self.api.clone();
-            let tx = self.tx.clone();
-            tokio::spawn(async move {
-                let result = api.me().await.map_err(|e| TaskError::of(&e));
-                tx.send(Msg::Bootstrap(result)).ok();
-            });
+            self.restore_session();
         } else {
             // No session: start the browser login immediately — zero keys.
             self.screens.push(screens::login_state());
             self.begin_login();
         }
+    }
+
+    /// Spawn the `api.me()` check that restores (or invalidates) a stored
+    /// session. Split out of `bootstrap` so a transient failure's "press r
+    /// to retry" (issue #551) can re-run exactly this step without pushing a
+    /// second Home screen.
+    fn restore_session(&mut self) {
+        self.status = "Restoring session…".into();
+        let api = self.api.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = api.me().await.map_err(|e| TaskError::of(&e));
+            tx.send(Msg::Bootstrap(result)).ok();
+        });
     }
 
     fn start_pollers(&mut self) {
@@ -566,6 +653,8 @@ impl App {
             Constraint::Length(1),
         ])
         .areas(f.area());
+        // Where the wheel is allowed to act (issue #549).
+        self.body_rect = body;
 
         // Crumbs are the screen stack's own names. Login is excluded: it is a
         // gate, not a place, and it owns the whole screen while it is up.
@@ -764,6 +853,20 @@ impl App {
             self.logout();
             return;
         }
+        // A transient bootstrap failure (issue #551) leaves the session
+        // unrestored with no login screen up; `r` re-runs the check instead
+        // of falling through to whatever the Home screen would otherwise do
+        // with it. `self.me` is never set at this point, so nothing else
+        // needs `r` more than this does.
+        if self.bootstrap_retry_needed
+            && k.modifiers.is_empty()
+            && k.code == KeyCode::Char('r')
+            && !self.input_active()
+        {
+            self.bootstrap_retry_needed = false;
+            self.restore_session();
+            return;
+        }
         // The palette owns every key while it is up, including `?` and Esc.
         // The event is taken first so the arms can borrow `self` again.
         if let Some(event) = self.palette.as_mut().map(|p| p.key(k)) {
@@ -898,6 +1001,7 @@ impl App {
     fn execute_action(&mut self, action: Action) {
         match action {
             Action::None => {}
+            Action::Notice(msg) => self.status = msg,
             Action::PopScreen => {
                 if self.screens.len() > 1 {
                     self.screens.pop();
@@ -940,19 +1044,16 @@ impl App {
                     query: format!("by: {username} ({content})"),
                     input_mode: false,
                     loading: true,
+                    // The screen remembers it is a member's content list, so
+                    // paging and `t` re-issue `search_member` instead of
+                    // searching for that label (issue #548).
+                    member: Some((user_id, content.clone())),
+                    content_type: if content == "post" { 2 } else { 1 },
                     ..Default::default()
                 };
                 self.push_screen(Screen::Search(s));
-                let api = self.api.clone();
-                let tx = self.tx.clone();
+                self.load_member_content(user_id, content, 1);
                 self.status = format!("Searching {display_title}…");
-                tokio::spawn(async move {
-                    let result = api
-                        .search_member(user_id, &content, 1)
-                        .await
-                        .map_err(|e| TaskError::of(&e));
-                    tx.send(Msg::SearchDone { page: 1, result }).ok();
-                });
             }
             Action::OpenConversation(conv) => self.open_conversation(conv),
             Action::LoadForum(node_id, page) => self.load_forum(node_id, page),
@@ -969,6 +1070,11 @@ impl App {
                 self.load_nodes();
             }
             Action::RunSearchQuery(query) => self.run_search_query(query),
+            Action::LoadMemberContent {
+                user_id,
+                content,
+                page,
+            } => self.load_member_content(user_id, content, page),
             Action::MarkThreadRead(id) => self.mark_thread_read(id),
             Action::MarkForumRead(node_id) => {
                 let api = self.api.clone();
@@ -1251,18 +1357,34 @@ impl App {
 
     // ---- login orchestration ----
 
+    /// Start a login flow, superseding any flow already running.
+    ///
+    /// Enter is advertised as "restart login" on the whole Login screen, so it
+    /// has to work while the client is polling too: a denied approval, a
+    /// failed Turnstile/2FA or a lost link otherwise stranded the user for the
+    /// link's full 10-minute TTL (issue #547). The previous task is aborted
+    /// and the generation bumped, so neither its poll loop nor a message that
+    /// outraced the abort can touch the new flow.
     fn begin_login(&mut self) {
+        if let Some(task) = self.login_task.take() {
+            task.abort();
+        }
+        self.login_generation = self.login_generation.wrapping_add(1);
+        let generation = self.login_generation;
         if let Some(Screen::Login(ls)) = self.screens.last_mut() {
             ls.busy = true;
             ls.error = None;
+            ls.stage = crate::screens::LoginStage::Idle;
+            ls.url.clear();
         }
         let tx = self.tx.clone();
         let client = self.client.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_login_flow(&tx, client).await {
-                tx.send(Msg::LoginFailed(e)).ok();
+        let handle = tokio::spawn(async move {
+            if let Err(message) = run_login_flow(&tx, client, generation).await {
+                tx.send(Msg::LoginFailed { generation, message }).ok();
             }
         });
+        self.login_task = Some(handle.abort_handle());
     }
 
     // ---- paste handling (bracketed paste and clipboard) ----
@@ -1421,17 +1543,45 @@ impl App {
                     }
                 }
             }
-            K::ScrollUp => {
-                for _ in 0..3 {
-                    self.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-                }
-            }
-            K::ScrollDown => {
-                for _ in 0..3 {
-                    self.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-                }
-            }
+            K::ScrollUp => self.handle_wheel(pos, KeyCode::Up),
+            K::ScrollDown => self.handle_wheel(pos, KeyCode::Down),
             _ => {}
+        }
+    }
+
+    /// Three lines of scroll, aimed by the pointer (issue #549).
+    ///
+    /// Two things the old "synthesise three Up/Down keys through `handle_key`"
+    /// got wrong: the dual-pane Home/Inbox layouts moved whichever pane had
+    /// the keyboard, which is usually not the one under the mouse, and the
+    /// three synthetic keys ran the overlay layer — closing the `?` card and
+    /// cancelling an armed `g` chord. So the wheel focuses the pane it is over
+    /// and then goes straight to the screen.
+    fn handle_wheel(&mut self, pos: (u16, u16), code: KeyCode) {
+        let at = ratatui::layout::Position::new(pos.0, pos.1);
+        if !self.body_rect.contains(at) {
+            return; // the header band and the key/status rows do not scroll
+        }
+        // The palette is a list of its own and owns the keyboard while it is
+        // up; the other overlays are not scrollable, and must survive a wheel.
+        if self.palette.is_some() {
+            for _ in 0..3 {
+                self.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            }
+            return;
+        }
+        if self.show_help || self.prefix.armed() {
+            return;
+        }
+        if let Some(screen) = self.screens.last_mut() {
+            screen.focus_pane_at(pos.0, pos.1);
+        }
+        for _ in 0..3 {
+            let action = match self.screens.last_mut() {
+                Some(screen) => screen.on_key(KeyEvent::new(code, KeyModifiers::NONE)),
+                None => Action::None,
+            };
+            self.execute_action(action);
         }
     }
 
@@ -1999,7 +2149,10 @@ impl App {
 
     fn handle_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::LoginReady { url } => {
+            Msg::LoginReady { generation, url } => {
+                if generation != self.login_generation {
+                    return; // a flow the user already restarted (issue #547)
+                }
                 // Hand the short link over every channel we have: OSC 8 on
                 // screen (rendered by the login screen), OSC 52 clipboard,
                 // and a file for plain `cat`.
@@ -2013,7 +2166,11 @@ impl App {
                     ls.stage = crate::screens::LoginStage::Waiting;
                 }
             }
-            Msg::LoginFailed(message) => {
+            Msg::LoginFailed { generation, message } => {
+                if generation != self.login_generation {
+                    return; // the restarted flow owns the screen now
+                }
+                self.login_task = None;
                 if let Some(Screen::Login(ls)) = self.screens.last_mut() {
                     ls.busy = false;
                     ls.error = Some(message);
@@ -2025,24 +2182,34 @@ impl App {
                     }
                 }
             }
-            Msg::LoginComplete(Ok(user)) => {
-                self.me = Some(user);
-                if self.screens.len() > 1 && matches!(self.screens.last(), Some(Screen::Login(_))) {
-                    self.screens.pop();
+            Msg::LoginComplete { generation, result } => {
+                if generation != self.login_generation {
+                    return; // a superseded flow must not sign anyone in
                 }
-                self.status = format!(
-                    "Welcome, {}.",
-                    self.me.as_ref().map(|u| u.username.as_str()).unwrap_or("")
-                );
-                self.start_pollers();
-                self.load_nodes();
-                self.prime_home_list();
-            }
-            Msg::LoginComplete(Err(e)) => {
-                if let Some(Screen::Login(ls)) = self.screens.last_mut() {
-                    ls.busy = false;
-                    ls.error = Some(e.message);
-                    ls.stage = crate::screens::LoginStage::Idle;
+                self.login_task = None;
+                match result {
+                    Ok(user) => {
+                        self.me = Some(user);
+                        if self.screens.len() > 1
+                            && matches!(self.screens.last(), Some(Screen::Login(_)))
+                        {
+                            self.screens.pop();
+                        }
+                        self.status = format!(
+                            "Welcome, {}.",
+                            self.me.as_ref().map(|u| u.username.as_str()).unwrap_or("")
+                        );
+                        self.start_pollers();
+                        self.load_nodes();
+                        self.prime_home_list();
+                    }
+                    Err(e) => {
+                        if let Some(Screen::Login(ls)) = self.screens.last_mut() {
+                            ls.busy = false;
+                            ls.error = Some(e.message);
+                            ls.stage = crate::screens::LoginStage::Idle;
+                        }
+                    }
                 }
             }
             Msg::ImageLoaded { key, result } => {
@@ -2079,6 +2246,7 @@ impl App {
                 }
             }
             Msg::Bootstrap(Ok(user)) => {
+                self.bootstrap_retry_needed = false;
                 self.me = Some(user);
                 self.status = "Session restored.".into();
                 self.start_pollers();
@@ -2089,12 +2257,21 @@ impl App {
                 self.prime_home_list();
             }
             Msg::Bootstrap(Err(e)) => {
-                // Dead token → login screen (only if none is up already —
-                // bootstrap pushes one when there is no token at all).
-                if !self.screens.iter().any(|s| matches!(s, Screen::Login(_))) {
-                    self.screens.push(screens::login_state());
+                // Only a failure that means the stored session itself is
+                // invalid (no token, OAuth refused, 401/403) may send the
+                // user to the login screen. A transport failure or a server
+                // 5xx must not throw away a token that would work the
+                // moment the network/server recovers (issue #551).
+                if e.kind.ends_session() {
+                    self.bootstrap_retry_needed = false;
+                    if !self.screens.iter().any(|s| matches!(s, Screen::Login(_))) {
+                        self.screens.push(screens::login_state());
+                    }
+                    self.status = format!("Session expired ({e}); log in again.");
+                } else {
+                    self.bootstrap_retry_needed = true;
+                    self.status = format!("Can't reach windowsforum.com ({e}) — press r to retry.");
                 }
-                self.status = format!("Session expired ({e}); log in again.");
             }
             Msg::NodesLoaded(result) => {
                 let tree = self.tree_mut();
@@ -2379,7 +2556,17 @@ impl App {
                         }
                         Err(e) => {
                             view.loading = false;
-                            view.error = Some(e.message);
+                            // Clamp to the server-reported max page, exactly
+                            // as `Msg::ThreadLoaded` does (issue #550) — a
+                            // reply-triggered reload asking for "known last
+                            // page + 1" lands here when that guess overshot.
+                            if let Some(max) = e.max_page {
+                                view.last_page = max;
+                                view.loading = true;
+                                self.load_conversation(id, max, user_opened);
+                            } else {
+                                view.error = Some(e.message);
+                            }
                         }
                     }
                 }
@@ -2436,7 +2623,15 @@ impl App {
                         }
                         self.status = "Message sent.".into();
                         if cid > 0 {
-                            self.load_conversation(cid, 1, true);
+                            // Mirror the thread-reply reload (issue #529): a
+                            // conversation with more than one page of
+                            // messages must not jump back to page 1 and hide
+                            // the reply just sent. Ask one past the last
+                            // page we knew about and let the `max_page`
+                            // clamp in `Msg::ConversationLoaded` settle on
+                            // the true last page (issue #550).
+                            let known_last = known_conversation_last_page(&self.screens, cid);
+                            self.load_conversation(cid, known_last.saturating_add(1), true);
                         }
                     }
                     Err(e) => {
@@ -2653,6 +2848,23 @@ impl App {
         });
     }
 
+    /// One page of a member's threads or posts (issue #548). Member content
+    /// comes from `/search/member`, which takes the user id and `content`
+    /// directly — the Search screen's `query` there is a display label, not a
+    /// search term, so it must never be sent as one.
+    pub fn load_member_content(&mut self, user_id: u32, content: String, page: u32) {
+        self.status = "Searching…".into();
+        let api = self.api.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = api
+                .search_member(user_id, &content, page)
+                .await
+                .map_err(|e| TaskError::of(&e));
+            tx.send(Msg::SearchDone { page, result }).ok();
+        });
+    }
+
     pub fn run_search_query(&mut self, query: SearchQuery) {
         let api = self.api.clone();
         let tx = self.tx.clone();
@@ -2697,14 +2909,11 @@ impl App {
         if url.is_empty() {
             return;
         }
-        let target = if url.starts_with("http://") || url.starts_with("https://") {
-            url.to_string()
-        } else {
-            let base = common::config::base_url();
-            if url.starts_with('/') {
-                format!("{base}{url}")
-            } else {
-                format!("{base}/{url}")
+        let target = match resolve_open_url(url, &common::config::base_url()) {
+            Ok(target) => target,
+            Err(scheme) => {
+                self.status = format!("Refused to open \"{scheme}:\" link.");
+                return;
             }
         };
         // Remote sessions: even if the opener targets the wrong machine, the
@@ -2712,6 +2921,53 @@ impl App {
         self.copy_text(&target);
         self.status = format!("Opening {target} (also copied to clipboard)");
         let _ = common::oauth::open_browser(&target);
+    }
+}
+
+/// The scheme prefix of `url` (the part before its first `:`), lower-cased,
+/// when it is a syntactically valid RFC 3986 scheme
+/// (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`) — never true of a
+/// scheme-less relative path, which never contains a colon before its first
+/// `/`. A colon that appears only after a `/` (e.g. a query string) does not
+/// count as a scheme.
+fn url_scheme(url: &str) -> Option<String> {
+    let colon = url.find(':')?;
+    if let Some(slash) = url.find('/')
+        && slash < colon
+    {
+        return None;
+    }
+    let scheme = &url[..colon];
+    let mut chars = scheme.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.') {
+        return None;
+    }
+    Some(scheme.to_ascii_lowercase())
+}
+
+/// Decide what `Action::OpenUrl`/`o` should actually hand the system opener.
+/// `Ok` is the absolute URL to open; `Err` carries the refused scheme for the
+/// status message. Only `http`/`https`/`mailto`/`ftp` (matched
+/// ASCII-case-insensitively, so `HTTPS://…` and `MAILTO:…` both work) pass
+/// through unchanged; every other scheme (`javascript`, `data`, `file`,
+/// `vbscript`, or anything unrecognized) is refused outright rather than
+/// silently mis-handled. A URL with no scheme at all is a site-relative path
+/// and gets `base` prefixed, exactly as before (issue #553).
+fn resolve_open_url(url: &str, base: &str) -> Result<String, String> {
+    match url_scheme(url) {
+        Some(scheme) => match scheme.as_str() {
+            "http" | "https" | "mailto" | "ftp" => Ok(url.to_string()),
+            other => Err(other.to_string()),
+        },
+        None => Ok(if let Some(path) = url.strip_prefix('/') {
+            format!("{base}/{path}")
+        } else {
+            format!("{base}/{url}")
+        }),
     }
 }
 
@@ -2750,6 +3006,7 @@ fn capture_active(app: &App) -> bool {
 async fn run_login_flow(
     tx: &mpsc::UnboundedSender<Msg>,
     client: Arc<WfApiClient>,
+    generation: u64,
 ) -> Result<(), String> {
     let client_id = common::config::oauth_client_id().map_err(|e| e.to_string())?;
     let http = common::http::build().map_err(|e| e.to_string())?;
@@ -2759,7 +3016,7 @@ async fn run_login_flow(
     let link = common::oauth::register_link(&http, &state, &pkce.challenge)
         .await
         .map_err(|e| e.to_string())?;
-    tx.send(Msg::LoginReady { url: link.url.clone() }).ok();
+    tx.send(Msg::LoginReady { generation, url: link.url.clone() }).ok();
     let _ = common::oauth::open_browser(&link.url);
 
     for _ in 0..300 {
@@ -2775,7 +3032,7 @@ async fn run_login_flow(
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-                finish_login(tx, client, tokens).await;
+                finish_login(tx, client, tokens, generation).await;
                 return Ok(());
             }
             Ok(common::oauth::PollStatus::Expired) => {
@@ -2794,17 +3051,20 @@ async fn finish_login(
     tx: &mpsc::UnboundedSender<Msg>,
     client: Arc<WfApiClient>,
     tokens: common::token::TokenSet,
+    generation: u64,
 ) {
     if let Err(e) = client.set_tokens(tokens).await {
-        tx.send(Msg::LoginFailed(format!("token store: {e}"))).ok();
+        tx.send(Msg::LoginFailed { generation, message: format!("token store: {e}") })
+            .ok();
         return;
     }
     match client.me().await {
         Ok(user) => {
-            tx.send(Msg::LoginComplete(Ok(user))).ok();
+            tx.send(Msg::LoginComplete { generation, result: Ok(user) }).ok();
         }
         Err(e) => {
-            tx.send(Msg::LoginComplete(Err(TaskError::of(&e)))).ok();
+            tx.send(Msg::LoginComplete { generation, result: Err(TaskError::of(&e)) })
+                .ok();
         }
     }
 }
@@ -2833,6 +3093,27 @@ fn known_thread_last_page(screens: &[Screen], thread_id: u32) -> u32 {
         .rev()
         .find_map(|s| match s {
             Screen::ThreadView(v) if v.thread.thread_id == thread_id => Some(v.last_page.max(1)),
+            _ => None,
+        })
+        .unwrap_or(1)
+}
+
+/// The conversation twin of `known_thread_last_page` — a standalone
+/// `ConversationView` or the Inbox's inline view pane, whichever is showing
+/// this conversation (mirrors `App::conversation_view_mut`'s match arms).
+fn known_conversation_last_page(screens: &[Screen], conversation_id: u32) -> u32 {
+    screens
+        .iter()
+        .rev()
+        .find_map(|s| match s {
+            Screen::ConversationView(v) if v.conversation.conversation_id == conversation_id => {
+                Some(v.last_page.max(1))
+            }
+            Screen::Inbox(inbox) => inbox
+                .view
+                .as_ref()
+                .filter(|v| v.conversation.conversation_id == conversation_id)
+                .map(|v| v.last_page.max(1)),
             _ => None,
         })
         .unwrap_or(1)
@@ -3104,6 +3385,102 @@ mod tests {
         assert_eq!(known_thread_last_page(&screens, 7), 1);
     }
 
+    /// The conversation twin of the test above (issue #550): must find a
+    /// standalone `ConversationView`, must also find one sitting in the
+    /// Inbox's dual-pane view slot, and must default defensively to 1 rather
+    /// than 0 for both "no matching view" and "not yet loaded".
+    #[test]
+    fn known_conversation_last_page_finds_the_open_view_or_defaults_to_one() {
+        let convo = |id: u32| Conversation { conversation_id: id, ..Default::default() };
+        let standalone = |id: u32, last_page: u32| {
+            Screen::ConversationView(screens::ConversationViewState {
+                conversation: convo(id),
+                last_page,
+                ..Default::default()
+            })
+        };
+        let inbox_view = |id: u32, last_page: u32| {
+            Screen::Inbox(screens::InboxState {
+                dual: true,
+                view: Some(screens::ConversationViewState {
+                    conversation: convo(id),
+                    last_page,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+
+        let screens = vec![standalone(1, 1), standalone(42, 3)];
+        assert_eq!(known_conversation_last_page(&screens, 42), 3);
+        assert_eq!(known_conversation_last_page(&screens, 1), 1);
+        assert_eq!(known_conversation_last_page(&screens, 999), 1, "no matching view");
+
+        let screens = vec![inbox_view(9, 4)];
+        assert_eq!(known_conversation_last_page(&screens, 9), 4, "Inbox's dual-pane view slot");
+
+        // A conversation that briefly reports last_page 0 (unloaded) never
+        // yields a "request page 1" that a downstream +1 would leave at 1
+        // forever.
+        let screens = vec![standalone(7, 0)];
+        assert_eq!(known_conversation_last_page(&screens, 7), 1);
+    }
+
+    /// Issue #553: `open_url` used to test only for a lower-case
+    /// `http://`/`https://` prefix, so every other scheme (a `mailto:` link
+    /// from `[EMAIL]`, an upper-case `HTTPS://` auto-link, `ftp://`) fell
+    /// through to the "site-relative path" branch and got `base_url()`
+    /// prefixed onto it, mangling it into a 404 on the forum. `resolve_open_url`
+    /// must pass the four allowed schemes through untouched (matched
+    /// ASCII-case-insensitively) and refuse everything else with a scheme it
+    /// names, never silently rewriting it.
+    #[test]
+    fn resolve_open_url_allows_four_schemes_and_refuses_the_rest() {
+        let base = "https://windowsforum.com";
+
+        // The four allowed schemes pass through byte-for-byte.
+        assert_eq!(
+            resolve_open_url("mailto:someone@example.com", base),
+            Ok("mailto:someone@example.com".into())
+        );
+        assert_eq!(
+            resolve_open_url("HTTPS://Example.com/x", base),
+            Ok("HTTPS://Example.com/x".into()),
+            "case must not affect whether the scheme is recognized, or the URL itself"
+        );
+        assert_eq!(
+            resolve_open_url("ftp://host/file", base),
+            Ok("ftp://host/file".into())
+        );
+        assert_eq!(
+            resolve_open_url("http://windowsforum.com/threads/1", base),
+            Ok("http://windowsforum.com/threads/1".into())
+        );
+
+        // Everything else with a scheme is refused, never rewritten.
+        assert_eq!(resolve_open_url("javascript:alert(1)", base), Err("javascript".into()));
+        assert_eq!(resolve_open_url("data:text/html,x", base), Err("data".into()));
+        assert_eq!(resolve_open_url("file:///etc/passwd", base), Err("file".into()));
+        assert_eq!(resolve_open_url("VBScript:msgbox(1)", base), Err("vbscript".into()));
+
+        // No scheme at all: a site-relative path, prefixed with base exactly
+        // as before.
+        assert_eq!(
+            resolve_open_url("/threads/123", base),
+            Ok("https://windowsforum.com/threads/123".into())
+        );
+        assert_eq!(
+            resolve_open_url("threads/123", base),
+            Ok("https://windowsforum.com/threads/123".into())
+        );
+        // A colon appearing only in a query string (after the first `/`) is
+        // not a scheme.
+        assert_eq!(
+            resolve_open_url("/search?q=foo:bar", base),
+            Ok("https://windowsforum.com/search?q=foo:bar".into())
+        );
+    }
+
     /// A `WfApi` that never touches the network: every call fails with
     /// `NoToken` except `mark_conversation_read`, which just records the id.
     /// Substituted for `App::api` so a handler test can assert on the
@@ -3112,11 +3489,22 @@ mod tests {
     #[derive(Default)]
     struct RecordingApi {
         marked_read: std::sync::Mutex<Vec<u32>>,
+        /// `(user_id, content, page)` per `search_member` call, and the
+        /// keywords of every `search_advanced` call — issue #548 is exactly
+        /// "the member list asked the keyword search instead".
+        member_searches: std::sync::Mutex<Vec<(u32, String, u32)>>,
+        keyword_searches: std::sync::Mutex<Vec<String>>,
     }
 
     impl RecordingApi {
         fn marks(&self) -> Vec<u32> {
             self.marked_read.lock().expect("lock").clone()
+        }
+        fn member_searches(&self) -> Vec<(u32, String, u32)> {
+            self.member_searches.lock().expect("lock").clone()
+        }
+        fn keyword_searches(&self) -> Vec<String> {
+            self.keyword_searches.lock().expect("lock").clone()
         }
     }
 
@@ -3184,16 +3572,24 @@ mod tests {
         }
         async fn search_advanced(
             &self,
-            _: &SearchQuery,
+            query: &SearchQuery,
         ) -> common::error::Result<SearchResultsReply> {
+            self.keyword_searches
+                .lock()
+                .expect("lock")
+                .push(query.keywords.clone());
             Err(common::error::Error::NoToken)
         }
         async fn search_member(
             &self,
-            _: u32,
-            _: &str,
-            _: u32,
+            user_id: u32,
+            content: &str,
+            page: u32,
         ) -> common::error::Result<SearchResultsReply> {
+            self.member_searches
+                .lock()
+                .expect("lock")
+                .push((user_id, content.to_string(), page));
             Err(common::error::Error::NoToken)
         }
         async fn react_post(&self, _: u32, _: u32) -> common::error::Result<Toggle> {
@@ -3211,6 +3607,145 @@ mod tests {
         async fn find_user(&self, _: &str) -> common::error::Result<Option<User>> {
             Err(common::error::Error::NoToken)
         }
+    }
+
+    /// Issue #549: the wheel used to be three synthetic Up/Down keys pushed
+    /// through `handle_key` with the pointer position thrown away, so on the
+    /// dual-pane Home scrolling over the thread list walked the Forums cursor,
+    /// a wheel over the header or key bar still scrolled the body, and the
+    /// three keys closed the `?` card on the way past.
+    #[tokio::test]
+    async fn the_wheel_scrolls_the_pane_under_the_pointer_and_leaves_overlays_alone() {
+        use ratatui::crossterm::event::{MouseEvent, MouseEventKind};
+        use ratatui::layout::Rect;
+
+        let wheel = |column: u16, row: u16| MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let mut app = test_app();
+        // The frame the panes were drawn in: header row 0, body rows 1..21,
+        // key bar and status below it; Forums 37 wide, list to its right.
+        app.body_rect = Rect::new(0, 1, 120, 20);
+        app.screens.push(Screen::Home(screens::HomeState {
+            tree: screens::ForumTreeState {
+                nodes: (1..=5)
+                    .map(|node_id| Node {
+                        node_id,
+                        title: format!("Forum {node_id}"),
+                        node_type: "Forum".into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            list: screens::ThreadListState {
+                threads: (1..=5)
+                    .map(|thread_id| Thread {
+                        thread_id,
+                        title: format!("Thread {thread_id}"),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            focus: screens::Pane::Tree,
+            dual: true,
+            tree_rect: Rect::new(0, 1, 37, 20),
+            list_rect: Rect::new(37, 1, 83, 20),
+        }));
+
+        // Wheel over the RIGHT pane while the tree has the keyboard.
+        app.handle_mouse(wheel(100, 5));
+        {
+            let Some(Screen::Home(h)) = app.screens.last() else {
+                panic!("expected Home");
+            };
+            assert_eq!(h.list.sel, 3, "the list under the pointer must scroll");
+            assert_eq!(h.tree.sel, 0, "the focused tree must not move");
+            assert_eq!(h.focus, screens::Pane::List, "the pointer takes the keyboard");
+        }
+
+        // ...and back over the left pane.
+        app.handle_mouse(wheel(10, 5));
+        {
+            let Some(Screen::Home(h)) = app.screens.last() else {
+                panic!("expected Home");
+            };
+            assert_eq!(h.tree.sel, 3, "the tree under the pointer must scroll");
+            assert_eq!(h.list.sel, 3, "the list must stay where it was");
+            assert_eq!(h.focus, screens::Pane::Tree);
+        }
+
+        // Outside the body — the key bar — nothing scrolls at all.
+        app.handle_mouse(wheel(10, 21));
+        app.handle_mouse(wheel(10, 0));
+        {
+            let Some(Screen::Home(h)) = app.screens.last() else {
+                panic!("expected Home");
+            };
+            assert_eq!((h.tree.sel, h.list.sel), (3, 3), "only the body scrolls");
+        }
+
+        // The `?` card and an armed `g` chord survive a wheel.
+        app.show_help = true;
+        app.handle_mouse(wheel(100, 5));
+        assert!(app.show_help, "the wheel must not close the keys card");
+        app.show_help = false;
+        app.prefix.arm();
+        app.handle_mouse(wheel(100, 5));
+        assert!(app.prefix.armed(), "the wheel must not cancel an armed g chord");
+    }
+
+    /// Issue #548: the Search screen a profile's `t`/`p` opens is a member's
+    /// content list. Paging it and flipping threads/posts must reach
+    /// `search_member` with the right page and content — before this, they
+    /// posted the human label ("by: kemical (thread)") to the keyword search,
+    /// which returned unrelated hits or nothing at all.
+    #[tokio::test]
+    async fn member_content_keys_reach_search_member_and_never_the_keyword_search() {
+        let api = std::sync::Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+
+        app.execute_action(Action::OpenMemberContent {
+            user_id: 42,
+            username: "kemical".into(),
+            content: "thread".into(),
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(api.member_searches(), vec![(42, "thread".into(), 1)]);
+
+        // The screen remembers the mode, so the keys route through it.
+        let Some(Screen::Search(search)) = app.screens.last_mut() else {
+            panic!("expected the member's content on top");
+        };
+        assert_eq!(search.member, Some((42, "thread".to_string())));
+        search.page = 2;
+        search.last_page = 5;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        tokio::task::yield_now().await;
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            api.member_searches(),
+            vec![
+                (42, "thread".into(), 1),
+                (42, "thread".into(), 3),
+                (42, "post".into(), 1),
+            ],
+            "] pages the member's own list; t flips the content type"
+        );
+        assert!(
+            api.keyword_searches().is_empty(),
+            "member content must never be requested as a keyword search: {:?}",
+            api.keyword_searches()
+        );
     }
 
     /// Issue #541: a dual-pane Inbox primes its view pane with the newest
@@ -3287,6 +3822,203 @@ mod tests {
             "the Inbox row still shows unread after the server was told otherwise"
         );
         assert_eq!(app.convos_unread, 0);
+    }
+
+    /// Issue #550: after a DM reply the client used to hard-code a reload of
+    /// page 1, stranding the reply on a multi-page conversation exactly like
+    /// #529 did for threads before that fix. `ConvoReplySent(Ok)` must ask
+    /// for one page past whatever it already knew as the conversation's last
+    /// page, mirroring `ReplySent`.
+    #[tokio::test]
+    async fn convo_reply_sent_asks_for_one_page_past_the_known_last_page() {
+        let api = std::sync::Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+
+        app.screens.push(Screen::ConversationView(screens::ConversationViewState {
+            conversation: Conversation { conversation_id: 7, ..Default::default() },
+            page: 2,
+            last_page: 2,
+            ..Default::default()
+        }));
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ConversationReply {
+                conversation_id: 7,
+                conversation_title: "Hello".into(),
+                participants: "kemical".into(),
+            }),
+            body: "reply text".into(),
+            ..Default::default()
+        }));
+
+        app.handle_msg(Msg::ConvoReplySent(Ok(())));
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(1), app.rx.recv())
+            .await
+            .expect("load_conversation must send a message")
+            .expect("channel open");
+        match sent {
+            Msg::ConversationLoaded { id, page, mark_read, .. } => {
+                assert_eq!(id, 7);
+                assert_eq!(page, 3, "must ask for known last_page (2) + 1, not hard-coded 1");
+                assert!(mark_read, "the reader's own reload must still mark the DM read");
+            }
+            _ => panic!("expected ConversationLoaded"),
+        }
+        // The composer must be gone and the status must say so.
+        assert!(!app.screens.iter().any(|s| matches!(s, Screen::Compose(_))));
+        assert_eq!(app.status, "Message sent.");
+    }
+
+    /// Issue #550: a `ConversationLoaded` error that carries `max_page` (the
+    /// reply-reload above guessed one page too far) must clamp and re-ask for
+    /// the true last page, exactly as `Msg::ThreadLoaded` already does —
+    /// never leave the view showing a bare "Error: ..." for a page that
+    /// simply does not exist yet.
+    #[tokio::test]
+    async fn conversation_loaded_error_with_max_page_reloads_the_clamped_page() {
+        let api = std::sync::Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+
+        app.screens.push(Screen::ConversationView(screens::ConversationViewState {
+            conversation: Conversation { conversation_id: 7, ..Default::default() },
+            page: 3,
+            last_page: 3,
+            loading: true,
+            ..Default::default()
+        }));
+
+        app.handle_msg(Msg::ConversationLoaded {
+            id: 7,
+            page: 3,
+            mark_read: true,
+            result: Err(TaskError {
+                message: "invalid page".into(),
+                code: Some("invalid_page".into()),
+                max_page: Some(2),
+                kind: TaskErrorKind::Api(400),
+            }),
+        });
+
+        {
+            let Some(Screen::ConversationView(view)) = app.screens.last() else {
+                panic!("expected the ConversationView screen");
+            };
+            assert_eq!(view.last_page, 2, "the view must clamp to the server's max_page");
+            assert!(view.loading, "the clamped reload must be in flight");
+            assert!(view.error.is_none(), "a clamp-and-retry must not also show an error");
+        }
+
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(1), app.rx.recv())
+            .await
+            .expect("the clamp must re-request the page")
+            .expect("channel open");
+        match sent {
+            Msg::ConversationLoaded { id, page, mark_read, .. } => {
+                assert_eq!(id, 7);
+                assert_eq!(page, 2, "must re-request the clamped max_page, not the stale page");
+                assert!(mark_read, "the original mark_read intent must survive the retry");
+            }
+            _ => panic!("expected ConversationLoaded"),
+        }
+    }
+
+    /// Issue #551: `TaskError::of` must classify every `Error` variant into
+    /// exactly the kind `ends_session()` needs to answer correctly — a 401/403
+    /// `Api`, an `OAuth` refusal, and `NoToken` are session-ending; a 5xx/other
+    /// `Api` status and everything else are not.
+    #[test]
+    fn task_error_of_classifies_every_error_kind() {
+        let api = |status: u16| Error::Api {
+            code: "x".into(),
+            message: "m".into(),
+            status,
+            max_page: None,
+        };
+        assert_eq!(TaskError::of(&api(401)).kind, TaskErrorKind::Api(401));
+        assert_eq!(TaskError::of(&api(403)).kind, TaskErrorKind::Api(403));
+        assert_eq!(TaskError::of(&api(500)).kind, TaskErrorKind::Api(500));
+        assert_eq!(TaskError::of(&api(200)).kind, TaskErrorKind::Api(200));
+
+        assert_eq!(
+            TaskError::of(&Error::OAuth {
+                code: "invalid_grant".into(),
+                message: "expired".into(),
+                status: 400,
+            })
+            .kind,
+            TaskErrorKind::OAuth
+        );
+        assert_eq!(TaskError::of(&Error::NoToken).kind, TaskErrorKind::NoToken);
+
+        // Transport and every other non-session variant fall into `Other`.
+        assert_eq!(TaskError::of(&Error::Config("bad".into())).kind, TaskErrorKind::Other);
+        assert_eq!(TaskError::of(&Error::Throttled).kind, TaskErrorKind::Other);
+
+        assert!(TaskErrorKind::Api(401).ends_session());
+        assert!(TaskErrorKind::Api(403).ends_session());
+        assert!(TaskErrorKind::OAuth.ends_session());
+        assert!(TaskErrorKind::NoToken.ends_session());
+        assert!(!TaskErrorKind::Api(500).ends_session(), "a server 5xx must not end the session");
+        assert!(!TaskErrorKind::Api(200).ends_session());
+        assert!(!TaskErrorKind::Other.ends_session(), "a transport failure must not end the session");
+    }
+
+    /// Issue #551: a transient (transport/5xx) bootstrap failure must keep
+    /// the Home screen up (no Login pushed), arm the retry, and word the
+    /// status as "press r to retry" rather than "log in again" — and that
+    /// `r` must then actually re-run the session check.
+    #[tokio::test]
+    async fn bootstrap_transient_error_keeps_the_session_and_r_retries() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(true));
+
+        app.handle_msg(Msg::Bootstrap(Err(TaskError {
+            message: "http error: connection reset".into(),
+            code: None,
+            max_page: None,
+            kind: TaskErrorKind::Other,
+        })));
+
+        assert!(
+            !app.screens.iter().any(|s| matches!(s, Screen::Login(_))),
+            "a transient failure must not push the login screen"
+        );
+        assert!(app.bootstrap_retry_needed);
+        assert!(
+            app.status.contains("press r to retry"),
+            "status must offer a retry, not claim the session expired: {:?}",
+            app.status
+        );
+        assert!(!app.status.contains("Session expired"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(!app.bootstrap_retry_needed, "r must consume the retry flag");
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(1), app.rx.recv())
+            .await
+            .expect("r must re-run the session check")
+            .expect("channel open");
+        assert!(matches!(sent, Msg::Bootstrap(_)), "expected a fresh Bootstrap check");
+    }
+
+    /// Issue #551: the converse — a session-ending error (NoToken, OAuth,
+    /// 401/403) must still push the Login screen and must never leave the
+    /// retry armed (there is no session left to retry restoring).
+    #[test]
+    fn bootstrap_session_ending_error_still_goes_to_login() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(true));
+
+        app.handle_msg(Msg::Bootstrap(Err(TaskError {
+            message: "not logged in".into(),
+            code: None,
+            max_page: None,
+            kind: TaskErrorKind::NoToken,
+        })));
+
+        assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
+        assert!(!app.bootstrap_retry_needed);
+        assert!(app.status.contains("Session expired"));
     }
 
     /// Issue #538: XF's react/vote endpoints are toggles, so the notice has to
@@ -3396,6 +4128,95 @@ mod tests {
             last_title: String::new(),
             should_quit: false,
             poller_handles: Vec::new(),
+            bootstrap_retry_needed: false,
+            login_generation: 0,
+            login_task: None,
+            body_rect: ratatui::layout::Rect::default(),
+        }
+    }
+
+    /// Issue #547: `Enter` is advertised as "restart login" for the whole
+    /// Login screen, so it must restart while the client is polling — and the
+    /// restart must actually supersede the running flow: abort its poll loop
+    /// and make every message it already queued stale, or a denied approval's
+    /// late `LoginFailed`/`LoginReady` lands on the fresh flow's screen.
+    #[tokio::test]
+    async fn enter_while_waiting_restarts_login_and_supersedes_the_old_flow() {
+        let mut app = test_app();
+        app.screens.push(screens::login_state());
+        if let Some(Screen::Login(ls)) = app.screens.last_mut() {
+            ls.stage = screens::LoginStage::Waiting;
+            ls.url = "https://windowsforum.com/tui-start/old".into();
+        }
+
+        // 1. The key the bar advertises has to reach `begin_login` from
+        //    `Waiting`, not only from `Idle`.
+        let action = app
+            .screens
+            .last_mut()
+            .expect("login screen is on top")
+            .on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(action, Action::LoginBegin),
+            "Enter must restart the login flow while it is polling"
+        );
+
+        // 2. A restart aborts the flow that was running. (The stand-in task is
+        //    a plain sleep: the real login task must never be polled in a test,
+        //    it would talk to the live site.)
+        let running = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(3600)).await });
+        app.login_task = Some(running.abort_handle());
+        let before = app.login_generation;
+
+        app.begin_login();
+        let fresh = app.login_task.take().expect("the new flow is tracked");
+        fresh.abort();
+        assert!(
+            running.await.unwrap_err().is_cancelled(),
+            "restarting must abort the superseded poll loop"
+        );
+
+        let generation = app.login_generation;
+        assert_ne!(before, generation, "each restart gets its own generation");
+        match app.screens.last() {
+            Some(Screen::Login(ls)) => {
+                assert!(ls.busy, "the restarted flow is working again");
+                assert!(matches!(ls.stage, screens::LoginStage::Idle));
+                assert!(ls.url.is_empty(), "the superseded link must be cleared");
+            }
+            _ => unreachable!(),
+        }
+
+        // 3. The superseded flow's messages are ignored...
+        app.handle_msg(Msg::LoginReady {
+            generation: before,
+            url: "https://windowsforum.com/tui-start/stale".into(),
+        });
+        app.handle_msg(Msg::LoginFailed {
+            generation: before,
+            message: "login link expired".into(),
+        });
+        match app.screens.last() {
+            Some(Screen::Login(ls)) => {
+                assert!(ls.url.is_empty(), "a stale link must not be shown");
+                assert!(ls.error.is_none(), "a stale failure must not be reported");
+                assert!(ls.busy, "a stale message must not end the live flow");
+                assert!(matches!(ls.stage, screens::LoginStage::Idle));
+            }
+            _ => unreachable!(),
+        }
+
+        // ...while the live flow's still land.
+        app.handle_msg(Msg::LoginFailed {
+            generation,
+            message: "timed out waiting for approval".into(),
+        });
+        match app.screens.last() {
+            Some(Screen::Login(ls)) => {
+                assert!(!ls.busy);
+                assert_eq!(ls.error.as_deref(), Some("timed out waiting for approval"));
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -3481,6 +4302,7 @@ mod tests {
             message: "Flood control".into(),
             code: None,
             max_page: None,
+            kind: TaskErrorKind::Other,
         })));
         assert!(
             app.status.contains("Flood control"),
