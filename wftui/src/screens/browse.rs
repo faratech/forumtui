@@ -94,10 +94,7 @@ pub fn render_forum_tree(
             ListItem::new(Line::from(vec![
                 Span::styled(indent, theme.dim()),
                 Span::raw(n.title.clone()),
-                Span::styled(
-                    format!("  ({} discussions)", n.node_id),
-                    theme.dim(),
-                ),
+                Span::styled(format!("  #{}", n.node_id), theme.dim()),
             ]))
         })
         .collect();
