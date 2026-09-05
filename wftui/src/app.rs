@@ -31,14 +31,23 @@ const IMAGE_LOAD_CONCURRENCY: usize = 3;
 /// replace the left text and clear after 4 s" — issue #571).
 const STATUS_TOAST_SECS: u64 = 4;
 /// How long `session_recovery_pending` may stay open before the event loop's
-/// tick force-clears it and ends the session on its own (issue #587): the
-/// recheck task normally reports back with exactly one `Msg::Bootstrap`, but
-/// if that task dies without sending anything (panics, the channel closes,
-/// the runtime drops it) nothing else would ever clear the window, and every
-/// poller's `SessionLost` arriving inside it is swallowed as "stale" forever —
-/// a genuine signed-out session would then hang indefinitely instead of
-/// reaching the Login screen.
-const SESSION_RECOVERY_TIMEOUT_SECS: u64 = 15;
+/// tick force-clears it as a pure backstop (issue #587/#591): the recheck
+/// task itself now reports back unconditionally — a `ReportGuard` inside it
+/// (see `recheck_stored_session`) sends its own `Msg::Bootstrap { Err(NoToken) }`
+/// if the task ever exits (panics, is dropped) without having sent anything —
+/// so this timer only needs to cover the case where that report is somehow
+/// never delivered at all.
+///
+/// It must sit ABOVE the recheck's own legitimate network budget: a single
+/// `/me` call is `CONNECT_TIMEOUT` (10 s) + `REQUEST_TIMEOUT` (30 s), the
+/// recheck can spend that twice (a token refresh inside `valid_token()`
+/// before the `/me` request itself), and `api_gate` may additionally be
+/// carrying a rate-limit penalty (`DEFAULT_RATE_LIMIT_RETRY_SECS` = 30 s, or
+/// a server-supplied `Retry-After`). 15 s was shorter than one single
+/// `REQUEST_TIMEOUT`, so a merely slow — not dead — recheck used to be timed
+/// out from under a still-valid session (issue #591). 120 s comfortably
+/// covers 2×(10+30) + a 30-40 s retry-after penalty with headroom.
+const SESSION_RECOVERY_TIMEOUT_SECS: u64 = 120;
 
 /// What kind of failure a `TaskError` carries — just enough for a caller to
 /// decide whether the stored session itself is the problem, as opposed to
@@ -134,8 +143,11 @@ impl TaskError {
     /// — every one of those really does mean the session is over. Every
     /// other 403 (permission refusals on an ordinary content call,
     /// `missing_scope`) must NOT end the session — see
-    /// `TaskErrorKind::ends_session` (issue #564). Only `session_error_of`
-    /// calls this, and only for `Msg::Bootstrap`.
+    /// `TaskErrorKind::ends_session` (issue #564). Called by
+    /// `session_error_of` for `Msg::Bootstrap`, and (issue #594) by
+    /// `Msg::LoginComplete { Err }`'s handler — the freshly exchanged token's
+    /// own `/me` verification call in `finish_login` is the other place a
+    /// bootstrap-shaped 403 like this can land.
     fn is_account_gone(&self) -> bool {
         if !matches!(self.kind, TaskErrorKind::Api(403)) {
             return false;
@@ -723,10 +735,41 @@ impl App {
         let tx = self.tx.clone();
         let generation = self.bootstrap_generation;
         tokio::spawn(async move {
+            // Issue #591: make the recheck's report infallible instead of
+            // racing a short timer. If this task exits — normally, on a
+            // panic, or dropped by a runtime shutdown — without having sent
+            // its own `Msg::Bootstrap`, this guard's `Drop` sends a fallback
+            // `Err(NoToken)` under the same generation so the recovery
+            // window is never left open by a task that silently died.
+            struct ReportGuard {
+                tx: mpsc::UnboundedSender<Msg>,
+                generation: u64,
+                reported: bool,
+            }
+            impl Drop for ReportGuard {
+                fn drop(&mut self) {
+                    if !self.reported {
+                        self.tx
+                            .send(Msg::Bootstrap {
+                                generation: self.generation,
+                                result: Err(TaskError {
+                                    message: "session re-check ended unexpectedly".into(),
+                                    code: None,
+                                    max_page: None,
+                                    kind: TaskErrorKind::NoToken,
+                                }),
+                            })
+                            .ok();
+                    }
+                }
+            }
+            let mut guard = ReportGuard { tx: tx.clone(), generation, reported: false };
             if client.adopt_stored_tokens().await {
                 let result = api.me().await.map_err(|e| TaskError::of(&e));
+                guard.reported = true;
                 tx.send(Msg::Bootstrap { generation, result }).ok();
             } else {
+                guard.reported = true;
                 tx.send(Msg::Bootstrap {
                     generation,
                     result: Err(TaskError {
@@ -739,6 +782,45 @@ impl App {
                 .ok();
             }
         });
+    }
+
+    /// Arm the "no session, transient failure" retry state: `bootstrap_retry_needed`
+    /// (so a plain `r` re-runs `restore_session()`), the Forums panel's own
+    /// retry hint (so it stops spinning on "Loading forums…" for a load that
+    /// will never come), and a length-capped status line (issue #561: an
+    /// uncapped raw HTTP body pushed "press r to retry." off the end of a
+    /// 120-column terminal). Shared by the startup restore's `Msg::Bootstrap
+    /// { Err }` arm and, since issue #594, `Msg::LoginComplete { Err }` for a
+    /// transient failure right after a successful token exchange — both
+    /// leave `self.me` unset and a stored token that already works.
+    fn arm_bootstrap_retry(&mut self, e: &TaskError) {
+        self.bootstrap_retry_needed = true;
+        // The Forums panel must not spin on "Loading forums…" forever for a
+        // failure that will never resolve on its own (no `NodesLoaded` is
+        // coming — bootstrap never got that far) — show the same retry hint
+        // there `render_forum_panel` already knows how to draw for
+        // `NodesLoaded`'s own Err arm, instead of leaving the priming
+        // spinner up with no session and no way to tell the user anything
+        // went wrong (issue #561).
+        if let Some(tree) = self.tree_mut() {
+            tree.loading = false;
+            tree.error = Some(cap_message(&e.message, RAW_MESSAGE_CAP));
+        }
+        // `chrome::status_line` clips an overlong `left` string from the
+        // *right* to keep the write-gate widget on screen — so an uncapped
+        // raw HTTP body here is exactly what pushed " — press r to retry."
+        // off the end of a 120-column terminal (issue #561, the reported
+        // bug). `TaskError::of` already caps the synthetic `"http_error"`
+        // fallback at construction (`RAW_MESSAGE_CAP` = 80), but this
+        // wrapper's own fixed text already spends ~50 cells before the
+        // message even starts, so re-cap tighter here: this line's tail is
+        // load-bearing and must survive regardless of how the `TaskError`
+        // was built.
+        const BOOTSTRAP_STATUS_MSG_CAP: usize = 30;
+        self.set_hint(format!(
+            "Can't reach windowsforum.com ({}) — press r to retry.",
+            cap_message(&e.message, BOOTSTRAP_STATUS_MSG_CAP)
+        ));
     }
 
     /// Force-clears a `session_recovery_pending` window that has run past
@@ -756,7 +838,23 @@ impl App {
         {
             self.session_recovery_pending = false;
             self.session_recovery_started_at = None;
-            self.end_session("Session check timed out; log in again.");
+            // Issue #591: `recheck_stored_session` is only ever started with
+            // a live session (`self.me.is_some()` — the boundary that calls
+            // it checks this), so a token is still adopted and in use even
+            // though this backstop never heard back from the recheck. Ending
+            // the session here would be exactly the bug this fix closes —
+            // a working session torn down by a timer. Prefer the same
+            // "still signed in" hint the transient-failure arm uses and
+            // leave the pollers (or the next call) to decide if the session
+            // is really gone.
+            if let Some(user) = self.me.as_ref() {
+                let username = user.username.clone();
+                self.set_hint(format!(
+                    "Token re-check could not reach the site; still signed in as {username}."
+                ));
+            } else {
+                self.end_session("Session check timed out; log in again.");
+            }
         }
     }
 
@@ -2615,7 +2713,20 @@ impl App {
             // A live session that lost its token may just be sharing
             // `token.json` with a second instance that rotated it: re-read
             // the store once before giving up on the session.
-            if kind == TaskErrorKind::NoToken && self.me.is_some() && !self.session_recovery_tried {
+            //
+            // Issue #593: XenForo's refresh grant revokes the OLD access
+            // token in the SAME request, so a sibling's refresh can surface
+            // here as `Api(401)` — a request already in flight, or one sent
+            // during the clock-skew window before this instance's own 60 s
+            // margin trips — just as easily as it surfaces as the `NoToken`
+            // the refresh call itself produces. Treat the two identically:
+            // this cannot mask a genuine revoke, because the recheck's own
+            // `/me` (issue #581) verifies identity before anything is
+            // adopted, and `adopt_stored_tokens()` returning false (nothing
+            // new on disk) still reports `Err(NoToken)` and ends the session
+            // exactly as before.
+            let recheckable = matches!(kind, TaskErrorKind::NoToken | TaskErrorKind::Api(401));
+            if recheckable && self.me.is_some() && !self.session_recovery_tried {
                 self.recheck_stored_session(reason);
                 // The recheck's own report is the recovery machinery's
                 // business and has no owning screen — consume it here.
@@ -2627,13 +2738,14 @@ impl App {
                 // `mark_retryable`.
                 mark_retryable(&mut msg);
             } else if self.session_recovery_pending
-                && matches!(kind, TaskErrorKind::OAuth | TaskErrorKind::NoToken)
+                && matches!(kind, TaskErrorKind::OAuth | TaskErrorKind::NoToken | TaskErrorKind::Api(401))
             {
                 // Every caller that was queued behind the refresh which
-                // failed reports the same rejection, so an OAuth error — or
-                // a second NoToken, once `valid_token` clears the in-memory
-                // guard for every other queued caller (round 7 regression,
-                // issue #580) — arriving while the recheck is still in
+                // failed reports the same rejection, so an OAuth error, a
+                // second NoToken (once `valid_token` clears the in-memory
+                // guard for every other queued caller — round 7 regression,
+                // issue #580), or an `Api(401)` from the revoked old access
+                // token (issue #593) arriving while the recheck is still in
                 // flight describes the grant that recheck is already
                 // replacing — stale. Ending the session on it would kick a
                 // member whose sibling instance merely rotated the shared
@@ -2708,7 +2820,26 @@ impl App {
                         self.prime_home_list();
                     }
                     Err(e) => {
-                        if let Some(Screen::Login(ls)) = self.screens.last_mut() {
+                        // Issue #594: `finish_login` persists the exchanged
+                        // tokens BEFORE calling `client.me()` — so a
+                        // transient failure on that single verification call
+                        // (a timeout, a Cloudflare 5xx, an XF 500) must not
+                        // force the user through an entirely new browser
+                        // authorization when the tokens it just stored
+                        // already work: quitting and restarting proves it by
+                        // going straight through `bootstrap`/`restore_session`
+                        // silently. A session-ending rejection (bad grant) or
+                        // an account-gone one (banned/rejected/disabled) is
+                        // not this case — the Login screen's own error is
+                        // still the right place for those.
+                        if !e.ends_session() && !e.is_account_gone() {
+                            if self.screens.len() > 1
+                                && matches!(self.screens.last(), Some(Screen::Login(_)))
+                            {
+                                self.screens.pop();
+                            }
+                            self.arm_bootstrap_retry(&e);
+                        } else if let Some(Screen::Login(ls)) = self.screens.last_mut() {
                             ls.busy = false;
                             ls.error = Some(e.message);
                             ls.stage = crate::screens::LoginStage::Idle;
@@ -2843,41 +2974,33 @@ impl App {
                     // retry" banner over a working session. Just say so —
                     // the pollers (or the next call) will surface a real
                     // session loss if there is one.
+                    //
+                    // Issue #592: the poller that first noticed the `NoToken`
+                    // and triggered this recheck already sent its
+                    // `SessionLost` and returned (the alerts/conversations
+                    // poller loops `return` right after reporting) — nothing
+                    // else restarts it, so without this the Alerts/Inbox
+                    // badges would freeze for the rest of the session. The
+                    // recheck's `adopt_stored_tokens()` already ran (and
+                    // succeeded — only its later `/me` failed transiently),
+                    // so the adopted token is live and safe to poll on.
+                    // `session_recovery_tried` must also go back to `false`:
+                    // left `true`, the NEXT sibling rotation's `NoToken`
+                    // would skip the recheck gate entirely and fall straight
+                    // to `end_session` with a perfectly good token set on
+                    // disk — re-arming the exact #557/#568 sign-out this
+                    // machinery exists to prevent, off one network blip. This
+                    // is safe against a loop: a recheck whose
+                    // `adopt_stored_tokens()` finds nothing new to adopt
+                    // reports `Err(NoToken)` and ends the session as usual.
+                    self.start_pollers();
+                    self.session_recovery_tried = false;
                     let username = self.me.as_ref().map(|u| u.username.as_str()).unwrap_or("");
                     self.set_hint(format!(
                         "Token re-check could not reach the site; still signed in as {username}."
                     ));
                 } else {
-                    self.bootstrap_retry_needed = true;
-                    // The Forums panel must not spin on "Loading forums…"
-                    // forever for a failure that will never resolve on its
-                    // own (no `NodesLoaded` is coming — bootstrap never got
-                    // that far) — show the same retry hint there
-                    // `render_forum_panel` already knows how to draw for
-                    // `NodesLoaded`'s own Err arm, instead of leaving the
-                    // priming spinner up with no session and no way to tell
-                    // the user anything went wrong (issue #561).
-                    if let Some(tree) = self.tree_mut() {
-                        tree.loading = false;
-                        tree.error = Some(cap_message(&e.message, RAW_MESSAGE_CAP));
-                    }
-                    // `chrome::status_line` clips an overlong `left` string
-                    // from the *right* to keep the write-gate widget on
-                    // screen — so an uncapped raw HTTP body here is exactly
-                    // what pushed " — press r to retry." off the end of a
-                    // 120-column terminal (issue #561, the reported bug).
-                    // `TaskError::of` already caps the synthetic
-                    // `"http_error"` fallback at construction
-                    // (`RAW_MESSAGE_CAP` = 80), but this wrapper's own fixed
-                    // text already spends ~50 cells before the message even
-                    // starts, so re-cap tighter here: this line's tail is
-                    // load-bearing and must survive regardless of how the
-                    // `TaskError` was built.
-                    const BOOTSTRAP_STATUS_MSG_CAP: usize = 30;
-                    self.set_hint(format!(
-                        "Can't reach windowsforum.com ({}) — press r to retry.",
-                        cap_message(&e.message, BOOTSTRAP_STATUS_MSG_CAP)
-                    ));
+                    self.arm_bootstrap_retry(&e);
                 }
             }
             Msg::NodesLoaded(result) => {
@@ -4849,6 +4972,14 @@ mod tests {
     /// so would hijack the very next plain `r` — the reply key — into
     /// `restore_session()` instead of opening the composer, over a session
     /// that is actually still fine.
+    ///
+    /// Issue #592: this arm is also where the poller that first noticed the
+    /// `NoToken` (and so triggered the recheck) needs restarting — it
+    /// already sent its `SessionLost` and returned, and nothing else would
+    /// ever run it again, freezing the Alerts/Inbox badges — and where
+    /// `session_recovery_tried` must go back to `false`, or the next sibling
+    /// rotation's `NoToken` skips the recheck gate entirely and ends the
+    /// session outright with a perfectly good token set on disk.
     #[tokio::test]
     async fn bootstrap_transient_error_in_a_live_session_never_hijacks_r_from_the_composer() {
         let mut app = test_app();
@@ -4858,6 +4989,8 @@ mod tests {
             thread: Thread { thread_id: 42, reply_count: 3, ..Default::default() },
             ..Default::default()
         }));
+        app.session_recovery_tried = true;
+        assert!(app.poller_handles.is_empty(), "test setup: no pollers running yet");
 
         app.handle_msg(Msg::Bootstrap {
             generation: app.bootstrap_generation,
@@ -4880,6 +5013,14 @@ mod tests {
             app.status
         );
         assert!(!app.status.contains("press r to retry"));
+        assert!(
+            !app.poller_handles.is_empty(),
+            "the live session's pollers must be running again (issue #592)"
+        );
+        assert!(
+            !app.session_recovery_tried,
+            "the recheck gate must be re-armed for the next sibling rotation (issue #592)"
+        );
 
         // The key that would have run `restore_session()` must instead reach
         // the ThreadView and open the composer.
@@ -4888,6 +5029,21 @@ mod tests {
             matches!(app.screens.last(), Some(Screen::Compose(_))),
             "r in a ThreadView after a transient recheck failure must still open the composer"
         );
+
+        // A later `NodesLoaded(Err(NoToken))` — the next sibling rotation —
+        // must start a SECOND recheck rather than fall straight to
+        // `end_session` with a perfectly good token set on disk.
+        app.handle_msg(Msg::NodesLoaded(Err(TaskError {
+            message: "not logged in".into(),
+            code: None,
+            max_page: None,
+            kind: TaskErrorKind::NoToken,
+        })));
+        assert!(
+            app.session_recovery_pending,
+            "a second recheck must have started instead of ending the session"
+        );
+        assert!(app.me.is_some(), "the session must still be alive while the second recheck runs");
     }
 
     /// Issue #551: the converse — a session-ending error (NoToken, OAuth,
@@ -4941,6 +5097,74 @@ mod tests {
         );
         assert!(app.me.is_none(), "me must be cleared once the session ends");
         assert!(!app.bootstrap_retry_needed, "there is no session left to retry restoring");
+    }
+
+    /// Issue #594: `finish_login` persists the exchanged tokens BEFORE
+    /// calling `client.me()` — so a transient failure on that single
+    /// verification call (a timeout, a Cloudflare 5xx, an XF 500) must not
+    /// force the user through an entirely new browser authorization when the
+    /// tokens it just stored already work (quitting and restarting proves it
+    /// by going straight through `bootstrap`/`restore_session` silently).
+    /// `Msg::LoginComplete { Err }` must pop the Login screen and reuse the
+    /// startup transient-retry path instead of leaving "Enter" only able to
+    /// start a brand new authorize flow.
+    #[tokio::test]
+    async fn login_complete_transient_error_reuses_the_bootstrap_retry_path() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(true));
+        app.screens.push(screens::login_state());
+
+        app.handle_msg(Msg::LoginComplete {
+            generation: app.login_generation,
+            result: Err(TaskError {
+                message: "http error: connection reset".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::Other,
+            }),
+        });
+
+        assert!(
+            !app.screens.iter().any(|s| matches!(s, Screen::Login(_))),
+            "a transient failure right after a successful token exchange must not leave the Login screen up"
+        );
+        assert!(app.me.is_none());
+        assert!(app.bootstrap_retry_needed);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(!app.bootstrap_retry_needed, "r must consume the retry flag");
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(1), app.rx.recv())
+            .await
+            .expect("r must re-run the session check")
+            .expect("channel open");
+        assert!(matches!(sent, Msg::Bootstrap { .. }), "expected a fresh Bootstrap check");
+    }
+
+    /// Issue #594 (converse): a session-ending or account-gone failure right
+    /// after the token exchange must still surface on the Login screen — the
+    /// tokens `finish_login` stored are not usable, so there is nothing to
+    /// silently retry.
+    #[tokio::test]
+    async fn login_complete_session_ending_error_still_shows_on_the_login_screen() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(true));
+        app.screens.push(screens::login_state());
+
+        app.handle_msg(Msg::LoginComplete {
+            generation: app.login_generation,
+            result: Err(TaskError::of(&Error::OAuth {
+                code: "invalid_grant".into(),
+                message: "The provided authorization code or refresh token is invalid.".into(),
+                status: 400,
+            })),
+        });
+
+        assert!(!app.bootstrap_retry_needed);
+        let Some(Screen::Login(ls)) = app.screens.last() else {
+            panic!("a session-ending failure must still leave the Login screen up");
+        };
+        assert!(!ls.busy);
+        assert!(ls.error.is_some());
     }
 
     /// Issue #561: the converse of the test above — a genuinely transient
@@ -5053,10 +5277,19 @@ mod tests {
         );
 
         // A poller reporting the same failure (issue #557: it used to drop
-        // the error) routes to exactly the same place.
+        // the error) routes to exactly the same place — once the recheck
+        // gate is exhausted. Issue #593: a bare `Api(401)` (XenForo revokes
+        // the OLD access token in the same request that serves a sibling's
+        // refresh, so a rotation can surface as 401 just as easily as
+        // `NoToken`) now gets exactly one recheck first, same as `NoToken` —
+        // see `a_live_session_401_starts_a_recheck_instead_of_ending_the_session`
+        // for that case. This exercises what happens after that recheck has
+        // already run once (`session_recovery_tried` already true): a second
+        // 401 still ends the session rather than looping forever.
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
         app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.session_recovery_tried = true;
         app.handle_msg(Msg::SessionLost(TaskError {
             message: "unauthorized".into(),
             code: Some("api_error".into()),
@@ -5247,6 +5480,36 @@ mod tests {
         });
         assert!(app.me.is_none());
         assert!(app.status.contains("Session expired"), "status: {:?}", app.status);
+    }
+
+    /// Issue #593: XenForo revokes the OLD access token in the SAME request
+    /// that serves a sibling instance's refresh, so a request already in
+    /// flight (or sent during the clock-skew window before this instance's
+    /// own margin trips) can see that rotation as `Api(401)
+    /// api_error.unauthorized` instead of the `NoToken`/`OAuth` shapes the
+    /// recovery machinery already knew about. A live session must treat it
+    /// exactly the same way: start the recheck rather than sign out
+    /// immediately.
+    #[tokio::test]
+    async fn a_live_session_401_starts_a_recheck_instead_of_ending_the_session() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+
+        app.handle_msg(Msg::SessionLost(TaskError {
+            message: "Unauthorized".into(),
+            code: Some("api_error.unauthorized".into()),
+            max_page: None,
+            kind: TaskErrorKind::Api(401),
+        }));
+
+        assert!(
+            app.session_recovery_tried,
+            "an Api(401) in a live session must start the store recheck"
+        );
+        assert!(app.session_recovery_pending, "the recheck must be in flight");
+        assert!(app.me.is_some(), "the session must not be ended before the recheck reports back");
+        assert!(!matches!(app.screens.last(), Some(Screen::Login(_))));
     }
 
     /// Round 7 regression, issue #580: `valid_token()` clearing the
@@ -5619,16 +5882,21 @@ mod tests {
         );
     }
 
-    /// Issue #587: if the recheck task dies without ever reporting back (a
-    /// panic, a dropped future, a channel send that silently fails), nothing
-    /// would otherwise clear `session_recovery_pending` — leaving every
-    /// poller's `SessionLost` swallowed as "stale" forever and a genuinely
-    /// signed-out session never reaching the Login screen. The event loop's
-    /// tick bounds the window instead. Simulated clock: the window's start
-    /// is backdated past `SESSION_RECOVERY_TIMEOUT_SECS` rather than
-    /// actually sleeping.
+    /// Issue #587/#591: if the recheck task's own `Msg::Bootstrap` report is
+    /// somehow never delivered at all (the `ReportGuard` in
+    /// `recheck_stored_session` covers a plain panic/drop — this exercises
+    /// the pure backstop for when even that never lands), nothing would
+    /// otherwise clear `session_recovery_pending` — leaving every poller's
+    /// `SessionLost` swallowed as "stale" forever. The event loop's tick
+    /// bounds the window instead, but it must NOT end the session on its own
+    /// (issue #591): `recheck_stored_session` is only ever started with a
+    /// live session, so the timer firing means a token is still adopted and
+    /// in use, not that the session is over — it falls back to the same
+    /// "still signed in" hint the transient-failure arm uses. Simulated
+    /// clock: the window's start is backdated past
+    /// `SESSION_RECOVERY_TIMEOUT_SECS` rather than actually sleeping.
     #[test]
-    fn a_session_recovery_window_that_never_reports_back_times_out_and_ends_the_session() {
+    fn a_session_recovery_window_left_open_past_the_timeout_backstop_keeps_the_live_session() {
         let mut app = test_app();
         app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
         app.screens.push(screens::home_state(false));
@@ -5639,18 +5907,78 @@ mod tests {
 
         // Not old enough yet: a fresh window must survive a tick.
         app.expire_session_recovery_timeout();
-        assert!(app.me.is_some(), "must not end the session before the timeout elapses");
+        assert!(app.me.is_some(), "must not touch the session before the timeout elapses");
         assert!(app.session_recovery_pending);
 
-        // Backdate past the timeout — the recheck task never came back.
+        // Backdate past the timeout — nothing ever reported back.
         app.session_recovery_started_at =
             Some(std::time::Instant::now() - Duration::from_secs(SESSION_RECOVERY_TIMEOUT_SECS + 1));
         app.expire_session_recovery_timeout();
 
-        assert!(app.me.is_none(), "a recheck that never reports back must not hang forever");
-        assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
+        assert!(app.me.is_some(), "a live session must survive the timeout backstop");
+        assert!(!matches!(app.screens.last(), Some(Screen::Login(_))));
         assert!(!app.session_recovery_pending);
         assert!(app.session_recovery_started_at.is_none());
+        assert!(app.status.contains("still signed in"), "status: {:?}", app.status);
+    }
+
+    /// Issue #591: `SESSION_RECOVERY_TIMEOUT_SECS` used to be 15 s — shorter
+    /// than the recheck's own legitimate network budget (`CONNECT_TIMEOUT`
+    /// 10 s + `REQUEST_TIMEOUT` 30 s, possibly doubled by a token refresh
+    /// inside `valid_token()` before the `/me` call itself, plus any queued
+    /// `api_gate` rate-limit penalty) — so a recheck that was merely slow,
+    /// not dead, still got timed out from under a perfectly good session:
+    /// the Compose draft the boundary had just preserved was dropped, and
+    /// the recheck's later `Msg::Bootstrap { Ok }` arrived under a
+    /// now-stale generation and was discarded. A 16 s-old window — longer
+    /// than the old 15 s timeout — must survive a tick untouched under the
+    /// new backstop, and the recheck's own verdict must still land and
+    /// restore the session with the Compose screen intact.
+    #[tokio::test]
+    async fn a_recheck_slower_than_the_old_15s_timeout_still_restores_the_session() {
+        let user = User { user_id: 7, username: "kemical".into(), ..Default::default() };
+        let mut app = test_app();
+        app.me = Some(user.clone());
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 42,
+                thread_title: "a thread".into(),
+            }),
+            body: "a draft nobody may lose".into(),
+            busy: true,
+            ..Default::default()
+        }));
+
+        // The write's own `valid_token()` was the first caller to hit the
+        // sibling-rotated refresh token: `NoToken`, which opens the recheck.
+        app.handle_msg(Msg::ReplySent(Err(TaskError {
+            message: "not logged in".into(),
+            code: None,
+            max_page: None,
+            kind: TaskErrorKind::NoToken,
+        })));
+        assert!(app.session_recovery_pending, "test setup: the recheck must be in flight");
+
+        // Backdate the window by 16 s — longer than the OLD 15 s timeout,
+        // well inside the new backstop — and let a tick run.
+        app.session_recovery_started_at = Some(std::time::Instant::now() - Duration::from_secs(16));
+        app.expire_session_recovery_timeout();
+        assert!(
+            app.session_recovery_pending,
+            "16 s must not trip the new timeout backstop"
+        );
+        assert!(app.me.is_some(), "a merely slow recheck must not end the session early");
+
+        // The recheck's own (slow but successful) verdict still arrives
+        // under the same generation.
+        app.handle_msg(Msg::Bootstrap { generation: app.bootstrap_generation, result: Ok(user) });
+
+        assert!(app.me.is_some(), "the session must survive a slow-but-successful recheck");
+        let Some(Screen::Compose(compose)) = app.screens.last() else {
+            panic!("the Compose screen must survive a slow-but-successful recheck");
+        };
+        assert_eq!(compose.body, "a draft nobody may lose");
     }
 
     /// Issue #581: the token recheck's `Bootstrap { Ok(user) }` used to be
