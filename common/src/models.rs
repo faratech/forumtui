@@ -229,6 +229,13 @@ pub struct ForumReply {
     pub threads: Vec<Thread>,
     #[serde(default)]
     pub pagination: Pagination,
+    /// Pinned threads for this forum, sent only on page 1
+    /// (`ForumController::getThreadsInForumPaginated`'s `sticky` key) and
+    /// excluded from `threads`/`pagination.total` entirely. Absent (not an
+    /// empty array) when there are none or the page isn't 1, so this must
+    /// default rather than fail.
+    #[serde(default)]
+    pub sticky: Vec<Thread>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -876,6 +883,42 @@ mod tests {
         let r: ThreadsReply = serde_json::from_value(body).unwrap();
         assert_eq!(r.threads[0].title, "T");
         assert!(r.threads[0].view_url.is_none());
+    }
+
+    /// Fixture shaped exactly like `ForumController::getThreadsInForumPaginated`
+    /// (public_html/src/XF/Api/Controller/ForumController.php:107-146) on page
+    /// 1 of a forum with a pinned thread: `sticky` is a sibling array, and
+    /// `threads`/`pagination.total` cover only the non-sticky rows (issue #518).
+    #[test]
+    fn forum_reply_carries_sticky_threads_separately_from_paginated_threads() {
+        let body = serde_json::json!({
+            "forum": {"node_id": 4, "title": "Windows News"},
+            "sticky": [{"thread_id": 900, "title": "Read me first", "sticky": true}],
+            "threads": [{"thread_id": 901, "title": "Regular thread", "sticky": false}],
+            "pagination": {"current_page": 1, "last_page": 22, "total": 431}
+        });
+        let r: ForumReply = serde_json::from_value(body).unwrap();
+        assert_eq!(r.sticky.len(), 1);
+        assert_eq!(r.sticky[0].thread_id, 900);
+        assert!(r.sticky[0].sticky);
+        // Sticky rows never leak into the paginated array or its total.
+        assert_eq!(r.threads.len(), 1);
+        assert_eq!(r.threads[0].thread_id, 901);
+        assert_eq!(r.pagination.total, 431);
+    }
+
+    /// Page 2+ (and a forum with none pinned) sends no `sticky` key at all —
+    /// must default, not fail deserialization.
+    #[test]
+    fn forum_reply_defaults_sticky_when_the_key_is_absent() {
+        let body = serde_json::json!({
+            "forum": {"node_id": 4, "title": "Windows News"},
+            "threads": [{"thread_id": 950, "title": "Page 2 thread"}],
+            "pagination": {"current_page": 2, "last_page": 22, "total": 431}
+        });
+        let r: ForumReply = serde_json::from_value(body).unwrap();
+        assert!(r.sticky.is_empty());
+        assert_eq!(r.threads.len(), 1);
     }
 
     /// Fixture shaped exactly like `UserAlert::getStructure()` +

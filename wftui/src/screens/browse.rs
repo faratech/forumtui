@@ -436,10 +436,12 @@ pub(crate) fn render_forum_panel(
 /// `1–20 of 431`. The API's pagination has no `per_page`, so the last page's
 /// range is derived backwards from the total instead of guessed.
 fn list_range(s: &ThreadListState) -> Option<String> {
-    if s.total == 0 || s.threads.is_empty() {
+    if s.total == 0 || s.threads.len() <= s.sticky_count {
         return None;
     }
-    let len = s.threads.len() as u64;
+    // Sticky threads are prepended into `threads` for display but are never
+    // part of `pagination.total` or this page's row count — exclude them.
+    let len = (s.threads.len() - s.sticky_count) as u64;
     let (start, end) = if s.page >= s.last_page.max(1) && s.total >= len {
         (s.total - len + 1, s.total)
     } else {
@@ -2062,6 +2064,27 @@ mod tests {
         // No total from the server -> no footer at all.
         s.total = 0;
         assert!(list_range(&s).is_none());
+    }
+
+    /// Prepending sticky threads (issue #518) must not inflate the `1–20 of
+    /// 431` footer — sticky rows are outside XF's `pagination.total` and
+    /// outside every page's own 20-row count.
+    #[test]
+    fn list_range_excludes_sticky_rows_from_the_page_count() {
+        let mut s = ThreadListState {
+            // 2 sticky rows prepended in front of a normal 20-row page.
+            threads: vec![Thread::default(); 22],
+            sticky_count: 2,
+            page: 1,
+            last_page: 22,
+            total: 431,
+            ..Default::default()
+        };
+        assert_eq!(list_range(&s).as_deref(), Some("1\u{2013}20 of 431"));
+        s.page = 2;
+        s.sticky_count = 0; // stickies only ever arrive on page 1
+        s.threads = vec![Thread::default(); 20];
+        assert_eq!(list_range(&s).as_deref(), Some("21\u{2013}40 of 431"));
     }
 
     // ---------- Forums panel ----------

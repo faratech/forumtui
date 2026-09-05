@@ -467,9 +467,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         stack.push(Frame::Link(url));
                     }
                     "img" => {
-                        let lower = rest.to_ascii_lowercase();
-                        if lower.contains("[/img]") {
-                            let (inner, close_len) = take_until_close(rest, "img");
+                        if let Some((inner, close_len)) = split_at_close(rest, "img") {
                             let st = Style::from_stack(&stack);
                             let trimmed = strip_quotes(inner.trim());
                             if trimmed.is_empty() {
@@ -486,9 +484,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         }
                     }
                     "media" => {
-                        let lower = rest.to_ascii_lowercase();
-                        if lower.contains("[/media]") {
-                            let (inner, close_len) = take_until_close(rest, "media");
+                        if let Some((inner, close_len)) = split_at_close(rest, "media") {
                             let st = Style::from_stack(&stack);
                             let site = value.as_deref().map(strip_quotes).unwrap_or("media");
                             let (label, url) = resolve_media(site, inner);
@@ -499,9 +495,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         }
                     }
                     "attach" => {
-                        let lower = rest.to_ascii_lowercase();
-                        if lower.contains("[/attach]") {
-                            let (inner, close_len) = take_until_close(rest, "attach");
+                        if let Some((inner, close_len)) = split_at_close(rest, "attach") {
                             let st = Style::from_stack(&stack);
                             let id = if inner.trim().is_empty() {
                                 value.as_deref().map(strip_quotes).unwrap_or("").trim()
@@ -519,9 +513,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         }
                     }
                     "user" => {
-                        let lower = rest.to_ascii_lowercase();
-                        if lower.contains("[/user]") {
-                            let (inner, close_len) = take_until_close(rest, "user");
+                        if let Some((inner, close_len)) = split_at_close(rest, "user") {
                             let st = Style::from_stack(&stack);
                             out.push(Chunk::Text(format!("@{}", inner.trim()), st));
                             rest = &rest[close_len..];
@@ -702,15 +694,48 @@ fn is_tag_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Byte offset of the next `[/name]`, matched ASCII-case-insensitively in a
+/// single forward pass.
+///
+/// It used to lowercase the *whole remaining document* per call (and the
+/// callers below lowercased it a second time just to test for the close
+/// tag), which made a post's parse cost quadratic in its tag count: 16 000
+/// `[IMG]` tags took 425 ms, and every one of those parses happens on the UI
+/// thread (issue #522). Scanning bytes is safe here because `[`, `/`, `]`
+/// and ASCII letters never appear inside a multi-byte UTF-8 sequence.
+fn find_close_tag(s: &str, name: &str) -> Option<usize> {
+    let hay = s.as_bytes();
+    let needle = name.as_bytes();
+    let total = needle.len() + 3; // "[/" + name + "]"
+    if hay.len() < total {
+        return None;
+    }
+    let last = hay.len() - total;
+    let mut i = 0usize;
+    while i <= last {
+        if hay[i] == b'['
+            && hay[i + 1] == b'/'
+            && hay[i + 2 + needle.len()] == b']'
+            && hay[i + 2..i + 2 + needle.len()].eq_ignore_ascii_case(needle)
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `(content, bytes to consume)` for a tag that has a close tag; `None` when
+/// it has none — the callers that used to ask `lower.contains("[/img]")`
+/// first now ask this once and reuse the answer.
+fn split_at_close<'a>(s: &'a str, name: &str) -> Option<(&'a str, usize)> {
+    find_close_tag(s, name).map(|pos| (&s[..pos], pos + name.len() + 3))
+}
+
 /// Find the closing tag for `name` (case-insensitive) returning content end
 /// offset and the closing tag length.
 fn take_until_close<'a>(s: &'a str, name: &str) -> (&'a str, usize) {
-    let lower = s.to_ascii_lowercase();
-    let needle = format!("[/{}]", name.to_ascii_lowercase());
-    match lower.find(&needle) {
-        Some(pos) => (&s[..pos], pos + needle.len()),
-        None => (s, s.len()),
-    }
+    split_at_close(s, name).unwrap_or((s, s.len()))
 }
 
 /// Emit plain text: inside a [URL] frame the whole run is a link; otherwise
@@ -748,16 +773,26 @@ fn emit_text(out: &mut Vec<Chunk>, text: &str, stack: &[Frame]) {
     }
 }
 
+/// Offset of the next bare `http://` / `https://`, in one forward pass.
+///
+/// The lowercase-the-whole-remainder version this replaces was called once
+/// per URL from `emit_text`, so a post that is mostly links cost O(n^2) —
+/// 4 000 links took 75 ms, on the UI thread, per frame for a search page
+/// (issue #522). Each scan here covers only the text up to the URL it
+/// returns, and `emit_text` advances past it, so the whole run is linear.
 fn find_url(s: &str) -> Option<usize> {
-    let lower = s.to_ascii_lowercase();
-    let http = lower.find("http://");
-    let https = lower.find("https://");
-    match (http, https) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
+    fn starts_ci(hay: &[u8], needle: &[u8]) -> bool {
+        hay.len() >= needle.len() && hay[..needle.len()].eq_ignore_ascii_case(needle)
     }
+    let b = s.as_bytes();
+    for i in 0..b.len() {
+        if (b[i] | 0x20) == b'h'
+            && (starts_ci(&b[i..], b"http://") || starts_ci(&b[i..], b"https://"))
+        {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// Split `s` at the URL starting at `pos` into (before, url, after). The URL
@@ -813,6 +848,39 @@ fn pop_matching(stack: &mut Vec<Frame>, name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Issue #522: `render` must stay linear in the number of tags/URLs.
+    /// Both scans used to lowercase the whole remaining input per tag/URL,
+    /// which is quadratic — and every one of these parses runs on the UI
+    /// thread (a search page re-parsed twenty messages twenty times a
+    /// second). The bounds are deliberately loose: this is a complexity
+    /// assertion, not a benchmark. Measured unoptimized on the dev box:
+    /// 1.0 s before / 4.6 ms after for the 4 000-URL input.
+    #[test]
+    fn render_is_linear_in_tag_and_url_count() {
+        fn parse_ms(src: &str) -> f64 {
+            let t = std::time::Instant::now();
+            let out = render(src);
+            assert!(!out.is_empty());
+            t.elapsed().as_secs_f64() * 1000.0
+        }
+
+        let urls_4k = "see https://example.com/a here ".repeat(4000);
+        let urls_16k = "see https://example.com/a here ".repeat(16000);
+        let t4 = parse_ms(&urls_4k);
+        assert!(t4 < 400.0, "4 000 URLs took {t4:.1} ms — the URL scan is not linear");
+        let t16 = parse_ms(&urls_16k);
+        assert!(
+            t16 < 8.0 * t4.max(1.0),
+            "4x the input cost {:.1}x the time ({t4:.1} ms -> {t16:.1} ms): quadratic",
+            t16 / t4.max(0.001)
+        );
+
+        // Same for close-tag search, which has its own scan.
+        let imgs = "[IMG]https://example.com/a.png[/IMG] x ".repeat(4000);
+        let ti = parse_ms(&imgs);
+        assert!(ti < 400.0, "4 000 [IMG] tags took {ti:.1} ms");
+    }
+
     use super::*;
 
     fn texts(chunks: &[Chunk]) -> Vec<&str> {

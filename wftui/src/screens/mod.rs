@@ -82,6 +82,11 @@ pub struct ThreadListState {
     pub node_id: u32,
     pub title: String,
     pub threads: Vec<Thread>,
+    /// How many of the leading rows in `threads` are pinned/sticky threads
+    /// (XF's separate `sticky` array, prepended here for display but never
+    /// counted towards `pagination.total` or a page's row count — see
+    /// `list_range`).
+    pub sticky_count: usize,
     pub page: u32,
     pub last_page: u32,
     /// `pagination.total` when the server sends one — the `1–20 of 431` panel
@@ -209,6 +214,20 @@ pub struct ComposeState {
     /// Image rects the last preview render reserved, in absolute screen
     /// coordinates, for the app to paint.
     pub image_requests: Vec<crate::images::Request>,
+    /// The body pane's inner size in cells, stamped by the renderer every
+    /// frame. The key handler needs it to wrap the draft the same way the
+    /// screen does (Up/Down move by *visual* row, PageUp/PageDown by a
+    /// pane), and the draw always precedes the keys it is asked about.
+    pub body_width: u16,
+    pub body_height: u16,
+    /// First visual row of the body on screen. Follows the caret, so text
+    /// typed past the bottom of the pane scrolls into view instead of being
+    /// written blind (issue #519).
+    pub body_scroll: u16,
+    /// The column a run of Up/Down is aiming at, in cells. Set by the first
+    /// vertical move and cleared by every other key, so crossing a short
+    /// line does not clip the caret's column permanently (issue #523).
+    pub body_desired_col: Option<usize>,
 }
 
 #[derive(Default)]
@@ -235,6 +254,12 @@ pub struct ConversationViewState {
     pub scroll: u16,
     pub sel_msg: usize,
     pub msg_line_offsets: Vec<u16>,
+    /// What `lines`/`msg_line_offsets` were last built for: the pane width
+    /// and the selected message (the only two things the layout depends on).
+    /// `None` forces a rebuild — every writer of `messages` clears it. Both
+    /// the Inbox pane and the standalone screen used to re-wrap and re-parse
+    /// every message on every frame (issue #522).
+    pub built: Option<(u16, usize)>,
     pub loading: bool,
     pub error: Option<String>,
 }
@@ -252,6 +277,13 @@ pub struct NewConversationState {
     pub resolved_ids: Vec<u32>,
     pub errors: Vec<String>,
     pub busy: bool,
+    /// Same contract as `ComposeState`'s: the message pane's size stamped by
+    /// the renderer, the caret-following scroll offset, and the sticky
+    /// desired column for Up/Down.
+    pub body_width: u16,
+    pub body_height: u16,
+    pub body_scroll: u16,
+    pub body_desired_col: Option<usize>,
 }
 
 #[derive(Default)]
@@ -318,6 +350,13 @@ pub struct SearchState {
     pub order: u8,
     pub input_mode: bool,
     pub results: Vec<SearchHit>,
+    /// One pre-rendered dim snippet per result, parallel to `results`.
+    ///
+    /// Derived from the hit's BBCode message, which is a full post: doing it
+    /// in the renderer re-parsed every message on screen at the event loop's
+    /// 20 fps (issue #522). Fill it with `set_results`, which is the only
+    /// thing that should ever assign `results`.
+    pub snippets: Vec<String>,
     pub page: u32,
     pub last_page: u32,
     /// `pagination.total` when the server sends one — drives the `N results`
@@ -327,6 +366,18 @@ pub struct SearchState {
     pub sel: usize,
     pub loading: bool,
     pub error: Option<String>,
+}
+
+impl SearchState {
+    /// Adopt a page of results and derive everything the renderer would
+    /// otherwise re-derive per frame.
+    pub fn set_results(&mut self, results: Vec<SearchHit>) {
+        self.snippets = results
+            .iter()
+            .map(|h| misc::search_snippet(&h.message, 100))
+            .collect();
+        self.results = results;
+    }
 }
 
 #[derive(Default)]
@@ -358,6 +409,17 @@ pub enum Screen {
     NewConversation(NewConversationState),
     Search(SearchState),
     Profile(ProfileState),
+}
+
+/// What Esc means on the screen that is on top (see `Screen::esc_intent`).
+pub enum EscIntent {
+    /// The app's own Esc handling applies: pane focus, then pop/quit.
+    App,
+    /// The screen handles it in `on_key`.
+    Screen,
+    /// Esc is refused while a write is in flight; show this in the status
+    /// line so the refusal is not silent.
+    Blocked(&'static str),
 }
 
 /// Actions a screen asks the app to perform.
@@ -507,6 +569,28 @@ impl Screen {
             Screen::NewConversation(s) => social::new_conversation_key(s, key),
             Screen::Search(s) => misc::search_key(s, key),
             Screen::Profile(s) => misc::profile_key(s, key),
+        }
+    }
+
+    /// Who owns an Esc keypress.
+    ///
+    /// The app used to handle Esc for every screen before `on_key` ever saw
+    /// it, which made three things impossible (issue #520): leaving Search's
+    /// edit mode without closing the screen, a composer's own Esc arm, and —
+    /// worst — it popped a *busy* composer whose post was already spawned
+    /// and waiting on the write gate, so the post still landed, the screen
+    /// that would have shown a failure was gone, and the error was dropped.
+    pub fn esc_intent(&self) -> EscIntent {
+        match self {
+            Screen::Compose(c) if c.busy => EscIntent::Blocked(
+                "Sending\u{2026} Esc cannot cancel it \u{2014} wait for the result.",
+            ),
+            Screen::NewConversation(n) if n.busy => EscIntent::Blocked(
+                "Resolving recipients\u{2026} Esc cannot cancel it \u{2014} wait for the result.",
+            ),
+            Screen::Compose(_) | Screen::NewConversation(_) => EscIntent::Screen,
+            Screen::Search(s) if s.input_mode => EscIntent::Screen,
+            _ => EscIntent::App,
         }
     }
 

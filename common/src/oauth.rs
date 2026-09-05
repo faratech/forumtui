@@ -206,11 +206,24 @@ pub async fn refresh(client: &reqwest::Client, refresh_token: &str) -> Result<To
     token_request(client, &form).await
 }
 
-pub async fn revoke(client: &reqwest::Client, token: &str) -> Result<()> {
-    let form = [
-        ("token", token),
-        ("client_id", &config::oauth_client_id()?),
-    ];
+/// Revoke one token at the OAuth server.
+///
+/// `hint` is RFC 7009's `token_type_hint`. It matters: the endpoint defaults
+/// to `access_token`, so a logout that sent only the bearer left the 90-day
+/// refresh token alive — anyone with a copy of `token.json` could keep using
+/// the session (issue #527). Callers revoke the refresh token *and* the
+/// access token, and must not swallow the result: with the public PKCE
+/// client this call is expected to fail today (stock XF's revoke endpoint
+/// requires the `client_secret` a public client by definition does not
+/// hold), and that gap has to be visible rather than silent. Closing it for
+/// real needs a relay in the `WindowsForum/TuiLink` add-on, which is
+/// server-side work and out of this client's scope.
+pub async fn revoke(client: &reqwest::Client, token: &str, hint: Option<&str>) -> Result<()> {
+    let client_id = config::oauth_client_id()?;
+    let mut form: Vec<(&str, &str)> = vec![("token", token), ("client_id", &client_id)];
+    if let Some(hint) = hint {
+        form.push(("token_type_hint", hint));
+    }
     let url = format!("{}{}", config::base_url(), config::OAUTH_REVOKE_PATH);
     client.post(url).form(&form).send().await?.error_for_status()?;
     Ok(())
@@ -443,27 +456,34 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+/// Build the (program, argv) pair used to open `url` in the user's default
+/// browser. The URL always travels as a single argv element — never through
+/// a shell — so `&`, `%`, `|`, `^`, `<`, `>` inside it reach the child intact
+/// instead of being parsed. On Windows this is `rundll32.exe
+/// url.dll,FileProtocolHandler <url>` (no `cmd /C start`, which handed the
+/// whole string to cmd.exe for parsing and let it split/execute on `&`).
+///
+/// Deliberately not `#[cfg(target_os = ...)]`-gated so it compiles (and is
+/// unit-testable) on every host, not just the one it will run on.
+fn browser_command(url: &str) -> (&'static str, Vec<String>) {
+    if cfg!(target_os = "windows") {
+        (
+            "rundll32.exe",
+            vec!["url.dll,FileProtocolHandler".to_string(), url.to_string()],
+        )
+    } else if cfg!(target_os = "macos") {
+        ("open", vec![url.to_string()])
+    } else {
+        ("xdg-open", vec![url.to_string()])
+    }
+}
+
 /// Open the authorize URL in the user's browser. Fire-and-forget: we do not
 /// wait for the browser process.
 pub fn open_browser(url: &str) -> Result<()> {
-    #[cfg(target_os = "windows")]
-    let mut cmd = {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", "", url]);
-        c
-    };
-    #[cfg(target_os = "macos")]
-    let mut cmd = {
-        let mut c = std::process::Command::new("open");
-        c.arg(url);
-        c
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut cmd = {
-        let mut c = std::process::Command::new("xdg-open");
-        c.arg(url);
-        c
-    };
+    let (program, args) = browser_command(url);
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(&args);
     cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         // CRITICAL: xdg-open chains into browser-probe scripts that READ
@@ -491,6 +511,27 @@ mod tests {
         );
         let expected = Base64UrlUnpadded::encode_string(&Sha256::digest(pkce.verifier.as_bytes()));
         assert_eq!(pkce.challenge, expected);
+    }
+
+    #[test]
+    fn browser_command_passes_special_chars_through_argv_intact() {
+        // A URL containing `&` and `%` must reach the child process as one
+        // untouched argv element on every platform — never handed to a shell
+        // (cmd.exe, /bin/sh, ...) that could parse `&`/`|`/`^` inside it.
+        let url = "https://example.com/?a=1&calc.exe%20oops";
+        let (program, args) = browser_command(url);
+        assert!(!program.is_empty());
+        assert_eq!(args.len(), if cfg!(target_os = "windows") { 2 } else { 1 });
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some(url),
+            "URL must survive as a single argv element, unmodified"
+        );
+        // Windows path specifically: rundll32 via url.dll, never cmd.exe/start.
+        if cfg!(target_os = "windows") {
+            assert_eq!(program, "rundll32.exe");
+            assert_eq!(args[0], "url.dll,FileProtocolHandler");
+        }
     }
 
     #[test]

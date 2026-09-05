@@ -130,6 +130,11 @@ pub struct App {
     click_count: u8,
     last_title: String,
     should_quit: bool,
+    /// Handles for the alerts/conversations poll loops spawned by
+    /// `start_pollers`, so `logout` can abort them instead of leaving them
+    /// running (and doubled by the next login's `start_pollers` call) —
+    /// issue #524.
+    poller_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -244,6 +249,7 @@ pub async fn run(images: crate::images::Images) -> u8 {
         click_count: 0,
         last_title: String::new(),
         should_quit: false,
+        poller_handles: Vec::new(),
     };
     #[cfg(unix)]
     {
@@ -300,11 +306,16 @@ impl App {
         }
     }
 
-    fn start_pollers(&self) {
+    fn start_pollers(&mut self) {
+        // Defensive: a stray second call (there should never be one with the
+        // callers below, but this keeps the invariant "at most one poller
+        // pair running" regardless) stops the previous pair first rather
+        // than doubling the poll rate.
+        self.stop_pollers();
         // Alerts poller: unread count for the status bar.
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        self.poller_handles.push(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(common::config::ALERT_POLL_SECS)).await;
                 if let Ok(page) = api.alerts(1).await {
@@ -312,11 +323,11 @@ impl App {
                     tx.send(Msg::Notice(format!("alerts:{unread}"))).ok();
                 }
             }
-        });
+        }));
         // Conversations unread poller.
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        self.poller_handles.push(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(
                     common::config::CONVERSATION_POLL_SECS,
@@ -331,7 +342,18 @@ impl App {
                     tx.send(Msg::Notice(format!("convos:{unread}"))).ok();
                 }
             }
-        });
+        }));
+    }
+
+    /// Abort every poller spawned by `start_pollers` and forget its handles.
+    /// Called on logout so a signed-out session stops hitting `/alerts` and
+    /// `/conversations` — and so the next login's `start_pollers` starts a
+    /// fresh pair instead of adding to whatever was already running
+    /// (issue #524).
+    fn stop_pollers(&mut self) {
+        for h in self.poller_handles.drain(..) {
+            h.abort();
+        }
     }
 
     async fn event_loop(
@@ -563,9 +585,21 @@ impl App {
         for y in 0..area.height {
             let mut row = String::with_capacity(area.width as usize);
             let mut offsets = Vec::with_capacity(area.width as usize + 1);
+            // Columns still covered by the double-width character to their
+            // left. `set_stringn` *resets* those cells (their symbol reads
+            // back as " "), so mirroring them verbatim put a phantom space
+            // after every ideograph in the clipboard and broke word-select
+            // on CJK (issue #525). They contribute no bytes; their offset
+            // entry stays where the wide character ended, which keeps the
+            // column-to-byte map — and every selection through it — exact.
+            let mut continuation = 0usize;
             for x in 0..area.width {
                 offsets.push(row.len());
                 let cell = &f.buffer_mut()[(x, y)];
+                if continuation > 0 {
+                    continuation -= 1;
+                    continue;
+                }
                 // Image cells are not text: `ratatui-image` puts a whole
                 // escape payload in one anchor cell's symbol and marks the
                 // rest of the rect `Skip`. Copying either into the selection
@@ -574,7 +608,9 @@ impl App {
                 if is_image_cell(cell) {
                     row.push(' ');
                 } else {
-                    row.push_str(cell.symbol());
+                    let symbol = cell.symbol();
+                    row.push_str(symbol);
+                    continuation = crate::chrome::cell_width(symbol).saturating_sub(1);
                 }
             }
             offsets.push(row.len());
@@ -671,6 +707,25 @@ impl App {
             }
         }
         if k.code == KeyCode::Esc && !capture {
+            // Screens get first refusal (issue #520): a busy composer refuses
+            // Esc out loud rather than being popped out from under an
+            // in-flight post, and a screen with its own Esc arm (Search's
+            // edit mode, the composers' discard) runs it.
+            match self.screens.last().map(Screen::esc_intent) {
+                Some(screens::EscIntent::Blocked(hint)) => {
+                    self.status = hint.to_string();
+                    return;
+                }
+                Some(screens::EscIntent::Screen) => {
+                    let action = match self.screens.last_mut() {
+                        Some(screen) => screen.on_key(k),
+                        None => Action::None,
+                    };
+                    self.execute_action(action);
+                    return;
+                }
+                _ => {}
+            }
             // Home is the root screen, so a bare Esc there would quit. In the
             // list pane it means "back to the forums", which is what Esc means
             // everywhere else in the client.
@@ -1271,6 +1326,18 @@ impl App {
             let e = offsets[idx + 1];
             row.get(s..e)?.chars().next()
         };
+        // A column covered by the double-width character to its left carries
+        // no bytes of its own (see `capture_screen`); stepping over those is
+        // what lets a CJK word select as a word (issue #525).
+        let is_continuation = |col: u16| -> bool {
+            let idx = col as usize;
+            idx + 1 < offsets.len() && offsets[idx] == offsets[idx + 1]
+        };
+        // Clicking the right half of a wide character means the character.
+        let mut x = x;
+        while x > 0 && is_continuation(x) {
+            x -= 1;
+        }
 
         let target = get_char(x)?;
         if target.is_whitespace() {
@@ -1289,11 +1356,15 @@ impl App {
 
         let mut start_col = x;
         while start_col > 0 {
-            if let Some(c) = get_char(start_col - 1)
+            let mut prev = start_col - 1;
+            while prev > 0 && is_continuation(prev) {
+                prev -= 1;
+            }
+            if let Some(c) = get_char(prev)
                 && !c.is_whitespace()
                 && is_word_char(c) == target_is_word
             {
-                start_col -= 1;
+                start_col = prev;
                 continue;
             }
             break;
@@ -1301,14 +1372,23 @@ impl App {
 
         let mut end_col = x;
         while end_col < max_col {
-            if let Some(c) = get_char(end_col + 1)
+            let mut next = end_col + 1;
+            while next < max_col && is_continuation(next) {
+                next += 1;
+            }
+            if let Some(c) = get_char(next)
                 && !c.is_whitespace()
                 && is_word_char(c) == target_is_word
             {
-                end_col += 1;
+                end_col = next;
                 continue;
             }
             break;
+        }
+        // Include the trailing half of a wide last character, so the band
+        // covers what the eye sees and the byte slice ends after it.
+        while end_col < max_col && is_continuation(end_col + 1) {
+            end_col += 1;
         }
 
         Some((start_col, end_col))
@@ -1506,6 +1586,7 @@ impl App {
                         },
                         threads: r.threads,
                         pagination: r.pagination,
+                        sticky: Vec::new(),
                     })
                     .map_err(|e| TaskError::of(&e))
             } else {
@@ -1588,6 +1669,7 @@ impl App {
             h.list.last_page = 1;
             h.list.total = 0;
             h.list.threads.clear();
+            h.list.sticky_count = 0;
             h.list.sel = 0;
             h.list.error = None;
             h.list.loading = true;
@@ -1644,8 +1726,18 @@ impl App {
         }));
         let api = self.api.clone();
         let tx = self.tx.clone();
+        let fallback_name = fallback_name.to_string();
         tokio::spawn(async move {
-            let result = api.user(user_id).await.map_err(|e| TaskError::of(&e));
+            // Search hits (and any other caller that only has a username)
+            // pass user_id 0; resolve it to a real id via find-name first,
+            // since `GET /users/0` always 404s (issue #521).
+            let found = if user_id == 0 {
+                api.find_user(&fallback_name).await.ok().flatten().map(|u| u.user_id)
+            } else {
+                None
+            };
+            let id = resolve_profile_id(user_id, found);
+            let result = api.user(id).await.map_err(|e| TaskError::of(&e));
             tx.send(Msg::ProfileLoaded(result)).ok();
         });
     }
@@ -1717,17 +1809,55 @@ impl App {
         let client = self.client.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = async {
-                if let Ok(token) = client.valid_token().await {
-                    let http = common::http::build()?;
-                    let _ = common::oauth::revoke(&http, &token).await;
+            // Revoke the refresh token first and the access token second,
+            // each with its `token_type_hint` — the endpoint defaults to
+            // `access_token`, so the old single call left the 90-day refresh
+            // token valid for anyone holding a copy of `token.json`
+            // (issue #527). A failure here is reported, never swallowed:
+            // against stock XenForo this call cannot currently succeed for a
+            // public PKCE client (its revoke endpoint requires the
+            // `client_secret` this client deliberately does not have), and a
+            // silent "Logged out." would hide that the tokens are still
+            // live. The server-side fix is a relay in the TuiLink add-on and
+            // is out of this client's scope.
+            let mut failed: Vec<&str> = Vec::new();
+            let tokens = client.token_set().await;
+            if let Some(tokens) = tokens {
+                match common::http::build() {
+                    Ok(http) => {
+                        for (token, hint) in [
+                            (&tokens.refresh_token, "refresh_token"),
+                            (&tokens.access_token, "access_token"),
+                        ] {
+                            if token.is_empty() {
+                                continue;
+                            }
+                            if let Err(e) = common::oauth::revoke(&http, token, Some(hint)).await {
+                                tracing::warn!("logout: {hint} was not revoked server-side: {e}");
+                                failed.push(hint);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("logout: no HTTP client to revoke with: {e}");
+                        failed.push("refresh_token");
+                    }
                 }
-                client.forget_tokens().await
             }
-            .await;
-            tx.send(Msg::LoggedOut(result.map_err(|e| e.to_string()))).ok();
+            let result = match client.forget_tokens().await {
+                Err(e) => Err(e.to_string()),
+                Ok(()) if !failed.is_empty() => Err(format!(
+                    "the server kept {} valid \u{2014} sign out in a browser to end the session",
+                    failed.join(" and ").replace('_', " ")
+                )),
+                Ok(()) => Ok(()),
+            };
+            tx.send(Msg::LoggedOut(result)).ok();
         });
+        self.stop_pollers();
         self.me = None;
+        self.alerts_unread = 0;
+        self.convos_unread = 0;
         self.screens
             .retain(|s| matches!(s, Screen::Home(_) | Screen::ForumTree(_)));
         self.screens.push(screens::login_state());
@@ -1846,7 +1976,13 @@ impl App {
                             if !reply.forum.title.is_empty() {
                                 list.title = reply.forum.title;
                             }
-                            list.threads = reply.threads;
+                            // Sticky threads arrive in their own array (XF
+                            // excludes them from `threads`/`pagination` so
+                            // they don't shift pagination); prepend them so
+                            // they render first without inflating the count.
+                            list.sticky_count = reply.sticky.len();
+                            list.threads = reply.sticky;
+                            list.threads.extend(reply.threads);
                             list.page = page;
                             list.last_page = reply.pagination.last_page.max(1);
                             list.total = reply.pagination.total;
@@ -1919,7 +2055,18 @@ impl App {
                         }
                         self.status = "Reply posted.".into();
                         if thread_id > 0 {
-                            self.load_thread(thread_id, 1);
+                            // Land on the page the new reply actually lands
+                            // on, not page 1 (issue #529). The API gives no
+                            // `per_page`, so this client can't compute that
+                            // page from `post.position` alone — instead ask
+                            // one past the last page we knew about and let
+                            // `Msg::ThreadLoaded`'s existing `max_page` clamp
+                            // (below) settle on the true last page, whether
+                            // or not the reply pushed the thread onto a page
+                            // that didn't exist a moment ago. A single-page
+                            // thread clamps straight back to page 1.
+                            let known_last = known_thread_last_page(&self.screens, thread_id);
+                            self.load_thread(thread_id, known_last.saturating_add(1));
                         }
                     }
                     Err(e) => {
@@ -1928,6 +2075,12 @@ impl App {
                         {
                             compose.busy = false;
                             compose.error = Some(e.message);
+                        } else {
+                            // The composer is gone (popped, or the screen
+                            // stack moved on): the failure has nowhere to
+                            // render, so say it in the status line instead of
+                            // dropping it (issue #520).
+                            self.status = format!("Reply failed: {}", e.message);
                         }
                     }
                 }
@@ -1962,6 +2115,8 @@ impl App {
                         {
                             compose.busy = false;
                             compose.error = Some(e.message);
+                        } else {
+                            self.status = format!("Thread failed: {}", e.message);
                         }
                     }
                 }
@@ -2023,8 +2178,6 @@ impl App {
                 }
             }
             Msg::ConversationLoaded { id, page, result } => {
-                let theme = self.theme;
-                let glyphs = self.glyphs;
                 let mut mark_read: Option<u32> = None;
                 if let Some(view) = self.conversation_view_mut(id) {
                     match result {
@@ -2036,7 +2189,10 @@ impl App {
                             view.page = page;
                             view.last_page = reply.pagination.last_page.max(1);
                             view.loading = false;
-                            view.rebuild_lines(&theme, &glyphs);
+                            // The lines are derived by the renderer (which is
+                            // the only place that knows the pane width); this
+                            // just invalidates them.
+                            view.built = None;
                             mark_read = Some(view.conversation.conversation_id);
                         }
                         Err(e) => {
@@ -2089,6 +2245,8 @@ impl App {
                         {
                             compose.busy = false;
                             compose.error = Some(e.message);
+                        } else {
+                            self.status = format!("Message failed: {}", e.message);
                         }
                     }
                 }
@@ -2211,7 +2369,9 @@ impl App {
                 if let Some(search) = search {
                     match result {
                         Ok(reply) => {
-                            search.results = reply.results;
+                            // `set_results` also derives the snippets, so the
+                            // renderer never re-parses a post (issue #522).
+                            search.set_results(reply.results);
                             search.page = page;
                             search.last_page = reply.pagination.last_page.max(1);
                             search.total = reply.pagination.total;
@@ -2253,7 +2413,12 @@ impl App {
             }
             Msg::LoggedOut(result) => match result {
                 Ok(()) => tracing::info!("logout complete"),
-                Err(e) => tracing::warn!("logout error: {e}"),
+                Err(e) => {
+                    // The local token file is gone either way; say what did
+                    // not happen instead of leaving "Logged out." standing.
+                    tracing::warn!("logout error: {e}");
+                    self.status = format!("Logged out locally, but {e}.");
+                }
             },
         }
     }
@@ -2430,6 +2595,36 @@ async fn finish_login(
     }
 }
 
+/// The last page this client already believed `thread_id` had, found the
+/// same way `list_showing` locates a forum's list: scan the screen stack for
+/// an open `ThreadView` on that thread. `1` when none is open — reply is
+/// always initiated from one, but a stale/missing view must not crash the
+/// reload, just fall back to asking for page 2 (which the API's max-page
+/// clamp will correct if that's wrong too).
+fn known_thread_last_page(screens: &[Screen], thread_id: u32) -> u32 {
+    screens
+        .iter()
+        .rev()
+        .find_map(|s| match s {
+            Screen::ThreadView(v) if v.thread.thread_id == thread_id => Some(v.last_page.max(1)),
+            _ => None,
+        })
+        .unwrap_or(1)
+}
+
+/// The id `open_profile` should fetch: search hits only carry a username, so
+/// they call in with `user_id == 0` and a resolved id from `find_user` (or
+/// `None` if the lookup came up empty). Any caller that already had a real
+/// id keeps it — a stale/empty `found` never overrides a nonzero `user_id`
+/// (issue #521: `p` on a search result used to always open `/users/0`).
+fn resolve_profile_id(user_id: u32, found: Option<u32>) -> u32 {
+    if user_id == 0 {
+        found.unwrap_or(0)
+    } else {
+        user_id
+    }
+}
+
 /// The thread list a `ForumLoaded` for `node_id` is addressed to: the topmost
 /// `ThreadList` — or Home's list pane — that is actually showing that forum.
 ///
@@ -2481,6 +2676,238 @@ mod tests {
         // A cell that merely *looks* busy is still text.
         plain.set_symbol("\u{2503}");
         assert!(!is_image_cell(&plain));
+    }
+
+    /// Issue #527: a revoke that did not take must not hide behind
+    /// "Logged out." — the tokens are still live on the server until they
+    /// expire, and the only honest place to say so is the status line.
+    #[test]
+    fn a_failed_revoke_is_reported_in_the_status_line() {
+        let mut app = test_app();
+        app.status = "Logged out.".into();
+        app.handle_msg(Msg::LoggedOut(Err(
+            "the server kept refresh token valid".into()
+        )));
+        assert!(
+            app.status.contains("Logged out locally")
+                && app.status.contains("refresh token"),
+            "the revoke failure was swallowed: {:?}",
+            app.status
+        );
+
+        // A clean logout says nothing extra.
+        app.status = "Logged out.".into();
+        app.handle_msg(Msg::LoggedOut(Ok(())));
+        assert_eq!(app.status, "Logged out.");
+    }
+
+    /// Issue #525: `set_stringn` resets the cell(s) a double-width character
+    /// covers, so mirroring every cell's symbol put a phantom space after
+    /// each ideograph on the clipboard and made word-select stop at it.
+    #[test]
+    fn the_selection_mirror_skips_wide_char_continuation_cells() {
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::Paragraph;
+
+        let mut app = test_app();
+        let mut term = ratatui::Terminal::new(TestBackend::new(12, 1)).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            f.render_widget(Paragraph::new("\u{6f22}\u{5b57} ok"), area);
+            app.capture_screen(f);
+        })
+        .expect("draw");
+
+        assert_eq!(
+            app.screen_rows[0].trim_end(),
+            "\u{6f22}\u{5b57} ok",
+            "the mirror inserted a phantom space after a wide character"
+        );
+
+        // Columns: 0-1 = 漢, 2-3 = 字, 4 = space, 5-6 = "ok".
+        for col in [0u16, 1, 2, 3] {
+            assert_eq!(
+                app.find_word_bounds(col, 0),
+                Some((0, 3)),
+                "clicking column {col} must select the whole ideographic word"
+            );
+        }
+        assert_eq!(
+            app.extract_selection_text(0, 0, 3, 0),
+            "\u{6f22}\u{5b57}",
+            "the copied text must not carry the continuation cells"
+        );
+        assert_eq!(app.find_word_bounds(5, 0), Some((5, 6)));
+        assert_eq!(app.extract_selection_text(0, 0, 6, 0), "\u{6f22}\u{5b57} ok");
+        assert_eq!(app.find_word_bounds(4, 0), None, "a space is not a word");
+    }
+
+    /// Issue #529: after posting a reply the client must ask for one page
+    /// past whatever it already knew as the thread's last page (so the
+    /// existing `max_page` clamp in `Msg::ThreadLoaded` lands on the true
+    /// last page, new or not) — never hard-code page 1 and strand the
+    /// reader's own reply off-screen on a multi-page thread.
+    #[test]
+    fn known_thread_last_page_finds_the_open_view_or_defaults_to_one() {
+        let view = |thread_id: u32, last_page: u32| {
+            Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread { thread_id, ..Default::default() },
+                last_page,
+                ..Default::default()
+            })
+        };
+        let screens = vec![view(1, 1), view(42, 3)];
+        assert_eq!(known_thread_last_page(&screens, 42), 3);
+        assert_eq!(known_thread_last_page(&screens, 1), 1);
+        // No open ThreadView for this thread -> defensive default, never 0.
+        assert_eq!(known_thread_last_page(&screens, 999), 1);
+
+        // A thread that briefly reports last_page 0 (unloaded) never yields
+        // a "request page 1" that a downstream +1 would leave at 1 forever.
+        let screens = vec![view(7, 0)];
+        assert_eq!(known_thread_last_page(&screens, 7), 1);
+    }
+
+    /// Builds an `App` for poller bookkeeping tests. `start_pollers` spawns
+    /// loops that hold `Arc<dyn WfApi>`, but both loops `sleep` for their
+    /// full interval before ever calling the API, so a real `WfApiClient`
+    /// (reading whatever token store is on this machine, same as any other
+    /// cold start) never actually makes a network call within the test.
+    fn test_app() -> App {
+        let client = Arc::new(WfApiClient::new().expect("client init"));
+        let (tx, rx) = mpsc::unbounded_channel();
+        App {
+            api: client.clone(),
+            client,
+            tx,
+            rx,
+            theme: Theme::detect(),
+            glyphs: glyph::detect(),
+            images: crate::images::Images::default(),
+            screens: Vec::new(),
+            me: None,
+            alerts_unread: 3,
+            convos_unread: 5,
+            status: String::new(),
+            show_help: false,
+            palette: None,
+            prefix: Prefix::default(),
+            selection: None,
+            screen_rows: Vec::new(),
+            screen_cols: Vec::new(),
+            clipboard: String::new(),
+            last_click_instant: None,
+            last_click_pos: (0, 0),
+            click_count: 0,
+            last_title: String::new(),
+            should_quit: false,
+            poller_handles: Vec::new(),
+        }
+    }
+
+    /// Issue #524: a second `start_pollers` (the re-login path) must not
+    /// stack a second alerts/conversations pair on top of the first, and
+    /// `logout` must abort the pair entirely and clear the unread counters
+    /// they fed — not leave orphaned loops still polling after sign-out.
+    #[tokio::test]
+    async fn start_pollers_replaces_the_previous_pair_and_logout_stops_them() {
+        let mut app = test_app();
+
+        app.start_pollers();
+        assert_eq!(app.poller_handles.len(), 2, "one alerts + one conversations loop");
+        let first_pair: Vec<_> = app.poller_handles.iter().map(|h| h.id()).collect();
+
+        // Simulate logout -> login again without this fix: doubles the rate.
+        app.start_pollers();
+        assert_eq!(app.poller_handles.len(), 2, "re-login must not stack a second pair");
+        let second_pair: Vec<_> = app.poller_handles.iter().map(|h| h.id()).collect();
+        assert_ne!(
+            first_pair, second_pair,
+            "the first pair must actually be replaced (aborted), not merely uncounted"
+        );
+
+        app.logout();
+        assert!(app.poller_handles.is_empty(), "logout must abort every poller");
+        assert_eq!(app.alerts_unread, 0, "logout must clear the stale alerts count");
+        assert_eq!(app.convos_unread, 0, "logout must clear the stale conversations count");
+    }
+
+    /// Issue #520: the app used to swallow Esc for every screen. A composer
+    /// whose post is already in flight must survive it (with an audible
+    /// refusal), an idle one must run its own discard arm, Search must be
+    /// able to leave edit mode without closing, and a failure that arrives
+    /// after the composer is gone must still be visible.
+    #[test]
+    fn esc_reaches_the_screen_first_and_never_pops_a_busy_composer() {
+        let esc = || KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let composer = |busy: bool| {
+            Screen::Compose(screens::ComposeState {
+                target: Some(ComposeTarget::ThreadReply {
+                    thread_id: 1,
+                    thread_title: "A thread".into(),
+                }),
+                body: "draft".into(),
+                busy,
+                ..Default::default()
+            })
+        };
+
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(composer(true));
+        app.handle_key(esc());
+        assert_eq!(app.screens.len(), 2, "a busy composer must not be popped mid-send");
+        assert!(
+            app.status.contains("Esc"),
+            "the refusal must not be silent: {:?}",
+            app.status
+        );
+
+        // Idle: the composer's own Esc arm discards it.
+        app.screens.pop();
+        app.screens.push(composer(false));
+        app.handle_key(esc());
+        assert_eq!(app.screens.len(), 1, "Esc discards an idle composer");
+
+        // Search: Esc leaves edit mode, and only then closes the screen.
+        app.screens.push(Screen::Search(screens::SearchState {
+            query: "edge".into(),
+            input_mode: true,
+            ..Default::default()
+        }));
+        app.handle_key(esc());
+        assert_eq!(app.screens.len(), 2, "Esc in the query field must not close Search");
+        assert!(matches!(app.screens.last(), Some(Screen::Search(s)) if !s.input_mode));
+        app.handle_key(esc());
+        assert_eq!(app.screens.len(), 1, "a second Esc leaves Search");
+
+        // A late failure with no composer left on the stack still surfaces.
+        app.status.clear();
+        app.handle_msg(Msg::ReplySent(Err(TaskError {
+            message: "Flood control".into(),
+            code: None,
+            max_page: None,
+        })));
+        assert!(
+            app.status.contains("Flood control"),
+            "a late Err was dropped: {:?}",
+            app.status
+        );
+    }
+
+    /// A search hit's `p` (open profile) must resolve id 0 through
+    /// `find_user` rather than ever fetching `/users/0` (issue #521).
+    #[test]
+    fn resolve_profile_id_prefers_a_found_id_only_when_the_caller_had_none() {
+        // Search result: no id, but find-name resolved one.
+        assert_eq!(resolve_profile_id(0, Some(42)), 42);
+        // Search result: no id, and find-name came up empty (deleted user,
+        // typo'd/ambiguous name, network error) — do not synthesize one.
+        assert_eq!(resolve_profile_id(0, None), 0);
+        // Caller already had a real id (thread/post author): never let a
+        // find-name result override it.
+        assert_eq!(resolve_profile_id(7, Some(999)), 7);
+        assert_eq!(resolve_profile_id(7, None), 7);
     }
 
     /// Two `load_forum` calls can finish out of order (the rate-limit gate

@@ -52,6 +52,12 @@ impl WfApiClient {
         self.tokens.lock().await.is_some()
     }
 
+    /// A copy of the stored token set. Logout needs the refresh token (not
+    /// just the bearer `valid_token` hands out) so it can revoke both.
+    pub async fn token_set(&self) -> Option<TokenSet> {
+        self.tokens.lock().await.clone()
+    }
+
     pub async fn forget_tokens(&self) -> Result<()> {
         self.tokens.lock().await.take();
         self.store.erase()
@@ -243,14 +249,15 @@ impl WfApiClient {
     ///
     /// Refuses anything whose `Content-Type` doesn't start with `image/`, and
     /// caps the body at `max_bytes`: first cheaply, via `Content-Length` if
-    /// the server sent one; then for real, by checking the length of the
-    /// bytes actually received (a lying or missing `Content-Length` must not
-    /// bypass the cap — the buffer is still fully read either way, same as
-    /// `attachment_data` above, but thumbnails are small enough that this is
-    /// not worth a streaming dependency).
+    /// the server sent one; then for real, by streaming the body in chunks
+    /// and aborting the instant the running total exceeds the cap — a
+    /// chunked response with no (or a lying) `Content-Length` is never
+    /// buffered past `max_bytes` in memory, unlike `resp.bytes().await`
+    /// which reads the whole thing first regardless of what it decides to
+    /// do with it afterwards (issue #526).
     pub async fn fetch_bytes(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>> {
         self.api_gate.wait().await;
-        let resp = self.http.get(url).send().await?.error_for_status()?;
+        let mut resp = self.http.get(url).send().await?.error_for_status()?;
 
         let content_type = resp
             .headers()
@@ -276,14 +283,16 @@ impl WfApiClient {
             )));
         }
 
-        let bytes = resp.bytes().await?;
-        if bytes.len() > max_bytes {
-            return Err(Error::FetchRejected(format!(
-                "response body {} bytes exceeds cap {max_bytes} for {url}",
-                bytes.len()
-            )));
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            buf.extend_from_slice(&chunk);
+            if buf.len() > max_bytes {
+                return Err(Error::FetchRejected(format!(
+                    "response body exceeds cap {max_bytes} for {url}"
+                )));
+            }
         }
-        Ok(bytes.to_vec())
+        Ok(buf)
     }
 }
 
@@ -943,6 +952,56 @@ mod tests {
         assert_eq!(conv.conversation_id, 9);
     }
 
+    /// Issue #527: logout used to POST the bearer alone, with no
+    /// `token_type_hint`. RFC 7009 lets the server default that to
+    /// `access_token`, so the 90-day refresh token survived a "Logged out."
+    /// and anyone holding a copy of `token.json` kept the session. Both
+    /// tokens are now sent, each with its own hint.
+    #[tokio::test]
+    async fn revoke_sends_a_token_type_hint_for_both_tokens() {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-revoke");
+        Mock::given(method("POST"))
+            .and(path("/api/oauth2/revoke"))
+            .and(body_string_contains("token=refresh-1"))
+            .and(body_string_contains("token_type_hint=refresh_token"))
+            .and(body_string_contains("client_id=test-client"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/oauth2/revoke"))
+            .and(body_string_contains("token=tok-1"))
+            .and(body_string_contains("token_type_hint=access_token"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = crate::http::build().unwrap();
+        crate::oauth::revoke(&http, "refresh-1", Some("refresh_token"))
+            .await
+            .expect("refresh-token revoke");
+        crate::oauth::revoke(&http, "tok-1", Some("access_token"))
+            .await
+            .expect("access-token revoke");
+    }
+
+    /// Logout needs the refresh token, which `valid_token` never hands out.
+    #[tokio::test]
+    async fn token_set_exposes_both_tokens_for_logout() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-tokenset");
+        let c = logged_in_client("tok-1").await;
+        let set = c.token_set().await.expect("a stored token set");
+        assert_eq!(set.access_token, "tok-1");
+        assert!(!set.refresh_token.is_empty(), "the refresh token must be reachable");
+        c.forget_tokens().await.unwrap();
+        assert!(c.token_set().await.is_none());
+    }
+
     #[tokio::test]
     async fn expired_access_token_triggers_refresh() {
         let server = MockServer::start().await;
@@ -1384,6 +1443,36 @@ mod tests {
         let bytes = c.fetch_bytes(&url, 1024).await.unwrap();
         assert_eq!(bytes.len(), 256);
         assert!(bytes.iter().all(|&b| b == 7));
+    }
+
+    /// Issue #526: a chunked body with no `Content-Length` at all must still
+    /// be capped without ever buffering the whole thing — the old
+    /// `resp.bytes().await` read everything before checking `bytes.len()`.
+    /// `Transfer-Encoding: chunked` here is real framing (verified against a
+    /// live wiremock server), not a header lied about: reqwest reports
+    /// `content_length() == None` for it, exactly the "Content-Length
+    /// absent" case the finding describes.
+    #[tokio::test]
+    async fn fetch_bytes_caps_a_chunked_body_with_no_content_length() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-fetchchunked");
+        Mock::given(method("GET"))
+            .and(path("/chunked.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "image/png")
+                    .insert_header("Transfer-Encoding", "chunked")
+                    .set_body_bytes(vec![9u8; 4096]),
+            )
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let url = format!("{}/chunked.png", server.uri());
+        match c.fetch_bytes(&url, 1024).await.unwrap_err() {
+            Error::FetchRejected(msg) => assert!(msg.contains("1024"), "{msg}"),
+            other => panic!("wrong error: {other}"),
+        }
     }
 
     #[tokio::test]

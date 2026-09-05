@@ -350,6 +350,14 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
     if !is_new_thread {
         s.title_field = false;
     }
+    // The sticky column belongs to a *run* of vertical moves; any other key
+    // (including a Ctrl chord) ends the run.
+    if !matches!(
+        key.code,
+        KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+    ) {
+        s.body_desired_col = None;
+    }
 
     if key.code == KeyCode::Esc {
         return Action::PopScreen;
@@ -549,6 +557,25 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
                 crate::editor::insert_char(&mut s.body, &mut s.body_cursor, '\n');
                 Action::None
             }
+            // Vertical motion is over *visual* rows — the ones the editor
+            // panel actually drew (issue #523). `body_width`/`body_height`
+            // are stamped by that draw, which always precedes this key.
+            KeyCode::Up => {
+                compose_move_vertical(s, -1);
+                Action::None
+            }
+            KeyCode::Down => {
+                compose_move_vertical(s, 1);
+                Action::None
+            }
+            KeyCode::PageUp => {
+                compose_move_vertical(s, -compose_page(s));
+                Action::None
+            }
+            KeyCode::PageDown => {
+                compose_move_vertical(s, compose_page(s));
+                Action::None
+            }
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
@@ -559,6 +586,23 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
             _ => Action::None,
         }
     }
+}
+
+/// One PageUp/PageDown step: a pane's worth of visual rows, less one for
+/// context. 1 until the editor has been drawn once.
+fn compose_page(s: &super::ComposeState) -> isize {
+    (s.body_height.saturating_sub(1)).max(1) as isize
+}
+
+fn compose_move_vertical(s: &mut super::ComposeState, delta: isize) {
+    let width = if s.body_width == 0 { 1 } else { s.body_width as usize };
+    crate::editor::move_vertical(
+        &s.body,
+        width,
+        &mut s.body_cursor,
+        &mut s.body_desired_col,
+        delta,
+    );
 }
 
 pub fn compose_hints(s: &super::ComposeState) -> Hints {
@@ -706,22 +750,43 @@ fn draw_editor_panel(
     f.render_widget(Paragraph::new(rule_line(chunks[1].width)), chunks[1]);
 
     let is_new_thread = compose_is_new_thread(&s.target);
-    let mut body_lines: Vec<Line<'static>> = Vec::new();
-    for line in s.body.split('\n') {
-        body_lines.push(Line::from(Span::styled(line.to_string(), theme.base())));
-    }
+    // The body is pre-wrapped into visual rows here and drawn with
+    // `Paragraph::scroll` and no `Wrap`: the caret is tracked in the same
+    // rows, so it never drifts below a wrapped paragraph, and the offset
+    // follows it so a draft taller than the pane keeps typing on screen
+    // (issues #519/#523).
+    let body_area = chunks[2];
+    s.body_width = body_area.width;
+    s.body_height = body_area.height;
+    let chars: Vec<char> = s.body.chars().collect();
+    let rows = crate::editor::visual_rows_of(&chars, body_area.width as usize);
+    let (caret_row, caret_col) = crate::editor::caret_in_rows(&chars, &rows, s.body_cursor);
+    let mut body_lines: Vec<Line<'static>> = rows
+        .iter()
+        .map(|r| {
+            Line::from(Span::styled(
+                chars[r.start..r.end].iter().collect::<String>(),
+                theme.base(),
+            ))
+        })
+        .collect();
+    let mut total_rows = body_lines.len();
     if let Some(err) = &s.error {
         body_lines.push(Line::from(Span::styled(
             format!("Error: {err}"),
             Style::new().fg(theme.error),
         )));
+        total_rows += 1;
     }
     if s.busy {
         body_lines.push(Line::from(Span::styled("Sending\u{2026}", theme.dim())));
+        total_rows += 1;
     }
+    s.body_scroll =
+        crate::editor::follow_caret(s.body_scroll, caret_row, total_rows, body_area.height);
     f.render_widget(
-        Paragraph::new(body_lines).wrap(Wrap { trim: false }),
-        chunks[2],
+        Paragraph::new(body_lines).scroll((s.body_scroll, 0)),
+        body_area,
     );
 
     f.render_widget(rule_line(chunks[3].width), chunks[3]);
@@ -735,9 +800,10 @@ fn draw_editor_panel(
         let cur_x = (chunks[0].x + 7 + cur_col).min(chunks[0].x + chunks[0].width.saturating_sub(1));
         f.set_cursor_position((cur_x, chunks[0].y));
     } else {
-        let (b_col, b_row) = crate::editor::cursor_coords(&s.body, s.body_cursor);
-        let cur_x = (chunks[2].x + b_col).min(chunks[2].x + chunks[2].width.saturating_sub(1));
-        let cur_y = (chunks[2].y + b_row).min(chunks[2].y + chunks[2].height.saturating_sub(1));
+        let cur_x =
+            (body_area.x + caret_col as u16).min(body_area.x + body_area.width.saturating_sub(1));
+        let screen_row = (caret_row as u16).saturating_sub(s.body_scroll);
+        let cur_y = (body_area.y + screen_row).min(body_area.y + body_area.height.saturating_sub(1));
         f.set_cursor_position((cur_x, cur_y));
     }
 }
@@ -783,9 +849,20 @@ pub struct PreviewCache {
     /// this is the compose half of the contract — one hand-off per URL per
     /// session, however much the draft is edited around it.
     requested: HashSet<String>,
+    /// When `src` (the draft text a build last saw) last actually changed —
+    /// `None` until the first edit. Width/tier/learned-size changes don't
+    /// touch this, only the text does; see `settled`.
+    last_edit: Option<std::time::Instant>,
 }
 
 impl PreviewCache {
+    /// Editing a URL fires a rebuild (and a fresh, never-seen-before slot
+    /// key) on every keystroke; fetching each intermediate string leaks
+    /// partial URLs to whatever host they happen to spell and floods the
+    /// image store with junk (issue #530). Image fetches wait for the draft
+    /// to sit still for this long after the text itself last changed.
+    const EDIT_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
     /// True when nothing the layout depends on has changed since the build.
     fn is_fresh(&self, src: &str, width: u16, policy: images::Policy, sizes_len: usize) -> bool {
         self.built
@@ -795,13 +872,26 @@ impl PreviewCache {
             && self.src == src
     }
 
-    /// Record the keys this build wants painted and return the ones that are
-    /// new this session — what the frame is about to ask the store for.
-    fn note_requests(&mut self, keys: &[String]) -> Vec<String> {
-        keys.iter()
-            .filter(|k| self.requested.insert((*k).clone()))
-            .cloned()
-            .collect()
+    /// Restarts the settle timer when `body` differs from the text the last
+    /// build saw (call before folding `body` into `src`) — but only from the
+    /// *second* build on. The very first build a freshly opened composer (or
+    /// a draft resumed with a reference already in it) does is not a live
+    /// edit in progress; only a build that *replaces* prior content is.
+    /// Without this exemption every composer would wait out the settle
+    /// window before showing an image already sitting in the draft when the
+    /// screen opened.
+    fn note_body(&mut self, body: &str) {
+        if self.built && self.src != body {
+            self.last_edit = Some(std::time::Instant::now());
+        }
+    }
+
+    /// False while within `EDIT_SETTLE` of the last text change — callers
+    /// must not start a *new* (never-`requested`) image fetch until this is
+    /// true. A key already in `requested` is exempt: draw_preview_panel
+    /// keeps painting it every frame regardless, at no extra cost.
+    fn settled(&self) -> bool {
+        self.last_edit.is_none_or(|t| t.elapsed() >= Self::EDIT_SETTLE)
     }
 }
 
@@ -971,6 +1061,11 @@ fn draw_preview_panel(
         .preview_cache
         .is_fresh(&s.body, body.width, s.images, s.image_sizes.len())
     {
+        // Restart the settle timer before folding the new text into `src`
+        // below — this is the only place that changes `src`, so it is the
+        // only place that can tell an actual edit from a resize/tier/size
+        // change.
+        s.preview_cache.note_body(&s.body);
         let (lines, slots) = build_preview(
             &s.body,
             &s.attachments,
@@ -980,11 +1075,6 @@ fn draw_preview_panel(
             s.images,
             &s.image_sizes,
         );
-        let keys: Vec<String> = slots.iter().map(|slot| slot.key.clone()).collect();
-        let fresh = s.preview_cache.note_requests(&keys);
-        if !fresh.is_empty() {
-            tracing::debug!("compose preview: {} image(s) to load", fresh.len());
-        }
         s.preview_cache.built = true;
         s.preview_cache.src = s.body.clone();
         s.preview_cache.width = body.width;
@@ -1005,6 +1095,14 @@ fn draw_preview_panel(
     if !s.images.inline() {
         return;
     }
+    // Debounced, but only for a key the store has never seen: a URL that is
+    // already `requested` keeps painting every frame with no extra delay
+    // (it is a free cache hit, and the whole point of "one hand-off per
+    // session" is that retyping it must not make the picture disappear and
+    // reload). A brand-new key waits for the draft to sit still first — the
+    // fix for issue #530: without this, every keystroke while typing a URL
+    // is itself a new, never-seen key and would fetch immediately.
+    let mut newly_requested = 0usize;
     for slot in &s.preview_cache.slots {
         let y = body.y as usize + slot.line;
         if y + slot.rows as usize > body.bottom() as usize {
@@ -1014,10 +1112,21 @@ fn draw_preview_panel(
         if x + slot.cols as usize > body.right() as usize {
             continue;
         }
+        let known = s.preview_cache.requested.contains(&slot.key);
+        if !known {
+            if !s.preview_cache.settled() {
+                continue;
+            }
+            s.preview_cache.requested.insert(slot.key.clone());
+            newly_requested += 1;
+        }
         s.image_requests.push(images::Request {
             key: slot.key.clone(),
             rect: Rect::new(x as u16, y as u16, slot.cols, slot.rows),
         });
+    }
+    if newly_requested > 0 {
+        tracing::debug!("compose preview: {newly_requested} image(s) to load");
     }
 }
 
@@ -1578,6 +1687,7 @@ fn render_chip_row(s: &super::SearchState, f: &mut Frame, area: Rect, theme: &Th
 fn search_hit_lines(
     theme: &Theme,
     hit: &SearchHit,
+    snippet: &str,
     words: &[String],
     width: u16,
 ) -> Vec<Line<'static>> {
@@ -1608,7 +1718,6 @@ fn search_hit_lines(
     spans.push(right);
 
     let mut lines = vec![Line::from(spans)];
-    let snippet = search_snippet(&hit.message, 100);
     if !snippet.is_empty() {
         lines.push(Line::from(Span::styled(
             format!("   {snippet}"),
@@ -1698,10 +1807,21 @@ pub fn render_search(
             .split_whitespace()
             .map(|w| w.to_ascii_lowercase())
             .collect();
+        // Snippets come from the cache `set_results` filled; a mismatched
+        // length can only mean someone assigned `results` directly, so
+        // re-derive once rather than per frame (issue #522).
+        if s.snippets.len() != s.results.len() {
+            let hits = std::mem::take(&mut s.results);
+            s.set_results(hits);
+        }
         let items: Vec<ListItem> = s
             .results
             .iter()
-            .map(|hit: &SearchHit| ListItem::new(search_hit_lines(theme, hit, &words, sections[5].width)))
+            .enumerate()
+            .map(|(i, hit): (usize, &SearchHit)| {
+                let snippet = s.snippets.get(i).map(String::as_str).unwrap_or("");
+                ListItem::new(search_hit_lines(theme, hit, snippet, &words, sections[5].width))
+            })
             .collect();
         let mut state =
             ListState::default().with_selected(Some(s.sel.min(s.results.len() - 1)));
@@ -1918,6 +2038,161 @@ mod tests {
         (0..h)
             .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
             .collect()
+    }
+
+    /// Render a compose screen headless, returning its rows *and* where the
+    /// terminal cursor was left — the caret is the whole point of the editor
+    /// fixes, and it is invisible in the cell dump.
+    fn render_compose_probe(
+        s: &mut ComposeState,
+        w: u16,
+        h: u16,
+    ) -> (Vec<String>, (u16, u16)) {
+        let theme = Theme::truecolor();
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
+        term.draw(|f| {
+            let area = f.area();
+            render_compose(s, f, area, &theme, &UNICODE);
+        })
+        .expect("draw");
+        let pos = term.get_cursor_position().expect("cursor");
+        let buf = term.backend().buffer().clone();
+        let rows = (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect();
+        (rows, (pos.x, pos.y))
+    }
+
+    fn reply_state(body: &str) -> ComposeState {
+        let mut s = ComposeState {
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 1,
+                thread_title: "Thread".into(),
+            }),
+            body: body.to_string(),
+            ..Default::default()
+        };
+        s.body_cursor = s.body.chars().count();
+        s
+    }
+
+    /// Issue #519: a draft taller than the pane used to be typed blind (no
+    /// scroll offset) and the caret was placed from unwrapped char counts,
+    /// so it drifted a row for every wrapped paragraph above it.
+    #[test]
+    fn compose_editor_scrolls_to_the_caret_and_wraps_before_placing_it() {
+        // 40 short lines in an 18-row body: the tail must be on screen and
+        // the caret must sit at the end of the last one.
+        let body: String = (0..40).map(|i| format!("line {i:02}\n")).collect();
+        let mut s = reply_state(body.trim_end_matches('\n'));
+        let (rows, (cx, cy)) = render_compose_probe(&mut s, 80, 24);
+        let screen = rows.join("\n");
+        assert!(screen.contains("line 39"), "the caret's own line is off screen:\n{screen}");
+        assert!(!screen.contains("line 00"), "the pane did not scroll:\n{screen}");
+        let caret_row = rows
+            .iter()
+            .position(|r| r.contains("line 39"))
+            .expect("last line on screen") as u16;
+        // x = panel border (1) + the 7 cells of "line 39".
+        assert_eq!((cx, cy), (1 + 7, caret_row), "caret is not at the end of the last line");
+
+        // One long paragraph: the caret belongs on the *wrapped* row, not on
+        // row 0 with a column of 200.
+        let para = "w".repeat(200);
+        let mut s = reply_state(&para);
+        let (rows, (cx, cy)) = render_compose_probe(&mut s, 80, 24);
+        let body_top = rows
+            .iter()
+            .position(|r| r.trim_start_matches(['\u{2502}', ' ']).starts_with('w'))
+            .expect("body on screen") as u16;
+        // 200 cells over a 78-cell body = rows 0,1,2 with 44 cells on the last.
+        assert_eq!(cy, body_top + 2, "caret is not on the third wrapped row");
+        assert_eq!(cx, 1 + 44, "caret column ignores the wrap");
+    }
+
+    /// Issue #523: Up/Down did not exist in the body branch at all, and a run
+    /// of them must keep aiming at the column it started from.
+    #[test]
+    fn compose_up_down_move_by_visual_row_with_a_sticky_column() {
+        let mut s = reply_state("aaaaaaaa\nbb\ncccccccc");
+        render_compose_probe(&mut s, 80, 24); // stamps body_width/height
+        assert_eq!(s.body_cursor, 20, "cursor starts at the end");
+
+        compose_key(&mut s, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(s.body_cursor, 11, "Up lands on the short line, clamped to its end");
+        compose_key(&mut s, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(s.body_cursor, 8, "the sticky column survives the short line");
+        compose_key(&mut s, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        compose_key(&mut s, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(s.body_cursor, 20, "Down returns to column 8 of the last line");
+
+        // Any other key ends the run: the column is re-read from the caret.
+        compose_key(&mut s, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(s.body_desired_col, None);
+        compose_key(&mut s, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(s.body_cursor, 9, "Up from column 0 stays at column 0");
+
+        // PageUp/PageDown step by a pane of visual rows.
+        let body: String = (0..60).map(|i| format!("line {i:02}\n")).collect();
+        let mut s = reply_state(body.trim_end_matches('\n'));
+        render_compose_probe(&mut s, 80, 24);
+        let page = (s.body_height - 1) as usize;
+        compose_key(&mut s, KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        let (row, _) = crate::editor::caret_position(&s.body, s.body_width as usize, s.body_cursor);
+        assert_eq!(row, 59 - page, "PageUp moved {} rows", 59 - row);
+    }
+
+    /// A wrapped body is scrolled by whole visual rows, and Up/Down inside a
+    /// single long paragraph moves between those rows rather than doing
+    /// nothing (both editors share `editor::visual_rows_of`).
+    #[test]
+    fn compose_vertical_motion_works_inside_one_wrapped_paragraph() {
+        let mut s = reply_state(&"z".repeat(200));
+        render_compose_probe(&mut s, 80, 24);
+        let w = s.body_width as usize;
+        assert_eq!(w, 78);
+        compose_key(&mut s, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(s.body_cursor, 78 + 44, "Up moves one wrapped row, same column");
+        compose_key(&mut s, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(s.body_cursor, 44);
+    }
+
+    /// Issue #522: the search list used to call `to_plain` on every hit's
+    /// full BBCode message on every frame. The snippet is derived once, when
+    /// the results arrive, and the renderer only reads it.
+    #[test]
+    fn search_snippets_are_derived_once_and_read_from_the_cache() {
+        let hit = |title: &str, message: &str| SearchHit {
+            content_type: "post".into(),
+            title: title.into(),
+            message: message.into(),
+            username: "kemical".into(),
+            date: 1_700_000_000,
+            ..Default::default()
+        };
+        let mut s = super::super::SearchState {
+            query: "edge".into(),
+            ..Default::default()
+        };
+        s.set_results(vec![
+            hit("First", "[B]Edge[/B] updated again, see https://example.com/a"),
+            hit("Second", "plain body"),
+        ]);
+        assert_eq!(s.snippets.len(), 2);
+        assert_eq!(s.snippets[0], "Edge updated again, see https://example.com/a");
+
+        // Poison the cache: whatever the renderer draws must come from it,
+        // not from a fresh parse of the message.
+        s.snippets[0] = "FROM-THE-CACHE".into();
+        let theme = Theme::truecolor();
+        let rows = render_rows(100, 20, |f, area| {
+            render_search(&mut s, f, area, &theme, &UNICODE)
+        });
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains("FROM-THE-CACHE"),
+            "the renderer re-parsed the message instead of reading the cache:\n{screen}"
+        );
     }
 
     #[test]
@@ -2351,6 +2626,9 @@ mod tests {
         let draw = |s: &mut ComposeState, theme: &Theme| {
             render_rows(80, 30, |f, area| render_compose(s, f, area, theme, &UNICODE));
         };
+        // The composer opened with this reference already in the draft —
+        // not a live edit in progress — so the very first build is exempt
+        // from the settle wait and fetches right away.
         draw(&mut s, &theme);
         assert_eq!(s.image_requests.len(), 1);
 
@@ -2362,23 +2640,67 @@ mod tests {
             s.image_sizes.len()
         ));
 
-        // One more character: the layout is rebuilt, the URL is not re-asked.
+        // One more character: the layout is rebuilt, the URL is not re-asked
+        // (and, being already `requested`, keeps painting with no wait).
         s.body.push('!');
         draw(&mut s, &theme);
         assert!(!s.preview_cache.is_fresh("", s.preview_cache.width, s.images, 0));
         assert!(
-            s.preview_cache.note_requests(&[url.to_string()]).is_empty(),
+            s.preview_cache.requested.contains(url),
             "a keystroke re-requested an image already in flight"
         );
 
         // Even deleting the reference and typing it back does not re-request:
-        // the memo is per session, not per build.
+        // the memo is per session, not per build — and, already known, it
+        // paints again immediately with no new settle wait.
         s.body = String::new();
         draw(&mut s, &theme);
         s.body = img_draft(url);
         draw(&mut s, &theme);
-        assert!(s.preview_cache.note_requests(&[url.to_string()]).is_empty());
+        assert!(s.preview_cache.requested.contains(url));
         assert_eq!(s.image_requests.len(), 1, "it still paints, it just does not re-ask");
+    }
+
+    /// Issue #530: typing a URL character by character between an existing
+    /// `[IMG][/IMG]` pair used to fetch every intermediate string — leaking
+    /// partial hostnames/paths to whatever they happened to spell and
+    /// filling the store with junk. None of the never-settled intermediate
+    /// keys may reach `requested` (the only gate a network fetch is behind);
+    /// only the final, settled string may.
+    #[test]
+    fn typing_a_url_one_character_at_a_time_never_requests_an_intermediate_string() {
+        let theme = Theme::truecolor();
+        let mut s = ComposeState {
+            preview: true,
+            images: halfblocks(),
+            body: img_draft(""),
+            ..sample_reply()
+        };
+        let draw = |s: &mut ComposeState, theme: &Theme| {
+            render_rows(80, 30, |f, area| render_compose(s, f, area, theme, &UNICODE));
+        };
+
+        let target = "https://example.com/a/b/c.png";
+        let mut typed = String::new();
+        for ch in target.chars() {
+            typed.push(ch);
+            s.body = img_draft(&typed);
+            draw(&mut s, &theme);
+            assert!(
+                s.image_requests.is_empty(),
+                "fetched mid-typing at {typed:?}, before the draft ever settled"
+            );
+            assert!(
+                !s.preview_cache.requested.contains(typed.as_str()),
+                "{typed:?} (an intermediate keystroke) was handed to the store"
+            );
+        }
+
+        // Only once the draft sits still does the finished URL get requested.
+        std::thread::sleep(PreviewCache::EDIT_SETTLE + std::time::Duration::from_millis(50));
+        draw(&mut s, &theme);
+        assert_eq!(s.image_requests.len(), 1);
+        assert!(s.preview_cache.requested.contains(target));
     }
 
     #[test]

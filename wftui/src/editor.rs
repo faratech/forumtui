@@ -157,6 +157,183 @@ pub fn cursor_coords(text: &str, cursor: usize) -> (u16, u16) {
     (col, row)
 }
 
+// ---------- visual (wrapped) rows ----------
+//
+// The compose editors draw their body with `Paragraph::scroll` and no
+// `Wrap`, so *they* own the line breaking: a widget-level wrap would fold a
+// long logical line into rows the caret arithmetic knows nothing about, and
+// the cursor would drift a row down for every wrap above it (issue #519).
+// Everything below works in terminal *cells* (`chrome::cell_width`), never
+// `char`s, so a CJK/emoji character is billed the two columns it renders as.
+
+/// One visual row: the half-open character range of the body it covers.
+/// Rows are contiguous and cover the whole text, so a cursor index always
+/// lands in exactly one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisualRow {
+    pub start: usize,
+    pub end: usize,
+}
+
+fn char_cells(c: char) -> usize {
+    let mut buf = [0u8; 4];
+    crate::chrome::cell_width(c.encode_utf8(&mut buf))
+}
+
+/// Display width of `chars[a..b]` in cells.
+fn span_cells(chars: &[char], a: usize, b: usize) -> usize {
+    chars[a..b].iter().copied().map(char_cells).sum()
+}
+
+/// Greedy word wrap of `text` at `width` cells, as visual rows.
+pub fn visual_rows(text: &str, width: usize) -> Vec<VisualRow> {
+    let chars: Vec<char> = text.chars().collect();
+    visual_rows_of(&chars, width)
+}
+
+pub fn visual_rows_of(chars: &[char], width: usize) -> Vec<VisualRow> {
+    let width = width.max(1);
+    let n = chars.len();
+    let mut rows: Vec<VisualRow> = Vec::new();
+    let mut line_start = 0usize;
+    loop {
+        let mut le = line_start;
+        while le < n && chars[le] != '\n' {
+            le += 1;
+        }
+        wrap_logical_line(chars, line_start, le, width, &mut rows);
+        if le >= n {
+            break;
+        }
+        line_start = le + 1;
+        if line_start >= n {
+            // A trailing newline opens one more (empty) row to type on.
+            rows.push(VisualRow { start: n, end: n });
+            break;
+        }
+    }
+    rows
+}
+
+/// Wrap one logical line (`[start, end)`, no newline inside) into rows.
+///
+/// Greedy: fill until the next character would overflow, then break after
+/// the run of whitespace at that point (a break the eye already sees) or,
+/// failing that, after the last whitespace before it; a word longer than the
+/// whole line is hard-split. Whitespace that follows a break is absorbed
+/// into the row that ends there — trailing blanks hang past the margin
+/// rather than opening a row of their own.
+fn wrap_logical_line(
+    chars: &[char],
+    start: usize,
+    end: usize,
+    width: usize,
+    rows: &mut Vec<VisualRow>,
+) {
+    let mut pos = start;
+    loop {
+        let mut used = 0usize;
+        let mut fit = pos;
+        while fit < end {
+            let cw = char_cells(chars[fit]);
+            if used + cw > width {
+                break;
+            }
+            used += cw;
+            fit += 1;
+        }
+        if fit >= end {
+            rows.push(VisualRow { start: pos, end });
+            return;
+        }
+        let mut brk = if chars[fit].is_whitespace() {
+            fit
+        } else {
+            match (pos..fit).rev().find(|&i| chars[i].is_whitespace()) {
+                Some(ws) => ws + 1,
+                None => fit, // one unbreakable word: hard-split it
+            }
+        };
+        while brk < end && chars[brk].is_whitespace() {
+            brk += 1;
+        }
+        if brk <= pos {
+            brk = pos + 1; // the loop must always make progress
+        }
+        rows.push(VisualRow { start: pos, end: brk });
+        pos = brk;
+    }
+}
+
+/// The caret's `(row, col)` in `rows`, col measured in cells.
+pub fn caret_in_rows(chars: &[char], rows: &[VisualRow], cursor: usize) -> (usize, usize) {
+    let cursor = cursor.min(chars.len());
+    let idx = rows.iter().rposition(|r| r.start <= cursor).unwrap_or(0);
+    let Some(row) = rows.get(idx) else {
+        return (0, 0);
+    };
+    (idx, span_cells(chars, row.start, cursor.min(row.end)))
+}
+
+/// The caret's visual `(row, col)` for `text` wrapped at `width` cells.
+pub fn caret_position(text: &str, width: usize, cursor: usize) -> (usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let rows = visual_rows_of(&chars, width);
+    caret_in_rows(&chars, &rows, cursor)
+}
+
+/// Move the caret `delta` visual rows, keeping the sticky desired column:
+/// a run of Up/Down keeps aiming at the column the caret started from, so
+/// passing through a short line does not shorten the next move (`desired` is
+/// `None` after any other key — every caller clears it).
+pub fn move_vertical(
+    text: &str,
+    width: usize,
+    cursor: &mut usize,
+    desired: &mut Option<usize>,
+    delta: isize,
+) {
+    let chars: Vec<char> = text.chars().collect();
+    let rows = visual_rows_of(&chars, width);
+    if rows.is_empty() {
+        return;
+    }
+    let (row, col) = caret_in_rows(&chars, &rows, *cursor);
+    let want = (*desired).unwrap_or(col);
+    *desired = Some(want);
+    let target = (row as isize + delta).clamp(0, rows.len() as isize - 1) as usize;
+    if target == row {
+        return;
+    }
+    let r = rows[target];
+    let mut used = 0usize;
+    let mut i = r.start;
+    while i < r.end {
+        let cw = char_cells(chars[i]);
+        if used + cw > want {
+            break;
+        }
+        used += cw;
+        i += 1;
+    }
+    *cursor = i;
+}
+
+/// Follow the caret with a viewport `height` rows tall: the smallest scroll
+/// offset that keeps `caret_row` on screen, never past the last row.
+pub fn follow_caret(scroll: u16, caret_row: usize, rows: usize, height: u16) -> u16 {
+    let height = height.max(1);
+    let caret = caret_row as u16;
+    let mut top = scroll;
+    if caret < top {
+        top = caret;
+    } else if caret >= top.saturating_add(height) {
+        top = caret + 1 - height;
+    }
+    let max_top = (rows as u16).saturating_sub(height);
+    top.min(max_top)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +388,69 @@ mod tests {
         let mut c3 = 8; // in "second line" after 'o' (pos 4 on line 2, chars 4..8 "seco" deleted)
         kill_to_start(&mut s2, &mut c3);
         assert_eq!(s2, "fir\nnd line");
+    }
+
+    #[test]
+    fn visual_rows_wrap_greedily_and_cover_every_char() {
+        let rows = visual_rows("hello world", 5);
+        let chars: Vec<char> = "hello world".chars().collect();
+        let text: String = rows
+            .iter()
+            .flat_map(|r| chars[r.start..r.end].iter().copied())
+            .collect();
+        assert_eq!(text, "hello world", "wrapping must not drop a character");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].start, 6, "the break absorbs the space");
+
+        // Blank rows for blank lines, and one to type on after a trailing \n.
+        let rows = visual_rows("a\n\nb\n", 10);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[3], VisualRow { start: 5, end: 5 });
+
+        // A word longer than the line is hard-split, never dropped.
+        let rows = visual_rows(&"x".repeat(25), 10);
+        assert_eq!(rows.len(), 3);
+    }
+
+    /// The wrap budget and the caret column are terminal *cells*: a CJK body
+    /// billed one cell per character puts the caret half a line to the left
+    /// and builds rows twice the pane width (issue #519).
+    #[test]
+    fn visual_rows_and_caret_measure_cells_not_chars() {
+        let cjk: String = "\u{6f22}".repeat(10); // 10 ideographs = 20 cells
+        let rows = visual_rows(&cjk, 10);
+        assert_eq!(rows.len(), 2, "20 cells over a 10-cell line");
+        assert_eq!(rows[0], VisualRow { start: 0, end: 5 });
+        assert_eq!(caret_position(&cjk, 10, 3), (0, 6));
+        assert_eq!(caret_position(&cjk, 10, 7), (1, 4));
+
+        // An odd width never splits a double-width character across the edge.
+        let rows = visual_rows(&cjk, 9);
+        for r in &rows {
+            let w: usize = cjk.chars().collect::<Vec<_>>()[r.start..r.end]
+                .iter()
+                .map(|&c| char_cells(c))
+                .sum();
+            assert!(w <= 9, "row is {w} cells wide");
+        }
+    }
+
+    #[test]
+    fn vertical_motion_keeps_the_desired_column_and_the_view_follows() {
+        let text = "aaaaaaaa\nbb\ncccccccc";
+        let mut cursor = 20usize;
+        let mut want: Option<usize> = None;
+        move_vertical(text, 40, &mut cursor, &mut want, -1);
+        assert_eq!(cursor, 11, "clamped to the short line's end");
+        move_vertical(text, 40, &mut cursor, &mut want, -1);
+        assert_eq!(cursor, 8, "the desired column is sticky");
+
+        // follow_caret: the smallest offset that keeps the caret on screen.
+        assert_eq!(follow_caret(0, 0, 40, 10), 0);
+        assert_eq!(follow_caret(0, 12, 40, 10), 3);
+        assert_eq!(follow_caret(20, 5, 40, 10), 5);
+        assert_eq!(follow_caret(0, 39, 40, 10), 30);
+        assert_eq!(follow_caret(9, 0, 3, 10), 0, "never scrolls past the last row");
     }
 
     #[test]

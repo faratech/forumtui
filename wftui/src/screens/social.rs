@@ -7,7 +7,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
 use super::{
     browse::{push_bbcode, truncate},
@@ -16,7 +16,7 @@ use super::{
 };
 use crate::chrome::{self, Hints};
 use crate::glyph::Glyphs;
-use crate::theme::{fmt_age, fmt_time, Theme};
+use crate::theme::{fmt_age, Theme};
 
 /// Both panes fit side by side from here up (DESIGN.md) — the same threshold
 /// Home uses for its own tree+list split.
@@ -637,56 +637,6 @@ impl ConversationViewState {
         parts.join(", ")
     }
 
-    pub fn rebuild_lines(&mut self, theme: &Theme, g: &Glyphs) {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        let mut msg_offsets: Vec<u16> = Vec::new();
-        let rule = if g.ascii { "-" } else { "\u{2500}" };
-
-        // Prominent participants callout header at the top
-        let starter = self.conversation.starter();
-        let participants_str = self.participants_display();
-        lines.push(Line::from(Span::styled(
-            format!("CONVERSATION PARTICIPANTS {}", rule.repeat(48)),
-            theme.faint(),
-        )));
-        if !starter.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled(format!("{} ", g.gutter), theme.faint()),
-                Span::styled("Started by: ", theme.dim()),
-                Span::styled(starter.to_string(), theme.title().add_modifier(Modifier::BOLD)),
-            ]));
-        }
-        lines.push(Line::from(vec![
-            Span::styled(format!("{} ", g.gutter), theme.faint()),
-            Span::styled("All participants: ", theme.dim()),
-            Span::styled(participants_str, theme.base().add_modifier(Modifier::BOLD)),
-        ]));
-        lines.push(Line::from(Span::styled(rule.repeat(74), theme.faint())));
-        lines.push(Line::from(Span::raw("")));
-
-        for (i, msg) in self.messages.iter().enumerate() {
-            let offset = lines.len() as u16;
-            msg_offsets.push(offset);
-            let num = i + 1 + ((self.page.saturating_sub(1)) as usize * 20);
-            lines.push(Line::from(vec![
-                chrome::initials_chip(theme, &msg.username),
-                Span::raw(" "),
-                Span::styled(
-                    msg.username.clone(),
-                    theme.base().add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!(" · #{num} · {}", fmt_time(msg.message_date)), theme.dim()),
-            ]));
-            let mut sink: Vec<Line<'static>> = Vec::new();
-            let mut links = Vec::new();
-            push_bbcode(&mut sink, &mut links, &msg.message, theme);
-            lines.extend(sink);
-            lines.push(Line::from(Span::raw("")));
-        }
-        self.lines = lines;
-        self.msg_line_offsets = msg_offsets;
-    }
-
     /// Message-card lines for the Inbox's inline view pane: initials chip,
     /// bold username, right-aligned age, then the body behind a gutter glyph
     /// (accent when this is the selected message, per DESIGN.md). Rebuilt on
@@ -697,6 +647,10 @@ impl ConversationViewState {
     /// dump), this has no "CONVERSATION PARTICIPANTS" header — the Inbox pane
     /// draws its own compact `with … · started … · N messages` line above it.
     pub fn rebuild_message_lines(&mut self, theme: &Theme, g: &Glyphs, width: u16) {
+        if self.built == Some((width, self.sel_msg)) {
+            return;
+        }
+        self.built = Some((width, self.sel_msg));
         let width = width.max(1) as usize;
         let body_w = width.saturating_sub(3).max(4);
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -909,18 +863,20 @@ pub fn render_conversation_view(
     f.render_widget(Paragraph::new(header_lines), body[0]);
 
     let view = body[1];
+    // The same pre-wrapped message cards the Inbox's inline pane draws
+    // (issue #528): `Paragraph`'s own `Wrap` used to add visual rows the
+    // scroll clamp — computed from *logical* lines — knew nothing about, so
+    // below 110 columns the tail of a long DM could not be scrolled to, and
+    // the `n`/`N` offsets pointed at the wrong rows. Rebuilt only when the
+    // width or the selected message changes.
+    s.rebuild_message_lines(theme, g, view.width);
     let total = s.lines.len() as u16;
     let max_scroll = total.saturating_sub(view.height);
     if s.scroll > max_scroll {
         s.scroll = max_scroll;
     }
 
-    f.render_widget(
-        Paragraph::new(s.lines.clone())
-            .scroll((s.scroll, 0))
-            .wrap(Wrap { trim: false }),
-        view,
-    );
+    f.render_widget(Paragraph::new(s.lines.clone()).scroll((s.scroll, 0)), view);
 }
 
 // ================= new conversation =================
@@ -928,6 +884,12 @@ pub fn render_conversation_view(
 pub fn new_conversation_key(s: &mut super::NewConversationState, key: KeyEvent) -> Action {
     if s.busy {
         return Action::None;
+    }
+    if !matches!(
+        key.code,
+        KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+    ) {
+        s.body_desired_col = None;
     }
     if key.code == KeyCode::Esc {
         return Action::PopScreen;
@@ -1051,6 +1013,26 @@ pub fn new_conversation_key(s: &mut super::NewConversationState, key: KeyEvent) 
                 Action::None
             }
         }
+        // Vertical motion in the message field moves by visual row, like the
+        // Reply editor; in the single-line fields it steps between fields.
+        KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown if s.field == 2 => {
+            let page = (s.body_height.saturating_sub(1)).max(1) as isize;
+            let delta = match key.code {
+                KeyCode::Up => -1,
+                KeyCode::Down => 1,
+                KeyCode::PageUp => -page,
+                _ => page,
+            };
+            let width = if s.body_width == 0 { 1 } else { s.body_width as usize };
+            crate::editor::move_vertical(
+                &s.body,
+                width,
+                &mut s.body_cursor,
+                &mut s.body_desired_col,
+                delta,
+            );
+            Action::None
+        }
         KeyCode::Char(c)
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
@@ -1112,21 +1094,60 @@ pub fn render_new_conversation(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let text = vec![
-        Line::from(vec![
+    let [to_area, title_area, label_area, body_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .areas(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
             Span::styled("To (usernames, comma-separated): ", theme.dim()),
             Span::styled(s.recipients.clone(), theme.base()),
-        ]),
-        Line::from(vec![
+        ])),
+        to_area,
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
             Span::styled("Title: ", theme.dim()),
             Span::styled(s.title.clone(), theme.base()),
-        ]),
-        Line::from(Span::styled("Message (Tab to next field):", theme.dim())),
-        Line::from(Span::styled(s.body.clone(), theme.base())),
-    ];
+        ])),
+        title_area,
+    );
     f.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }),
-        inner,
+        Paragraph::new(Line::from(Span::styled(
+            "Message (Tab to next field):",
+            theme.dim(),
+        ))),
+        label_area,
+    );
+
+    // Same contract as the Reply editor (issues #519/#523): the message is
+    // pre-wrapped into visual rows, the caret is tracked in those rows, and
+    // the offset follows it — never `Paragraph`'s own `Wrap`, which would
+    // put the caret a row off for every wrap above it and leave anything
+    // past the pane's last row unreachable.
+    s.body_width = body_area.width;
+    s.body_height = body_area.height;
+    let body_chars: Vec<char> = s.body.chars().collect();
+    let rows = crate::editor::visual_rows_of(&body_chars, body_area.width as usize);
+    let (caret_row, caret_col) = crate::editor::caret_in_rows(&body_chars, &rows, s.body_cursor);
+    s.body_scroll =
+        crate::editor::follow_caret(s.body_scroll, caret_row, rows.len(), body_area.height);
+    let body_lines: Vec<Line<'static>> = rows
+        .iter()
+        .map(|r| {
+            Line::from(Span::styled(
+                body_chars[r.start..r.end].iter().collect::<String>(),
+                theme.base(),
+            ))
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(body_lines).scroll((s.body_scroll, 0)),
+        body_area,
     );
 
     let cur_pos = match s.field {
@@ -1134,25 +1155,24 @@ pub fn render_new_conversation(
             let col = s.recipients.chars().take(s.recipients_cursor).count() as u16;
             let prefix_len = 32u16;
             Some((
-                (inner.x + prefix_len + col).min(inner.x + inner.width.saturating_sub(1)),
-                inner.y,
+                (to_area.x + prefix_len + col).min(to_area.x + to_area.width.saturating_sub(1)),
+                to_area.y,
             ))
         }
         1 => {
             let col = s.title.chars().take(s.title_cursor).count() as u16;
             let prefix_len = 7u16;
             Some((
-                (inner.x + prefix_len + col).min(inner.x + inner.width.saturating_sub(1)),
-                inner.y + 1,
+                (title_area.x + prefix_len + col)
+                    .min(title_area.x + title_area.width.saturating_sub(1)),
+                title_area.y,
             ))
         }
-        2 => {
-            let (col, row) = crate::editor::cursor_coords(&s.body, s.body_cursor);
-            Some((
-                (inner.x + col).min(inner.x + inner.width.saturating_sub(1)),
-                (inner.y + 3 + row).min(inner.y + inner.height.saturating_sub(2)),
-            ))
-        }
+        2 => Some((
+            (body_area.x + caret_col as u16).min(body_area.x + body_area.width.saturating_sub(1)),
+            (body_area.y + (caret_row as u16).saturating_sub(s.body_scroll))
+                .min(body_area.y + body_area.height.saturating_sub(1)),
+        )),
         _ => None,
     };
     if let Some((x, y)) = cur_pos {
@@ -1252,6 +1272,136 @@ mod tests {
         (0..h)
             .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
             .collect()
+    }
+
+    /// Issue #519/#523 for the DM composer: the message body is pre-wrapped
+    /// into visual rows, the caret is placed in those rows, the pane follows
+    /// it, and Up/Down move between them.
+    #[test]
+    fn new_conversation_body_scrolls_and_places_the_caret_on_visual_rows() {
+        let body: String = (0..40).map(|i| format!("row {i:02}\n")).collect();
+        let mut s = super::super::NewConversationState {
+            field: 2,
+            body: body.trim_end_matches('\n').to_string(),
+            ..Default::default()
+        };
+        s.body_cursor = s.body.chars().count();
+
+        let theme = Theme::truecolor();
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE);
+        })
+        .expect("draw");
+        let pos = term.get_cursor_position().expect("cursor");
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..24)
+            .map(|y| (0..80).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect();
+        let screen = rows.join("\n");
+        assert!(screen.contains("row 39"), "the caret's line is off screen:\n{screen}");
+        assert!(!screen.contains("row 00"), "the pane did not scroll:\n{screen}");
+        let caret_row = rows.iter().position(|r| r.contains("row 39")).expect("last row") as u16;
+        assert_eq!((pos.x, pos.y), (1 + 6, caret_row));
+
+        // Up now moves a visual row instead of doing nothing.
+        new_conversation_key(&mut s, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        // Each row is "row NN" + "\n" = 7 chars; column 6 of row 38.
+        assert_eq!(s.body_cursor, 7 * 38 + 6, "Up lands at column 6 of the row above");
+    }
+
+    /// Issue #528: the standalone DM screen used to clamp its scroll by
+    /// *logical* line count while `Paragraph` wrapped the text, so on an
+    /// 80-column terminal the tail of a long conversation could not be
+    /// scrolled to at all. It now draws the pre-wrapped message cards.
+    #[test]
+    fn standalone_conversation_view_scrolls_to_the_end_of_a_wrapped_dm() {
+        let body = |n: usize| {
+            format!(
+                "{} paragraph {n} that is quite long and will wrap several times over.",
+                "filler words ".repeat(12)
+            )
+        };
+        let messages: Vec<ConversationMessage> = (0..6)
+            .map(|i| ConversationMessage {
+                message_id: i as u32 + 1,
+                conversation_id: 3,
+                user_id: 2,
+                username: "kemical".into(),
+                message: if i == 5 {
+                    format!("{} LASTWORD", body(i))
+                } else {
+                    body(i)
+                },
+                message_date: 1_700_000_000,
+            })
+            .collect();
+        let mut state = ConversationViewState {
+            conversation: sample_conversation(),
+            messages,
+            page: 1,
+            last_page: 1,
+            scroll: u16::MAX, // `G` / a long run of `j`
+            ..Default::default()
+        };
+
+        let theme = Theme::truecolor();
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            render_conversation_view(&mut state, f, area, &theme, &crate::glyph::UNICODE);
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..24)
+            .map(|y| (0..80).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect();
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains("LASTWORD"),
+            "the end of the conversation is unreachable:\n{screen}"
+        );
+        // Pre-wrapped, not `Wrap`: every body row fits inside the panel, so
+        // the scroll clamp counts exactly what is drawn.
+        assert!(
+            state.lines.iter().all(|l| l.width() <= 78),
+            "a line is wider than the panel: the pane is not pre-wrapped"
+        );
+    }
+
+    /// Issue #522: the message cards were re-parsed and re-wrapped on every
+    /// frame (20 fps). They are now derived once per (width, selection).
+    #[test]
+    fn message_lines_are_cached_until_the_width_or_selection_changes() {
+        let mut state = sample_inbox_state().view.take().expect("view");
+        let theme = Theme::truecolor();
+        let g = crate::glyph::UNICODE;
+        state.rebuild_message_lines(&theme, &g, 60);
+        assert!(!state.lines.is_empty());
+
+        // A sentinel survives a second call with the same key: no rebuild.
+        state.lines = vec![Line::from(Span::raw("SENTINEL"))];
+        state.rebuild_message_lines(&theme, &g, 60);
+        assert_eq!(state.lines.len(), 1, "the cards were rebuilt for an unchanged frame");
+
+        // A width change rebuilds...
+        state.rebuild_message_lines(&theme, &g, 40);
+        assert!(state.lines.len() > 1, "a resize must rebuild");
+
+        // ...so does moving the selection (the gutter is styled by it)...
+        state.lines = vec![Line::from(Span::raw("SENTINEL"))];
+        state.sel_msg = 1;
+        state.rebuild_message_lines(&theme, &g, 40);
+        assert!(state.lines.len() > 1, "a new selection must rebuild");
+
+        // ...and so does new data, which clears the key.
+        state.lines = vec![Line::from(Span::raw("SENTINEL"))];
+        state.built = None;
+        state.rebuild_message_lines(&theme, &g, 40);
+        assert!(state.lines.len() > 1, "fresh messages must rebuild");
     }
 
     fn key(c: char) -> KeyEvent {
@@ -1489,17 +1639,18 @@ mod tests {
             "Alice (starter), Bob, Charlie, Dave_Auditor"
         );
 
+        // The standalone screen now draws the same pre-wrapped message cards
+        // the Inbox pane does (issue #528); the participant roll-call it used
+        // to bake into `lines` is the panel's own persistent header.
         let theme = Theme::dark();
-        state.rebuild_lines(&theme, &crate::glyph::UNICODE);
-
-        // Verify the rendered lines contain CONVERSATION PARTICIPANTS
+        state.rebuild_message_lines(&theme, &crate::glyph::UNICODE, 70);
         let text: String = state
             .lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
-        assert!(text.contains("CONVERSATION PARTICIPANTS"));
-        assert!(text.contains("Alice (starter), Bob, Charlie, Dave_Auditor"));
+        assert!(text.contains("Alice"));
+        assert!(text.contains("Dave_Auditor"));
 
         // 'p': open profile of active message author (msg 0: Alice)
         let act = conversation_view_key(
