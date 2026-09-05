@@ -11,7 +11,7 @@ deployed.
 ```bash
 cd /web/wftui_app
 cargo build --release                 # release binary
-cargo test --workspace                # unit + wiremock (188 tests; 110 with --no-default-features)
+cargo test --workspace                # unit + wiremock (206 tests; 203 with --no-default-features)
 cargo clippy --all-targets --release -- -D warnings   # gate — must stay at 0
 cp target/release/wftui bin/wftui     # stable artifact location
 cp bin/wftui /usr/local/bin/wftui     # deploy on the server (also on PATH)
@@ -138,6 +138,18 @@ feature-gated — they are always compiled and chosen at runtime by `Picker` —
 and `image-defaults` is what gives us PNG/GIF/WEBP instead of JPEG only.
 `cargo build --no-default-features` drops the decoder entirely and leaves tier 5.
 
+Two surfaces draw images. The thread view sizes each post attachment from the
+API's own `width`/`height` and reserves the rows in `rebuild_lines`. The
+compose **Preview** pane does the same for the image references in the draft
+itself: `bbcode::Chunk::Image` / `Chunk::Attach` (their own chunk variants, so
+an image is never guessed from a `[image]`-shaped label) become a `▣ caption`
+line plus reserved rows, laid out by `screens::misc::build_preview` and cached
+in `PreviewCache` — the event loop redraws every 50 ms, so re-parsing the draft
+per frame would re-derive the same picture twenty times a second. A bare
+`[IMG]` URL carries no dimensions, so `images::Loaded` brings the source pixel
+size back with the decoded payload and `Images::sizes()` is stamped onto the
+screen beside the tier; the caption reads `▣ loading…` until then.
+
 The capability query reads stdin, so it runs in `main.rs` **before**
 `app::run` spawns the reader thread (hard rule 3). Image escapes are written
 only by the crate's widget, through ratatui's sanctioned diff-option path: the
@@ -157,7 +169,10 @@ overlay is up. `WFTUI_NO_IMAGES=1` or `NO_COLOR` forces tier 5.
 - Attachment upload is implemented in `common` but not wired into the compose
   screen; attachment *viewing* is inline on tiers 1-4 (thumbnails, ≤ 40 % of
   the panel and ≤ 12 rows) and `1`–`9` opens the nth image in a browser on
-  every tier. Enter-to-expand is not implemented: it needs a second, larger
+  every tier. Because nothing fills `ComposeState::attachments` yet, the
+  preview pane can only resolve `[IMG]` URLs — `[ATTACH]id[/ATTACH]` stays a
+  text placeholder until upload is wired up (`resolve_image` already handles
+  it, and is tested). Enter-to-expand is not implemented: it needs a second, larger
   encode inside an overlay, and overlays deliberately suppress image draws.
 - Double-click word-select / triple-click line-select not implemented (drag +
   release = copy is).

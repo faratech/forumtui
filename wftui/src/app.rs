@@ -91,7 +91,7 @@ pub enum Msg {
     #[cfg_attr(not(feature = "images"), allow(dead_code))]
     ImageLoaded {
         key: String,
-        result: Result<crate::images::Decoded, String>,
+        result: Result<crate::images::Loaded, String>,
     },
     Notice(String),
 }
@@ -448,7 +448,7 @@ impl App {
         // reach it before `render` rebuilds the lines.
         let policy = self.images.policy();
         let screen = self.screens.last_mut().expect("screen stack never empty");
-        screen.set_image_policy(policy);
+        screen.set_image_policy(policy, self.images.sizes());
         let screen_title = screen.title().to_string();
         let screen_hints = screen.hints();
         let keys_group = screen.keys_group();

@@ -190,6 +190,25 @@ pub struct ComposeState {
     /// Narrow-layout (< 110 cols) toggle: false shows the editor, true shows
     /// the rendered preview. `^O` flips it; unused once both panels fit.
     pub preview: bool,
+    /// Attachments this draft may reference with `[ATTACH]id[/ATTACH]`.
+    /// Nothing populates it yet — attachment *upload* is implemented in
+    /// `common` but not wired into compose (CLAUDE.md "Known gaps") — so in
+    /// practice today only `[IMG]` URLs resolve to a picture. The resolution
+    /// path is here (and tested) so wiring upload up is the only work left.
+    pub attachments: Vec<Attachment>,
+    /// Graphics policy, stamped by the app before every frame.
+    pub images: crate::images::Policy,
+    /// Source pixel sizes the image store has learned, stamped with it: the
+    /// preview's caption reads them for its `W×H` segment, which for a bare
+    /// `[IMG]` URL is only knowable once the bytes have been fetched.
+    pub image_sizes: crate::images::Sizes,
+    /// The preview's derived lines, image slots and request memo. Rebuilt
+    /// only when the draft, the pane width, the tier or a learned size
+    /// changes — that is what keeps typing from re-parsing and re-requesting.
+    pub preview_cache: misc::PreviewCache,
+    /// Image rects the last preview render reserved, in absolute screen
+    /// coordinates, for the app to paint.
+    pub image_requests: Vec<crate::images::Request>,
 }
 
 #[derive(Default)]
@@ -406,7 +425,7 @@ impl Screen {
     /// screens that draw images care; a change invalidates the thread view's
     /// wrapped lines, because inline images reserve rows the text tier does
     /// not (`width = 0` is the renderer's "rebuild me" signal).
-    pub fn set_image_policy(&mut self, policy: crate::images::Policy) {
+    pub fn set_image_policy(&mut self, policy: crate::images::Policy, sizes: &crate::images::Sizes) {
         match self {
             Screen::ThreadView(s) => {
                 if s.images != policy {
@@ -415,6 +434,14 @@ impl Screen {
                 }
             }
             Screen::Login(s) => s.images = policy,
+            Screen::Compose(s) => {
+                s.images = policy;
+                // The store only ever gains entries, so a length change is
+                // exactly "it learned a size the caption did not have".
+                if s.image_sizes.len() != sizes.len() {
+                    s.image_sizes = sizes.clone();
+                }
+            }
             _ => {}
         }
     }
@@ -426,6 +453,7 @@ impl Screen {
         match self {
             Screen::ThreadView(s) => &s.image_requests,
             Screen::Login(s) => &s.image_requests,
+            Screen::Compose(s) => &s.image_requests,
             _ => &[],
         }
     }

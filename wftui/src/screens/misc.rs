@@ -7,10 +7,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use common::models::SearchHit;
+use std::collections::HashSet;
+
+use common::bbcode;
+use common::models::{Attachment, SearchHit};
 
 use super::{
-    browse::{push_bbcode, truncate},
+    browse::{chunk_lines, truncate, wrap_spans},
     link_style, solo_panel, Action, ComposeTarget, LoginStage,
 };
 use crate::chrome::{self, Hints};
@@ -739,14 +742,221 @@ fn draw_editor_panel(
     }
 }
 
+// ---- compose preview: inline images ----
+
+/// One image the draft points at, resolved as far as the compose screen can
+/// resolve it: `[IMG]url[/IMG]` is already a URL, `[ATTACH]id[/ATTACH]` needs
+/// the draft's attachment list (`ComposeState::attachments`) to become one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewImage {
+    /// What the image store is keyed by: the absolute URL to fetch.
+    key: String,
+    /// Caption label — the file name when the URL has one, else the host.
+    label: String,
+    /// Pixel size when it is already known without fetching (an attachment
+    /// record carries `width`/`height`; a bare URL carries nothing).
+    px: Option<(u32, u32)>,
+}
+
+/// The compose preview's derived state.
+///
+/// The layout is a pure function of the draft, the pane width, the graphics
+/// tier and what the image store has learned, so it is rebuilt only when one
+/// of those changes — the event loop redraws every 50 ms, and re-parsing the
+/// draft on each of those frames would re-derive the same picture twenty
+/// times a second. `requested` is the other half: a URL is handed to the
+/// store once per session, so editing the text around an image (or deleting
+/// the reference and typing it back) never starts a second fetch.
+#[derive(Default)]
+pub struct PreviewCache {
+    built: bool,
+    src: String,
+    width: u16,
+    policy: images::Policy,
+    /// The store's `sizes` length the build saw. It only grows, so a change
+    /// means a caption can now show its `W×H`.
+    sizes_len: usize,
+    lines: Vec<Line<'static>>,
+    slots: Vec<images::Slot>,
+    /// Every image key this compose session has already handed to the store.
+    /// The store dedups the *fetch* (in-flight and failure memos, per box);
+    /// this is the compose half of the contract — one hand-off per URL per
+    /// session, however much the draft is edited around it.
+    requested: HashSet<String>,
+}
+
+impl PreviewCache {
+    /// True when nothing the layout depends on has changed since the build.
+    fn is_fresh(&self, src: &str, width: u16, policy: images::Policy, sizes_len: usize) -> bool {
+        self.built
+            && self.width == width
+            && self.policy == policy
+            && self.sizes_len == sizes_len
+            && self.src == src
+    }
+
+    /// Record the keys this build wants painted and return the ones that are
+    /// new this session — what the frame is about to ask the store for.
+    fn note_requests(&mut self, keys: &[String]) -> Vec<String> {
+        keys.iter()
+            .filter(|k| self.requested.insert((*k).clone()))
+            .cloned()
+            .collect()
+    }
+}
+
+/// The caption line for one preview image (DESIGN.md's `▣ name · W×H`).
+///
+/// `▣ loading…` while an inline tier is still fetching: the size of a bare
+/// `[IMG]` URL is not knowable until the bytes arrive, and a caption that
+/// claimed a name and no size would look like a finished render of nothing.
+/// On the text tier (and `--no-default-features`) nothing will ever be
+/// fetched, so the label is shown straight away — the caption is all there is.
+fn preview_caption(g: &Glyphs, img: &PreviewImage, px: Option<(u32, u32)>, inline: bool) -> String {
+    match px {
+        Some((w, h)) => format!("{} {} \u{00b7} {w}\u{00d7}{h}", g.image, img.label),
+        None if inline => format!("{} loading\u{2026}", g.image),
+        None => format!("{} {}", g.image, img.label),
+    }
+}
+
+/// File name from a URL, or its host when the path has none ("…/photo.png" →
+/// `photo.png`, "https://imgur.com/a/xyz/" → `imgur.com`).
+fn url_label(url: &str) -> String {
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let path = after_scheme.split(['?', '#']).next().unwrap_or("");
+    let host = path.split('/').next().unwrap_or("");
+    let last = path.rsplit('/').next().unwrap_or("");
+    if last != host && last.contains('.') {
+        last.to_string()
+    } else if host.is_empty() {
+        url.to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+/// Resolve one parsed image reference against the draft's attachment list.
+/// `None` means "not an image this client can show" — an `[ATTACH]` id the
+/// draft does not carry, or an attachment that is not an image — and the
+/// reference then renders as the plain text placeholder it always did.
+fn resolve_image(r: &bbcode::ImageRef, attachments: &[Attachment]) -> Option<PreviewImage> {
+    match r {
+        bbcode::ImageRef::Url(url) => Some(PreviewImage {
+            key: url.clone(),
+            label: url_label(url),
+            px: None,
+        }),
+        bbcode::ImageRef::Attachment(id) => {
+            let att = attachments.iter().find(|a| a.attachment_id == *id)?;
+            let url = images::attachment_url(att)?;
+            let px = match (att.width, att.height) {
+                (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+                _ => None,
+            };
+            Some(PreviewImage {
+                key: url.to_string(),
+                label: att.filename.clone(),
+                px,
+            })
+        }
+    }
+}
+
+/// Lay the draft out for the preview pane: the same BBCode rendering the
+/// thread view uses, with every resolvable image reference lifted out into a
+/// caption line plus the blank rows the app paints the picture over.
+///
+/// Reserving the rows here (rather than drawing over whatever follows) is
+/// what keeps the text after an image from ending up underneath it — the same
+/// contract `ThreadViewState::rebuild_lines` keeps for post attachments.
+fn build_preview(
+    body: &str,
+    attachments: &[Attachment],
+    theme: &Theme,
+    g: &Glyphs,
+    width: u16,
+    policy: images::Policy,
+    sizes: &images::Sizes,
+) -> (Vec<Line<'static>>, Vec<images::Slot>) {
+    let w = width.max(1);
+    let chunks = bbcode::render(body);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut slots: Vec<images::Slot> = Vec::new();
+    let mut links: Vec<String> = Vec::new();
+    let mut run_start = 0usize;
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let Some(img) = chunk.image_ref().and_then(|r| resolve_image(&r, attachments)) else {
+            continue;
+        };
+        push_wrapped(&mut lines, &chunks[run_start..i], &mut links, theme, w);
+        run_start = i + 1;
+
+        let px = img.px.or_else(|| sizes.get(&img.key).copied());
+        lines.push(Line::from(Span::styled(
+            truncate(&preview_caption(g, &img, px, policy.inline()), w as usize),
+            theme.dim(),
+        )));
+        if !policy.inline() {
+            continue;
+        }
+        // Until the bytes arrive the aspect is a guess, exactly as it is for
+        // an attachment the API sent no dimensions for; the box is re-fitted
+        // (and the payload re-encoded for it) on the frame after the load.
+        let (cols, rows) = images::fit(w, px.unwrap_or((16, 9)), policy.font);
+        slots.push(images::Slot {
+            line: lines.len(),
+            x: 0,
+            cols: cols.min(w).max(1),
+            rows,
+            key: img.key.clone(),
+        });
+        for _ in 0..rows {
+            lines.push(Line::from(Span::raw("")));
+        }
+    }
+    push_wrapped(&mut lines, &chunks[run_start..], &mut links, theme, w);
+    (lines, slots)
+}
+
+/// Render one run of chunks into the preview's line list, pre-wrapped.
+///
+/// Pre-wrapped rather than left to `Paragraph`'s own `Wrap`: a widget-level
+/// wrap would fold a long line into rows the slot arithmetic above knows
+/// nothing about, and the images would then land on top of the text.
+fn push_wrapped(
+    out: &mut Vec<Line<'static>>,
+    chunks: &[bbcode::Chunk],
+    links: &mut Vec<String>,
+    theme: &Theme,
+    width: u16,
+) {
+    for logical in chunk_lines(chunks, links, theme) {
+        for wrapped in wrap_spans(&logical, width as usize) {
+            out.push(Line::from(wrapped));
+        }
+    }
+}
+
 /// The `Preview` panel: renders the draft through the same
-/// `common::bbcode::render` chunk-to-line logic the thread view uses
-/// (`push_bbcode`), so what a member sees here is what the post will render
-/// as, not the raw BBCode source.
-fn draw_preview_panel(s: &super::ComposeState, f: &mut Frame, area: Rect, theme: &Theme, g: &Glyphs) {
+/// `common::bbcode::render` chunk-to-line logic the thread view uses, so what
+/// a member sees here is what the post will render as, not the raw BBCode
+/// source — and, on a graphics tier, with the images the draft references
+/// drawn under their captions once they resolve.
+fn draw_preview_panel(
+    s: &mut super::ComposeState,
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    g: &Glyphs,
+) {
     let block = chrome::panel(theme, g, "Preview", false, None, None);
     let inner = block.inner(area);
     f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
     let chunks =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
@@ -755,11 +965,60 @@ fn draw_preview_panel(s: &super::ComposeState, f: &mut Frame, area: Rect, theme:
         Paragraph::new(Line::from(Span::styled("as it will appear", theme.dim()))),
         chunks[0],
     );
+    let body = chunks[2];
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut links: Vec<String> = Vec::new();
-    push_bbcode(&mut lines, &mut links, &s.body, theme);
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[2]);
+    if !s
+        .preview_cache
+        .is_fresh(&s.body, body.width, s.images, s.image_sizes.len())
+    {
+        let (lines, slots) = build_preview(
+            &s.body,
+            &s.attachments,
+            theme,
+            g,
+            body.width,
+            s.images,
+            &s.image_sizes,
+        );
+        let keys: Vec<String> = slots.iter().map(|slot| slot.key.clone()).collect();
+        let fresh = s.preview_cache.note_requests(&keys);
+        if !fresh.is_empty() {
+            tracing::debug!("compose preview: {} image(s) to load", fresh.len());
+        }
+        s.preview_cache.built = true;
+        s.preview_cache.src = s.body.clone();
+        s.preview_cache.width = body.width;
+        s.preview_cache.policy = s.images;
+        s.preview_cache.sizes_len = s.image_sizes.len();
+        s.preview_cache.lines = lines;
+        s.preview_cache.slots = slots;
+    }
+
+    // Already wrapped to `body.width` by `build_preview` — no widget-level
+    // `Wrap`, or the reserved image rows would stop lining up.
+    f.render_widget(Paragraph::new(s.preview_cache.lines.clone()), body);
+
+    // Translate the reserved slots into absolute screen rects for the app to
+    // paint. A slot that does not fit whole is dropped and its caption left
+    // in place: kitty and sixel paint pixels, not cells, so half an image
+    // would spill over the panel border.
+    if !s.images.inline() {
+        return;
+    }
+    for slot in &s.preview_cache.slots {
+        let y = body.y as usize + slot.line;
+        if y + slot.rows as usize > body.bottom() as usize {
+            continue;
+        }
+        let x = body.x as usize + slot.x as usize;
+        if x + slot.cols as usize > body.right() as usize {
+            continue;
+        }
+        s.image_requests.push(images::Request {
+            key: slot.key.clone(),
+            rect: Rect::new(x as u16, y as u16, slot.cols, slot.rows),
+        });
+    }
 }
 
 pub fn render_compose(
@@ -769,6 +1028,9 @@ pub fn render_compose(
     theme: &Theme,
     g: &Glyphs,
 ) {
+    // Cleared before every frame: a stale rect would have the app paint an
+    // image over the editor (narrow layout) or over a shrunk panel.
+    s.image_requests.clear();
     if area.width >= 110 {
         let cols = Layout::horizontal([
             Constraint::Length(72),
@@ -1920,6 +2182,218 @@ mod tests {
         assert!(rows[0].contains(" Preview "), "{}", rows[0]);
         assert!(!rows[0].contains(" Reply "), "{}", rows[0]);
         assert!(rows.join("\n").contains("as it will appear"));
+    }
+
+    // ---------- Reply / compose: inline images ----------
+
+    fn img_draft(url: &str) -> String {
+        format!("before\n[IMG]{url}[/IMG]\nafter")
+    }
+
+    fn halfblocks() -> crate::images::Policy {
+        crate::images::Policy {
+            tier: crate::images::Tier::Halfblocks,
+            font: (10, 20),
+        }
+    }
+
+    #[test]
+    fn url_labels_prefer_the_file_name_and_fall_back_to_the_host() {
+        assert_eq!(url_label("https://cdn.example/a/b/shot.png"), "shot.png");
+        assert_eq!(url_label("https://cdn.example/a/b/shot.png?w=800#x"), "shot.png");
+        assert_eq!(url_label("https://imgur.com/a/xyz/"), "imgur.com");
+        assert_eq!(url_label("https://imgur.com/a/xyz"), "imgur.com");
+        assert_eq!(url_label("https://example.com"), "example.com");
+    }
+
+    #[test]
+    fn attach_references_resolve_only_against_the_drafts_own_attachments() {
+        let att = Attachment {
+            attachment_id: 77,
+            filename: "screenshot.png".into(),
+            width: Some(1200),
+            height: Some(800),
+            thumbnail_url: Some("https://wf/attachments/77/thumb".into()),
+            ..Default::default()
+        };
+        let refs = bbcode::image_refs(r#"[ATTACH type="full"]77[/ATTACH] [ATTACH]78[/ATTACH]"#);
+        assert_eq!(refs.len(), 2);
+
+        let resolved = resolve_image(&refs[0], std::slice::from_ref(&att)).expect("77 resolves");
+        assert_eq!(resolved.key, "https://wf/attachments/77/thumb");
+        assert_eq!(resolved.label, "screenshot.png");
+        assert_eq!(resolved.px, Some((1200, 800)));
+
+        // An id the draft does not carry stays a text placeholder.
+        assert!(resolve_image(&refs[1], std::slice::from_ref(&att)).is_none());
+        // …and with no attachment list at all (today's compose screen),
+        // nothing but `[IMG]` URLs can resolve.
+        assert!(resolve_image(&refs[0], &[]).is_none());
+    }
+
+    #[test]
+    fn the_text_tier_captions_an_image_reference_and_asks_for_no_pixels() {
+        let theme = Theme::truecolor();
+        let mut s = ComposeState {
+            preview: true,
+            body: img_draft("https://cdn.example/shot.png"),
+            ..sample_reply()
+        };
+        let rows = render_rows(80, 24, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE));
+        let all = rows.join("\n");
+        assert!(all.contains("\u{25a3} shot.png"), "no caption line: {all}");
+        assert!(!all.contains("[image]"), "the placeholder survived: {all}");
+        assert!(all.contains("before") && all.contains("after"), "{all}");
+        assert!(
+            s.image_requests.is_empty(),
+            "the text tier must not ask for pixels: {:?}",
+            s.image_requests
+        );
+    }
+
+    #[test]
+    fn an_inline_tier_reserves_the_rows_under_the_caption_within_the_design_caps() {
+        let theme = Theme::truecolor();
+        let url = "https://cdn.example/shot.png";
+        let mut s = ComposeState {
+            preview: true,
+            images: halfblocks(),
+            body: img_draft(url),
+            ..sample_reply()
+        };
+        let rows = render_rows(80, 30, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE));
+        let all = rows.join("\n");
+        // Nothing is known about a bare URL until its bytes arrive.
+        assert!(all.contains("\u{25a3} loading\u{2026}"), "{all}");
+
+        assert_eq!(s.image_requests.len(), 1, "{:?}", s.image_requests);
+        let req = &s.image_requests[0];
+        assert_eq!(req.key, url);
+        let pane = s.preview_cache.width;
+        assert!(
+            req.rect.width <= pane * crate::images::WIDTH_PERCENT / 100,
+            "{} exceeds 40 % of {pane}",
+            req.rect.width
+        );
+        assert!(req.rect.height <= crate::images::MAX_ROWS, "{}", req.rect.height);
+
+        // The text after the reference is below the reserved rows, not under
+        // them: the line list accounts for the image.
+        let after = rows
+            .iter()
+            .position(|r| r.contains("after"))
+            .expect("the trailing text is still drawn") as u16;
+        assert!(
+            after >= req.rect.y + req.rect.height,
+            "text at row {after} runs under an image at {}..{}",
+            req.rect.y,
+            req.rect.y + req.rect.height
+        );
+        // And the rows the image covers are blank.
+        for y in req.rect.y..req.rect.y + req.rect.height {
+            let band: String = rows[y as usize]
+                .chars()
+                .skip(req.rect.x as usize)
+                .take(req.rect.width as usize)
+                .collect();
+            assert!(band.trim().is_empty(), "row {y} is not reserved: {band:?}");
+        }
+    }
+
+    #[test]
+    fn a_learned_size_turns_the_loading_caption_into_the_design_caption() {
+        let theme = Theme::truecolor();
+        let url = "https://cdn.example/shot.png";
+        let mut s = ComposeState {
+            preview: true,
+            images: halfblocks(),
+            body: img_draft(url),
+            ..sample_reply()
+        };
+        let _ = render_rows(80, 30, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE));
+        // What `Msg::ImageLoaded` teaches the store, the app stamps here.
+        s.image_sizes.insert(url.to_string(), (1200, 800));
+        let rows = render_rows(80, 30, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE));
+        let all = rows.join("\n");
+        assert!(all.contains("\u{25a3} shot.png \u{b7} 1200\u{d7}800"), "{all}");
+        assert!(!all.contains("loading"), "{all}");
+    }
+
+    #[test]
+    fn an_image_that_would_run_past_the_pane_edge_is_dropped_and_keeps_its_caption() {
+        let theme = Theme::truecolor();
+        let mut s = ComposeState {
+            preview: true,
+            images: halfblocks(),
+            body: img_draft("https://cdn.example/shot.png"),
+            ..sample_reply()
+        };
+        // Tall enough for the caption, too short for the twelve reserved rows.
+        let rows = render_rows(80, 10, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE));
+        assert!(rows.join("\n").contains("\u{25a3} loading\u{2026}"), "{rows:?}");
+        assert!(
+            s.image_requests.is_empty(),
+            "a half-visible image was still requested: {:?}",
+            s.image_requests
+        );
+    }
+
+    #[test]
+    fn typing_around_an_image_neither_re_scans_it_nor_asks_for_it_again() {
+        let theme = Theme::truecolor();
+        let url = "https://cdn.example/shot.png";
+        let mut s = ComposeState {
+            preview: true,
+            images: halfblocks(),
+            body: img_draft(url),
+            ..sample_reply()
+        };
+        let draw = |s: &mut ComposeState, theme: &Theme| {
+            render_rows(80, 30, |f, area| render_compose(s, f, area, theme, &UNICODE));
+        };
+        draw(&mut s, &theme);
+        assert_eq!(s.image_requests.len(), 1);
+
+        // Same draft, same pane, same tier: the next frame reuses the build.
+        assert!(s.preview_cache.is_fresh(
+            &s.body,
+            s.preview_cache.width,
+            s.images,
+            s.image_sizes.len()
+        ));
+
+        // One more character: the layout is rebuilt, the URL is not re-asked.
+        s.body.push('!');
+        draw(&mut s, &theme);
+        assert!(!s.preview_cache.is_fresh("", s.preview_cache.width, s.images, 0));
+        assert!(
+            s.preview_cache.note_requests(&[url.to_string()]).is_empty(),
+            "a keystroke re-requested an image already in flight"
+        );
+
+        // Even deleting the reference and typing it back does not re-request:
+        // the memo is per session, not per build.
+        s.body = String::new();
+        draw(&mut s, &theme);
+        s.body = img_draft(url);
+        draw(&mut s, &theme);
+        assert!(s.preview_cache.note_requests(&[url.to_string()]).is_empty());
+        assert_eq!(s.image_requests.len(), 1, "it still paints, it just does not re-ask");
+    }
+
+    #[test]
+    fn a_non_http_image_reference_is_never_requested() {
+        let theme = Theme::truecolor();
+        let mut s = ComposeState {
+            preview: true,
+            images: halfblocks(),
+            body: "[IMG]data:image/png;base64,AAAA[/IMG]".into(),
+            ..sample_reply()
+        };
+        let rows = render_rows(80, 30, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE));
+        assert!(s.image_requests.is_empty(), "{:?}", s.image_requests);
+        // Nothing is dropped: it still renders as the placeholder it was.
+        assert!(rows.join("\n").contains("[image]"), "{rows:?}");
     }
 
     // ---------- Sign in ----------

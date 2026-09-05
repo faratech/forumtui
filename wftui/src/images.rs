@@ -172,6 +172,31 @@ pub type Decoded = ratatui_image::protocol::Protocol;
 #[cfg(not(feature = "images"))]
 pub type Decoded = ();
 
+/// A finished load: the payload plus the source image's pixel size.
+///
+/// The size is not decoration. An attachment arrives from the API with
+/// `width`/`height` already on it, but a bare `[IMG]url[/IMG]` in a draft
+/// carries no metadata at all, so the compose preview's caption
+/// (`▣ name · W×H`) can only learn its dimensions from the
+/// bytes — this is how they cross back.
+///
+/// No `Debug`: `ratatui_image::protocol::Protocol` does not implement it.
+#[derive(Clone)]
+pub struct Loaded {
+    pub decoded: Decoded,
+    pub px: (u32, u32),
+}
+
+/// Source pixel sizes learned this session, keyed by the image's own key
+/// (the URL, or [`LOGO_KEY`]) — *not* by the size-qualified store key, since
+/// the pixel size of the source does not change with the box it is drawn in.
+pub type Sizes = HashMap<String, (u32, u32)>;
+
+/// The image key inside a store key (`store_key` prefixes it with the box).
+pub fn source_of(store_key: &str) -> &str {
+    store_key.split_once('|').map(|(_, key)| key).unwrap_or(store_key)
+}
+
 // ---------------------------------------------------------------- sizing ---
 
 /// Fit `px` (an image's pixel size) into the caps: ≤ `WIDTH_PERCENT` of
@@ -470,6 +495,9 @@ pub struct Images {
     cache: Lru<Decoded>,
     inflight: HashSet<String>,
     failed: HashSet<String>,
+    /// Source pixel size per image key, learned when a load finishes. Grows
+    /// only; captions read it for their `W×H` segment.
+    sizes: Sizes,
     disk: DiskCache,
 }
 
@@ -489,6 +517,7 @@ impl Images {
             cache: Lru::new(LRU_CAP),
             inflight: HashSet::new(),
             failed: HashSet::new(),
+            sizes: Sizes::new(),
             disk: DiskCache::new(),
         }
     }
@@ -540,6 +569,13 @@ impl Images {
         self.disk.clone()
     }
 
+    /// What the store has learned about the images it loaded: source pixel
+    /// size per image key. Stamped onto the screens that caption images
+    /// before every frame.
+    pub fn sizes(&self) -> &Sizes {
+        &self.sizes
+    }
+
     #[cfg(feature = "images")]
     pub fn picker(&self) -> Option<ratatui_image::picker::Picker> {
         self.picker.clone()
@@ -580,15 +616,16 @@ impl Images {
 
     /// A background load finished (or failed). A failure is remembered so a
     /// dead thumbnail is fetched once per session, not once per frame.
-    pub fn on_loaded(&mut self, key: String, result: Result<Decoded, String>) {
+    pub fn on_loaded(&mut self, key: String, result: Result<Loaded, String>) {
         self.inflight.remove(&key);
         match result {
-            Ok(decoded) => {
+            Ok(loaded) => {
+                self.sizes.insert(source_of(&key).to_string(), loaded.px);
                 #[cfg(feature = "images")]
-                self.cache.insert(key, decoded);
+                self.cache.insert(key, loaded.decoded);
                 #[cfg(not(feature = "images"))]
                 {
-                    let _ = (key, decoded);
+                    let _ = (key, loaded);
                 }
             }
             Err(e) => {
@@ -607,15 +644,17 @@ pub fn decode(
     bytes: &[u8],
     cols: u16,
     rows: u16,
-) -> Result<Decoded, String> {
+) -> Result<Loaded, String> {
     use ratatui::layout::Size;
     use ratatui_image::{FilterType, Resize};
     let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
+    let px = (img.width(), img.height());
     // ratatui-image 11 takes the target box as a `Size`, not a `Rect` (9 took
     // a Rect and ignored its origin).
-    picker
+    let decoded = picker
         .new_protocol(img, Size::new(cols, rows), Resize::Fit(Some(FilterType::Triangle)))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(Loaded { decoded, px })
 }
 
 /// Fetch (disk cache first, then the network through `api_gate`) and decode.
@@ -627,7 +666,7 @@ pub async fn load(
     disk: &DiskCache,
     picker: ratatui_image::picker::Picker,
     pending: &Pending,
-) -> Result<Decoded, String> {
+) -> Result<Loaded, String> {
     let bytes = if pending.key == LOGO_KEY {
         LOGO_BYTES.to_vec()
     } else if let Some(cached) = disk.get(&pending.key) {
@@ -652,7 +691,7 @@ pub async fn load(
     _disk: &DiskCache,
     _picker: (),
     _pending: &Pending,
-) -> Result<Decoded, String> {
+) -> Result<Loaded, String> {
     Err("built without the `images` feature".to_string())
 }
 

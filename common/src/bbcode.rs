@@ -28,6 +28,60 @@ pub enum Chunk {
     Text(String, Style),
     /// Visible label + target URL.
     Link(String, String, Style),
+    /// `[IMG]url[/IMG]` — an inline image reference. Its own variant rather
+    /// than a `Link` labelled `[image]` so a consumer can tell a picture
+    /// apart from a link whose label merely reads that way: the compose
+    /// preview turns these into a caption plus a real inline image, and
+    /// guessing from a label would put a picture under `[URL=x][image][/URL]`.
+    Image(String, Style),
+    /// `[ATTACH]id[/ATTACH]` (and the `=full` / `type="full"` spellings) — an
+    /// attachment referenced by id. Only whoever holds the post's (or the
+    /// draft's) attachment list can turn the id into a URL, so the parser
+    /// carries the id through untouched.
+    Attach(String, Style),
+}
+
+/// An image a piece of BBCode points at, in source order — what
+/// [`Chunk::image_ref`] and [`image_refs`] hand back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageRef {
+    /// `[IMG]https://…[/IMG]`. Always http/https: any other scheme
+    /// (`data:`, `javascript:`, `file:`) is dropped here rather than at the
+    /// fetch, so no consumer can be talked into loading one.
+    Url(String),
+    /// `[ATTACH]id[/ATTACH]`, resolved against an attachment list by the
+    /// caller. Non-numeric ids are dropped — XenForo attachment ids are
+    /// integers.
+    Attachment(u32),
+}
+
+impl Chunk {
+    /// The image this chunk references, if it is one. `None` for text, links
+    /// and for image references that cannot be fetched (a non-http `[IMG]`
+    /// target, an `[ATTACH]` whose id is not a number).
+    pub fn image_ref(&self) -> Option<ImageRef> {
+        match self {
+            Chunk::Image(url, _) if is_http_url(url) => Some(ImageRef::Url(url.clone())),
+            Chunk::Attach(id, _) => id.trim().parse::<u32>().ok().map(ImageRef::Attachment),
+            _ => None,
+        }
+    }
+}
+
+/// Every image reference in `src`, in source order. Duplicates are kept: they
+/// are separate references, and de-duplication is the caller's policy.
+///
+/// Tolerant in exactly the way [`render`] is, because it *is* `render`: tags
+/// are case-insensitive, an unclosed `[IMG]` stays literal text, and an
+/// `[IMG]` inside `[CODE]`/`[PLAIN]` is source, not a picture.
+pub fn image_refs(src: &str) -> Vec<ImageRef> {
+    render(src).iter().filter_map(Chunk::image_ref).collect()
+}
+
+/// True for an absolute http/https URL, scheme compared case-insensitively.
+pub fn is_http_url(s: &str) -> bool {
+    let lower = s.trim().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
 }
 
 impl Style {
@@ -226,6 +280,8 @@ fn ends_with_newline(chunks: &[Chunk]) -> bool {
     chunks.last().is_some_and(|c| match c {
         Chunk::Text(t, _) => t.ends_with('\n'),
         Chunk::Link(l, _, _) => l.ends_with('\n'),
+        // Both render as a one-line placeholder, never a paragraph break.
+        Chunk::Image(..) | Chunk::Attach(..) => false,
     })
 }
 
@@ -419,16 +475,12 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             if trimmed.is_empty() {
                                 out.push(Chunk::Text("[image]".into(), st));
                             } else {
-                                out.push(Chunk::Link("[image]".into(), trimmed.to_string(), st));
+                                out.push(Chunk::Image(trimmed.to_string(), st));
                             }
                             rest = &rest[close_len..];
                         } else if let Some(v) = &value {
                             let st = Style::from_stack(&stack);
-                            out.push(Chunk::Link(
-                                "[image]".into(),
-                                strip_quotes(v).to_string(),
-                                st,
-                            ));
+                            out.push(Chunk::Image(strip_quotes(v).to_string(), st));
                         } else {
                             emit_text(&mut out, raw_tag, &stack);
                         }
@@ -456,12 +508,12 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             } else {
                                 inner.trim()
                             };
-                            out.push(Chunk::Text(format!("[attachment {id}]"), st));
+                            out.push(Chunk::Attach(id.to_string(), st));
                             rest = &rest[close_len..];
                         } else if let Some(v) = &value {
                             let st = Style::from_stack(&stack);
                             let clean = strip_quotes(v);
-                            out.push(Chunk::Text(format!("[attachment {clean}]"), st));
+                            out.push(Chunk::Attach(clean.to_string(), st));
                         } else {
                             emit_text(&mut out, raw_tag, &stack);
                         }
@@ -563,6 +615,13 @@ pub fn to_plain(src: &str) -> String {
                     s.push_str(&format!(" ({url})"));
                 }
             }
+            Chunk::Image(url, _) => {
+                s.push_str("[image]");
+                if !url.is_empty() {
+                    s.push_str(&format!(" ({url})"));
+                }
+            }
+            Chunk::Attach(id, _) => s.push_str(&format!("[attachment {id}]")),
         }
     }
     s.replace('\n', " ").split_whitespace().collect::<Vec<_>>().join(" ")
@@ -983,25 +1042,85 @@ mod tests {
     }
 
     #[test]
-    fn img_becomes_link() {
+    fn img_becomes_an_image_chunk() {
         let chunks = render("[IMG]https://example.com/pic.png[/IMG]");
         match &chunks[0] {
-            Chunk::Link(label, url, _) => {
-                assert_eq!(label, "[image]");
-                assert_eq!(url, "https://example.com/pic.png");
-            }
-            _ => panic!("expected image link"),
+            Chunk::Image(url, _) => assert_eq!(url, "https://example.com/pic.png"),
+            other => panic!("expected an image chunk, got {other:?}"),
         }
+        assert_eq!(to_plain("[IMG]https://example.com/pic.png[/IMG]"), "[image] (https://example.com/pic.png)");
     }
 
     #[test]
     fn attach_and_user_markers_with_attributes() {
-        let all = texts(&render(
-            r#"[ATTACH type="full"]1234[/ATTACH] by [USER=9]bob[/USER]"#,
-        ))
-        .concat();
-        assert!(all.contains("[attachment 1234]"));
-        assert!(all.contains("@bob"));
+        let chunks = render(r#"[ATTACH type="full"]1234[/ATTACH] by [USER=9]bob[/USER]"#);
+        match &chunks[0] {
+            Chunk::Attach(id, _) => assert_eq!(id, "1234"),
+            other => panic!("expected an attachment chunk, got {other:?}"),
+        }
+        assert!(texts(&chunks).concat().contains("@bob"));
+        assert!(to_plain(r#"[ATTACH type="full"]1234[/ATTACH]"#).contains("[attachment 1234]"));
+    }
+
+    // ---------- image reference extraction ----------
+
+    #[test]
+    fn image_refs_collects_img_and_attach_in_source_order() {
+        let refs = image_refs(
+            "intro\n[IMG]https://a.example/1.png[/IMG]\n[ATTACH]12[/ATTACH]\n             [ATTACH=full]34[/ATTACH] [ATTACH type=\"full\"]56[/ATTACH]\n             [img]HTTP://B.example/2.PNG[/img]",
+        );
+        assert_eq!(
+            refs,
+            vec![
+                ImageRef::Url("https://a.example/1.png".into()),
+                ImageRef::Attachment(12),
+                ImageRef::Attachment(34),
+                ImageRef::Attachment(56),
+                ImageRef::Url("HTTP://B.example/2.PNG".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn image_refs_survive_nesting_and_reject_everything_unfetchable() {
+        // Nested inside other tags: still an image, still in order.
+        assert_eq!(
+            image_refs("[QUOTE=\"bob\"][B][IMG]https://a.example/in-quote.png[/IMG][/B][/QUOTE]"),
+            vec![ImageRef::Url("https://a.example/in-quote.png".into())]
+        );
+        // Duplicates are separate references; de-duplication is the caller's.
+        assert_eq!(image_refs("[IMG]https://a/x.png[/IMG][IMG]https://a/x.png[/IMG]").len(), 2);
+
+        // Non-http schemes never become a fetchable reference.
+        for src in [
+            "[IMG]data:image/png;base64,AAAA[/IMG]",
+            "[IMG]javascript:alert(1)[/IMG]",
+            "[IMG]file:///etc/passwd[/IMG]",
+            "[IMG]/relative/path.png[/IMG]",
+            "[IMG][/IMG]",
+        ] {
+            assert!(image_refs(src).is_empty(), "{src} produced a reference");
+        }
+        // …but the content is still shown, never silently dropped.
+        assert!(to_plain("[IMG]data:image/png;base64,AAAA[/IMG]").contains("data:image/png"));
+
+        // A missing close tag stays literal text.
+        assert!(image_refs("[IMG]https://a.example/1.png").is_empty());
+        assert!(to_plain("[IMG]https://a.example/1.png").contains("[IMG]"));
+
+        // An unclosed IMG after a closed one: the closed one still resolves,
+        // the unclosed one stays literal.
+        assert_eq!(
+            image_refs("[IMG]https://a/1.png[/IMG] then [IMG]https://a/2.png"),
+            vec![ImageRef::Url("https://a/1.png".into())]
+        );
+
+        // Source, not pictures.
+        assert!(image_refs("[CODE][IMG]https://a.example/1.png[/IMG][/CODE]").is_empty());
+        assert!(image_refs("[PLAIN][IMG]https://a.example/1.png[/IMG][/PLAIN]").is_empty());
+
+        // A non-numeric attachment id is not an id.
+        assert!(image_refs("[ATTACH]screenshot[/ATTACH]").is_empty());
     }
 
     #[test]

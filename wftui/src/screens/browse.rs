@@ -980,7 +980,7 @@ fn cell_width(s: &str) -> usize {
 /// The body is drawn with `Paragraph::new(..).scroll(..)` and no `Wrap`, so
 /// anything over-long is silently clipped at the panel edge rather than
 /// folded.
-fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
     let width = width.max(1);
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
     let mut line: Vec<Span<'static>> = Vec::new();
@@ -1068,9 +1068,21 @@ fn bbcode_lines(
     links: &mut Vec<String>,
     theme: &Theme,
 ) -> Vec<Vec<Span<'static>>> {
+    chunk_lines(&bbcode::render(src), links, theme)
+}
+
+/// `bbcode_lines` over an already-parsed chunk stream. Split out so a screen
+/// that treats some chunks specially — the compose preview lifts image
+/// references out into a caption plus reserved image rows — can render the
+/// runs between them without a second copy of this loop.
+pub(crate) fn chunk_lines(
+    chunks: &[Chunk],
+    links: &mut Vec<String>,
+    theme: &Theme,
+) -> Vec<Vec<Span<'static>>> {
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
-    for chunk in bbcode::render(src) {
+    for chunk in chunks.iter().cloned() {
         match chunk {
             Chunk::Text(t, s) => {
                 if t.is_empty() {
@@ -1100,6 +1112,24 @@ fn bbcode_lines(
                 current.push(Span::styled(
                     format!(" [{}]", links.len()),
                     link_style(theme),
+                ));
+            }
+            // The thread view has the real picture beside its own caption
+            // (built from the API's attachment record), so here an image
+            // reference stays what it has always been: the `[image]`
+            // placeholder plus a numbered link for `o` / `1`-`9`.
+            Chunk::Image(url, s) => {
+                links.push(url);
+                current.push(Span::styled("[image]".to_string(), style_from(theme, &s)));
+                current.push(Span::styled(
+                    format!(" [{}]", links.len()),
+                    link_style(theme),
+                ));
+            }
+            Chunk::Attach(id, s) => {
+                current.push(Span::styled(
+                    format!("[attachment {id}]"),
+                    style_from(theme, &s),
                 ));
             }
         }
