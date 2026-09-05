@@ -16,7 +16,7 @@ use super::{
 };
 use crate::chrome::{self, Hints};
 use crate::glyph::Glyphs;
-use crate::theme::{fmt_age, Theme};
+use crate::theme::{fmt_age, fmt_age_parts, Theme};
 
 /// Both panes fit side by side from here up (DESIGN.md) — the same threshold
 /// Home uses for its own tree+list split.
@@ -518,7 +518,16 @@ fn render_inbox_view_panel(
     ];
     let mut tail = String::new();
     if started > 0 {
-        tail.push_str(&format!(" \u{00B7} started {} ago", fmt_age(started)));
+        // "ago" only reads right on the relative rungs ("14h", "6d"); once
+        // the ladder falls back to a calendar date or bare year (issue
+        // #578), the phrase must be "started on Jul 26" / "started on
+        // 2025", not "started Jul 26 ago".
+        let (age_text, is_relative) = fmt_age_parts(started);
+        if is_relative {
+            tail.push_str(&format!(" \u{00B7} started {age_text} ago"));
+        } else {
+            tail.push_str(&format!(" \u{00B7} started on {age_text}"));
+        }
     }
     tail.push_str(&format!(" \u{00B7} {total_messages} messages"));
     meta.push(Span::styled(tail, theme.dim()));
@@ -1687,6 +1696,38 @@ mod tests {
         let rows = render_rows_inbox(&mut s, 120, 36);
         let text = rows.join("\n");
         assert!(text.contains("unread"), "alerts footer missing: {text}");
+    }
+
+    /// Issue #578: the view panel's header used to append "ago"
+    /// unconditionally (`"started {fmt_age} ago"`), which only reads right
+    /// on `fmt_age`'s relative rungs (`14h`, `6d`). Past 30 days the ladder
+    /// falls back to a calendar date or a bare year, and "started Jul 26
+    /// ago" / "started 2025 ago" is nonsense. A conversation whose first
+    /// message is 90 days old must read "started on <date>" instead.
+    #[test]
+    fn inbox_view_header_says_started_on_for_a_message_past_the_relative_rungs() {
+        let now = time::OffsetDateTime::now_utc();
+        let ninety_days_ago = now.unix_timestamp() - 90 * 86_400;
+        // Confirm the fixture actually lands on a calendar/year rung, not a
+        // relative one — otherwise this test would pass for the wrong
+        // reason regardless of the fix.
+        let (age_text, is_relative) = crate::theme::fmt_age_parts(ninety_days_ago);
+        assert!(!is_relative, "test setup: 90 days must land past the relative rungs");
+
+        let mut s = sample_inbox_state();
+        if let Some(view) = &mut s.view {
+            view.messages[0].message_date = ninety_days_ago;
+        }
+        let rows = render_rows_inbox(&mut s, 120, 36);
+        let text = rows.join("\n");
+        assert!(
+            text.contains(&format!("started on {age_text}")),
+            "expected calendar-date wording: {text}"
+        );
+        assert!(
+            !text.contains(&format!("started {age_text} ago")),
+            "must not say '... ago' once the ladder is past its relative rungs: {text}"
+        );
     }
 
     #[test]

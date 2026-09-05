@@ -925,8 +925,9 @@ impl App {
                                     if !text.is_empty() {
                                         let n = text.chars().count();
                                         self.copy_text(&text);
-                                        self.status =
-                                            format!("Copied {n} chars to clipboard (selection cleared)");
+                                        self.set_status(format!(
+                                            "Copied {n} chars to clipboard (selection cleared)"
+                                        ));
                                     }
                                 } else {
                                     return 0;
@@ -1811,8 +1812,9 @@ impl App {
                         if !text.is_empty() {
                             let n = text.chars().count();
                             self.copy_text(&text);
-                            self.status =
-                                format!("Copied word ({n} chars) to clipboard (and Ctrl+Y)");
+                            self.set_status(format!(
+                                "Copied word ({n} chars) to clipboard (and Ctrl+Y)"
+                            ));
                         }
                     }
                 } else if self.click_count == 3 {
@@ -1826,8 +1828,9 @@ impl App {
                         if !text.is_empty() {
                             let n = text.chars().count();
                             self.copy_text(&text);
-                            self.status =
-                                format!("Copied line ({n} chars) to clipboard (and Ctrl+Y)");
+                            self.set_status(format!(
+                                "Copied line ({n} chars) to clipboard (and Ctrl+Y)"
+                            ));
                         }
                     }
                 } else {
@@ -1855,8 +1858,9 @@ impl App {
                     if !text.is_empty() {
                         let n = text.chars().count();
                         self.copy_text(&text);
-                        self.status =
-                            format!("Copied {n} chars to your clipboard (and Ctrl+Y)");
+                        self.set_status(format!(
+                            "Copied {n} chars to your clipboard (and Ctrl+Y)"
+                        ));
                     }
                 }
             }
@@ -2411,6 +2415,23 @@ impl App {
         let client = self.client.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
+            // Snapshot the token set, then take it out of memory and erase
+            // the store *immediately* — before either revoke round-trip,
+            // not after both. Each revoke call can take up to CONNECT 10s +
+            // REQUEST 30s (a slow site, a CF challenge, a stalled
+            // connection — exactly the conditions under which people sign
+            // out and back in), and the old order called
+            // `client.forget_tokens()` only once that ~80s window had
+            // elapsed. A sign-in completed inside it lands its fresh tokens
+            // via `set_tokens()` first, and the late, unconditional
+            // `forget_tokens()` then took the NEW session out of memory and
+            // erased the NEW `token.json` (issue #574). Snapshotting and
+            // forgetting back-to-back, with no network call between them,
+            // closes that window: the revoke calls below use the snapshot,
+            // never the live session, so anything `set_tokens()` installs
+            // afterward survives untouched.
+            let tokens = client.token_set().await;
+            let forgotten = client.forget_tokens().await;
             // Revoke the refresh token first and the access token second,
             // each with its `token_type_hint` — the endpoint defaults to
             // `access_token`, so the old single call left the 90-day refresh
@@ -2423,7 +2444,6 @@ impl App {
             // live. The server-side fix is a relay in the TuiLink add-on and
             // is out of this client's scope.
             let mut failed: Vec<&str> = Vec::new();
-            let tokens = client.token_set().await;
             if let Some(tokens) = tokens {
                 match common::http::build() {
                     Ok(http) => {
@@ -2449,7 +2469,7 @@ impl App {
                     }
                 }
             }
-            let result = match client.forget_tokens().await {
+            let result = match forgotten {
                 Err(e) => Err(e.to_string()),
                 Ok(()) if !failed.is_empty() => Err(format!(
                     "the server kept {} valid \u{2014} sign out in a browser to end the session",
@@ -3214,8 +3234,23 @@ impl App {
                 Err(e) => {
                     // The local token file is gone either way; say what did
                     // not happen instead of leaving "Logged out." standing.
+                    // This is the one place the user learns their 90-day
+                    // refresh token may still be live server-side (issue
+                    // #527), so it must not be a toast that
+                    // `expire_status_toast` blanks after `STATUS_TOAST_SECS`
+                    // — a status write that vanishes on its own clock while
+                    // the user is reading the sign-in link box is the same
+                    // silence #527 wanted fixed (issue #575). `set_hint`
+                    // keeps it up until something else replaces it, and it
+                    // is also mirrored onto the Login screen's own error
+                    // line (cleared by `begin_login`) so it stays beside the
+                    // sign-in box rather than only on the status row.
                     tracing::warn!("logout error: {e}");
-                    self.set_status(format!("Logged out locally, but {e}."));
+                    let message = format!("Logged out locally, but {e}.");
+                    self.set_hint(message.clone());
+                    if let Some(Screen::Login(ls)) = self.screens.last_mut() {
+                        ls.error = Some(message);
+                    }
                 }
             },
         }
@@ -3626,13 +3661,25 @@ mod tests {
         assert!(!is_image_cell(&plain));
     }
 
-    /// Issue #527: a revoke that did not take must not hide behind
+    /// Issue #527/#575: a revoke that did not take must not hide behind
     /// "Logged out." — the tokens are still live on the server until they
-    /// expire, and the only honest place to say so is the status line.
+    /// expire, and the only honest place to say so is the status line. Round
+    /// 6 routed that message through `set_status`, so it was a 4-second
+    /// toast `expire_status_toast` blanked while the user was still reading
+    /// the sign-in link box — the #527 gap going silent again. It must be a
+    /// persistent hint (`status_set_at` stays `None`, so nothing ever clears
+    /// it on its own), and it must also land on the Login screen's own error
+    /// line so it stays beside the sign-in box rather than only on the
+    /// status row.
     #[test]
     fn a_failed_revoke_is_reported_in_the_status_line() {
         let mut app = test_app();
+        app.screens.push(screens::login_state());
         app.status = "Logged out.".into();
+        // A stale toast timer must not survive: if this write went through
+        // `set_status`, `status_set_at` would stay `Some` and the message
+        // would vanish `STATUS_TOAST_SECS` later.
+        app.status_set_at = Some(std::time::Instant::now());
         app.handle_msg(Msg::LoggedOut(Err(
             "the server kept refresh token valid".into()
         )));
@@ -3642,6 +3689,20 @@ mod tests {
             "the revoke failure was swallowed: {:?}",
             app.status
         );
+        assert!(
+            app.status_set_at.is_none(),
+            "a mandated security signal must be a persistent hint, not a toast that expires"
+        );
+        match app.screens.last() {
+            Some(Screen::Login(ls)) => {
+                assert!(
+                    ls.error.as_deref().is_some_and(|e| e.contains("refresh token")),
+                    "the warning must also surface beside the sign-in box: {:?}",
+                    ls.error
+                );
+            }
+            _ => panic!("expected the Login screen on top"),
+        }
 
         // A clean logout says nothing extra.
         app.status = "Logged out.".into();
@@ -4744,6 +4805,80 @@ mod tests {
         assert!(app.me.is_some(), "the current generation's answer must still land");
     }
 
+    /// Issue #574: each `/api/oauth2/revoke` round-trip inside `logout()` can
+    /// take up to CONNECT 10s + REQUEST 30s. The old order only took the
+    /// session out of memory and erased the store *after* both had returned,
+    /// so a sign-in completed inside that window (`finish_login`'s
+    /// `set_tokens()`) landed its fresh tokens first, and the late,
+    /// unconditional `forget_tokens()` then deleted the NEW session it had
+    /// nothing to do with. `logout()` must snapshot-and-forget before either
+    /// revoke call, not after, so a `set_tokens()` that lands while the
+    /// (mocked, deliberately slow) revoke calls are still in flight survives
+    /// untouched — in memory and on disk.
+    #[tokio::test]
+    async fn set_tokens_after_logouts_snapshot_survives_a_slow_revoke() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/oauth2/revoke"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_delay(Duration::from_millis(300)),
+            )
+            .mount(&server)
+            .await;
+
+        let store_path = scratch_config_dir().join("token-race-574.json");
+        let _ = std::fs::remove_file(&store_path);
+        let store = common::token::Store::with_path(store_path.clone());
+        let client = Arc::new(WfApiClient::with_store(store, server.uri()).expect("client init"));
+        client
+            .set_tokens(common::token::TokenSet {
+                access_token: "old-access".into(),
+                refresh_token: "old-refresh".into(),
+                expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                scope: "test".into(),
+            })
+            .await
+            .unwrap();
+
+        let mut app = test_app();
+        app.client = client.clone();
+        app.screens.push(screens::home_state(true));
+
+        app.logout();
+
+        // Long enough for the spawned task to pass its snapshot-and-forget
+        // step (near-instant: no network call happens before it) but well
+        // short of either mocked revoke's 300ms delay.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // A sign-in lands here — exactly what `finish_login` does.
+        client
+            .set_tokens(common::token::TokenSet {
+                access_token: "new-access".into(),
+                refresh_token: "new-refresh".into(),
+                expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                scope: "test".into(),
+            })
+            .await
+            .unwrap();
+
+        // Let both revoke calls finish and `Msg::LoggedOut` land.
+        let sent = tokio::time::timeout(Duration::from_secs(2), app.rx.recv())
+            .await
+            .expect("logout must report back")
+            .expect("channel open");
+        assert!(matches!(sent, Msg::LoggedOut(_)), "expected LoggedOut");
+
+        let live = client.token_set().await.expect("the new session must survive in memory");
+        assert_eq!(live.access_token, "new-access");
+
+        let on_disk = common::token::Store::with_path(store_path)
+            .load()
+            .unwrap()
+            .expect("the new session must survive on disk");
+        assert_eq!(on_disk.refresh_token, "new-refresh");
+    }
+
     /// Issue #568: while the store recheck is in flight, every other caller
     /// that was queued behind the refresh which just failed reports the same
     /// `invalid_grant`. Those describe the grant the recheck is already
@@ -5242,6 +5377,32 @@ mod tests {
         assert_eq!(
             app.status, "Sign in first, or press q to quit.",
             "a persistent hint must never auto-clear"
+        );
+    }
+
+    /// Issue #576: four "Copied …" writes (Ctrl+C-with-selection, and the
+    /// double-/triple-click/drag-release copy paths in `handle_mouse`) used
+    /// to assign `self.status` directly, skipping `status_set_at` — so the
+    /// message either inherited whatever toast timer was already running or
+    /// (behind a persistent hint) never expired at all. `set_status` and
+    /// `set_hint` are the only two places `App::status` may be written
+    /// directly; this pins that every other write in the file routes
+    /// through one of them, so a new direct assignment fails this test
+    /// immediately instead of silently reintroducing the bug.
+    #[test]
+    fn no_direct_status_writes_bypass_set_status_or_set_hint() {
+        let src = include_str!("app.rs");
+        let direct_writes: Vec<&str> = src
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| l.starts_with("self.status ="))
+            .collect();
+        assert_eq!(
+            direct_writes,
+            vec!["self.status = s.into();", "self.status = s.into();"],
+            "only set_status/set_hint may assign `self.status` directly — \
+             found an unexpected direct write, which will inherit or never \
+             clear a stale toast timer (issue #576)"
         );
     }
 

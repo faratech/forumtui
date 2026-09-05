@@ -150,14 +150,22 @@ impl WfApiClient {
     /// of the session: XF rotates the refresh token on every refresh, so a
     /// sibling instance sharing the config dir (a tmux session on the
     /// server plus a local one) invalidates this process's in-memory grant
-    /// while leaving a perfectly good token set on disk. When the store
-    /// holds a *different* refresh token than the one the server just
-    /// rejected, that set is adopted and the call retried once — the
-    /// recovery `adopt_stored_tokens` was written for, which the app could
-    /// never reach because the first error a rotated refresh produces is
-    /// this `OAuth` one, not the `NoToken` the recheck listens for
-    /// (issue #568). Only when there is nothing newer to adopt (or the
-    /// sibling's token is dead too) does the session end.
+    /// while leaving a perfectly good token set on disk — but that set may
+    /// belong to a *different account* (issue #573: the store's `TokenSet`
+    /// carries no user id, so this client cannot tell), and this call has no
+    /// way to refresh `App::me`, the header, or any "as <user>" assumption
+    /// before its caller's next write goes out. So a different token set on
+    /// disk is no longer adopted here: the in-memory session is cleared and
+    /// `Error::NoToken` is returned, routing through the app-level boundary
+    /// (`recheck_stored_session` -> `adopt_stored_tokens` -> `/me` ->
+    /// `Msg::Bootstrap`) that already exists for exactly this recovery and
+    /// always refreshes `App::me` before anything else runs (issue
+    /// #568/#557). The store itself is left untouched in that case — it may
+    /// hold a sibling's (or a different account's) perfectly good session,
+    /// and only the app-level recheck may adopt it. Only when there is
+    /// nothing newer on disk (the store still holds the very token that was
+    /// just rejected, or nothing at all) does the session end outright, with
+    /// the original error returned and the dead token erased.
     pub async fn valid_token(&self) -> Result<String> {
         let mut guard = self.tokens.lock().await;
         let existing = guard.as_ref().ok_or(Error::NoToken)?.clone();
@@ -177,36 +185,22 @@ impl WfApiClient {
         if !matches!(&err, Error::OAuth { code, .. } if code == "invalid_grant") {
             return Err(err);
         }
-        // Rejected. Before ending the session, look on disk: a sibling may
-        // have rotated the shared token set out from under this process.
+        // Rejected. Check the store for a different token set before ending
+        // the session outright — but never adopt it here (see doc comment
+        // above); that identity re-check belongs to the app-level recheck.
         let sibling = self
             .store
             .load()
             .ok()
             .flatten()
             .filter(|t| t.refresh_token != refresh_token && !t.refresh_token.is_empty());
-        let Some(sibling) = sibling else {
-            // Nothing newer to adopt: force a clean re-login. Only wipe the
-            // store if it still holds this refresh token (the user may have
-            // re-logged in from another code path).
-            self.forget_rejected(&mut guard, &refresh_token);
-            return Err(err);
-        };
-        *guard = Some(sibling.clone());
-        if !sibling.access_expired(OffsetDateTime::now_utc()) {
-            return Ok(sibling.access_token);
+        if sibling.is_some() {
+            *guard = None;
+            return Err(Error::NoToken);
         }
-        // The sibling's access token is expired too — one retry with ITS
-        // refresh token, then give up for real.
-        match oauth::refresh(&self.http, &self.base, &sibling.refresh_token).await {
-            Ok(refreshed) => Ok(self.keep_refreshed(&mut guard, refreshed)),
-            Err(e) => {
-                if matches!(&e, Error::OAuth { code, .. } if code == "invalid_grant") {
-                    self.forget_rejected(&mut guard, &sibling.refresh_token);
-                }
-                Err(e)
-            }
-        }
+        // Nothing newer to recover from: the session really is over.
+        self.forget_rejected(&mut guard, &refresh_token);
+        Err(err)
     }
 
     /// Install a freshly refreshed token set as the live session and hand
@@ -1444,23 +1438,31 @@ mod tests {
         let _ = std::fs::remove_file(dir);
     }
 
-    /// Issue #568: two clients sharing one `token.json` (a tmux session on
-    /// the server plus a local one) invalidate each other's in-memory grant,
-    /// because XF rotates the refresh token on every refresh. The instance
-    /// that lost the race asks the token endpoint with its now-revoked
-    /// refresh token and is told `invalid_grant` — which used to end the
-    /// session outright, kicking the member to sign-in with a perfectly good
-    /// token set sitting on disk. (`adopt_stored_tokens` existed for exactly
-    /// this, but the app only ran it for `NoToken`, which this path never
-    /// produces.) The rejection is now checked against the store first: a
-    /// *different* refresh token there means a sibling rotated it, so that
-    /// set is adopted and the call goes through.
+    /// Issue #568/#573: two clients sharing one `token.json` (a tmux session
+    /// on the server plus a local one) invalidate each other's in-memory
+    /// grant, because XF rotates the refresh token on every refresh. The
+    /// instance that lost the race asks the token endpoint with its
+    /// now-revoked refresh token and is told `invalid_grant`. Round 6 had
+    /// `valid_token` adopt whatever *different* refresh token it found on
+    /// disk right here and hand back its access token — but `TokenSet`
+    /// carries no user id, so that set could belong to a different account
+    /// entirely, and nothing would tell the app: the header, `as <user>`,
+    /// and every "you" assumption would keep showing the old identity while
+    /// the call (and any write after it) went out as whoever's token was on
+    /// disk. `valid_token` must instead clear the in-memory session and
+    /// return `Error::NoToken` — routing through the app-level boundary
+    /// (`recheck_stored_session` -> `adopt_stored_tokens` -> `/me` ->
+    /// `Msg::Bootstrap`) that re-verifies identity before anything else runs.
+    /// The store itself is left untouched: it may hold a sibling's — or a
+    /// different account's — perfectly good session, and only the app-level
+    /// recheck may adopt it.
     #[tokio::test]
-    async fn a_refresh_rejected_after_a_sibling_rotated_the_store_adopts_the_sibling_token() {
+    async fn a_refresh_rejected_with_a_different_token_set_on_disk_ends_the_session_without_adopting_it()
+     {
         let server = MockServer::start().await;
         let dir = "/tmp/wftui-t-sibling-rotation";
         let _env = EnvGuard::hold(&server.uri(), dir);
-        // This process's refresh token is the one the sibling consumed.
+        // This process's refresh token is the one that gets rejected.
         Mock::given(method("POST"))
             .and(path("/api/oauth2/token"))
             .and(wiremock::matchers::body_string_contains("refresh_token=refresh-1"))
@@ -1470,14 +1472,14 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        // The sibling's access token is still good, so no second refresh is
-        // needed — and the request must carry it, not the dead one.
+        // If the old adoption behavior regressed, this call would go out
+        // under the foreign identity — assert it never fires.
         Mock::given(method("GET"))
             .and(path("/api/nodes"))
-            .and(header("Authorization", "Bearer access-2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "nodes": [{"node_id": 4, "title": "Windows News", "node_type_id": "Forum"}]
             })))
+            .expect(0)
             .mount(&server)
             .await;
 
@@ -1490,8 +1492,9 @@ mod tests {
         })
         .await
         .unwrap();
-        // The sibling instance refreshed and wrote the rotated set to the
-        // shared store; this process still holds the old one in memory.
+        // A different token set sits on disk — a sibling's rotation, or (the
+        // threat model this closes) a different account's session left on a
+        // shared machine. Either way `valid_token` must not adopt it.
         let store = token::Store::with_path(std::path::PathBuf::from(dir).join("token.json"));
         store
             .save(&TokenSet {
@@ -1502,20 +1505,67 @@ mod tests {
             })
             .unwrap();
 
-        let nodes = c
-            .nodes()
-            .await
-            .expect("the sibling's token set must carry the call through");
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].title, "Windows News");
-        // Adopted in memory, and the sibling's set is still on disk (an
-        // `invalid_grant` for a token the store no longer holds must never
-        // erase someone else's session).
-        assert_eq!(c.valid_token().await.unwrap(), "access-2");
+        let err = c.valid_token().await.expect_err("must not adopt silently");
+        assert!(matches!(err, Error::NoToken), "expected NoToken, got {err:?}");
+        // No call went out under the foreign identity, and no write can
+        // follow: the in-memory session is gone.
+        assert!(!c.has_tokens().await, "the live session must be cleared, not swapped");
+        // The store is untouched — the foreign set is still there for the
+        // app-level recheck (which verifies identity via `/me`) to adopt.
         assert_eq!(
             store.load().unwrap().expect("the store must survive").refresh_token,
             "refresh-2"
         );
+    }
+
+    /// Companion to the above at the call-site level: even a write-shaped
+    /// call (`nodes()` stands in for any authenticated request) must come
+    /// back `NoToken` rather than quietly succeeding as whoever's token set
+    /// is on disk — the mock's `expect(0)` on `/api/nodes` is the assertion
+    /// that no request ever leaves under the unverified identity.
+    #[tokio::test]
+    async fn a_call_after_invalid_grant_with_a_foreign_token_on_disk_never_goes_out() {
+        let server = MockServer::start().await;
+        let dir = "/tmp/wftui-t-sibling-rotation-call-site";
+        let _env = EnvGuard::hold(&server.uri(), dir);
+        Mock::given(method("POST"))
+            .and(path("/api/oauth2/token"))
+            .and(wiremock::matchers::body_string_contains("refresh_token=refresh-1"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "errors": [{"code": "invalid_grant", "message": "Invalid refresh token"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/nodes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "nodes": [{"node_id": 4, "title": "Windows News", "node_type_id": "Forum"}]
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let c = WfApiClient::new().unwrap();
+        c.set_tokens(TokenSet {
+            access_token: "expired".into(),
+            refresh_token: "refresh-1".into(),
+            expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
+            scope: "test".into(),
+        })
+        .await
+        .unwrap();
+        let store = token::Store::with_path(std::path::PathBuf::from(dir).join("token.json"));
+        store
+            .save(&TokenSet {
+                access_token: "access-2".into(),
+                refresh_token: "refresh-2".into(),
+                expires_at: OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                scope: "test".into(),
+            })
+            .unwrap();
+
+        let result = c.nodes().await;
+        assert!(matches!(result, Err(Error::NoToken)), "expected NoToken, got {result:?}");
     }
 
     /// The other half of #568: when the store holds the *same* refresh token

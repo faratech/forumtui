@@ -1237,12 +1237,17 @@ mod dispatch_tests {
                     // screen state, no `Action` (see its arm in
                     // `compose_key`).
                     "^O",
-                    // `^A` (attach) is shadowed: attachment upload is
-                    // implemented in `common` but not wired into compose
-                    // (CLAUDE.md "Known gaps"), so `Ctrl+A` in the body
-                    // falls through to the readline `move_home` binding a
-                    // few lines below it and always returns `Action::None`.
-                    "^A",
+                    // No `^A` entry to skip here any more (issue #577):
+                    // `compose_hints` used to advertise `^A attach` while
+                    // `Ctrl+A` actually falls through to the readline
+                    // `move_home` binding in both fields (attachment upload
+                    // is implemented in `common` but not wired into compose
+                    // — CLAUDE.md "Known gaps") — an advertised key doing
+                    // something else with no notice. The cap was dropped
+                    // from both hint sets instead of adding it to this skip
+                    // list, so this loop no longer sees it at all; pinned
+                    // directly by
+                    // `misc::tests::compose_hints_never_advertise_attach_and_ctrl_a_still_moves_home`.
                 ],
             },
             Case {

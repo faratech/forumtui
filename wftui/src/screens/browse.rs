@@ -1095,8 +1095,21 @@ pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<
                         break; // swallow the run that wrap runoff already dropped
                     }
                     if used + len > width {
-                        out.push(std::mem::take(&mut line));
-                        used = 0;
+                        // Only flush a row when something was actually
+                        // placed on it: at `used == 0` (the very start of
+                        // this logical line, or right after a previous
+                        // token already flushed) there is no content-bearing
+                        // `line` to push, so pushing here opened a spurious
+                        // blank row — a `[CODE]` line indented deeper than
+                        // the wrap width rendered as a blank row before its
+                        // content, and a whitespace-only line wider than the
+                        // width rendered as two blank rows (issue #579). The
+                        // oversized run is still dropped as wrap runoff
+                        // either way.
+                        if used > 0 {
+                            out.push(std::mem::take(&mut line));
+                            used = 0;
+                        }
                         just_wrapped = true;
                     } else {
                         line.push(Span::styled(rest.to_string(), style));
@@ -3005,6 +3018,30 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].iter().map(|s| s.content.as_ref()).collect::<String>(), "aaaaa");
         assert_eq!(out[1].iter().map(|s| s.content.as_ref()).collect::<String>(), "bbbbb");
+
+        // Issue #579 (a round-6 regression in the #566 fix above): a
+        // leading whitespace run *wider than the wrap width itself* must be
+        // dropped as runoff, not opened onto its own blank row — `line` is
+        // still empty at `used == 0`, so flushing it unconditionally pushed
+        // an empty `Vec` before the real content.
+        let joined = |v: &Vec<Span<'static>>| v.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let out = wrap_spans(&[Span::raw(format!("{}x", " ".repeat(12)))], 10);
+        assert_eq!(
+            out.iter().map(joined).collect::<Vec<_>>(),
+            vec!["x".to_string()],
+            "an oversized leading whitespace run must not open a spurious blank row"
+        );
+
+        // The same run with nothing after it (a trailing-space-only line
+        // from a pasted log) must collapse to exactly one (empty) row, not
+        // two — the old bug pushed the flushed empty row AND the trailing
+        // `out.push(line)` unconditional flush at the end of the function.
+        let out = wrap_spans(&[Span::raw(" ".repeat(12))], 10);
+        assert_eq!(
+            out.iter().map(joined).collect::<Vec<_>>(),
+            vec![String::new()],
+            "a whitespace-only line wider than the width must yield one row, not two"
+        );
     }
 
     /// Issue #566: a `[CODE]` block's indentation must round-trip through

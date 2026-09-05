@@ -52,3 +52,10 @@ libc = "0.2"
 # implementation outside `common` needs the same macro. Keeps handler tests
 # off the network entirely (`common` already depends on it).
 async-trait = "0.1"
+# Only for the `logout()` race test (issue #574): a real (loopback) server
+# whose `/api/oauth2/revoke` can be told to answer slowly, to reproduce a
+# sign-in landing while the revoke round-trips are still in flight. Every
+# other test still uses `RecordingApi`/`offline_client` and never reaches
+# this — see the `guard_no_test_touches_the_real_config_dir_or_the_live_site`
+# discipline above.
+wiremock = "0.6"

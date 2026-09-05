@@ -618,12 +618,18 @@ pub fn compose_hints(s: &super::ComposeState) -> Hints {
     let is_new_thread = matches!(s.target, Some(ComposeTarget::NewThread { .. }));
     let primary = if is_new_thread { "post thread" } else { "send" };
     let primary_short = if is_new_thread { "post" } else { "send" };
+    // Issue #577: `^A attach` was advertised here while Ctrl+A actually
+    // moves the caret to the start of the line in both fields (there is no
+    // `Action` for attachments — upload is implemented in `common` but not
+    // wired into this screen, per CLAUDE.md's "Known gaps"). Never advertise
+    // a key and then do something else / refuse silently (the same rule
+    // that dropped `N`/`m` from the Latest list). Drop the cap until upload
+    // is wired; Ctrl+A stays bound to move-home, just not in this namespace.
     Hints::with_short(
         &[
             ("^S", primary),
             ("^O", "preview on/off"),
             ("^Y", "paste"),
-            ("^A", "attach"),
             ("Tab", "field"),
             ("Esc", "discard"),
         ],
@@ -631,7 +637,6 @@ pub fn compose_hints(s: &super::ComposeState) -> Hints {
             ("^S", primary_short),
             ("^O", "preview"),
             ("^Y", ""),
-            ("^A", ""),
             ("Esc", "discard"),
         ],
         0,
@@ -2415,6 +2420,55 @@ mod tests {
         compose_key(&mut s, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         assert_eq!(s.body, "    a");
         assert!(s.title.is_empty());
+    }
+
+    /// Issue #577: `compose_hints()` used to advertise `^A attach` in both
+    /// the full and short sets while `compose_key` bound Ctrl+A to
+    /// `move_home` in both fields — an advertised key that silently does
+    /// something else, with no attach flow behind it (upload is implemented
+    /// in `common` but not wired into this screen). The cap must not be
+    /// advertised until that is fixed; Ctrl+A must keep working as
+    /// move-to-start-of-line either way.
+    #[test]
+    fn compose_hints_never_advertise_attach_and_ctrl_a_still_moves_home() {
+        for target in [
+            ComposeTarget::NewThread { node_id: 4 },
+            ComposeTarget::ThreadReply {
+                thread_id: 1,
+                thread_title: "Thread".into(),
+            },
+        ] {
+            let s = ComposeState {
+                target: Some(target),
+                ..Default::default()
+            };
+            let hints = compose_hints(&s);
+            assert!(
+                hints.keys.iter().all(|(cap, _)| *cap != "^A"),
+                "^A must not be advertised in the full hint set until attach is wired"
+            );
+            assert!(
+                hints.short.iter().all(|(cap, _)| *cap != "^A"),
+                "^A must not be advertised in the short hint set until attach is wired"
+            );
+        }
+
+        // Ctrl+A itself is unchanged: still home, in both fields.
+        let mut s = ComposeState {
+            target: Some(ComposeTarget::NewThread { node_id: 4 }),
+            title_field: true,
+            title: "hello".into(),
+            title_cursor: 5,
+            body: "world".into(),
+            body_cursor: 5,
+            ..Default::default()
+        };
+        compose_key(&mut s, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(s.title_cursor, 0, "Ctrl+A in the title field must still move home");
+
+        s.title_field = false;
+        compose_key(&mut s, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(s.body_cursor, 0, "Ctrl+A in the body field must still move home");
     }
 
     #[test]

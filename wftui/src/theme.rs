@@ -358,34 +358,51 @@ pub fn fmt_age(ts: i64) -> String {
 /// `fmt_age` with an injected "now", so the ladder is testable without
 /// freezing the clock.
 pub fn fmt_age_at(ts: i64, now: time::OffsetDateTime) -> String {
+    fmt_age_parts_at(ts, now).0
+}
+
+/// `fmt_age`, plus whether the rung it landed on is *relative* ("now",
+/// "45m", "14h", "6d") rather than a calendar date or bare year.
+///
+/// A caller that wraps the text in its own phrase (`"started {} ago"`) needs
+/// this to know whether "ago" is even grammatical: it is for the relative
+/// rungs, but not once the ladder falls back to `"Jul 26"` or `"2025"` —
+/// "started Jul 26 ago" / "started 2025 ago" (issue #578).
+pub fn fmt_age_parts(ts: i64) -> (String, bool) {
+    fmt_age_parts_at(ts, time::OffsetDateTime::now_utc())
+}
+
+/// `fmt_age_parts` with an injected "now", so the ladder is testable without
+/// freezing the clock.
+pub fn fmt_age_parts_at(ts: i64, now: time::OffsetDateTime) -> (String, bool) {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     let Ok(t) = time::OffsetDateTime::from_unix_timestamp(ts) else {
-        return String::new();
+        return (String::new(), true);
     };
     let age = now.unix_timestamp() - ts;
     if age < 0 {
         // A clock skew or a scheduled post: fall back to the date rather than
         // printing a negative age.
-        return format!("{} {}", MONTHS[t.month() as usize - 1], t.day());
+        return (format!("{} {}", MONTHS[t.month() as usize - 1], t.day()), false);
     }
     if age < 60 {
-        return "now".into();
+        return ("now".into(), true);
     }
     if age < 3_600 {
-        return format!("{}m", age / 60);
+        return (format!("{}m", age / 60), true);
     }
     if age < 86_400 {
-        return format!("{}h", age / 3_600);
+        return (format!("{}h", age / 3_600), true);
     }
     if age < 30 * 86_400 {
-        return format!("{}d", age / 86_400);
+        return (format!("{}d", age / 86_400), true);
     }
     if t.year() == now.year() {
-        return format!("{} {}", MONTHS[t.month() as usize - 1], t.day());
+        return (format!("{} {}", MONTHS[t.month() as usize - 1], t.day()), false);
     }
-    t.year().to_string()
+    (t.year().to_string(), false)
 }
 
 #[cfg(test)]
