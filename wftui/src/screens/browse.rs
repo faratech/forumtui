@@ -296,6 +296,8 @@ pub(crate) fn push_bbcode(
     src: &str,
     theme: &Theme,
 ) {
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+
     for chunk in bbcode::render(src) {
         match chunk {
             Chunk::Text(t, s) => {
@@ -305,10 +307,11 @@ pub(crate) fn push_bbcode(
                 // Preserve line breaks inside the chunk.
                 for (i, seg) in t.split('\n').enumerate() {
                     if i > 0 {
-                        lines.push(Line::from(Span::raw("")));
+                        lines.push(Line::from(std::mem::take(&mut current_spans)));
                     }
                     if !seg.is_empty() {
-                        lines.push(Line::from(Span::styled(seg.to_string(), style_from(theme, &s))));
+                        current_spans
+                            .push(Span::styled(seg.to_string(), style_from(theme, &s)));
                     }
                 }
             }
@@ -317,12 +320,24 @@ pub(crate) fn push_bbcode(
                 // Plain styled text only — never embed OSC sequences in
                 // spans (ratatui re-emits cells and the terminal eats the
                 // surrounding text). Select-with-mouse or open via [o].
-                lines.push(Line::from(vec![
-                    Span::styled(label, style_from(theme, &s)),
-                    Span::styled(format!(" [{}]", links.len()), link_style(theme)),
-                ]));
+                for (i, seg) in label.split('\n').enumerate() {
+                    if i > 0 {
+                        lines.push(Line::from(std::mem::take(&mut current_spans)));
+                    }
+                    if !seg.is_empty() {
+                        current_spans
+                            .push(Span::styled(seg.to_string(), style_from(theme, &s)));
+                    }
+                }
+                current_spans.push(Span::styled(
+                    format!(" [{}]", links.len()),
+                    link_style(theme),
+                ));
             }
         }
+    }
+    if !current_spans.is_empty() {
+        lines.push(Line::from(current_spans));
     }
 }
 
@@ -506,5 +521,40 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
     } else {
         let cut: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{cut}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_bbcode_keeps_inline_formatting_on_same_line() {
+        let theme = Theme::dark();
+        let mut lines = Vec::new();
+        let mut links = Vec::new();
+        push_bbcode(
+            &mut lines,
+            &mut links,
+            "Hello [B]world[/B] from [URL=https://example.com]Windows[/URL]!",
+            &theme,
+        );
+        assert_eq!(lines.len(), 1, "inline styling should remain on a single line");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0], "https://example.com");
+    }
+
+    #[test]
+    fn push_bbcode_respects_newlines() {
+        let theme = Theme::dark();
+        let mut lines = Vec::new();
+        let mut links = Vec::new();
+        push_bbcode(
+            &mut lines,
+            &mut links,
+            "Line 1 with [B]bold[/B]\nLine 2 with [I]italic[/I]\n\nLine 4",
+            &theme,
+        );
+        assert_eq!(lines.len(), 4);
     }
 }
