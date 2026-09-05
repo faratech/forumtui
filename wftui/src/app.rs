@@ -10,7 +10,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use tokio::sync::mpsc;
 
-use common::api::{WfApi, WfApiClient};
+use common::api::{Toggle, WfApi, WfApiClient};
 use common::error::Error;
 use common::models::*;
 
@@ -20,6 +20,11 @@ use crate::glyph::{self, Glyphs};
 use crate::overlay::{self, GoTarget, Palette, PaletteEvent, Prefix, PrefixEvent};
 use crate::screens::{self, Action, ComposeTarget, Screen};
 use crate::theme::Theme;
+
+/// How many image loads may be in flight at once (issue #543). Small on
+/// purpose: decoration is never what the user is waiting for, and `draw`
+/// spawns one task per visible image slot the moment a thread opens.
+const IMAGE_LOAD_CONCURRENCY: usize = 3;
 
 /// Serializable error payload crossing from background tasks into the UI.
 #[derive(Debug, Clone)]
@@ -71,7 +76,17 @@ pub enum Msg {
     ThreadCreated(TaskResult<Thread>),
     MarkedRead(TaskResult<()>),
     ConversationsLoaded { page: u32, result: TaskResult<ConversationsReply> },
-    ConversationLoaded { id: u32, page: u32, result: TaskResult<ConversationReply> },
+    /// A conversation page came back. `mark_read` says whether this load was
+    /// the USER opening the conversation — only then may the client tell the
+    /// server it has been read. The dual-pane Inbox primes its right half with
+    /// the newest conversation before anyone has selected it, and marking that
+    /// read was a real data side-effect of merely pressing `c` (issue #541).
+    ConversationLoaded {
+        id: u32,
+        page: u32,
+        mark_read: bool,
+        result: TaskResult<ConversationReply>,
+    },
     ConvoReplySent(TaskResult<()>),
     ConvoCreated(TaskResult<Conversation>),
     ConversationMarked(TaskResult<()>),
@@ -93,7 +108,48 @@ pub enum Msg {
         key: String,
         result: Result<crate::images::Loaded, String>,
     },
+    /// A like or a vote came back. XF toggles both, so the reply's
+    /// insert-vs-delete is what decides the wording, and the ♡/▲ footer is
+    /// baked into the post lines, so the page is re-fetched (issue #538).
+    PostToggled { verb: PostVerb, result: TaskResult<Toggle> },
     Notice(String),
+}
+
+/// Which toggle a `Msg::PostToggled` is answering, so the notice can name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostVerb {
+    Like,
+    VoteUp,
+    VoteDown,
+}
+
+impl PostVerb {
+    fn of_vote(vote_type: &str) -> PostVerb {
+        if vote_type.eq_ignore_ascii_case("down") {
+            PostVerb::VoteDown
+        } else {
+            PostVerb::VoteUp
+        }
+    }
+
+    /// The status line for an outcome. "liked" is never claimed for an unlike.
+    pub fn notice(self, toggle: Toggle) -> &'static str {
+        match (self, toggle) {
+            (PostVerb::Like, Toggle::Inserted) => "Post liked.",
+            (PostVerb::Like, Toggle::Removed) => "Like removed.",
+            (PostVerb::VoteUp, Toggle::Inserted) => "Voted up.",
+            (PostVerb::VoteDown, Toggle::Inserted) => "Voted down.",
+            (PostVerb::VoteUp | PostVerb::VoteDown, Toggle::Removed) => "Vote removed.",
+        }
+    }
+
+    /// The status line when the call itself failed.
+    fn failure(self) -> &'static str {
+        match self {
+            PostVerb::Like => "Like failed",
+            PostVerb::VoteUp | PostVerb::VoteDown => "Vote failed",
+        }
+    }
 }
 
 pub struct App {
@@ -105,11 +161,22 @@ pub struct App {
     pub glyphs: Glyphs,
     /// Inline graphics: detected tier, decoded-protocol LRU, disk cache.
     pub images: crate::images::Images,
+    /// At most this many image loads are in flight at once. `draw` spawns one
+    /// task per visible image slot in the first frame after a thread opens, so
+    /// without a cap a cold cache turns one keypress into a screenful of
+    /// concurrent fetch+decode work (issue #543). The per-request spacing is
+    /// still `WfApiClient::image_gate`'s.
+    #[cfg_attr(not(feature = "images"), allow(dead_code))]
+    image_slots: Arc<tokio::sync::Semaphore>,
     pub screens: Vec<Screen>,
     pub me: Option<User>,
     pub alerts_unread: u32,
     pub convos_unread: u32,
     pub status: String,
+    /// Set just before a reload whose only purpose is to refresh a thread page
+    /// in place (`thread_id`, `page`, `sel_post`, `scroll`); consumed by the
+    /// matching `Msg::ThreadLoaded` (issue #538).
+    keep_thread_position: Option<(u32, u32, usize, u16)>,
     show_help: bool,
     /// The go-to palette, when it is open. It owns the keyboard while it is.
     palette: Option<Palette>,
@@ -164,12 +231,18 @@ impl TerminalGuard {
         };
         use ratatui::crossterm::terminal::*;
         enable_raw_mode()?;
-        ratatui::crossterm::execute!(
+        if let Err(e) = ratatui::crossterm::execute!(
             std::io::stdout(),
             EnterAlternateScreen,
             EnableMouseCapture,
             EnableBracketedPaste,
-        )?;
+        ) {
+            // Don't leave the terminal in raw mode if we're bailing out here —
+            // otherwise the caller's `eprintln!` (and the shell prompt after
+            // it) render with no line discipline.
+            let _ = disable_raw_mode();
+            return Err(e.into());
+        }
         let _ = ratatui::crossterm::execute!(
             std::io::stdout(),
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
@@ -178,23 +251,88 @@ impl TerminalGuard {
     }
 }
 
+/// The restore steps `restore_terminal` issues, in order — extracted as plain
+/// data so the ordering can be pinned by a unit test without a real terminal.
+/// The order matters (Pop first, matching the enable-side Push-last symmetry)
+/// but each step MUST be independent: see `restore_terminal`. Test-only: this
+/// exists purely as the pinned reference for `restore_terminal`'s ordering.
+#[cfg(test)]
+fn restore_steps() -> [&'static str; 5] {
+    [
+        "pop_keyboard_enhancement_flags",
+        "disable_bracketed_paste",
+        "leave_alternate_screen",
+        "disable_mouse_capture",
+        "cursor_show",
+    ]
+}
+
+/// Shared by `TerminalGuard::drop` and the panic hook in `main.rs`.
+///
+/// Each crossterm command is issued in its OWN `execute!` call. In crossterm
+/// 0.29 `PopKeyboardEnhancementFlags::is_ansi_code_supported()` is `false` on
+/// Windows and its `execute_winapi()` returns `Err(Unsupported)`; `execute!`
+/// expands to a `queue().and_then(queue).and_then(queue)...` chain, so a
+/// single call listing all five commands would short-circuit at Pop and skip
+/// `LeaveAlternateScreen`/`DisableMouseCapture`/`cursor::Show` on every exit
+/// path on Windows (issue #531). Splitting them means Pop's failure can never
+/// gate the commands that actually restore visible terminal state.
+pub(crate) fn restore_terminal() {
+    use ratatui::crossterm::event::{
+        DisableBracketedPaste, DisableMouseCapture, PopKeyboardEnhancementFlags,
+    };
+    use ratatui::crossterm::execute;
+    use ratatui::crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
+
+    let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = execute!(std::io::stdout(), ratatui::crossterm::cursor::Show);
+    let _ = disable_raw_mode();
+    // LAST: crossterm restores the attributes it snapshotted at its first
+    // `enable_raw_mode()`, which may have been taken while the graphics query
+    // still had ICANON/ECHO cleared (#532). Our own pre-query snapshot wins.
+    crate::tty::restore();
+}
+
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        use ratatui::crossterm::event::{
-            DisableBracketedPaste, DisableMouseCapture, PopKeyboardEnhancementFlags,
-        };
-        use ratatui::crossterm::execute;
-        use ratatui::crossterm::terminal::*;
-        let _ = execute!(
-            std::io::stdout(),
-            PopKeyboardEnhancementFlags,
-            DisableBracketedPaste,
-            LeaveAlternateScreen,
-            DisableMouseCapture,
-            ratatui::crossterm::cursor::Show
-        );
-        let _ = disable_raw_mode();
+        restore_terminal();
         emit_raw(&common::osc::set_title(""));
+    }
+}
+
+#[cfg(test)]
+mod terminal_guard_tests {
+    use super::*;
+
+    /// Pins the restore ordering: Pop first (mirroring Push-last on the way
+    /// in), then the three commands that actually restore visible terminal
+    /// state, then cursor::Show. Each is independent — see `restore_terminal`.
+    #[test]
+    fn restore_steps_are_ordered_and_independent() {
+        let steps = restore_steps();
+        assert_eq!(
+            steps,
+            [
+                "pop_keyboard_enhancement_flags",
+                "disable_bracketed_paste",
+                "leave_alternate_screen",
+                "disable_mouse_capture",
+                "cursor_show",
+            ]
+        );
+    }
+
+    /// Regression for issue #531: `restore_terminal` must not early-return or
+    /// panic when an individual crossterm command errors (e.g. no attached
+    /// tty in a test process, or — on Windows — PopKeyboardEnhancementFlags
+    /// being unsupported); every step is `let _ =`-isolated so later steps
+    /// always run.
+    #[test]
+    fn restore_terminal_runs_to_completion_without_a_tty() {
+        restore_terminal();
     }
 }
 
@@ -232,11 +370,13 @@ pub async fn run(images: crate::images::Images) -> u8 {
         theme: Theme::detect(),
         glyphs: glyph::detect(),
         images,
+        image_slots: Arc::new(tokio::sync::Semaphore::new(IMAGE_LOAD_CONCURRENCY)),
         screens: Vec::new(),
         me: None,
         alerts_unread: 0,
         convos_unread: 0,
         status: "Starting…".into(),
+        keep_thread_position: None,
         show_help: false,
         palette: None,
         prefix: Prefix::default(),
@@ -334,11 +474,7 @@ impl App {
                 ))
                 .await;
                 if let Ok(page) = api.conversations(1).await {
-                    let unread = page
-                        .conversations
-                        .iter()
-                        .filter(|c| c.conversation_unread)
-                        .count() as u32;
+                    let unread = common::models::count_unread_conversations(&page.conversations);
                     tx.send(Msg::Notice(format!("convos:{unread}"))).ok();
                 }
             }
@@ -822,7 +958,8 @@ impl App {
             Action::LoadForum(node_id, page) => self.load_forum(node_id, page),
             Action::LoadThread(id, page) => self.load_thread(id, page),
             Action::LoadConversations(page) => self.load_conversations(page),
-            Action::LoadConversation(id, page) => self.load_conversation(id, page),
+            // Paging inside a conversation the user already opened.
+            Action::LoadConversation(id, page) => self.load_conversation(id, page, true),
             Action::LoadAlerts => self.load_alerts(),
             Action::LoadNodes => {
                 if let Some(tree) = self.tree_mut() {
@@ -850,29 +987,20 @@ impl App {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
                 tokio::spawn(async move {
-                    match api.react_post(post_id, 1).await {
-                        Ok(()) => {
-                            tx.send(Msg::Notice("Post liked!".into())).ok();
-                        }
-                        Err(e) => {
-                            tx.send(Msg::Notice(format!("Like failed: {e}"))).ok();
-                        }
-                    }
+                    let result = api.react_post(post_id, 1).await.map_err(|e| TaskError::of(&e));
+                    tx.send(Msg::PostToggled { verb: PostVerb::Like, result }).ok();
                 });
             }
             Action::VotePost(post_id, vote_type) => {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
-                let vt = vote_type.clone();
+                let verb = PostVerb::of_vote(&vote_type);
                 tokio::spawn(async move {
-                    match api.vote_post(post_id, &vote_type).await {
-                        Ok(()) => {
-                            tx.send(Msg::Notice(format!("Voted {vt}!"))).ok();
-                        }
-                        Err(e) => {
-                            tx.send(Msg::Notice(format!("Vote failed: {e}"))).ok();
-                        }
-                    }
+                    let result = api
+                        .vote_post(post_id, &vote_type)
+                        .await
+                        .map_err(|e| TaskError::of(&e));
+                    tx.send(Msg::PostToggled { verb, result }).ok();
                 });
             }
             Action::StartReply(thread) => self.reply_to_thread(&thread),
@@ -882,7 +1010,10 @@ impl App {
                 let mut state = screens::NewConversationState::default();
                 if let Some(r) = recipient {
                     state.recipients = format!("{r}, ");
-                    state.recipients_cursor = state.recipients.len();
+                    // Char count, not byte length — editor.rs cursors are
+                    // char indices, and a non-ASCII username (e.g. "Zoë")
+                    // has more bytes than chars (issue #535).
+                    state.recipients_cursor = state.recipients.chars().count();
                     state.field = 1;
                 }
                 self.push_screen(Screen::NewConversation(state));
@@ -1529,7 +1660,7 @@ impl App {
                 ..Default::default()
             });
             inbox.focus = screens::InboxPane::View;
-            self.load_conversation(cid, 1);
+            self.load_conversation(cid, 1, true);
             return;
         }
         self.push_screen(Screen::ConversationView(screens::ConversationViewState {
@@ -1538,7 +1669,7 @@ impl App {
             loading: true,
             ..Default::default()
         }));
-        self.load_conversation(cid, 1);
+        self.load_conversation(cid, 1, true);
     }
 
     pub fn load_conversations(&mut self, page: u32) {
@@ -1917,6 +2048,25 @@ impl App {
             Msg::ImageLoaded { key, result } => {
                 self.images.on_loaded(key, result);
             }
+            Msg::PostToggled { verb, result } => {
+                match result {
+                    Ok(toggle) => {
+                        self.status = verb.notice(toggle).to_string();
+                        // The ♡/▲ counts live in the baked post lines, so the
+                        // page has to come back from the server; keep the
+                        // reader where they were while it does (issue #538).
+                        if let Some((id, page, sel_post, scroll)) =
+                            open_thread_position(&self.screens)
+                        {
+                            self.keep_thread_position = Some((id, page, sel_post, scroll));
+                            self.load_thread(id, page);
+                        }
+                    }
+                    Err(e) => {
+                        self.status = format!("{}: {}", verb.failure(), e.message);
+                    }
+                }
+            }
             Msg::Notice(n) => {
                 if n == "quit" {
                     self.should_quit = true;
@@ -1951,6 +2101,8 @@ impl App {
                 if let Some(tree) = tree {
                     match result {
                         Ok(nodes) => {
+                            // See ForumLoaded (issue #537).
+                            tree.error = None;
                             if tree.sel == 0
                                 && !nodes.is_empty()
                                 && let Some(idx) = nodes.iter().position(|n| n.node_type == "Forum")
@@ -1973,6 +2125,10 @@ impl App {
                 if let Some(list) = list {
                     match result {
                         Ok(reply) => {
+                            // A previous failed load must not keep rendering
+                            // "Error: ... Press r to retry" forever once a
+                            // later load succeeds (issue #537).
+                            list.error = None;
                             if !reply.forum.title.is_empty() {
                                 list.title = reply.forum.title;
                             }
@@ -1997,6 +2153,13 @@ impl App {
                 }
             }
             Msg::ThreadLoaded { id, page, result } => {
+                // One-shot: a reload that only exists to refresh the ♡/▲
+                // counts must not scroll the reader back to the top or move
+                // the selection out from under the next `l`/`v` (issue #538).
+                let keep = self
+                    .keep_thread_position
+                    .take()
+                    .filter(|(kid, kpage, _, _)| *kid == id && *kpage == page);
                 let view = self.screens.iter_mut().rev().find_map(|s| match s {
                     Screen::ThreadView(view) if view.thread.thread_id == id => Some(view),
                     _ => None,
@@ -2004,6 +2167,9 @@ impl App {
                 if let Some(view) = view {
                     match result {
                         Ok(reply) => {
+                            // See ForumLoaded: clear a stale error on success
+                            // (issue #537).
+                            view.error = None;
                             if reply.thread.thread_id > 0 || !reply.thread.title.is_empty() {
                                 view.thread = reply.thread;
                             }
@@ -2014,6 +2180,11 @@ impl App {
                             view.loading = false;
                             view.scroll = 0;
                             view.sel_post = 0;
+                            if let Some((_, _, sel_post, scroll)) = keep {
+                                view.sel_post =
+                                    sel_post.min(view.posts.len().saturating_sub(1));
+                                view.scroll = scroll;
+                            }
                             view.rebuild_lines(&self.theme, &self.glyphs);
                         }
                         Err(e) => {
@@ -2129,6 +2300,8 @@ impl App {
                 if let Some(inbox) = self.inbox_mut() {
                     match result {
                         Ok(reply) => {
+                            // See ForumLoaded (issue #537).
+                            inbox.convos.error = None;
                             inbox.convos.conversations = reply.conversations;
                             inbox.convos.page = page;
                             inbox.convos.last_page = reply.pagination.last_page.max(1);
@@ -2138,14 +2311,9 @@ impl App {
                                 .convos
                                 .sel
                                 .min(inbox.convos.conversations.len().saturating_sub(1));
-                            new_unread = Some(
-                                inbox
-                                    .convos
-                                    .conversations
-                                    .iter()
-                                    .filter(|c| c.is_unread_conv())
-                                    .count() as u32,
-                            );
+                            new_unread = Some(common::models::count_unread_conversations(
+                                &inbox.convos.conversations,
+                            ));
                             // Prime the view pane with the first conversation
                             // so a dual Inbox never opens onto an empty right
                             // panel.
@@ -2174,14 +2342,17 @@ impl App {
                     self.convos_unread = n;
                 }
                 if let Some(cid) = auto_load {
-                    self.load_conversation(cid, 1);
+                    // Primed, not opened: never mark this one read (#541).
+                    self.load_conversation(cid, 1, false);
                 }
             }
-            Msg::ConversationLoaded { id, page, result } => {
+            Msg::ConversationLoaded { id, page, mark_read: user_opened, result } => {
                 let mut mark_read: Option<u32> = None;
                 if let Some(view) = self.conversation_view_mut(id) {
                     match result {
                         Ok(reply) => {
+                            // See ForumLoaded/ThreadLoaded (issue #537).
+                            view.error = None;
                             if reply.conversation.conversation_id > 0 {
                                 view.conversation = reply.conversation;
                             }
@@ -2189,11 +2360,22 @@ impl App {
                             view.page = page;
                             view.last_page = reply.pagination.last_page.max(1);
                             view.loading = false;
+                            // A freshly loaded page is a different set of
+                            // messages (paging, or a post-reply reload) —
+                            // sel_msg/scroll from the previous page no longer
+                            // refer to anything here. rebuild_message_lines
+                            // also clamps defensively, but resetting here
+                            // means the view opens at the top of the new page
+                            // instead of some carried-over offset (issue #534).
+                            view.sel_msg = 0;
+                            view.scroll = 0;
                             // The lines are derived by the renderer (which is
                             // the only place that knows the pane width); this
                             // just invalidates them.
                             view.built = None;
-                            mark_read = Some(view.conversation.conversation_id);
+                            if user_opened {
+                                mark_read = Some(view.conversation.conversation_id);
+                            }
                         }
                         Err(e) => {
                             view.loading = false;
@@ -2202,6 +2384,24 @@ impl App {
                     }
                 }
                 if let Some(cid) = mark_read {
+                    // Keep the client's own picture in step with the server:
+                    // the Inbox row keeps its unread glyph (and the header
+                    // badge its count) otherwise, until some later poll
+                    // happens to contradict them (issue #541).
+                    if let Some(inbox) = self.inbox_mut() {
+                        if let Some(row) = inbox
+                            .convos
+                            .conversations
+                            .iter_mut()
+                            .find(|c| c.conversation_id == cid)
+                        {
+                            row.is_unread = false;
+                            row.conversation_unread = false;
+                        }
+                        let unread =
+                            common::models::count_unread_conversations(&inbox.convos.conversations);
+                        self.convos_unread = unread;
+                    }
                     let api = self.api.clone();
                     let tx = self.tx.clone();
                     tokio::spawn(async move {
@@ -2236,7 +2436,7 @@ impl App {
                         }
                         self.status = "Message sent.".into();
                         if cid > 0 {
-                            self.load_conversation(cid, 1);
+                            self.load_conversation(cid, 1, true);
                         }
                     }
                     Err(e) => {
@@ -2331,6 +2531,8 @@ impl App {
                     let alerts = &mut inbox.alerts;
                     match result {
                         Ok(page) => {
+                            // See ForumLoaded (issue #537).
+                            alerts.error = None;
                             new_unread =
                                 Some(page.alerts.iter().filter(|a| !a.viewed()).count() as u32);
                             alerts.alerts = page.alerts;
@@ -2369,6 +2571,8 @@ impl App {
                 if let Some(search) = search {
                     match result {
                         Ok(reply) => {
+                            // See ForumLoaded (issue #537).
+                            search.error = None;
                             // `set_results` also derives the snippets, so the
                             // renderer never re-parses a post (issue #522).
                             search.set_results(reply.results);
@@ -2401,6 +2605,8 @@ impl App {
                 if let Some(profile) = profile {
                     match result {
                         Ok(user) => {
+                            // See ForumLoaded (issue #537).
+                            profile.error = None;
                             profile.user = Some(user);
                             profile.loading = false;
                         }
@@ -2432,7 +2638,10 @@ impl App {
         });
     }
 
-    pub fn load_conversation(&mut self, id: u32, page: u32) {
+    /// `mark_read` must be `true` only for a load the user asked for (opening
+    /// a conversation, paging inside it, the post-reply reload) — never for
+    /// the dual-pane Inbox priming its view pane (issue #541).
+    pub fn load_conversation(&mut self, id: u32, page: u32, mark_read: bool) {
         let api = self.api.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -2440,7 +2649,7 @@ impl App {
                 .conversation(id, page)
                 .await
                 .map_err(|e| TaskError::of(&e));
-            tx.send(Msg::ConversationLoaded { id, page, result }).ok();
+            tx.send(Msg::ConversationLoaded { id, page, mark_read, result }).ok();
         });
     }
 
@@ -2469,7 +2678,12 @@ impl App {
         let client = self.client.clone();
         let disk = self.images.disk();
         let tx = self.tx.clone();
+        let slots = self.image_slots.clone();
         tokio::spawn(async move {
+            // Decoration waits its turn behind at most a couple of siblings;
+            // `image_gate` then spaces the ones that get through, in a lane of
+            // its own so nothing here delays an interactive call (issue #543).
+            let _permit = slots.acquire_owned().await;
             let key = pending.store_key();
             let result = crate::images::load(&client, &disk, picker, &pending).await;
             tx.send(Msg::ImageLoaded { key, result }).ok();
@@ -2601,6 +2815,18 @@ async fn finish_login(
 /// always initiated from one, but a stale/missing view must not crash the
 /// reload, just fall back to asking for page 2 (which the API's max-page
 /// clamp will correct if that's wrong too).
+/// The topmost open thread view as (`thread_id`, `page`, `sel_post`,
+/// `scroll`) — what a like/vote needs to refresh the page it acted on without
+/// losing the reader's place.
+fn open_thread_position(screens: &[Screen]) -> Option<(u32, u32, usize, u16)> {
+    screens.iter().rev().find_map(|s| match s {
+        Screen::ThreadView(v) if v.thread.thread_id > 0 => {
+            Some((v.thread.thread_id, v.page.max(1), v.sel_post, v.scroll))
+        }
+        _ => None,
+    })
+}
+
 fn known_thread_last_page(screens: &[Screen], thread_id: u32) -> u32 {
     screens
         .iter()
@@ -2701,6 +2927,116 @@ mod tests {
         assert_eq!(app.status, "Logged out.");
     }
 
+    /// Issue #537: a transient load failure must not be permanent. Once a
+    /// later `ForumLoaded`/`ThreadLoaded` succeeds, `error` must clear so the
+    /// panel goes back to drawing real content instead of the frozen
+    /// "Error: ... Press r to retry." — verified both on the state and by
+    /// actually rendering the panel headlessly.
+    #[test]
+    fn a_successful_load_clears_a_previous_error_from_the_panel() {
+        let mut app = test_app();
+        app.push_screen(Screen::ThreadList(screens::ThreadListState {
+            node_id: 1,
+            error: Some("connection reset".into()),
+            loading: true,
+            ..Default::default()
+        }));
+        app.handle_msg(Msg::ForumLoaded {
+            node_id: 1,
+            page: 1,
+            result: Ok(ForumReply::default()),
+        });
+        {
+            let Some(Screen::ThreadList(list)) = app.screens.last() else {
+                panic!("expected the ThreadList screen");
+            };
+            assert!(list.error.is_none(), "a successful ForumLoaded must clear the old error");
+        }
+
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            let screen = app.screens.last_mut().expect("screen");
+            screen.render(f, area, &app.theme, &app.glyphs);
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let screen_text: String = (0..24)
+            .map(|y| (0..80).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect();
+        assert!(
+            !screen_text.contains("Error:"),
+            "the panel is still showing the stale error after a successful reload:\n{screen_text}"
+        );
+
+        // Same contract for the thread view.
+        app.screens.clear();
+        app.push_screen(Screen::ThreadView(screens::ThreadViewState {
+            error: Some("timed out".into()),
+            loading: true,
+            thread: Thread { thread_id: 9, ..Default::default() },
+            ..Default::default()
+        }));
+        app.handle_msg(Msg::ThreadLoaded {
+            id: 9,
+            page: 1,
+            result: Ok(ThreadReply {
+                thread: Thread { thread_id: 9, ..Default::default() },
+                ..Default::default()
+            }),
+        });
+        {
+            let Some(Screen::ThreadView(view)) = app.screens.last() else {
+                panic!("expected the ThreadView screen");
+            };
+            assert!(view.error.is_none(), "a successful ThreadLoaded must clear the old error");
+        }
+        let mut term2 =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        term2
+            .draw(|f| {
+                let area = f.area();
+                let screen = app.screens.last_mut().expect("screen");
+                screen.render(f, area, &app.theme, &app.glyphs);
+            })
+            .expect("draw");
+        let buf2 = term2.backend().buffer().clone();
+        let screen2: String = (0..24)
+            .map(|y| (0..80).map(|x| buf2[(x, y)].symbol().to_string()).collect::<String>())
+            .collect();
+        assert!(!screen2.contains("Error:"), "thread view still shows the stale error:\n{screen2}");
+    }
+
+    /// Issue #535: the recipients field prefilled from a profile's `c` key
+    /// must seed a CHAR cursor, not a byte length — every editor.rs helper
+    /// indexes by chars, and a non-ASCII username has more bytes than chars.
+    #[test]
+    fn recipient_prefill_seeds_a_char_cursor_not_a_byte_length() {
+        let mut app = test_app();
+        app.execute_action(Action::StartNewConversation(Some("Zoë".into())));
+        let Some(Screen::NewConversation(state)) = app.screens.last() else {
+            panic!("expected a NewConversation screen to be pushed");
+        };
+        assert_eq!(state.recipients, "Zoë, ");
+        assert_eq!(state.recipients.len(), 6, "sanity: the byte length differs from the char count");
+        assert_eq!(
+            state.recipients_cursor,
+            state.recipients.chars().count(),
+            "cursor must be a char index"
+        );
+        assert_eq!(state.recipients_cursor, 5);
+
+        // With the old byte-length seed (6), Ctrl+W would drain
+        // `start..*cursor` = `0..6` against a 5-char Vec and panic. It must
+        // now just delete the whole prefilled string.
+        let mut cursor = state.recipients_cursor;
+        let mut text = state.recipients.clone();
+        crate::editor::delete_word_back(&mut text, &mut cursor);
+        assert_eq!(text, "");
+        assert_eq!(cursor, 0);
+    }
+
     /// Issue #525: `set_stringn` resets the cell(s) a double-width character
     /// covers, so mirroring every cell's symbol put a phantom space after
     /// each ideograph on the clipboard and made word-select stop at it.
@@ -2768,6 +3104,262 @@ mod tests {
         assert_eq!(known_thread_last_page(&screens, 7), 1);
     }
 
+    /// A `WfApi` that never touches the network: every call fails with
+    /// `NoToken` except `mark_conversation_read`, which just records the id.
+    /// Substituted for `App::api` so a handler test can assert on the
+    /// PRESENCE or ABSENCE of a server-side side-effect (issue #541) without
+    /// a single request leaving the process.
+    #[derive(Default)]
+    struct RecordingApi {
+        marked_read: std::sync::Mutex<Vec<u32>>,
+    }
+
+    impl RecordingApi {
+        fn marks(&self) -> Vec<u32> {
+            self.marked_read.lock().expect("lock").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WfApi for RecordingApi {
+        async fn mark_conversation_read(&self, id: u32) -> common::error::Result<()> {
+            self.marked_read.lock().expect("lock").push(id);
+            Ok(())
+        }
+        async fn nodes(&self) -> common::error::Result<Vec<Node>> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn forum(&self, _: u32, _: u32) -> common::error::Result<ForumReply> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn threads(&self, _: u32) -> common::error::Result<common::models::ThreadsReply> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn thread(&self, _: u32, _: u32) -> common::error::Result<ThreadReply> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn thread_posts(&self, _: u32, _: u32) -> common::error::Result<common::models::PostsReply> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn reply(&self, _: u32, _: &str) -> common::error::Result<common::models::Post> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn create_thread(&self, _: u32, _: &str, _: &str) -> common::error::Result<Thread> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn mark_thread_read(&self, _: u32) -> common::error::Result<()> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn mark_forum_read(&self, _: u32) -> common::error::Result<()> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn conversations(&self, _: u32) -> common::error::Result<ConversationsReply> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn conversation(&self, _: u32, _: u32) -> common::error::Result<ConversationReply> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn reply_conversation(&self, _: u32, _: &str) -> common::error::Result<()> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn create_conversation(
+            &self,
+            _: &[u32],
+            _: &str,
+            _: &str,
+        ) -> common::error::Result<Conversation> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn delete_conversation(&self, _: u32) -> common::error::Result<()> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn alerts(&self, _: u32) -> common::error::Result<AlertsReply> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn mark_alert_read(&self, _: u32) -> common::error::Result<()> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn search(&self, _: &str, _: u32) -> common::error::Result<SearchResultsReply> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn search_advanced(
+            &self,
+            _: &SearchQuery,
+        ) -> common::error::Result<SearchResultsReply> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn search_member(
+            &self,
+            _: u32,
+            _: &str,
+            _: u32,
+        ) -> common::error::Result<SearchResultsReply> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn react_post(&self, _: u32, _: u32) -> common::error::Result<Toggle> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn vote_post(&self, _: u32, _: &str) -> common::error::Result<Toggle> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn me(&self) -> common::error::Result<User> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn user(&self, _: u32) -> common::error::Result<User> {
+            Err(common::error::Error::NoToken)
+        }
+        async fn find_user(&self, _: &str) -> common::error::Result<Option<User>> {
+            Err(common::error::Error::NoToken)
+        }
+    }
+
+    /// Issue #541: a dual-pane Inbox primes its view pane with the newest
+    /// conversation before the user has selected anything. That load must not
+    /// mark it read on the server; the load the user actually asked for must,
+    /// and must also stop the Inbox row and the header badge from claiming it
+    /// is still unread.
+    #[tokio::test]
+    async fn only_a_user_opened_conversation_is_marked_read() {
+        let api = std::sync::Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+
+        let conv = Conversation {
+            conversation_id: 7,
+            title: "Hello".into(),
+            is_unread: true,
+            ..Default::default()
+        };
+        let reply = || ConversationReply {
+            conversation: Conversation { conversation_id: 7, ..Default::default() },
+            ..Default::default()
+        };
+        app.screens.push(Screen::Inbox(screens::InboxState {
+            dual: true,
+            convos: screens::ConversationsState {
+                conversations: vec![conv.clone()],
+                page: 1,
+                last_page: 1,
+                ..Default::default()
+            },
+            view: Some(screens::ConversationViewState {
+                conversation: conv.clone(),
+                page: 1,
+                loading: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        app.convos_unread = 1;
+
+        // The priming load: no mark-read, and the row stays unread.
+        app.handle_msg(Msg::ConversationLoaded {
+            id: 7,
+            page: 1,
+            mark_read: false,
+            result: Ok(reply()),
+        });
+        tokio::task::yield_now().await;
+        assert!(api.marks().is_empty(), "priming the pane marked a DM read on the server");
+        {
+            let Some(Screen::Inbox(inbox)) = app.screens.last() else {
+                panic!("expected the Inbox screen");
+            };
+            assert!(inbox.convos.conversations[0].is_unread_conv());
+        }
+        assert_eq!(app.convos_unread, 1);
+
+        // The user opening it: marked read once, and the client's own picture
+        // (row + badge) follows.
+        app.handle_msg(Msg::ConversationLoaded {
+            id: 7,
+            page: 1,
+            mark_read: true,
+            result: Ok(reply()),
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(api.marks(), vec![7]);
+        let Some(Screen::Inbox(inbox)) = app.screens.last() else {
+            panic!("expected the Inbox screen");
+        };
+        assert!(
+            !inbox.convos.conversations[0].is_unread_conv(),
+            "the Inbox row still shows unread after the server was told otherwise"
+        );
+        assert_eq!(app.convos_unread, 0);
+    }
+
+    /// Issue #538: XF's react/vote endpoints are toggles, so the notice has to
+    /// come from the reply's `action`, and the refresh they trigger must not
+    /// move the reader (or the selection the next `l` acts on).
+    #[test]
+    fn like_and_vote_notices_follow_the_servers_insert_or_delete() {
+        use common::api::Toggle::{Inserted, Removed};
+        assert_eq!(PostVerb::Like.notice(Inserted), "Post liked.");
+        assert_eq!(PostVerb::Like.notice(Removed), "Like removed.");
+        assert_eq!(PostVerb::VoteUp.notice(Inserted), "Voted up.");
+        assert_eq!(PostVerb::VoteDown.notice(Inserted), "Voted down.");
+        assert_eq!(PostVerb::VoteUp.notice(Removed), "Vote removed.");
+        assert_eq!(PostVerb::VoteDown.notice(Removed), "Vote removed.");
+        assert_eq!(PostVerb::of_vote("up"), PostVerb::VoteUp);
+        assert_eq!(PostVerb::of_vote("DOWN"), PostVerb::VoteDown);
+    }
+
+    #[test]
+    fn the_refresh_after_a_like_keeps_the_reader_and_the_selection_in_place() {
+        let mut app = test_app();
+        let posts = |n: u32| {
+            (1..=n)
+                .map(|i| common::models::Post { post_id: i, ..Default::default() })
+                .collect::<Vec<_>>()
+        };
+        app.push_screen(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 42, ..Default::default() },
+            page: 2,
+            sel_post: 3,
+            scroll: 12,
+            posts: posts(5),
+            ..Default::default()
+        }));
+
+        // What the toggle handler hands to `load_thread`.
+        assert_eq!(open_thread_position(&app.screens), Some((42, 2, 3, 12)));
+
+        app.keep_thread_position = Some((42, 2, 3, 12));
+        app.handle_msg(Msg::ThreadLoaded {
+            id: 42,
+            page: 2,
+            result: Ok(ThreadReply {
+                thread: Thread { thread_id: 42, ..Default::default() },
+                posts: posts(5),
+                ..Default::default()
+            }),
+        });
+        {
+            let Some(Screen::ThreadView(view)) = app.screens.last() else {
+                panic!("expected the ThreadView screen");
+            };
+            assert_eq!(view.sel_post, 3, "a counts refresh must not move the selection");
+            assert_eq!(view.scroll, 12, "…nor scroll the reader back to the top");
+        }
+        assert!(app.keep_thread_position.is_none(), "the hint is one-shot");
+
+        // Every other load still lands at the top of the page.
+        app.handle_msg(Msg::ThreadLoaded {
+            id: 42,
+            page: 2,
+            result: Ok(ThreadReply {
+                thread: Thread { thread_id: 42, ..Default::default() },
+                posts: posts(5),
+                ..Default::default()
+            }),
+        });
+        let Some(Screen::ThreadView(view)) = app.screens.last() else {
+            panic!("expected the ThreadView screen");
+        };
+        assert_eq!((view.sel_post, view.scroll), (0, 0));
+    }
+
     /// Builds an `App` for poller bookkeeping tests. `start_pollers` spawns
     /// loops that hold `Arc<dyn WfApi>`, but both loops `sleep` for their
     /// full interval before ever calling the API, so a real `WfApiClient`
@@ -2784,11 +3376,13 @@ mod tests {
             theme: Theme::detect(),
             glyphs: glyph::detect(),
             images: crate::images::Images::default(),
+            image_slots: Arc::new(tokio::sync::Semaphore::new(IMAGE_LOAD_CONCURRENCY)),
             screens: Vec::new(),
             me: None,
             alerts_unread: 3,
             convos_unread: 5,
             status: String::new(),
+            keep_thread_position: None,
             show_help: false,
             palette: None,
             prefix: Prefix::default(),

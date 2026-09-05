@@ -647,6 +647,12 @@ impl ConversationViewState {
     /// dump), this has no "CONVERSATION PARTICIPANTS" header — the Inbox pane
     /// draws its own compact `with … · started … · N messages` line above it.
     pub fn rebuild_message_lines(&mut self, theme: &Theme, g: &Glyphs, width: u16) {
+        // Defensive clamp: sel_msg is written by the n/N keys against the
+        // PREVIOUS page's message count, and paging/reload can shrink the
+        // list out from under it before this next rebuild runs (issue #534).
+        self.sel_msg = self
+            .sel_msg
+            .min(self.messages.len().saturating_sub(1));
         if self.built == Some((width, self.sel_msg)) {
             return;
         }
@@ -743,16 +749,20 @@ fn conversation_view_key_inner(s: &mut ConversationViewState, key: KeyEvent) -> 
             }
         }
         KeyCode::Char('n') => {
-            if !s.msg_line_offsets.is_empty() && s.sel_msg + 1 < s.msg_line_offsets.len() {
+            if s.sel_msg + 1 < s.msg_line_offsets.len()
+                && let Some(&line) = s.msg_line_offsets.get(s.sel_msg + 1)
+            {
                 s.sel_msg += 1;
-                s.scroll = s.msg_line_offsets[s.sel_msg];
+                s.scroll = line;
             }
             Action::None
         }
         KeyCode::Char('N') => {
-            if s.sel_msg > 0 && !s.msg_line_offsets.is_empty() {
+            if s.sel_msg > 0
+                && let Some(&line) = s.msg_line_offsets.get(s.sel_msg - 1)
+            {
                 s.sel_msg -= 1;
-                s.scroll = s.msg_line_offsets[s.sel_msg];
+                s.scroll = line;
             }
             Action::None
         }
@@ -1102,16 +1112,18 @@ pub fn render_new_conversation(
     ])
     .areas(inner);
 
+    const TO_LABEL: &str = "To (usernames, comma-separated): ";
+    const TITLE_LABEL: &str = "Title: ";
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("To (usernames, comma-separated): ", theme.dim()),
+            Span::styled(TO_LABEL, theme.dim()),
             Span::styled(s.recipients.clone(), theme.base()),
         ])),
         to_area,
     );
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Title: ", theme.dim()),
+            Span::styled(TITLE_LABEL, theme.dim()),
             Span::styled(s.title.clone(), theme.base()),
         ])),
         title_area,
@@ -1153,7 +1165,10 @@ pub fn render_new_conversation(
     let cur_pos = match s.field {
         0 => {
             let col = s.recipients.chars().take(s.recipients_cursor).count() as u16;
-            let prefix_len = 32u16;
+            // Measured from the label itself (cells, not a hand-counted
+            // constant) so the caret can't drift off by however many cells
+            // someone gets wrong re-copying the string (issue #535).
+            let prefix_len = crate::chrome::cell_width(TO_LABEL) as u16;
             Some((
                 (to_area.x + prefix_len + col).min(to_area.x + to_area.width.saturating_sub(1)),
                 to_area.y,
@@ -1161,7 +1176,7 @@ pub fn render_new_conversation(
         }
         1 => {
             let col = s.title.chars().take(s.title_cursor).count() as u16;
-            let prefix_len = 7u16;
+            let prefix_len = crate::chrome::cell_width(TITLE_LABEL) as u16;
             Some((
                 (title_area.x + prefix_len + col)
                     .min(title_area.x + title_area.width.saturating_sub(1)),
@@ -1272,6 +1287,44 @@ mod tests {
         (0..h)
             .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
             .collect()
+    }
+
+    /// Issue #535: the recipients caret used a hand-counted `32` for the
+    /// 33-cell label `"To (usernames, comma-separated): "`, landing one cell
+    /// left of the actual insertion point. Pin the caret to where the typed
+    /// text itself renders, so a wrong constant fails regardless of panel
+    /// border internals.
+    #[test]
+    fn recipients_caret_aligns_with_the_actual_label_width() {
+        let mut s = super::super::NewConversationState {
+            field: 0,
+            recipients: "abc".to_string(),
+            recipients_cursor: 3,
+            ..Default::default()
+        };
+        let theme = Theme::truecolor();
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE);
+        })
+        .expect("draw");
+        let pos = term.get_cursor_position().expect("cursor");
+        let buf = term.backend().buffer().clone();
+        // Per-cell symbols, one per column — unlike a joined `String`, this
+        // keeps the index aligned to the buffer's x coordinate even though
+        // the border glyphs are multi-byte UTF-8.
+        let cells: Vec<String> = (0..80).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
+        let text_start = cells
+            .windows(3)
+            .position(|w| w[0] == "a" && w[1] == "b" && w[2] == "c")
+            .expect("recipients text on screen") as u16;
+        assert_eq!(
+            pos.x,
+            text_start + 3,
+            "caret must land right after the typed text, not one cell short"
+        );
     }
 
     /// Issue #519/#523 for the DM composer: the message body is pre-wrapped
@@ -1402,6 +1455,53 @@ mod tests {
         state.built = None;
         state.rebuild_message_lines(&theme, &g, 40);
         assert!(state.lines.len() > 1, "fresh messages must rebuild");
+    }
+
+    fn conv_messages(n: usize) -> Vec<ConversationMessage> {
+        (0..n)
+            .map(|i| ConversationMessage {
+                message_id: i as u32 + 1,
+                conversation_id: 3,
+                user_id: 2,
+                username: "kemical".into(),
+                message: format!("message {i}"),
+                message_date: 1_700_000_000,
+            })
+            .collect()
+    }
+
+    /// Issue #534: a page change (or the post-reply reload) used to leave
+    /// `sel_msg` pointing past the new, shorter page. `rebuild_message_lines`
+    /// must clamp it before indexing, and `N` must never index past the
+    /// clamped bound — repro is page 1 with 6 messages at sel_msg=5, then a
+    /// page swap down to 2 messages, then `N`.
+    #[test]
+    fn stale_sel_msg_after_a_page_change_is_clamped_not_indexed() {
+        let mut state = ConversationViewState {
+            conversation: sample_conversation(),
+            messages: conv_messages(6),
+            page: 1,
+            last_page: 2,
+            sel_msg: 5,
+            ..Default::default()
+        };
+        let theme = Theme::truecolor();
+        let g = crate::glyph::UNICODE;
+        state.rebuild_message_lines(&theme, &g, 60);
+        assert_eq!(state.sel_msg, 5);
+
+        // Simulate the shorter page 2 landing without an app.rs-level reset
+        // (the defense-in-depth this test pins): sel_msg is still 5.
+        state.messages = conv_messages(2);
+        state.built = None;
+        state.rebuild_message_lines(&theme, &g, 60);
+        assert_eq!(state.sel_msg, 1, "sel_msg must clamp to the new last index");
+
+        // `N` must not panic and must stop at 0, using the clamped offsets.
+        conversation_view_key_inner(&mut state, key('N'));
+        assert_eq!(state.sel_msg, 0);
+        conversation_view_key_inner(&mut state, key('N'));
+        assert_eq!(state.sel_msg, 0, "N past the top must be a no-op, not a panic");
     }
 
     fn key(c: char) -> KeyEvent {

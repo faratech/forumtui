@@ -1594,6 +1594,12 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
         KeyCode::Char('n') => {
             if s.sel_post + 1 < s.posts.len() {
                 s.sel_post += 1;
+                // `lines`' gutter colour is baked in by `rebuild_lines` off
+                // `sel_post`; `s.width != inner.width` is the renderer's only
+                // rebuild trigger, so force it by invalidating the cached
+                // width — otherwise the accent gutter stays on the old post
+                // while the footer/l/v/p/1-9 all act on the new one (issue #542).
+                s.width = 0;
                 if let Some(&line) = s.post_line_offsets.get(s.sel_post) {
                     s.scroll = line as u16;
                 }
@@ -1603,6 +1609,7 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
         KeyCode::Char('N') => {
             if s.sel_post > 0 {
                 s.sel_post -= 1;
+                s.width = 0;
                 if let Some(&line) = s.post_line_offsets.get(s.sel_post) {
                     s.scroll = line as u16;
                 }
@@ -2513,6 +2520,32 @@ mod tests {
         for (i, fg) in gutters {
             let want = if i >= second { theme.accent } else { theme.faint };
             assert_eq!(fg, Some(want), "gutter at line {i} (post starts {first}/{second})");
+        }
+
+        // Issue #542: `n` alone (no resize in between) must move the gutter
+        // too — thread_view_key's `n`/`N` write `sel_post` directly and used
+        // to leave `lines` (and its baked gutter colour) stale until a
+        // resize, tier change, or reload happened to rebuild it. The
+        // renderer's only rebuild trigger is `s.width != inner.width`, so
+        // pin that `n` now invalidates that cache.
+        s.sel_post = 0;
+        s.width = 80; // pretend a previous render already settled this width
+        s.rebuild_lines(&theme, &UNICODE);
+        thread_view_key(&mut s, key('n'));
+        assert_eq!(s.sel_post, 1);
+        assert_eq!(s.width, 0, "n must invalidate the cached width so the next render rebuilds");
+        s.width = 80;
+        s.rebuild_lines(&theme, &UNICODE);
+        let gutters_after_n: Vec<(usize, Option<ratatui::style::Color>)> = s
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.spans.get(1).is_some_and(|sp| sp.content == "\u{2503}"))
+            .map(|(i, l)| (i, l.spans[1].style.fg))
+            .collect();
+        for (i, fg) in gutters_after_n {
+            let want = if i >= second { theme.accent } else { theme.faint };
+            assert_eq!(fg, Some(want), "gutter at line {i} did not follow `n`");
         }
     }
 

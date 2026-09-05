@@ -363,6 +363,13 @@ pub struct Conversation {
     pub last_message_date: i64,
     #[serde(default, rename = "last_message_username")]
     pub last_message_username: String,
+    /// XF's `ConversationMaster::setupApiResultData` never emits this key —
+    /// `is_unread` (below) is the only unread flag the API actually sends.
+    /// It stays here (always `false` off the wire, defaulted) only so old
+    /// fixtures/tests that set it keep compiling; NEVER filter/branch on it
+    /// alone — use `is_unread_conv()`, which ORs both (issue #536: the
+    /// conversations poller filtered on this field alone and always sent
+    /// `convos:0`, resetting the Inbox badge every poll).
     #[serde(default, rename = "conversation_unread")]
     pub conversation_unread: bool,
     #[serde(default, rename = "is_unread")]
@@ -375,6 +382,14 @@ pub struct Conversation {
     pub view_url: Option<String>,
     #[serde(default, deserialize_with = "deserialize_recipients")]
     pub recipients: Vec<ConversationRecipient>,
+}
+
+/// Shared by wftui's conversations poller and `Msg::ConversationsLoaded`:
+/// only `is_unread_conv()` reflects what XF actually emits over the wire
+/// (issue #536 — filtering on `conversation_unread` alone always counted
+/// zero, since XF never sends that key).
+pub fn count_unread_conversations(conversations: &[Conversation]) -> u32 {
+    conversations.iter().filter(|c| c.is_unread_conv()).count() as u32
 }
 
 impl Conversation {
@@ -1126,5 +1141,26 @@ mod tests {
         }))
         .unwrap();
         assert!(!closed.discussion_open);
+    }
+
+    /// Issue #536: XF only ever emits `is_unread` on a conversation, never
+    /// `conversation_unread` (`ConversationMaster::setupApiResultData`). A
+    /// count that filtered on `conversation_unread` alone always came out
+    /// zero — this fixture is shaped exactly like the real wire payload.
+    #[test]
+    fn count_unread_conversations_reads_is_unread_not_the_never_emitted_field() {
+        let wire = serde_json::json!([
+            {"conversation_id": 1, "title": "A", "is_unread": true},
+            {"conversation_id": 2, "title": "B", "is_unread": false},
+        ]);
+        let convs: Vec<Conversation> = serde_json::from_value(wire).unwrap();
+        // Sanity: the wire payload really doesn't carry the other field.
+        assert!(!convs[0].conversation_unread);
+        assert!(convs[0].is_unread);
+        assert_eq!(
+            count_unread_conversations(&convs),
+            1,
+            "the poller's badge count must see the one truly-unread conversation"
+        );
     }
 }

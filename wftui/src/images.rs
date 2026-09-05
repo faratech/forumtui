@@ -463,6 +463,84 @@ where
     )
 }
 
+/// The `WFTUI_GRAPHICS` operator override, parsed. Unrecognised values are
+/// `None` (the caller warns and falls back to automatic detection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphicsChoice {
+    /// Detect as usual.
+    Auto,
+    /// Tier 5, same as `WFTUI_NO_IMAGES=1`.
+    Off,
+    /// Use this tier without asking the terminal anything.
+    Tier(Tier),
+}
+
+/// Parse one `WFTUI_GRAPHICS` value. Case- and space-insensitive.
+pub fn parse_graphics_choice(raw: &str) -> Option<GraphicsChoice> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => Some(GraphicsChoice::Auto),
+        "none" | "off" | "text" => Some(GraphicsChoice::Off),
+        "kitty" => Some(GraphicsChoice::Tier(Tier::Kitty)),
+        "sixel" => Some(GraphicsChoice::Tier(Tier::Sixel)),
+        "iterm2" | "iterm" => Some(GraphicsChoice::Tier(Tier::Iterm2)),
+        "halfblocks" | "half-blocks" | "blocks" => Some(GraphicsChoice::Tier(Tier::Halfblocks)),
+        _ => None,
+    }
+}
+
+/// How `detect` should establish the tier. Split out of `detect` so the policy
+/// is a pure function of the environment and can be pinned by unit tests with
+/// no terminal in sight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectPlan {
+    /// Tier 5: no picker, no query.
+    TextOnly,
+    /// Build a picker for this tier without touching stdin.
+    Forced(Tier),
+    /// Ask the terminal: writes capability escapes and READS STDIN.
+    Query,
+    /// No query: half-blocks with the fallback font size.
+    Fallback,
+}
+
+/// Decide the plan. The stdio query is the dangerous step (issue #532:
+/// `ratatui-image` leaks a thread blocked in `read()` with `ICANON`/`ECHO`
+/// cleared whenever the terminal does not answer within 2 s), so it is only
+/// ever chosen when it can plausibly succeed:
+///
+/// * an explicit `WFTUI_GRAPHICS` wins over everything — that is the escape
+///   hatch for slow SSH links, which answer the DSR *after* the timeout;
+/// * Windows never queries. `ratatui-image`'s own source documents ConPTY as
+///   a terminal that does not reliably deliver the reply, so the query there
+///   is a guaranteed 2 s stall plus a leaked reader that eats the user's first
+///   keystrokes and re-enables `ENABLE_PROCESSED_INPUT` behind the TUI;
+/// * a non-terminal stdin (pipe, `< /dev/null`) can never answer either.
+pub fn detect_plan<F>(var: F, windows: bool, stdin_is_tty: bool) -> DetectPlan
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if env_disables_images(&var) {
+        return DetectPlan::TextOnly;
+    }
+    if let Some(raw) = var("WFTUI_GRAPHICS") {
+        match parse_graphics_choice(&raw) {
+            Some(GraphicsChoice::Off) => return DetectPlan::TextOnly,
+            Some(GraphicsChoice::Tier(t)) => return DetectPlan::Forced(t),
+            Some(GraphicsChoice::Auto) => {}
+            None => {
+                tracing::warn!(
+                    "ignoring WFTUI_GRAPHICS={raw:?}: expected kitty|sixel|iterm2|halfblocks|none"
+                );
+            }
+        }
+    }
+    if windows || !stdin_is_tty {
+        DetectPlan::Fallback
+    } else {
+        DetectPlan::Query
+    }
+}
+
 /// `Picker::font_size` returns `ratatui_image::FontSize` (a struct since
 /// ratatui-image 10; it was a bare `(u16, u16)` in 9). `Policy.font` stays a
 /// tuple because `fit`/`attachment_box` and every screen do arithmetic on it.
@@ -470,6 +548,20 @@ where
 fn font_pair(picker: &ratatui_image::picker::Picker) -> (u16, u16) {
     let fs = picker.font_size();
     (fs.width, fs.height)
+}
+
+/// The inverse of `tier_of`. `Tier::Text` has no protocol (it never reaches a
+/// picker).
+#[cfg(feature = "images")]
+pub fn protocol_of(t: Tier) -> Option<ratatui_image::picker::ProtocolType> {
+    use ratatui_image::picker::ProtocolType;
+    match t {
+        Tier::Kitty => Some(ProtocolType::Kitty),
+        Tier::Sixel => Some(ProtocolType::Sixel),
+        Tier::Iterm2 => Some(ProtocolType::Iterm2),
+        Tier::Halfblocks => Some(ProtocolType::Halfblocks),
+        Tier::Text => None,
+    }
 }
 
 #[cfg(feature = "images")]
@@ -524,8 +616,9 @@ impl Images {
 
     /// Query the terminal for its graphics protocol and cell size.
     ///
-    /// **This reads stdin directly** (it writes capability-query escapes and
-    /// blocks on the replies), so it MUST complete before
+    /// **On the `DetectPlan::Query` path this reads stdin directly** (it writes
+    /// capability-query escapes and blocks on the replies), so it MUST complete
+    /// before
     /// `event::spawn_reader` starts — CLAUDE.md hard rule 3: input comes from
     /// one dedicated blocking reader thread, and two readers racing on stdin
     /// would split the terminal's reply the same way the login-corruption
@@ -533,19 +626,44 @@ impl Images {
     /// control to `app::run`, which is what spawns the reader. The query also
     /// runs before raw mode and the alternate screen (it manages termios
     /// itself, and this is the ordering `ratatui-image`'s own binary uses).
+    ///
+    /// `detect_plan` decides whether the query runs at all: never on Windows,
+    /// never without a terminal on stdin, never when `WFTUI_GRAPHICS` names a
+    /// tier. `main.rs` brackets this call with `tty::snapshot()` /
+    /// `tty::restore()` so even the query path cannot poison the exit state.
     #[cfg(feature = "images")]
     pub fn detect() -> Self {
+        use std::io::IsTerminal;
         let mut me = Self::text_only();
-        if env_disables_images(|k| std::env::var(k).ok()) {
-            tracing::debug!("inline images disabled by environment");
-            return me;
-        }
-        let picker = match ratatui_image::picker::Picker::from_query_stdio() {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("graphics capability query failed ({e}); staying on text tier");
+        let plan = detect_plan(
+            |k| std::env::var(k).ok(),
+            cfg!(windows),
+            std::io::stdin().is_terminal(),
+        );
+        let picker = match plan {
+            DetectPlan::TextOnly => {
+                tracing::debug!("inline images disabled by environment");
                 return me;
             }
+            DetectPlan::Forced(tier) => {
+                let mut p = ratatui_image::picker::Picker::halfblocks();
+                if let Some(proto) = protocol_of(tier) {
+                    p.set_protocol_type(proto);
+                }
+                tracing::debug!("graphics tier forced by WFTUI_GRAPHICS: {}", tier.label());
+                p
+            }
+            DetectPlan::Fallback => {
+                tracing::debug!("skipping the graphics capability query; half-blocks fallback");
+                ratatui_image::picker::Picker::halfblocks()
+            }
+            DetectPlan::Query => match ratatui_image::picker::Picker::from_query_stdio() {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("graphics capability query failed ({e}); staying on text tier");
+                    return me;
+                }
+            },
         };
         let tier = tier_of(picker.protocol_type());
         let font = font_pair(&picker);
@@ -832,6 +950,56 @@ mod tests {
         // NO_COLOR selects the Mono theme tier; a colour image contradicts it.
         let mono = |k: &str| (k == "NO_COLOR").then(String::new);
         assert!(env_disables_images(mono));
+    }
+
+    #[test]
+    fn graphics_override_parsing_covers_every_documented_value() {
+        use GraphicsChoice::*;
+        assert_eq!(parse_graphics_choice("kitty"), Some(Tier(super::Tier::Kitty)));
+        assert_eq!(parse_graphics_choice(" SIXEL "), Some(Tier(super::Tier::Sixel)));
+        assert_eq!(parse_graphics_choice("iTerm2"), Some(Tier(super::Tier::Iterm2)));
+        assert_eq!(parse_graphics_choice("halfblocks"), Some(Tier(super::Tier::Halfblocks)));
+        assert_eq!(parse_graphics_choice("half-blocks"), Some(Tier(super::Tier::Halfblocks)));
+        assert_eq!(parse_graphics_choice("none"), Some(Off));
+        assert_eq!(parse_graphics_choice("off"), Some(Off));
+        assert_eq!(parse_graphics_choice("auto"), Some(Auto));
+        assert_eq!(parse_graphics_choice(""), Some(Auto));
+        // Unrecognised is not an error and not a tier: the caller warns and
+        // detects normally.
+        assert_eq!(parse_graphics_choice("chafa"), None);
+    }
+
+    #[test]
+    fn the_stdio_query_only_runs_on_a_unix_terminal_with_no_override() {
+        let none = |_: &str| None;
+        // The one case that may touch stdin.
+        assert_eq!(detect_plan(none, false, true), DetectPlan::Query);
+        // Windows never queries (ConPTY does not answer; the leaked reader
+        // then eats keystrokes and re-enables ENABLE_PROCESSED_INPUT).
+        assert_eq!(detect_plan(none, true, true), DetectPlan::Fallback);
+        // Neither does a piped/redirected stdin.
+        assert_eq!(detect_plan(none, false, false), DetectPlan::Fallback);
+        assert_eq!(detect_plan(none, true, false), DetectPlan::Fallback);
+
+        // The override is honoured BEFORE any query, on both platforms.
+        let g = |v: &'static str| move |k: &str| (k == "WFTUI_GRAPHICS").then(|| v.to_string());
+        assert_eq!(detect_plan(g("kitty"), false, true), DetectPlan::Forced(Tier::Kitty));
+        assert_eq!(detect_plan(g("sixel"), true, false), DetectPlan::Forced(Tier::Sixel));
+        assert_eq!(detect_plan(g("halfblocks"), false, true), DetectPlan::Forced(Tier::Halfblocks));
+        assert_eq!(detect_plan(g("none"), false, true), DetectPlan::TextOnly);
+        // Auto and garbage both fall through to automatic detection.
+        assert_eq!(detect_plan(g("auto"), false, true), DetectPlan::Query);
+        assert_eq!(detect_plan(g("chafa"), false, true), DetectPlan::Query);
+        assert_eq!(detect_plan(g("chafa"), true, true), DetectPlan::Fallback);
+
+        // The existing off switches still win over an override that asks for
+        // pixels.
+        let both = |k: &str| match k {
+            "WFTUI_NO_IMAGES" => Some("1".to_string()),
+            "WFTUI_GRAPHICS" => Some("kitty".to_string()),
+            _ => None,
+        };
+        assert_eq!(detect_plan(both, false, true), DetectPlan::TextOnly);
     }
 
     #[test]

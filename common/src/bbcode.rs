@@ -329,7 +329,29 @@ pub fn render(src: &str) -> Vec<Chunk> {
                     "s" | "strike" => stack.push(Frame::Strike),
                     "sub" | "sup" => stack.push(Frame::Italic),
                     "highlight" => stack.push(Frame::Bold),
-                    "icode" | "inlinecode" => stack.push(Frame::InlineCode),
+                    "icode" | "inlinecode" => {
+                        // XF's `icode` rule is `['plain' => true]` — children
+                        // are literal, like [CODE]/[PHP]/[HTML]. Pushing a
+                        // stack frame instead let the render loop keep
+                        // scanning `[` inside the body, so a bracket in the
+                        // content (e.g. `con2fb_map[i]`) opened a REAL `[i]`
+                        // frame that leaked past `[/ICODE]` and a `[url]`
+                        // opened a dangling link that swallowed the rest of
+                        // the post (issue #540). Verbatim when a close tag
+                        // exists; fall back to the old frame behaviour only
+                        // when there is none, so an unclosed `[ICODE]` still
+                        // degrades the way it always has rather than
+                        // swallowing the rest of the document like [CODE]'s
+                        // unclosed fallback does.
+                        if let Some((inner, close_len)) = split_at_close(rest, &tag_lower) {
+                            let mut st = Style::from_stack(&stack);
+                            st.code = true;
+                            out.push(Chunk::Text(decode_html_entities(inner), st));
+                            rest = &rest[close_len..];
+                        } else {
+                            stack.push(Frame::InlineCode);
+                        }
+                    }
                     "code" | "php" | "html" => {
                         let (inner, close_len) = take_until_close(rest, &tag_lower);
                         let mut st = Style::from_stack(&stack);
@@ -656,21 +678,31 @@ fn parse_tag(s: &str) -> Option<TagEvent> {
 
     // Split on first '=' or whitespace. Notice: check if there is a space BEFORE '='
     // (e.g. [ATTACH type="full"] vs [QUOTE="Alice, post: 123"]).
+    //
+    // A space before the `=` means this is the ATTRIBUTE form —
+    // `[NAME attr="v" ...]`, e.g. XF's auto-unfurl `[url unfurl="true"]` or
+    // `[ATTACH type="full"]` — where `attr`'s value is NOT the tag's own
+    // value. Returning it as `value` made every `[url unfurl="true"]…[/url]`
+    // (XF's stored form for ~1,600 posts) resolve to the literal href
+    // "true" instead of falling back to the link text (issue #539). `[NAME=
+    // value]` (no whitespace before `=`) is the real value form and is
+    // unaffected.
     let (name, value) = if let Some(eq_pos) = inner.find('=') {
         let before_eq = &inner[..eq_pos];
         if let Some(space_pos) = before_eq.find(char::is_whitespace) {
             let name_part = before_eq[..space_pos].trim();
-            let val = inner[eq_pos + 1..].trim();
-            (name_part, Some(strip_quotes(val).to_string()))
+            (name_part, None)
         } else {
             let name_part = before_eq.trim();
             let val = inner[eq_pos + 1..].trim();
             (name_part, Some(strip_quotes(val).to_string()))
         }
-    } else if let Some(space_pos) = inner.find(char::is_whitespace) {
-        let name_part = inner[..space_pos].trim();
-        let val = inner[space_pos + 1..].trim();
-        (name_part, Some(strip_quotes(val).to_string()))
+    } else if let Some((name_part, val)) = inner.split_once(char::is_whitespace) {
+        // `split_once` locates the match with the Pattern API (char-boundary
+        // aware) rather than a raw byte offset + `+ 1`, so a multi-byte
+        // whitespace character (U+00A0 NBSP, U+3000 IDEOGRAPHIC SPACE, ...)
+        // can't land the slice mid-codepoint and panic (issue #533).
+        (name_part.trim(), Some(strip_quotes(val.trim()).to_string()))
     } else {
         (inner.trim(), None)
     };
@@ -944,6 +976,94 @@ mod tests {
             }
             _ => panic!("expected link"),
         }
+    }
+
+    /// Issue #539: XF stores every pasted bare URL as
+    /// `[url unfurl="true"]https://…[/url]` (~1,600 live posts). The space
+    /// before `=` makes this the ATTRIBUTE form, not `[url=value]` — the
+    /// link's href must fall back to its text, not become the literal
+    /// string "true".
+    #[test]
+    fn url_with_unfurl_attribute_uses_the_link_text_as_href() {
+        let chunks = render(r#"[url unfurl="true"]https://www.axios.com/x[/url]"#);
+        match &chunks[0] {
+            Chunk::Link(label, url, _) => {
+                assert_eq!(label, "https://www.axios.com/x");
+                assert_eq!(url, "https://www.axios.com/x");
+            }
+            other => panic!("expected link, got {other:?}"),
+        }
+        assert_eq!(
+            to_plain(r#"see [url unfurl="true"]https://www.axios.com/x[/url] now"#),
+            "see https://www.axios.com/x now"
+        );
+    }
+
+    /// The real value form (`[URL='...']`, no space before `=`) must keep
+    /// working exactly as before.
+    #[test]
+    fn url_with_quoted_value_form_is_unaffected() {
+        let chunks = render("[URL='https://example.com']label[/URL]");
+        match &chunks[0] {
+            Chunk::Link(label, url, _) => {
+                assert_eq!(label, "label");
+                assert_eq!(url, "https://example.com");
+            }
+            other => panic!("expected link, got {other:?}"),
+        }
+    }
+
+    /// `[ATTACH type="full"]` is also the attribute form — must still resolve
+    /// the attachment id from the tag's inner content, not from `type`'s
+    /// value ("full").
+    #[test]
+    fn attach_type_attribute_does_not_leak_into_the_attachment_id() {
+        let chunks = render(r#"[ATTACH type="full" alt="x"]1[/ATTACH]"#);
+        match &chunks[0] {
+            Chunk::Attach(id, _) => assert_eq!(id, "1"),
+            other => panic!("expected an attachment chunk, got {other:?}"),
+        }
+    }
+
+    /// Issue #540: `[ICODE]` content used to be parsed for nested tags
+    /// instead of being verbatim (XF's `icode` rule is `plain => true`, like
+    /// `[CODE]`). A bracket in the body must not open a real tag that leaks
+    /// past `[/ICODE]`.
+    #[test]
+    fn icode_body_is_verbatim_and_does_not_leak_style_past_the_close() {
+        let chunks = render("[ICODE]con2fb_map[i][/ICODE] rest");
+        let code = chunks
+            .iter()
+            .find(|c| matches!(c, Chunk::Text(t, _) if t.contains("con2fb_map")))
+            .expect("code chunk");
+        match code {
+            Chunk::Text(t, s) => {
+                assert_eq!(t, "con2fb_map[i]", "the literal [i] must survive, not open Italic");
+                assert!(s.code);
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+        let after = chunks
+            .iter()
+            .find(|c| matches!(c, Chunk::Text(t, _) if t.contains("rest")))
+            .expect("trailing text");
+        if let Chunk::Text(_, s) = after {
+            assert!(!s.italic, "italic leaked past [/ICODE]");
+        }
+    }
+
+    /// A `[url]` opened inside `[ICODE]` must not push a real `Frame::Link`
+    /// that swallows every following text run as a numbered self-link.
+    #[test]
+    fn icode_body_does_not_open_a_dangling_link_frame() {
+        let chunks = render("[ICODE][url][/ICODE] see docs");
+        let after = chunks
+            .iter()
+            .find(|c| matches!(c, Chunk::Text(t, _) if t.contains("see docs")));
+        assert!(
+            matches!(after, Some(Chunk::Text(_, _))),
+            "expected a plain Text chunk after ICODE, got {chunks:?}"
+        );
     }
 
     #[test]
@@ -1247,6 +1367,38 @@ mod tests {
             render(""),
             vec![Chunk::Text(String::new(), Style::default())]
         );
+    }
+
+    /// Issue #533: a multi-byte Unicode space inside an unrecognized `[...]`
+    /// used to panic in `parse_tag`'s no-`=` branch (`&inner[space_pos + 1..]`
+    /// assumed a one-byte space and sliced mid-codepoint). NBSP (U+00A0) is
+    /// common in text pasted from the web/Word. The tag is unrecognized, so
+    /// the whole bracket is passed through literally.
+    #[test]
+    fn multibyte_whitespace_in_a_tag_does_not_panic() {
+        let nbsp = texts(&render("[Note\u{a0}here] x")).concat();
+        assert!(nbsp.contains("[Note\u{a0}here]"), "got: {nbsp:?}");
+
+        let ideographic = texts(&render("[x\u{3000}y] x")).concat();
+        assert!(ideographic.contains("[x\u{3000}y]"), "got: {ideographic:?}");
+
+        let thin = texts(&render("[a\u{2009}b] x")).concat();
+        assert!(thin.contains("[a\u{2009}b]"), "got: {thin:?}");
+    }
+
+    /// Sweep every `char::is_whitespace` code point (not just the three
+    /// spot-checked above) through the same no-`=` branch and assert `render`
+    /// never panics, regardless of the space's UTF-8 width.
+    #[test]
+    fn every_whitespace_code_point_is_char_boundary_safe() {
+        for cp in 0u32..0x11_0000 {
+            let Some(c) = char::from_u32(cp) else { continue };
+            if !c.is_whitespace() {
+                continue;
+            }
+            let src = format!("[a{c}b] x");
+            let _ = render(&src); // must not panic
+        }
     }
 }
 

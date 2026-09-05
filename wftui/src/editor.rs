@@ -6,39 +6,39 @@
 /// Insert a single character at the character cursor position.
 pub fn insert_char(text: &mut String, cursor: &mut usize, c: char) {
     let mut chars: Vec<char> = text.chars().collect();
-    let idx = (*cursor).min(chars.len());
-    chars.insert(idx, c);
-    *cursor = idx + 1;
+    *cursor = (*cursor).min(chars.len());
+    chars.insert(*cursor, c);
+    *cursor += 1;
     *text = chars.into_iter().collect();
 }
 
 /// Insert a string slice at the character cursor position.
 pub fn insert_str(text: &mut String, cursor: &mut usize, s: &str) {
     let mut chars: Vec<char> = text.chars().collect();
-    let idx = (*cursor).min(chars.len());
+    *cursor = (*cursor).min(chars.len());
     let insert_chars: Vec<char> = s.chars().collect();
     let count = insert_chars.len();
-    chars.splice(idx..idx, insert_chars);
-    *cursor = idx + count;
+    chars.splice(*cursor..*cursor, insert_chars);
+    *cursor += count;
     *text = chars.into_iter().collect();
 }
 
 /// Delete the character immediately preceding the cursor (Backspace).
 pub fn delete_back(text: &mut String, cursor: &mut usize) {
+    let mut chars: Vec<char> = text.chars().collect();
+    *cursor = (*cursor).min(chars.len());
     if *cursor == 0 {
         return;
     }
-    let mut chars: Vec<char> = text.chars().collect();
-    if *cursor <= chars.len() {
-        chars.remove(*cursor - 1);
-        *cursor -= 1;
-        *text = chars.into_iter().collect();
-    }
+    chars.remove(*cursor - 1);
+    *cursor -= 1;
+    *text = chars.into_iter().collect();
 }
 
 /// Delete the character immediately at the cursor (Delete).
 pub fn delete_forward(text: &mut String, cursor: &mut usize) {
     let mut chars: Vec<char> = text.chars().collect();
+    *cursor = (*cursor).min(chars.len());
     if *cursor < chars.len() {
         chars.remove(*cursor);
         *text = chars.into_iter().collect();
@@ -47,11 +47,17 @@ pub fn delete_forward(text: &mut String, cursor: &mut usize) {
 
 /// Delete the word preceding the cursor (Ctrl+W / Alt+Backspace).
 pub fn delete_word_back(text: &mut String, cursor: &mut usize) {
+    let mut chars: Vec<char> = text.chars().collect();
+    // Clamp FIRST and use the clamped value for the rest of this call
+    // (including the final drain) — a `*cursor` past `chars.len()` (e.g. the
+    // recipients field seeded with a byte length, issue #535) used to make
+    // `chars.drain(start..*cursor)` panic even though `end`/`start` were
+    // themselves clamped.
+    *cursor = (*cursor).min(chars.len());
     if *cursor == 0 {
         return;
     }
-    let mut chars: Vec<char> = text.chars().collect();
-    let mut end = (*cursor).min(chars.len());
+    let mut end = *cursor;
 
     // Skip trailing whitespace before cursor
     while end > 0 && chars[end - 1].is_whitespace() {
@@ -73,7 +79,8 @@ pub fn delete_word_back(text: &mut String, cursor: &mut usize) {
 /// Kill (delete) text from the cursor to the end of the current line (Ctrl+K).
 pub fn kill_to_end(text: &mut String, cursor: &mut usize) {
     let mut chars: Vec<char> = text.chars().collect();
-    let start = (*cursor).min(chars.len());
+    *cursor = (*cursor).min(chars.len());
+    let start = *cursor;
     let mut end = start;
     while end < chars.len() && chars[end] != '\n' {
         end += 1;
@@ -90,11 +97,12 @@ pub fn kill_to_end(text: &mut String, cursor: &mut usize) {
 
 /// Kill (delete) text from the start of the current line to the cursor (Ctrl+U).
 pub fn kill_to_start(text: &mut String, cursor: &mut usize) {
+    let mut chars: Vec<char> = text.chars().collect();
+    *cursor = (*cursor).min(chars.len());
     if *cursor == 0 {
         return;
     }
-    let mut chars: Vec<char> = text.chars().collect();
-    let end = (*cursor).min(chars.len());
+    let end = *cursor;
     let mut start = end;
     while start > 0 && chars[start - 1] != '\n' {
         start -= 1;
@@ -114,6 +122,7 @@ pub fn move_left(cursor: &mut usize) {
 /// Move cursor right by 1 character.
 pub fn move_right(text: &str, cursor: &mut usize) {
     let max = text.chars().count();
+    *cursor = (*cursor).min(max);
     *cursor = (*cursor + 1).min(max);
 }
 
@@ -316,6 +325,22 @@ pub fn move_vertical(
         used += cw;
         i += 1;
     }
+    // A CONTINUATION row (soft-wrapped — a hard-split word, or hanging
+    // whitespace absorbed into the row before a break) shares its `end` with
+    // the next row's `start`; a true logical-line end does not (the next
+    // row starts one past a real newline). `caret_in_rows` resolves an index
+    // equal to a row's `end` to that FOLLOWING row via `rposition`, so
+    // landing exactly on `r.end` here — the sticky column reaching or
+    // exceeding the row's width — would draw the caret at column 0 of the
+    // row after the target: Up/Down moves sideways instead, and since
+    // `desired` stays sticky, every further press repeats the same non-move
+    // (issue #544). Clamp to the row's last real character instead.
+    if i == r.end
+        && i > r.start
+        && rows.get(target + 1).is_some_and(|next| next.start == r.end)
+    {
+        i -= 1;
+    }
     *cursor = i;
 }
 
@@ -390,6 +415,39 @@ mod tests {
         assert_eq!(s2, "fir\nnd line");
     }
 
+    /// Issue #535: a cursor seeded from a BYTE length (e.g. the new-DM
+    /// recipients field prefilled with a non-ASCII username) can sit past
+    /// `chars.len()`. `delete_word_back` used to clamp `start`/`end` but then
+    /// drain `start..*cursor` with the still-unclamped cursor, panicking.
+    /// Every editor.rs helper now clamps `*cursor` up front and uses that
+    /// clamped value everywhere, including the final drain.
+    #[test]
+    fn cursor_past_char_len_is_clamped_not_drained_raw() {
+        let mut s = "é".to_string(); // 1 char, 2 bytes
+        let mut c = s.len(); // the exact bug: byte length used as a char cursor
+        delete_word_back(&mut s, &mut c);
+        assert_eq!(s, "");
+        assert_eq!(c, 0);
+
+        // Backspace/Delete/kill-to-start must likewise clamp rather than
+        // panic or silently no-op forever.
+        let mut s2 = "ab".to_string();
+        let mut c2 = s2.len() + 5; // absurdly past the end
+        delete_back(&mut s2, &mut c2);
+        assert_eq!(s2, "a");
+        assert_eq!(c2, 1);
+
+        let mut s3 = "ab".to_string();
+        let mut c3 = 100;
+        delete_forward(&mut s3, &mut c3);
+        assert_eq!(s3, "ab", "cursor past the end: nothing to delete forward");
+
+        let mut s4 = "ab".to_string();
+        let mut c4 = 100;
+        kill_to_start(&mut s4, &mut c4);
+        assert_eq!(s4, "");
+    }
+
     #[test]
     fn visual_rows_wrap_greedily_and_cover_every_char() {
         let rows = visual_rows("hello world", 5);
@@ -451,6 +509,44 @@ mod tests {
         assert_eq!(follow_caret(20, 5, 40, 10), 5);
         assert_eq!(follow_caret(0, 39, 40, 10), 30);
         assert_eq!(follow_caret(9, 0, 3, 10), 0, "never scrolls past the last row");
+    }
+
+    /// Issue #544: a vertical move that lands exactly on a soft-wrapped
+    /// (continuation) row's `end` used to leave the caret one row down and
+    /// at column 0 instead of at the end of the target row — and because
+    /// `desired` stays sticky, every further Up repeated the same non-move.
+    /// Hard-split word case: "xxxxxxxxxx" at width 5 -> rows {0,5},{5,10}.
+    #[test]
+    fn vertical_motion_does_not_stick_at_a_hard_split_continuation_boundary() {
+        let text = "x".repeat(10);
+        let rows = visual_rows(&text, 5);
+        assert_eq!(rows, vec![VisualRow { start: 0, end: 5 }, VisualRow { start: 5, end: 10 }]);
+
+        let mut cursor = 10usize; // end of text: row 1, col 5
+        let mut desired: Option<usize> = None;
+        move_vertical(&text, 5, &mut cursor, &mut desired, -1);
+        assert_eq!(cursor, 4, "must land on row 0's last real character, not row 1 col 0");
+
+        // A second Up must actually do nothing more (already at row 0) —
+        // not repeat the same sideways non-move.
+        move_vertical(&text, 5, &mut cursor, &mut desired, -1);
+        assert_eq!(cursor, 4, "already at the top row: Up is a no-op");
+    }
+
+    /// Hanging-whitespace case: "hello world" at width 5 wraps as
+    /// {0,6} (absorbs the space after "hello"), {6,11} ("world"). A sticky
+    /// column reaching the full absorbed width (6) must clamp inside row 0,
+    /// not spill into row 1.
+    #[test]
+    fn vertical_motion_does_not_stick_at_a_hanging_whitespace_continuation_boundary() {
+        let text = "hello world";
+        let rows = visual_rows(text, 5);
+        assert_eq!(rows, vec![VisualRow { start: 0, end: 6 }, VisualRow { start: 6, end: 11 }]);
+
+        let mut cursor = 11usize; // end of "world": row 1, col 5
+        let mut desired: Option<usize> = None;
+        move_vertical(text, 5, &mut cursor, &mut desired, -1);
+        assert!(cursor < 6, "must stay inside row 0, not spill onto row 1's start: got {cursor}");
     }
 
     #[test]

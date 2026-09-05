@@ -73,6 +73,14 @@ pub const SCOPES: [&str; 12] = [
 /// Minimum spacing between any two API calls (politeness budget; the zone's
 /// flood ceiling is shared with every other visitor).
 pub const GLOBAL_MIN_INTERVAL_MS: u64 = 250;
+/// Thumbnails, avatars and the sign-in logo (`WfApiClient::fetch_bytes`) get
+/// their OWN budget at the same spacing. `Gate` is FIFO with no priority, so
+/// while decoration shared `api_gate` a single cold thread open reserved one
+/// slot per visible image and every navigation the user made next queued
+/// behind them — ~10 images ≈ 2.5 s before `/threads/{id}` was even sent
+/// (issue #543). Same politeness per request; decoration just cannot spend
+/// the interactive lane's slots any more.
+pub const IMAGE_MIN_INTERVAL_MS: u64 = 250;
 /// Search is the expensive server-side path (ES/hybrid backend): stricter.
 pub const SEARCH_MIN_INTERVAL_MS: u64 = 3_000;
 /// XF enforces 30s between posts / 180s between new threads per user; mirror

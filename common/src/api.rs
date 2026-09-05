@@ -26,6 +26,10 @@ pub struct WfApiClient {
     pub api_gate: Arc<Gate>,
     pub search_gate: Arc<Gate>,
     pub write_gate: Arc<Gate>,
+    /// Decoration only (`fetch_bytes`): a separate lane so a screenful of
+    /// thumbnails can never sit in front of the request the user is waiting
+    /// on (issue #543).
+    pub image_gate: Arc<Gate>,
 }
 
 impl WfApiClient {
@@ -37,6 +41,7 @@ impl WfApiClient {
             api_gate: Arc::new(Gate::new(config::GLOBAL_MIN_INTERVAL_MS)),
             search_gate: Arc::new(Gate::new(config::SEARCH_MIN_INTERVAL_MS)),
             write_gate: Arc::new(Gate::new(config::WRITE_COOLDOWN_MS)),
+            image_gate: Arc::new(Gate::new(config::IMAGE_MIN_INTERVAL_MS)),
         })
     }
 
@@ -170,6 +175,25 @@ impl WfApiClient {
             .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate, &self.write_gate]))
     }
 
+    /// A POST to one of XF's *toggle* endpoints (react, vote). Same gating as
+    /// `post_unit`, but the reply body is what says which way the toggle went,
+    /// so it is decoded instead of discarded (issue #538).
+    async fn post_toggle(&self, path: &str, form: &[(&str, String)]) -> Result<Toggle> {
+        #[derive(serde::Deserialize)]
+        struct ToggleReply {
+            #[serde(default)]
+            action: String,
+        }
+        self.api_gate.wait().await;
+        let token = self.valid_token().await?;
+        let url = format!("{}{path}", config::api_base());
+        let resp = self.http.post(url).form(form).bearer_auth(&token).send().await?;
+        let reply: ToggleReply = decode(resp)
+            .await
+            .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate, &self.write_gate]))?;
+        Ok(Toggle::from_action(&reply.action))
+    }
+
     async fn post_unit_path(&self, path: &str) -> Result<()> {
         self.post_unit(path, &[]).await
     }
@@ -241,8 +265,12 @@ impl WfApiClient {
     /// concern, not a forum-data operation the trait's mock implementations
     /// need to fake.
     ///
-    /// Goes through `api_gate` like every other call (one shared politeness
-    /// budget), and the request carries the client UA because it's the same
+    /// Goes through `image_gate`, NOT `api_gate`: same 250 ms spacing, but a
+    /// lane of its own, because `Gate` hands out slots first-come-first-served
+    /// and one cold thread open reserves a slot per visible avatar/thumbnail —
+    /// on the shared gate that put ~2.5 s of decoration in front of the user's
+    /// next navigation (issue #543). The request carries the client UA because
+    /// it's the same
     /// pooled `reqwest::Client` every other method uses — `http::build()`
     /// bakes `config::user_agent()` in at construction (hard rule 6), so
     /// there is nothing extra to set per-request.
@@ -256,7 +284,7 @@ impl WfApiClient {
     /// which reads the whole thing first regardless of what it decides to
     /// do with it afterwards (issue #526).
     pub async fn fetch_bytes(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>> {
-        self.api_gate.wait().await;
+        self.image_gate.wait().await;
         let mut resp = self.http.get(url).send().await?.error_for_status()?;
 
         let content_type = resp
@@ -375,6 +403,32 @@ fn derive_node_depths(mut nodes: Vec<Node>) -> Vec<Node> {
     nodes
 }
 
+/// XF's reaction and content-vote endpoints are **toggles**: posting the
+/// `reaction_id`/`type` that is already set removes it, and the reply says
+/// which of the two happened (`{"success":true,"action":"insert"|"delete"}` —
+/// `ReactionPlugin::actionReact` / `ContentVotePlugin::actionVote`). The
+/// client has to read that or it announces "liked" for an unlike (issue #538).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Toggle {
+    /// The reaction/vote was added.
+    Inserted,
+    /// It was already there and has now been removed.
+    Removed,
+}
+
+impl Toggle {
+    /// Map the reply's `action`. Anything that is not an explicit `delete`
+    /// (including a body that omits the key) counts as an insert, which is the
+    /// behaviour this client had before it read the body at all.
+    pub fn from_action(action: &str) -> Toggle {
+        if action.trim().eq_ignore_ascii_case("delete") {
+            Toggle::Removed
+        } else {
+            Toggle::Inserted
+        }
+    }
+}
+
 #[async_trait]
 pub trait WfApi: Send + Sync {
     async fn nodes(&self) -> Result<Vec<Node>>;
@@ -407,8 +461,8 @@ pub trait WfApi: Send + Sync {
         content: &str,
         page: u32,
     ) -> Result<SearchResultsReply>;
-    async fn react_post(&self, post_id: u32, reaction_id: u32) -> Result<()>;
-    async fn vote_post(&self, post_id: u32, vote: &str) -> Result<()>;
+    async fn react_post(&self, post_id: u32, reaction_id: u32) -> Result<Toggle>;
+    async fn vote_post(&self, post_id: u32, vote: &str) -> Result<Toggle>;
     async fn me(&self) -> Result<User>;
     async fn user(&self, id: u32) -> Result<User>;
     async fn find_user(&self, username: &str) -> Result<Option<User>>;
@@ -670,16 +724,16 @@ impl WfApi for WfApiClient {
         .await
     }
 
-    async fn react_post(&self, post_id: u32, reaction_id: u32) -> Result<()> {
-        self.post_unit(
+    async fn react_post(&self, post_id: u32, reaction_id: u32) -> Result<Toggle> {
+        self.post_toggle(
             &format!("/posts/{post_id}/react"),
             &[("reaction_id", reaction_id.to_string())],
         )
         .await
     }
 
-    async fn vote_post(&self, post_id: u32, vote: &str) -> Result<()> {
-        self.post_unit(
+    async fn vote_post(&self, post_id: u32, vote: &str) -> Result<Toggle> {
+        self.post_toggle(
             &format!("/posts/{post_id}/vote"),
             &[("type", vote.to_string())],
         )
@@ -1490,7 +1544,100 @@ mod tests {
             .await;
 
         let c = logged_in_client("tok-1").await;
-        let res = c.react_post(101, 1).await;
-        assert!(res.is_ok());
+        assert_eq!(c.react_post(101, 1).await.unwrap(), Toggle::Inserted);
+    }
+
+    /// Issue #543: `Gate` is FIFO with no priority, so while thumbnails shared
+    /// `api_gate` a screenful of them reserved a 250 ms slot each and the next
+    /// thing the user asked for started only after all of them. Ten queued
+    /// image fetches must now cost the interactive call at most its own slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_image_fetches_do_not_delay_the_next_interactive_request() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-imggate");
+        Mock::given(method("GET"))
+            .and(path("/thumb.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "image/png")
+                    .set_body_bytes(vec![7u8; 64]),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/threads/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "thread": {"thread_id": 1, "title": "T"},
+                "posts": [],
+                "pagination": {"current_page": 1, "last_page": 1, "total": 0}
+            })))
+            .mount(&server)
+            .await;
+
+        let c = Arc::new(logged_in_client("tok-1").await);
+        let url = format!("{}/thumb.png", server.uri());
+        // Exactly what `App::draw` does on the first frame of a cold thread.
+        let mut loads = Vec::new();
+        for _ in 0..10 {
+            let c = c.clone();
+            let url = url.clone();
+            loads.push(tokio::spawn(async move {
+                let _ = c.fetch_bytes(&url, 1024).await;
+            }));
+        }
+        // Let all ten reserve their slots before the user navigates.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let started = std::time::Instant::now();
+        let thread = c.thread(1, 1).await.expect("thread");
+        let waited = started.elapsed();
+        assert_eq!(thread.thread.thread_id, 1);
+        // One interactive slot (250 ms) plus the mock round trip. On the
+        // shared gate this was ten slots ≈ 2.5 s.
+        assert!(
+            waited < Duration::from_millis(900),
+            "the interactive request queued behind decoration: {waited:?}"
+        );
+        for l in loads {
+            let _ = l.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn react_and_vote_report_the_servers_delete_action_as_a_removal() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-react-del");
+        // Sending the reaction/type that is already set is XF's *undo*; the
+        // body is the only thing that says so (issue #538).
+        Mock::given(method("POST"))
+            .and(path("/api/posts/101/react"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "action": "delete"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/posts/101/vote"))
+            .and(wiremock::matchers::body_string_contains("type=up"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "action": "delete"
+            })))
+            .mount(&server)
+            .await;
+        // A body with no `action` at all still reads as an insert.
+        Mock::given(method("POST"))
+            .and(path("/api/posts/102/vote"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true
+            })))
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        assert_eq!(c.react_post(101, 1).await.unwrap(), Toggle::Removed);
+        assert_eq!(c.vote_post(101, "up").await.unwrap(), Toggle::Removed);
+        assert_eq!(c.vote_post(102, "up").await.unwrap(), Toggle::Inserted);
     }
 }

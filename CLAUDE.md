@@ -44,9 +44,12 @@ Two-crate workspace (house style from `services/mirror`: resolver 2, edition
     (`POST /api/wf-tuilink/poll`), exchanges it at `/api/oauth2/token`.
     Also: token refresh, revoke, loopback-listener legacy path (unused).
   - `api.rs` — `WfApi` trait (the seam screens consume; tests substitute it)
-    and `WfApiClient`: Bearer auth, silent refresh-on-expiry, and three
+    and `WfApiClient`: Bearer auth, silent refresh-on-expiry, and four
     politeness gates (`api_gate` 250ms, `search_gate` 3s, `write_gate` 30s —
-    180s after new threads). ALL traffic goes through these gates.
+    180s after new threads — and `image_gate` 250ms, the decoration-only lane
+    `fetch_bytes` uses so a screenful of thumbnails can never queue in front of
+    the user's next navigation, issue #543; `app.rs` also caps image loads at
+    `IMAGE_LOAD_CONCURRENCY` in flight). ALL traffic goes through these gates.
   - `ratelimit.rs` — the gates. `token.rs` — 0600 atomic token store.
   - `bbcode.rs` — BBCode → styled chunks (UI-agnostic; golden-tested).
   - `osc.rs` — OSC 8 hyperlinks + OSC 52 clipboard, with tmux DCS passthrough.
@@ -163,6 +166,17 @@ overlays all have to leave those cells alone: `app::is_image_cell` is the
 shared probe and it tests `diff_option != None`, the kitty-tier test in
 `images.rs` pins the marking, and images are suppressed entirely while an
 overlay is up. `WFTUI_NO_IMAGES=1` or `NO_COLOR` forces tier 5.
+
+The query itself is opt-in by circumstance (`images::detect_plan`, issue #532):
+ratatui-image gives up after 2 s but leaks the thread it left blocked in
+`read()` with `ICANON`/`ECHO` cleared, so it is only run on unix, with a
+terminal on stdin, and no override. Windows (ConPTY never answers reliably) and
+a piped stdin take the half-blocks fallback picker instead, and
+`WFTUI_GRAPHICS=kitty|sixel|iterm2|halfblocks|none` names the tier outright —
+that is the escape hatch for a link whose DSR reply arrives after the timeout.
+`tty.rs` snapshots the line discipline with `tcgetattr` before `detect()` and
+re-applies it after `disable_raw_mode()` in `app::restore_terminal`, so a late
+restore from the leaked thread can never be the last word on the exit state.
 
 ## Known gaps
 

@@ -3880,9 +3880,11 @@ dependencies = [
 name = "wftui"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "common",
  "crossterm",
  "image",
+ "libc",
  "ratatui",
  "ratatui-image",
  "serde_json",

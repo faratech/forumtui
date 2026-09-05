@@ -13,6 +13,7 @@ pub mod images;
 mod overlay;
 mod screens;
 mod theme;
+pub mod tty;
 
 fn main() -> std::process::ExitCode {
     common::logging::init();
@@ -21,15 +22,10 @@ fn main() -> std::process::ExitCode {
     // before the default panic hook prints backtrace/errors to stdout/stderr.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = ratatui::crossterm::execute!(
-            std::io::stdout(),
-            ratatui::crossterm::event::PopKeyboardEnhancementFlags,
-            ratatui::crossterm::event::DisableBracketedPaste,
-            ratatui::crossterm::terminal::LeaveAlternateScreen,
-            ratatui::crossterm::event::DisableMouseCapture,
-            ratatui::crossterm::cursor::Show
-        );
-        let _ = ratatui::crossterm::terminal::disable_raw_mode();
+        // Shared with `TerminalGuard::drop` — each crossterm restore command
+        // is issued in its own `execute!` call so a Windows-unsupported
+        // PopKeyboardEnhancementFlags can never skip the rest (issue #531).
+        app::restore_terminal();
         original_hook(panic_info);
     }));
 
@@ -41,7 +37,13 @@ fn main() -> std::process::ExitCode {
     // exactly the way the login-corruption incident split escape sequences.
     // It also runs before raw mode and the alternate screen: the query drives
     // termios itself, which is the ordering ratatui-image's own binary uses.
+    // …and before either, snapshot the terminal's line discipline, so the exit
+    // state cannot be poisoned by the query's leaked reader thread (#532).
+    tty::snapshot();
     let images = images::Images::detect();
+    // Undo anything the query left behind BEFORE crossterm's first
+    // `enable_raw_mode()` snapshots the mode it finds.
+    tty::restore();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

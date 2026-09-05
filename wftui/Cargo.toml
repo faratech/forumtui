@@ -39,3 +39,16 @@ sha2 = "0.11"
 # it only JPEG decodes.
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"], optional = true }
 image = { version = "0.25", default-features = false, optional = true }
+
+# Unix only, and only for `tty.rs`: a `tcgetattr` snapshot of the terminal's
+# line discipline taken before the graphics query, re-applied on every exit
+# path (issue #532). Pure Rust (declarations only, no C is compiled) and
+# cfg-gated off Windows entirely, so the Windows build is untouched.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Test-only `WfApi` fakes: the trait is declared with `#[async_trait]`, so an
+# implementation outside `common` needs the same macro. Keeps handler tests
+# off the network entirely (`common` already depends on it).
+async-trait = "0.1"

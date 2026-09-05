@@ -615,6 +615,9 @@ impl Screen {
             Screen::ThreadView(v) => {
                 v.scroll = 0;
                 v.sel_post = 0;
+                // Force `rebuild_lines` (issue #542 — see thread_view_key's
+                // n/N for the same fix and why).
+                v.width = 0;
             }
             Screen::Inbox(ib) => match ib.tab {
                 InboxTab::Conversations => ib.convos.sel = 0,
@@ -643,6 +646,7 @@ impl Screen {
             Screen::ThreadView(v) => {
                 v.scroll = v.lines.len() as u16;
                 v.sel_post = v.posts.len().saturating_sub(1);
+                v.width = 0;
             }
             Screen::Inbox(ib) => match ib.tab {
                 InboxTab::Conversations => {
