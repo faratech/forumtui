@@ -283,11 +283,11 @@ pub struct UserReply {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct UsersFindReply {
+pub struct UsersFindNameReply {
     #[serde(default)]
-    pub user: Option<User>,
+    pub exact: Option<User>,
     #[serde(default)]
-    pub users: Vec<User>,
+    pub recommendations: Vec<User>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

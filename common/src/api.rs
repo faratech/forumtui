@@ -456,19 +456,10 @@ impl WfApi for WfApiClient {
     }
 
     async fn find_user(&self, username: &str) -> Result<Option<User>> {
-        match self
-            .get::<UserReply>("/users/find-name", &[("username", username.to_string())])
-            .await
-        {
-            Ok(reply) => Ok(Some(reply.user)),
-            // An unknown member is a normal outcome for DM recipient entry.
-            Err(Error::Api { ref code, status: 404, .. })
-                if code == "user_not_found" || code == "requested_user_not_found" =>
-            {
-                Ok(None)
-            }
-            Err(e) => Err(e),
-        }
+        let reply: UsersFindNameReply = self
+            .get("/users/find-name", &[("username", username.to_string())])
+            .await?;
+        Ok(reply.exact.filter(|u| u.user_id > 0))
     }
 }
 
@@ -672,5 +663,36 @@ mod tests {
             .unwrap();
         assert_eq!(stored.access_token, "tok-2");
         assert_eq!(stored.refresh_token, "refresh-2");
+    }
+
+    #[tokio::test]
+    async fn find_user_decodes_exact_match_or_none() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-finduser");
+        Mock::given(method("GET"))
+            .and(path("/api/users/find-name"))
+            .and(wiremock::matchers::query_param("username", "alice"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "exact": {"user_id": 42, "username": "alice", "message_count": 10},
+                "recommendations": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/users/find-name"))
+            .and(wiremock::matchers::query_param("username", "unknown"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "exact": null,
+                "recommendations": [{"user_id": 99, "username": "unknown_other"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let found = c.find_user("alice").await.unwrap();
+        assert_eq!(found.map(|u| u.user_id), Some(42));
+
+        let not_found = c.find_user("unknown").await.unwrap();
+        assert!(not_found.is_none());
     }
 }
