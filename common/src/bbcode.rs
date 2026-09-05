@@ -7,6 +7,8 @@
 //! House rule for unknown input: never silently drop content. Unknown tags
 //! and malformed brackets pass through as literal text.
 
+use std::borrow::Cow;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Style {
     pub bold: bool,
@@ -38,13 +40,57 @@ impl Style {
                 Frame::Underline => s.underline = true,
                 Frame::Strike => s.strikethrough = true,
                 Frame::Quote { .. } => s.quote_depth += 1,
-                Frame::List => s.list_depth += 1,
+                Frame::List(_) => s.list_depth += 1,
                 Frame::Spoiler => s.spoiler = true,
-                Frame::Verbatim | Frame::Color(_) | Frame::Size(_) | Frame::Font(_)
-                | Frame::Align(_) | Frame::Link(_) => {}
+                Frame::InlineCode => s.code = true,
+                Frame::Heading(_) | Frame::TableHeader => {
+                    s.bold = true;
+                }
+                Frame::Color(_)
+                | Frame::Size(_)
+                | Frame::Font(_)
+                | Frame::Align(_)
+                | Frame::Link(_)
+                | Frame::Table
+                | Frame::TableRow
+                | Frame::TableCell => {}
             }
         }
         s
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListKind {
+    Bullet,
+    Numbered(usize),
+    Alpha(usize),
+}
+
+impl ListKind {
+    fn from_attr(attr: Option<&str>) -> Self {
+        match attr {
+            Some("1") => ListKind::Numbered(1),
+            Some("a") | Some("A") => ListKind::Alpha(1),
+            _ => ListKind::Bullet,
+        }
+    }
+
+    fn next_marker(&mut self) -> String {
+        match self {
+            ListKind::Bullet => "• ".into(),
+            ListKind::Numbered(n) => {
+                let cur = *n;
+                *n += 1;
+                format!("{cur}. ")
+            }
+            ListKind::Alpha(n) => {
+                let cur = *n;
+                *n += 1;
+                let c = (b'a' + ((cur - 1) % 26) as u8) as char;
+                format!("{c}. ")
+            }
+        }
     }
 }
 
@@ -55,16 +101,145 @@ enum Frame {
     Underline,
     Strike,
     Quote { byline: Option<String> },
-    List,
+    List(ListKind),
     Spoiler,
-    /// CODE/PHP: scan raw until the exact closing tag.
-    Verbatim,
+    InlineCode,
+    Heading(u8),
     Color(String),
     Size(String),
     Font(String),
     Align(String),
     /// [URL=href] — content until [/URL] is the label.
     Link(String),
+    Table,
+    TableRow,
+    TableHeader,
+    TableCell,
+}
+
+/// Strip surrounding quotation marks ("..." or '...') and trim whitespace.
+pub fn strip_quotes(s: &str) -> &str {
+    let trimmed = s.trim();
+    if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    }
+}
+
+/// Decode standard HTML entities commonly found in XenForo BBCode / API output.
+pub fn decode_html_entities(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after_amp = &rest[amp + 1..];
+        if let Some(semi) = after_amp.find(';') {
+            let entity = &after_amp[..semi];
+            let decoded: Option<Cow<'static, str>> = match entity {
+                "amp" => Some("&".into()),
+                "quot" => Some("\"".into()),
+                "#039" | "apos" => Some("'".into()),
+                "lt" => Some("<".into()),
+                "gt" => Some(">".into()),
+                "nbsp" | "#160" => Some(" ".into()),
+                _ if entity.starts_with('#') => {
+                    let num_str = &entity[1..];
+                    let ch = if let Some(hex) = num_str.strip_prefix('x').or_else(|| num_str.strip_prefix('X')) {
+                        u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+                    } else {
+                        num_str.parse::<u32>().ok().and_then(char::from_u32)
+                    };
+                    ch.map(|c| Cow::Owned(c.to_string()))
+                }
+                _ => None,
+            };
+            if let Some(d) = decoded {
+                out.push_str(&d);
+                rest = &after_amp[semi + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = after_amp;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Parse XenForo quote attributes: e.g. "Alice, post: 12345, member: 678" -> ("Alice", Some(12345))
+fn parse_quote_byline(raw: &str) -> (String, Option<u32>) {
+    let unquoted = strip_quotes(raw);
+    if let Some((author, rest)) = unquoted.split_once(',') {
+        let post_id = rest
+            .split(',')
+            .find_map(|part| {
+                let part = part.trim();
+                part.strip_prefix("post:").and_then(|p| p.trim().parse::<u32>().ok())
+            });
+        (author.trim().to_string(), post_id)
+    } else {
+        (unquoted.to_string(), None)
+    }
+}
+
+/// Resolve XenForo [MEDIA=site]id[/MEDIA] tags to valid hyperlinks and readable labels.
+fn resolve_media(site: &str, media_id: &str) -> (String, String) {
+    let clean_id = media_id.trim();
+    match site.to_ascii_lowercase().as_str() {
+        "youtube" => (
+            "[video: YouTube]".into(),
+            format!("https://www.youtube.com/watch?v={clean_id}"),
+        ),
+        "vimeo" => (
+            "[video: Vimeo]".into(),
+            format!("https://vimeo.com/{clean_id}"),
+        ),
+        "twitter" => (
+            "[media: Twitter/X]".into(),
+            format!("https://twitter.com/x/status/{clean_id}"),
+        ),
+        "tiktok" => (
+            "[video: TikTok]".into(),
+            format!("https://www.tiktok.com/@user/video/{clean_id}"),
+        ),
+        "spotify" => (
+            "[audio: Spotify]".into(),
+            format!("https://open.spotify.com/track/{clean_id}"),
+        ),
+        other => {
+            if clean_id.starts_with("http://") || clean_id.starts_with("https://") {
+                (format!("[media: {other}]"), clean_id.to_string())
+            } else {
+                (format!("[media: {other}]"), format!("https://{other}.com/{clean_id}"))
+            }
+        }
+    }
+}
+
+fn ends_with_newline(chunks: &[Chunk]) -> bool {
+    chunks.last().is_some_and(|c| match c {
+        Chunk::Text(t, _) => t.ends_with('\n'),
+        Chunk::Link(l, _, _) => l.ends_with('\n'),
+    })
+}
+
+fn emit_list_marker(out: &mut Vec<Chunk>, stack: &mut [Frame]) {
+    let marker = if let Some(Frame::List(kind)) =
+        stack.iter_mut().rev().find(|f| matches!(f, Frame::List(_)))
+    {
+        kind.next_marker()
+    } else {
+        "• ".to_string()
+    };
+    let mut st = Style::from_stack(stack);
+    st.bold = true;
+    out.push(Chunk::Text(marker, st));
 }
 
 pub fn render(src: &str) -> Vec<Chunk> {
@@ -73,23 +248,6 @@ pub fn render(src: &str) -> Vec<Chunk> {
     let mut rest = src;
 
     'outer: while !rest.is_empty() {
-        // Verbatim frames swallow everything up to their closing tag.
-        if stack.iter().any(|f| matches!(f, Frame::Verbatim)) {
-            let close = find_verbatim_close(rest);
-            match close {
-                Some((end_content, close_len)) => {
-                    let content = &rest[..end_content];
-                    emit_verbatim(&mut out, content, &stack);
-                    rest = &rest[end_content + close_len..];
-                }
-                None => {
-                    emit_verbatim(&mut out, rest, &stack);
-                    rest = "";
-                }
-            }
-            continue;
-        }
-
         let bracket = match rest.find('[') {
             Some(i) => i,
             None => {
@@ -107,66 +265,224 @@ pub fn render(src: &str) -> Vec<Chunk> {
             Some(TagEvent::Open { name, value, len }) => {
                 let raw_tag = &rest[..len];
                 rest = &rest[len..];
-                match name.to_ascii_lowercase().as_str() {
+                let tag_lower = name.to_ascii_lowercase();
+                match tag_lower.as_str() {
                     "b" => stack.push(Frame::Bold),
                     "i" => stack.push(Frame::Italic),
                     "u" => stack.push(Frame::Underline),
-                    "s" => stack.push(Frame::Strike),
+                    "s" | "strike" => stack.push(Frame::Strike),
+                    "sub" | "sup" => stack.push(Frame::Italic),
+                    "highlight" => stack.push(Frame::Bold),
+                    "icode" | "inlinecode" => stack.push(Frame::InlineCode),
+                    "code" | "php" | "html" => {
+                        let (inner, close_len) = take_until_close(rest, &tag_lower);
+                        let mut st = Style::from_stack(&stack);
+                        st.code = true;
+                        if let Some(v) = &value {
+                            let clean_v = strip_quotes(v);
+                            if !clean_v.is_empty() {
+                                let mut hst = Style::from_stack(&stack);
+                                hst.bold = true;
+                                out.push(Chunk::Text(format!("[{clean_v} code]\n"), hst));
+                            }
+                        }
+                        let decoded = decode_html_entities(inner.trim_matches('\n'));
+                        out.push(Chunk::Text(decoded, st.clone()));
+                        out.push(Chunk::Text("\n".into(), st));
+                        rest = &rest[close_len..];
+                    }
+                    "plain" => {
+                        let (inner, close_len) = take_until_close(rest, "plain");
+                        emit_text(&mut out, inner, &stack);
+                        rest = &rest[close_len..];
+                    }
                     "quote" => {
                         let byline = value.filter(|v| !v.trim().is_empty());
                         if let Some(by) = &byline {
+                            let (author, _) = parse_quote_byline(by);
                             let mut st = Style::from_stack(&stack);
                             st.italic = true;
-                            out.push(Chunk::Text(format!("{by} wrote:\n"), st));
+                            out.push(Chunk::Text(format!("{author} wrote:\n"), st));
                         }
                         stack.push(Frame::Quote { byline });
                     }
-                    "list" => stack.push(Frame::List),
-                    "spoiler" | "ispoiler" => stack.push(Frame::Spoiler),
-                    "code" | "php" => stack.push(Frame::Verbatim),
+                    "list" => {
+                        let kind = ListKind::from_attr(value.as_deref());
+                        stack.push(Frame::List(kind));
+                    }
+                    "spoiler" | "ispoiler" => {
+                        if let Some(title) = &value {
+                            let clean = strip_quotes(title);
+                            if !clean.is_empty() {
+                                let mut st = Style::from_stack(&stack);
+                                st.bold = true;
+                                out.push(Chunk::Text(format!("[Spoiler: {clean}]\n"), st));
+                            }
+                        }
+                        stack.push(Frame::Spoiler);
+                    }
                     "color" => stack.push(Frame::Color(value.unwrap_or_default())),
                     "size" => stack.push(Frame::Size(value.unwrap_or_default())),
                     "font" => stack.push(Frame::Font(value.unwrap_or_default())),
-                    "left" | "center" | "right" => {
-                        stack.push(Frame::Align(name.to_ascii_lowercase()))
+                    "left" | "center" | "right" | "justify" => {
+                        stack.push(Frame::Align(tag_lower))
                     }
                     "indent" => stack.push(Frame::Align("indent".into())),
-                    "url" => match value.filter(|v| !v.trim().is_empty()) {
-                        Some(href) => stack.push(Frame::Link(href.to_string())),
-                        None => stack.push(Frame::Link(String::new())), // label IS the url
-                    },
-                    "img" | "media" => {
-                        let (inner, len) = take_until_close(rest, &name);
-                        let st = Style::from_stack(&stack);
-                        let trimmed = inner.trim();
-                        if trimmed.is_empty() {
-                            out.push(Chunk::Text("[image]".into(), st));
-                        } else {
-                            out.push(Chunk::Link("[image]".into(), trimmed.to_string(), st));
+                    "heading" => {
+                        let level = value
+                            .as_deref()
+                            .and_then(|v| strip_quotes(v).parse::<u8>().ok())
+                            .unwrap_or(1);
+                        if !out.is_empty() && !ends_with_newline(&out) {
+                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
                         }
-                        rest = &rest[len..];
+                        stack.push(Frame::Heading(level));
+                    }
+                    "h1" => {
+                        if !out.is_empty() && !ends_with_newline(&out) {
+                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                        }
+                        stack.push(Frame::Heading(1));
+                    }
+                    "h2" => {
+                        if !out.is_empty() && !ends_with_newline(&out) {
+                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                        }
+                        stack.push(Frame::Heading(2));
+                    }
+                    "h3" => {
+                        if !out.is_empty() && !ends_with_newline(&out) {
+                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                        }
+                        stack.push(Frame::Heading(3));
+                    }
+                    "hr" => {
+                        if !out.is_empty() && !ends_with_newline(&out) {
+                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                        }
+                        out.push(Chunk::Text("───\n".into(), Style::from_stack(&stack)));
+                    }
+                    "table" => {
+                        if !out.is_empty() && !ends_with_newline(&out) {
+                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                        }
+                        stack.push(Frame::Table);
+                    }
+                    "tr" => {
+                        if !out.is_empty() && !ends_with_newline(&out) {
+                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                        }
+                        stack.push(Frame::TableRow);
+                    }
+                    "th" => stack.push(Frame::TableHeader),
+                    "td" => stack.push(Frame::TableCell),
+                    "url" => match value.filter(|v| !v.trim().is_empty()) {
+                        Some(href) => stack.push(Frame::Link(strip_quotes(&href).to_string())),
+                        None => stack.push(Frame::Link(String::new())),
+                    },
+                    "email" => match value.filter(|v| !v.trim().is_empty()) {
+                        Some(target) => {
+                            let clean = strip_quotes(&target);
+                            let href = if clean.starts_with("mailto:") {
+                                clean.to_string()
+                            } else {
+                                format!("mailto:{clean}")
+                            };
+                            stack.push(Frame::Link(href));
+                        }
+                        None => stack.push(Frame::Link(String::new())),
+                    },
+                    "post" => {
+                        let id = value.as_deref().map(strip_quotes).unwrap_or("");
+                        let url = if !id.is_empty() {
+                            format!("https://windowsforum.com/posts/{id}/")
+                        } else {
+                            String::new()
+                        };
+                        stack.push(Frame::Link(url));
+                    }
+                    "thread" => {
+                        let id = value.as_deref().map(strip_quotes).unwrap_or("");
+                        let url = if !id.is_empty() {
+                            format!("https://windowsforum.com/threads/{id}/")
+                        } else {
+                            String::new()
+                        };
+                        stack.push(Frame::Link(url));
+                    }
+                    "img" => {
+                        let lower = rest.to_ascii_lowercase();
+                        if lower.contains("[/img]") {
+                            let (inner, close_len) = take_until_close(rest, "img");
+                            let st = Style::from_stack(&stack);
+                            let trimmed = strip_quotes(inner.trim());
+                            if trimmed.is_empty() {
+                                out.push(Chunk::Text("[image]".into(), st));
+                            } else {
+                                out.push(Chunk::Link("[image]".into(), trimmed.to_string(), st));
+                            }
+                            rest = &rest[close_len..];
+                        } else if let Some(v) = &value {
+                            let st = Style::from_stack(&stack);
+                            out.push(Chunk::Link(
+                                "[image]".into(),
+                                strip_quotes(v).to_string(),
+                                st,
+                            ));
+                        } else {
+                            emit_text(&mut out, raw_tag, &stack);
+                        }
+                    }
+                    "media" => {
+                        let lower = rest.to_ascii_lowercase();
+                        if lower.contains("[/media]") {
+                            let (inner, close_len) = take_until_close(rest, "media");
+                            let st = Style::from_stack(&stack);
+                            let site = value.as_deref().map(strip_quotes).unwrap_or("media");
+                            let (label, url) = resolve_media(site, inner);
+                            out.push(Chunk::Link(label, url, st));
+                            rest = &rest[close_len..];
+                        } else {
+                            emit_text(&mut out, raw_tag, &stack);
+                        }
                     }
                     "attach" => {
-                        let (inner, len) = take_until_close(rest, &name);
-                        let st = Style::from_stack(&stack);
-                        out.push(Chunk::Text(
-                            format!("[attachment {}]", inner.trim()),
-                            st,
-                        ));
-                        rest = &rest[len..];
+                        let lower = rest.to_ascii_lowercase();
+                        if lower.contains("[/attach]") {
+                            let (inner, close_len) = take_until_close(rest, "attach");
+                            let st = Style::from_stack(&stack);
+                            let id = if inner.trim().is_empty() {
+                                value.as_deref().map(strip_quotes).unwrap_or("").trim()
+                            } else {
+                                inner.trim()
+                            };
+                            out.push(Chunk::Text(format!("[attachment {id}]"), st));
+                            rest = &rest[close_len..];
+                        } else if let Some(v) = &value {
+                            let st = Style::from_stack(&stack);
+                            let clean = strip_quotes(v);
+                            out.push(Chunk::Text(format!("[attachment {clean}]"), st));
+                        } else {
+                            emit_text(&mut out, raw_tag, &stack);
+                        }
                     }
                     "user" => {
-                        // [USER=123]name[/USER]
-                        let (inner, len) = take_until_close(rest, &name);
-                        let st = Style::from_stack(&stack);
-                        out.push(Chunk::Text(format!("@{}", inner.trim()), st));
-                        rest = &rest[len..];
+                        let lower = rest.to_ascii_lowercase();
+                        if lower.contains("[/user]") {
+                            let (inner, close_len) = take_until_close(rest, "user");
+                            let st = Style::from_stack(&stack);
+                            out.push(Chunk::Text(format!("@{}", inner.trim()), st));
+                            rest = &rest[close_len..];
+                        } else if let Some(v) = &value {
+                            let st = Style::from_stack(&stack);
+                            let clean = strip_quotes(v);
+                            out.push(Chunk::Text(format!("@{clean}"), st));
+                        } else {
+                            emit_text(&mut out, raw_tag, &stack);
+                        }
                     }
                     "*" => {
-                        // List item marker inside [LIST]; bullet outside a list too.
-                        let mut st = Style::from_stack(&stack);
-                        st.bold = true;
-                        out.push(Chunk::Text("• ".into(), st));
+                        emit_list_marker(&mut out, &mut stack);
                     }
                     _ => {
                         // Unknown tag: literal passthrough, no frame pushed.
@@ -177,16 +493,48 @@ pub fn render(src: &str) -> Vec<Chunk> {
             Some(TagEvent::Close { name, len }) => {
                 let raw_tag = &rest[..len];
                 rest = &rest[len..];
-                if !pop_matching(&mut stack, &name.to_ascii_lowercase()) {
-                    // Closing tag for an unknown/unopened tag: keep it visible.
-                    emit_text(&mut out, raw_tag, &stack);
+                let tag_lower = name.to_ascii_lowercase();
+                match tag_lower.as_str() {
+                    "heading" | "h1" | "h2" | "h3" => {
+                        if pop_matching(&mut stack, &tag_lower)
+                            && !out.is_empty()
+                            && !ends_with_newline(&out)
+                        {
+                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                        }
+                    }
+                    "td" | "th" => {
+                        if pop_matching(&mut stack, &tag_lower) {
+                            out.push(Chunk::Text(" | ".into(), Style::from_stack(&stack)));
+                        }
+                    }
+                    "tr" => {
+                        if pop_matching(&mut stack, "tr")
+                            && !out.is_empty()
+                            && !ends_with_newline(&out)
+                        {
+                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                        }
+                    }
+                    "table" => {
+                        if pop_matching(&mut stack, "table")
+                            && !out.is_empty()
+                            && !ends_with_newline(&out)
+                        {
+                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                        }
+                    }
+                    _ => {
+                        if !pop_matching(&mut stack, &tag_lower) {
+                            // Closing tag for an unknown/unopened tag: keep it visible.
+                            emit_text(&mut out, raw_tag, &stack);
+                        }
+                    }
                 }
             }
             Some(TagEvent::Star(len)) => {
                 rest = &rest[len..];
-                let mut st = Style::from_stack(&stack);
-                st.bold = true;
-                out.push(Chunk::Text("• ".into(), st));
+                emit_list_marker(&mut out, &mut stack);
             }
             None => {
                 // Stray '[': literal.
@@ -211,7 +559,7 @@ pub fn to_plain(src: &str) -> String {
             Chunk::Text(t, _) => s.push_str(&t),
             Chunk::Link(label, url, _) => {
                 s.push_str(&label);
-                if label != url {
+                if label != url && !url.is_empty() {
                     s.push_str(&format!(" ({url})"));
                 }
             }
@@ -221,8 +569,15 @@ pub fn to_plain(src: &str) -> String {
 }
 
 enum TagEvent {
-    Open { name: String, value: Option<String>, len: usize },
-    Close { name: String, len: usize },
+    Open {
+        name: String,
+        value: Option<String>,
+        len: usize,
+    },
+    Close {
+        name: String,
+        len: usize,
+    },
     Star(usize),
 }
 
@@ -230,7 +585,6 @@ fn parse_tag(s: &str) -> Option<TagEvent> {
     debug_assert!(s.starts_with('['));
     let close = s.find(']')?;
     let inner = &s[1..close];
-    // Reject obviously malformed tag bodies (spaces in tag names, newlines).
     if inner.is_empty() || inner.contains('\n') || inner.contains('\r') {
         return None;
     }
@@ -239,19 +593,41 @@ fn parse_tag(s: &str) -> Option<TagEvent> {
         if name.is_empty() || !is_tag_name(name) {
             return None;
         }
-        return Some(TagEvent::Close { name: name.to_string(), len: close + 1 });
+        return Some(TagEvent::Close {
+            name: name.to_string(),
+            len: close + 1,
+        });
     }
-    let (name, value) = match inner.split_once('=') {
-        Some((n, v)) => (n, Some(v.to_string())),
-        None => (inner, None),
-    };
-    let name = name.trim();
-    if name == "*" {
+
+    if inner.trim() == "*" {
         return Some(TagEvent::Star(close + 1));
     }
+
+    // Split on first '=' or whitespace. Notice: check if there is a space BEFORE '='
+    // (e.g. [ATTACH type="full"] vs [QUOTE="Alice, post: 123"]).
+    let (name, value) = if let Some(eq_pos) = inner.find('=') {
+        let before_eq = &inner[..eq_pos];
+        if let Some(space_pos) = before_eq.find(char::is_whitespace) {
+            let name_part = before_eq[..space_pos].trim();
+            let val = inner[eq_pos + 1..].trim();
+            (name_part, Some(strip_quotes(val).to_string()))
+        } else {
+            let name_part = before_eq.trim();
+            let val = inner[eq_pos + 1..].trim();
+            (name_part, Some(strip_quotes(val).to_string()))
+        }
+    } else if let Some(space_pos) = inner.find(char::is_whitespace) {
+        let name_part = inner[..space_pos].trim();
+        let val = inner[space_pos + 1..].trim();
+        (name_part, Some(strip_quotes(val).to_string()))
+    } else {
+        (inner.trim(), None)
+    };
+
     if !is_tag_name(name) {
         return None;
     }
+
     Some(TagEvent::Open {
         name: name.to_string(),
         value,
@@ -271,41 +647,11 @@ fn is_tag_name(name: &str) -> bool {
 /// offset and the closing tag length.
 fn take_until_close<'a>(s: &'a str, name: &str) -> (&'a str, usize) {
     let lower = s.to_ascii_lowercase();
-    let mut needle = String::with_capacity(name.len() + 3);
-    needle.push_str("[/");
-    needle.push_str(&name.to_ascii_lowercase());
-    needle.push(']');
+    let needle = format!("[/{}]", name.to_ascii_lowercase());
     match lower.find(&needle) {
         Some(pos) => (&s[..pos], pos + needle.len()),
         None => (s, s.len()),
     }
-}
-
-/// In verbatim mode find the first [/CODE] or [/PHP]; returns content end and
-/// close-tag length.
-fn find_verbatim_close(s: &str) -> Option<(usize, usize)> {
-    let lower = s.to_ascii_lowercase();
-    let code = lower.find("[/code]");
-    let php = lower.find("[/php]");
-    match (code, php) {
-        (Some(a), Some(b)) => {
-            if a < b {
-                Some((a, 7))
-            } else {
-                Some((b, 6))
-            }
-        }
-        (Some(a), None) => Some((a, 7)),
-        (None, Some(b)) => Some((b, 6)),
-        (None, None) => None,
-    }
-}
-
-fn emit_verbatim(out: &mut Vec<Chunk>, content: &str, stack: &[Frame]) {
-    let mut st = Style::from_stack(stack);
-    st.code = true;
-    out.push(Chunk::Text(content.trim_matches('\n').to_string(), st.clone()));
-    out.push(Chunk::Text("\n".into(), st));
 }
 
 /// Emit plain text: inside a [URL] frame the whole run is a link; otherwise
@@ -314,17 +660,22 @@ fn emit_text(out: &mut Vec<Chunk>, text: &str, stack: &[Frame]) {
     if text.is_empty() {
         return;
     }
+    let decoded_text = decode_html_entities(text);
     let st = Style::from_stack(stack);
     if let Some(href) = stack.iter().rev().find_map(|f| match f {
         Frame::Link(h) => Some(h.clone()),
         _ => None,
     }) {
         // [URL=href]label[/URL] — empty href means the label IS the url.
-        let target = if href.is_empty() { text } else { &href };
-        out.push(Chunk::Link(text.to_string(), target.to_string(), st));
+        let target = if href.is_empty() {
+            decoded_text.clone()
+        } else {
+            href
+        };
+        out.push(Chunk::Link(decoded_text, target, st));
         return;
     }
-    let mut rest = text;
+    let mut rest = decoded_text.as_str();
     while let Some(pos) = find_url(rest) {
         let (before, url, after) = split_url(rest, pos);
         if !before.is_empty() {
@@ -367,29 +718,30 @@ fn split_url(s: &str, pos: usize) -> (&str, &str, &str) {
 
 /// Pop the innermost frame matching the closing tag name; false if none.
 fn pop_matching(stack: &mut Vec<Frame>, name: &str) -> bool {
-    #[allow(clippy::match_like_matches_macro)] // paired (name, frame) arms read clearer as a match
+    #[allow(clippy::match_like_matches_macro)]
     fn is_closer(name: &str, f: &Frame) -> bool {
-    match (name, f) {
-        ("b", Frame::Bold)
-        | ("i", Frame::Italic)
-        | ("u", Frame::Underline)
-        | ("s", Frame::Strike)
-        | ("list", Frame::List)
-        | ("spoiler", Frame::Spoiler)
-        | ("ispoiler", Frame::Spoiler)
-        | ("code", Frame::Verbatim)
-        | ("php", Frame::Verbatim)
-        | ("color", Frame::Color(_))
-        | ("size", Frame::Size(_))
-        | ("font", Frame::Font(_))
-        | ("left", Frame::Align(_))
-        | ("center", Frame::Align(_))
-        | ("right", Frame::Align(_))
-        | ("indent", Frame::Align(_))
-        | ("url", Frame::Link(_)) => true,
-        ("quote", Frame::Quote { .. }) => true,
-        _ => false,
-    }
+        match (name, f) {
+            ("b", Frame::Bold)
+            | ("i", Frame::Italic)
+            | ("u", Frame::Underline)
+            | ("s" | "strike", Frame::Strike)
+            | ("sub" | "sup" | "highlight", Frame::Italic | Frame::Bold)
+            | ("list", Frame::List(_))
+            | ("spoiler" | "ispoiler", Frame::Spoiler)
+            | ("icode" | "inlinecode", Frame::InlineCode)
+            | ("heading" | "h1" | "h2" | "h3", Frame::Heading(_))
+            | ("color", Frame::Color(_))
+            | ("size", Frame::Size(_))
+            | ("font", Frame::Font(_))
+            | ("left" | "center" | "right" | "justify" | "indent", Frame::Align(_))
+            | ("url" | "email" | "post" | "thread", Frame::Link(_))
+            | ("table", Frame::Table)
+            | ("tr", Frame::TableRow)
+            | ("th", Frame::TableHeader)
+            | ("td", Frame::TableCell) => true,
+            ("quote", Frame::Quote { .. }) => true,
+            _ => false,
+        }
     }
     match stack.iter().rposition(|f| is_closer(name, f)) {
         Some(pos) => {
@@ -422,7 +774,10 @@ mod tests {
             _ => panic!(),
         };
         assert!(s0.bold && !s0.italic);
-        let it = chunks.iter().find(|c| matches!(c, Chunk::Text(t, _) if t.contains("it"))).unwrap();
+        let it = chunks
+            .iter()
+            .find(|c| matches!(c, Chunk::Text(t, _) if t.contains("it")))
+            .unwrap();
         if let Chunk::Text(_, s) = it {
             assert!(s.italic && !s.bold);
         }
@@ -431,6 +786,18 @@ mod tests {
     #[test]
     fn url_with_label_is_link() {
         let chunks = render("[URL=https://example.com]click[/URL]");
+        match &chunks[0] {
+            Chunk::Link(label, url, _) => {
+                assert_eq!(label, "click");
+                assert_eq!(url, "https://example.com");
+            }
+            _ => panic!("expected link"),
+        }
+    }
+
+    #[test]
+    fn url_with_quotes_stripped() {
+        let chunks = render(r#"[URL="https://example.com"]click[/URL]"#);
         match &chunks[0] {
             Chunk::Link(label, url, _) => {
                 assert_eq!(label, "click");
@@ -470,17 +837,65 @@ mod tests {
     }
 
     #[test]
-    fn code_block_is_verbatim_and_flags_code() {
-        let chunks = render("[CODE]not [B]bold[/B] and [I]not it[/I][/CODE] after");
+    fn code_block_is_verbatim_and_does_not_corrupt_subsequent_text() {
+        let chunks = render("[CODE]not [B]bold[/B] and [I]not it[/I][/CODE] after code");
         let code = &chunks[0];
         if let Chunk::Text(t, s) = code {
             assert!(s.code);
             assert!(t.contains("[B]bold[/B]"));
-            assert!(!t.contains("after"));
+            assert!(!t.contains("after code"));
         } else {
             panic!("expected verbatim text");
         }
-        assert!(texts(&chunks).iter().any(|t| t.contains("after")));
+
+        // CRITICAL BUG VERIFICATION: Text after [/CODE] must NOT have s.code = true!
+        let after = chunks
+            .iter()
+            .find(|c| matches!(c, Chunk::Text(t, _) if t.contains("after code")))
+            .expect("should find after-code chunk");
+        if let Chunk::Text(_, s) = after {
+            assert!(!s.code, "text after [/CODE] must not inherit code style!");
+        }
+    }
+
+    #[test]
+    fn code_block_with_language_tag() {
+        let chunks = render("[CODE=rust]let x = 42;[/CODE]");
+        let all = texts(&chunks).concat();
+        assert!(all.contains("[rust code]"));
+        assert!(all.contains("let x = 42;"));
+    }
+
+    #[test]
+    fn inline_code_tag() {
+        let chunks = render("call [ICODE]println![/ICODE] here");
+        let icode = chunks
+            .iter()
+            .find(|c| matches!(c, Chunk::Text(t, _) if t == "println!"))
+            .unwrap();
+        if let Chunk::Text(_, s) = icode {
+            assert!(s.code);
+        } else {
+            panic!("expected code chunk");
+        }
+        let after = chunks
+            .iter()
+            .find(|c| matches!(c, Chunk::Text(t, _) if t.contains("here")))
+            .unwrap();
+        if let Chunk::Text(_, s) = after {
+            assert!(!s.code);
+        }
+    }
+
+    #[test]
+    fn plain_tag_escapes_bbcode() {
+        let chunks = render("[PLAIN][B]not bold[/B] and [URL]none[/URL][/PLAIN] outside");
+        let all = texts(&chunks).concat();
+        assert!(all.contains("[B]not bold[/B]"));
+        assert!(!chunks.iter().any(|c| match c {
+            Chunk::Text(_, s) => s.bold,
+            _ => false,
+        }));
     }
 
     #[test]
@@ -509,11 +924,12 @@ mod tests {
     }
 
     #[test]
-    fn quote_byline_renders() {
-        let chunks = render("[QUOTE=alice, post: 123]hi[/QUOTE]");
+    fn quote_byline_renders_and_unquotes() {
+        let chunks = render(r#"[QUOTE="Alice, post: 12345, member: 678"]hi there[/QUOTE]"#);
         let all = texts(&chunks).concat();
-        assert!(all.contains("alice"));
-        assert!(all.contains("hi"));
+        assert!(all.contains("Alice wrote:"));
+        assert!(!all.contains('"'));
+        assert!(all.contains("hi there"));
     }
 
     #[test]
@@ -522,6 +938,19 @@ mod tests {
         let all = texts(&chunks).concat();
         assert!(all.contains("• one"));
         assert!(all.contains("• two"));
+    }
+
+    #[test]
+    fn ordered_list_numbered_and_alpha() {
+        let numbered = render("[LIST=1]\n[*]first\n[*]second\n[/LIST]");
+        let all_num = texts(&numbered).concat();
+        assert!(all_num.contains("1. first"));
+        assert!(all_num.contains("2. second"));
+
+        let alpha = render("[LIST=a]\n[*]alpha\n[*]beta\n[/LIST]");
+        let all_alpha = texts(&alpha).concat();
+        assert!(all_alpha.contains("a. alpha"));
+        assert!(all_alpha.contains("b. beta"));
     }
 
     #[test]
@@ -566,10 +995,41 @@ mod tests {
     }
 
     #[test]
-    fn attach_and_user_markers() {
-        let all = texts(&render("[ATTACH=full]1234[/ATTACH] by [USER=9]bob[/USER]")).concat();
+    fn attach_and_user_markers_with_attributes() {
+        let all = texts(&render(
+            r#"[ATTACH type="full"]1234[/ATTACH] by [USER=9]bob[/USER]"#,
+        ))
+        .concat();
         assert!(all.contains("[attachment 1234]"));
         assert!(all.contains("@bob"));
+    }
+
+    #[test]
+    fn media_youtube_resolves() {
+        let chunks = render("[MEDIA=youtube]dQw4w9WgXcQ[/MEDIA]");
+        match &chunks[0] {
+            Chunk::Link(label, url, _) => {
+                assert_eq!(label, "[video: YouTube]");
+                assert_eq!(url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+            }
+            _ => panic!("expected youtube link"),
+        }
+    }
+
+    #[test]
+    fn table_and_heading_rendering() {
+        let chunks = render("[HEADING=2]Section[/HEADING][TABLE][TR][TH]Header[/TH][/TR][TR][TD]Data[/TD][/TR][/TABLE]");
+        let all = texts(&chunks).concat();
+        assert!(all.contains("Section"));
+        assert!(all.contains("Header |"));
+        assert!(all.contains("Data |"));
+    }
+
+    #[test]
+    fn html_entity_decoding() {
+        let chunks = render("Tom &amp; Jerry said &quot;hello&#039;s &lt;world&gt;&quot;");
+        let all = texts(&chunks).concat();
+        assert_eq!(all, "Tom & Jerry said \"hello's <world>\"");
     }
 
     #[test]
@@ -596,6 +1056,10 @@ mod tests {
 
     #[test]
     fn empty_input_yields_one_empty_chunk() {
-        assert_eq!(render(""), vec![Chunk::Text(String::new(), Style::default())]);
+        assert_eq!(
+            render(""),
+            vec![Chunk::Text(String::new(), Style::default())]
+        );
     }
 }
+
