@@ -902,7 +902,11 @@ impl App {
                 self.status = format!("Session expired ({e}); log in again.");
             }
             Msg::NodesLoaded(result) => {
-                if let Some(Screen::ForumTree(tree)) = self.screens.first_mut() {
+                let tree = self.screens.iter_mut().find_map(|s| match s {
+                    Screen::ForumTree(tree) => Some(tree),
+                    _ => None,
+                });
+                if let Some(tree) = tree {
                     match result {
                         Ok(nodes) => {
                             tree.nodes = nodes;
@@ -916,7 +920,11 @@ impl App {
                 }
             }
             Msg::ForumLoaded { page, result } => {
-                if let Some(Screen::ThreadList(list)) = self.screens.last_mut() {
+                let list = self.screens.iter_mut().rev().find_map(|s| match s {
+                    Screen::ThreadList(list) => Some(list),
+                    _ => None,
+                });
+                if let Some(list) = list {
                     match result {
                         Ok(reply) => {
                             list.threads = reply.threads;
@@ -933,10 +941,11 @@ impl App {
                 }
             }
             Msg::ThreadLoaded { id, page, result } => {
-                if let Some(Screen::ThreadView(view)) = self.screens.last_mut() {
-                    if view.thread.thread_id != id {
-                        return;
-                    }
+                let view = self.screens.iter_mut().rev().find_map(|s| match s {
+                    Screen::ThreadView(view) if view.thread.thread_id == id => Some(view),
+                    _ => None,
+                });
+                if let Some(view) = view {
                     match result {
                         Ok(reply) => {
                             if !reply.thread.title.is_empty() {
@@ -965,43 +974,73 @@ impl App {
                 }
             }
             Msg::ReplySent(result) => {
-                if let Some(Screen::Compose(compose)) = self.screens.last_mut() {
-                    match result {
-                        Ok(_) => {
-                            let thread_id = match compose.target {
-                                Some(ComposeTarget::ThreadReply { thread_id, .. }) => thread_id,
-                                _ => 0,
-                            };
-                            self.screens.pop();
-                            self.status = "Reply posted.".into();
-                            if thread_id > 0 {
-                                self.load_thread(thread_id, 1);
-                            }
+                let (compose_idx, target) = self
+                    .screens
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(idx, s)| match s {
+                        Screen::Compose(c) if matches!(c.target, Some(ComposeTarget::ThreadReply { .. })) => {
+                            Some((idx, c.target.clone()))
                         }
-                        Err(e) => {
-                            compose.busy = false;
-                            compose.error = Some(e.message);
+                        _ => None,
+                    })
+                    .unzip();
+                match result {
+                    Ok(_) => {
+                        let thread_id = match target.flatten() {
+                            Some(ComposeTarget::ThreadReply { thread_id, .. }) => thread_id,
+                            _ => 0,
+                        };
+                        if let Some(idx) = compose_idx {
+                            self.screens.remove(idx);
+                        }
+                        self.status = "Reply posted.".into();
+                        if thread_id > 0 {
+                            self.load_thread(thread_id, 1);
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(idx) = compose_idx {
+                            if let Screen::Compose(compose) = &mut self.screens[idx] {
+                                compose.busy = false;
+                                compose.error = Some(e.message);
+                            }
                         }
                     }
                 }
             }
-            Msg::ThreadCreated(result) => match result {
-                Ok(thread) => {
-                    self.screens.pop();
-                    self.status = "Thread created.".into();
-                    self.load_forum(thread.node_id, 1);
-                }
-                Err(e) => {
-                    if let Some(Screen::Compose(compose)) = self.screens.last_mut() {
-                        compose.busy = false;
-                        compose.error = Some(e.message);
+            Msg::ThreadCreated(result) => {
+                let compose_idx = self.screens.iter().rposition(|s| match s {
+                    Screen::Compose(c) => matches!(c.target, Some(ComposeTarget::NewThread { .. })),
+                    _ => false,
+                });
+                match result {
+                    Ok(thread) => {
+                        if let Some(idx) = compose_idx {
+                            self.screens.remove(idx);
+                        }
+                        self.status = "Thread created.".into();
+                        self.load_forum(thread.node_id, 1);
+                    }
+                    Err(e) => {
+                        if let Some(idx) = compose_idx {
+                            if let Screen::Compose(compose) = &mut self.screens[idx] {
+                                compose.busy = false;
+                                compose.error = Some(e.message);
+                            }
+                        }
                     }
                 }
-            },
+            }
             Msg::MarkedRead(Ok(())) => self.status = "Marked read.".into(),
             Msg::MarkedRead(Err(e)) => self.status = format!("Mark-read failed: {e}"),
             Msg::ConversationsLoaded { page, result } => {
-                if let Some(Screen::Conversations(convs)) = self.screens.last_mut() {
+                let convs = self.screens.iter_mut().rev().find_map(|s| match s {
+                    Screen::Conversations(convs) => Some(convs),
+                    _ => None,
+                });
+                if let Some(convs) = convs {
                     match result {
                         Ok(reply) => {
                             convs.conversations = reply.conversations;
@@ -1018,10 +1057,13 @@ impl App {
                 }
             }
             Msg::ConversationLoaded { id, page, result } => {
-                if let Some(Screen::ConversationView(view)) = self.screens.last_mut() {
-                    if view.conversation.conversation_id != id {
-                        return;
+                let view = self.screens.iter_mut().rev().find_map(|s| match s {
+                    Screen::ConversationView(view) if view.conversation.conversation_id == id => {
+                        Some(view)
                     }
+                    _ => None,
+                });
+                if let Some(view) = view {
                     match result {
                         Ok(reply) => {
                             view.messages = reply.messages;
@@ -1045,58 +1087,78 @@ impl App {
                 }
             }
             Msg::ConvoReplySent(result) => {
-                if let Some(Screen::Compose(compose)) = self.screens.last_mut() {
-                    match result {
-                        Ok(()) => {
-                            let cid = match compose.target {
-                                Some(ComposeTarget::ConversationReply {
-                                    conversation_id, ..
-                                }) => conversation_id,
-                                _ => 0,
-                            };
-                            self.screens.pop();
-                            self.status = "Message sent.".into();
-                            if cid > 0 {
-                                self.load_conversation(cid, 1);
-                            }
+                let (compose_idx, target) = self
+                    .screens
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(idx, s)| match s {
+                        Screen::Compose(c) if matches!(c.target, Some(ComposeTarget::ConversationReply { .. })) => {
+                            Some((idx, c.target.clone()))
                         }
-                        Err(e) => {
-                            compose.busy = false;
-                            compose.error = Some(e.message);
+                        _ => None,
+                    })
+                    .unzip();
+                match result {
+                    Ok(()) => {
+                        let cid = match target.flatten() {
+                            Some(ComposeTarget::ConversationReply {
+                                conversation_id, ..
+                            }) => conversation_id,
+                            _ => 0,
+                        };
+                        if let Some(idx) = compose_idx {
+                            self.screens.remove(idx);
+                        }
+                        self.status = "Message sent.".into();
+                        if cid > 0 {
+                            self.load_conversation(cid, 1);
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(idx) = compose_idx {
+                            if let Screen::Compose(compose) = &mut self.screens[idx] {
+                                compose.busy = false;
+                                compose.error = Some(e.message);
+                            }
                         }
                     }
                 }
             }
             Msg::RecipientResolved { name, id } => {
-                let done = {
-                    match self.screens.last_mut() {
-                        Some(Screen::NewConversation(nc)) => {
-                            nc.resolving = nc.resolving.saturating_sub(1);
-                            match id {
-                                Some(id) => nc.resolved_ids.push(id),
-                                None => nc.errors.push(format!("{name}: not found")),
-                            }
-                            nc.resolving == 0
-                        }
-                        _ => false,
+                let nc = self.screens.iter_mut().rev().find_map(|s| match s {
+                    Screen::NewConversation(nc) => Some(nc),
+                    _ => None,
+                });
+                let done = if let Some(nc) = nc {
+                    nc.resolving = nc.resolving.saturating_sub(1);
+                    match id {
+                        Some(id) => nc.resolved_ids.push(id),
+                        None => nc.errors.push(format!("{name}: not found")),
                     }
+                    nc.resolving == 0
+                } else {
+                    false
                 };
                 if done {
-                    let (ids, title, body) =
-                        if let Some(Screen::NewConversation(nc)) = self.screens.last_mut() {
-                            nc.busy = false;
-                            if nc.resolved_ids.is_empty() || !nc.errors.is_empty() {
-                                (Vec::new(), String::new(), String::new())
-                            } else {
-                                (
-                                    nc.resolved_ids.clone(),
-                                    nc.title.clone(),
-                                    nc.body.clone(),
-                                )
-                            }
-                        } else {
+                    let nc = self.screens.iter_mut().rev().find_map(|s| match s {
+                        Screen::NewConversation(nc) => Some(nc),
+                        _ => None,
+                    });
+                    let (ids, title, body) = if let Some(nc) = nc {
+                        nc.busy = false;
+                        if nc.resolved_ids.is_empty() || !nc.errors.is_empty() {
                             (Vec::new(), String::new(), String::new())
-                        };
+                        } else {
+                            (
+                                nc.resolved_ids.clone(),
+                                nc.title.clone(),
+                                nc.body.clone(),
+                            )
+                        }
+                    } else {
+                        (Vec::new(), String::new(), String::new())
+                    };
                     if !ids.is_empty() {
                         let api = self.api.clone();
                         let tx = self.tx.clone();
@@ -1131,14 +1193,22 @@ impl App {
                     self.load_conversation(cid, 1);
                 }
                 Err(e) => {
-                    if let Some(Screen::NewConversation(new)) = self.screens.last_mut() {
+                    let nc = self.screens.iter_mut().rev().find_map(|s| match s {
+                        Screen::NewConversation(nc) => Some(nc),
+                        _ => None,
+                    });
+                    if let Some(new) = nc {
                         new.busy = false;
                         new.errors.push(e.message);
                     }
                 }
             },
             Msg::AlertsLoaded(result) => {
-                if let Some(Screen::Alerts(alerts)) = self.screens.last_mut() {
+                let alerts = self.screens.iter_mut().rev().find_map(|s| match s {
+                    Screen::Alerts(alerts) => Some(alerts),
+                    _ => None,
+                });
+                if let Some(alerts) = alerts {
                     match result {
                         Ok(page) => {
                             self.alerts_unread =
@@ -1162,7 +1232,11 @@ impl App {
                 Err(e) => self.status = format!("Mark failed: {e}"),
             },
             Msg::SearchDone { page, result } => {
-                if let Some(Screen::Search(search)) = self.screens.last_mut() {
+                let search = self.screens.iter_mut().rev().find_map(|s| match s {
+                    Screen::Search(search) => Some(search),
+                    _ => None,
+                });
+                if let Some(search) = search {
                     match result {
                         Ok(reply) => {
                             search.results = reply.results;
@@ -1179,7 +1253,11 @@ impl App {
                 }
             }
             Msg::ProfileLoaded(result) => {
-                if let Some(Screen::Profile(profile)) = self.screens.last_mut() {
+                let profile = self.screens.iter_mut().rev().find_map(|s| match s {
+                    Screen::Profile(profile) => Some(profile),
+                    _ => None,
+                });
+                if let Some(profile) = profile {
                     match result {
                         Ok(user) => {
                             profile.user = Some(user);
