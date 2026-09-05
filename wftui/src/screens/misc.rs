@@ -2,7 +2,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
@@ -55,62 +55,64 @@ const TEXT_COL: usize = 21;
 const STEP_NUM_COL: usize = 3;
 const STEP_BODY_COL: usize = 6;
 
-/// The four-pane mark as a bubble box: rounded corners except a deliberately
-/// square bottom-right (`┘`, matching the artboard exactly), each quadrant
-/// drawn as a solid row (`███`, fg=bg) then a "fade" row (`▀▀▀`, fg only) so
-/// two terminal rows read as one squarish tile. ASCII mode has no half-block
-/// glyph, so it repeats a plain `##` tile instead of faking the fade.
-/// Returns exactly 6 rows, aligned with `login_text_rows`'s 6 slots.
+/// The mark as a white speech-bubble chip, echoing `wf-logo.png`: rounded
+/// top-left/top-right/bottom-left corners (quarter-block glyphs `▗ ▖ ▝`) and a
+/// deliberately square bottom-right corner (a full block `█`, matching the
+/// logo exactly), with the interior painted in chrome_fg (white) and `WF` set
+/// bold in chrome_bg (brand blue). The four-color quadrant glyph the logo
+/// carries inside that same bubble is dropped here on purpose: shown bare (no
+/// bubble, no wordmark for context) the way the old block mark rendered it,
+/// red/green/blue/yellow quadrants read as the Microsoft Windows logo — a
+/// trademark problem this white-on-blue "WF" chip does not have.
+///
+/// The bubble itself is 4 rows (top / WF row / blank card row / bottom); rows
+/// 0 and 5 are blank padding so this still returns exactly 6 rows, aligned
+/// with `login_text_rows`'s 6 slots. ASCII has no half-block glyphs to fake
+/// rounding, so it falls back to a single plain `[ WF ]` chip on row 2 instead
+/// of a multi-row shape.
 fn login_mark_rows(theme: &Theme, g: &Glyphs) -> Vec<Vec<Span<'static>>> {
     let pad = || Span::raw(" ".repeat(MARK_PAD));
+    let blank = || vec![pad()];
+    let wf = Style::new()
+        .fg(theme.chrome_bg)
+        .bg(theme.chrome_fg)
+        .add_modifier(Modifier::BOLD);
     if g.ascii {
-        let tile = |l: Color, r: Color| {
-            vec![
-                pad(),
-                Span::styled("| ", theme.faint()),
-                Span::styled("##", Style::new().fg(l)),
-                Span::styled(" ", theme.faint()),
-                Span::styled("##", Style::new().fg(r)),
-                Span::styled(" |", theme.faint()),
-            ]
-        };
-        return vec![
-            vec![pad(), Span::styled("+-------+", theme.faint())],
-            tile(theme.mark_r, theme.mark_g),
-            tile(theme.mark_r, theme.mark_g),
-            tile(theme.mark_b, theme.mark_y),
-            tile(theme.mark_b, theme.mark_y),
-            vec![pad(), Span::styled("+-------+", theme.faint())],
+        let chip = vec![
+            pad(),
+            Span::styled("[", theme.faint()),
+            Span::styled(" WF ", wf),
+            Span::styled("]", theme.faint()),
         ];
+        return vec![blank(), blank(), chip, blank(), blank(), blank()];
     }
-    let solid = |l: Color, r: Color| {
-        vec![
-            pad(),
-            Span::styled("\u{2502} ", theme.faint()),
-            Span::styled("\u{2588}\u{2588}\u{2588}", Style::new().fg(l).bg(l)),
-            Span::styled(" ", theme.faint()),
-            Span::styled("\u{2588}\u{2588}\u{2588}", Style::new().fg(r).bg(r)),
-            Span::styled(" \u{2502}", theme.faint()),
-        ]
-    };
-    let fade = |l: Color, r: Color| {
-        vec![
-            pad(),
-            Span::styled("\u{2502} ", theme.faint()),
-            Span::styled("\u{2580}\u{2580}\u{2580}", Style::new().fg(l)),
-            Span::styled(" ", theme.faint()),
-            Span::styled("\u{2580}\u{2580}\u{2580}", Style::new().fg(r)),
-            Span::styled(" \u{2502}", theme.faint()),
-        ]
-    };
-    vec![
-        vec![pad(), Span::styled("\u{256D}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256E}", theme.faint())],
-        solid(theme.mark_r, theme.mark_g),
-        fade(theme.mark_r, theme.mark_g),
-        solid(theme.mark_b, theme.mark_y),
-        fade(theme.mark_b, theme.mark_y),
-        vec![pad(), Span::styled("\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}", theme.faint())],
-    ]
+    let white = Style::new().fg(theme.chrome_fg);
+    let fill = Style::new().bg(theme.chrome_fg);
+    let top = vec![
+        pad(),
+        Span::styled("\u{2597}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2596}", white),
+    ];
+    let label = vec![
+        pad(),
+        Span::styled("\u{2588}", white),
+        Span::styled("  ", fill),
+        Span::styled("WF", wf),
+        Span::styled("   ", fill),
+        Span::styled("\u{2588}", white),
+    ];
+    let card = vec![
+        pad(),
+        Span::styled("\u{2588}", white),
+        Span::styled(" ".repeat(7), fill),
+        Span::styled("\u{2588}", white),
+    ];
+    let bottom = vec![
+        pad(),
+        // The last glyph is a full block, not a rounded quarter-block: the
+        // one corner that stays square, matching wf-logo.png exactly.
+        Span::styled("\u{259D}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2588}", white),
+    ];
+    vec![blank(), top, label, card, bottom, blank()]
 }
 
 /// The brand copy beside the mark box, one entry per `login_mark_rows` slot;
@@ -157,7 +159,8 @@ fn login_logo_lines(theme: &Theme) -> Vec<Line<'static>> {
 }
 
 fn login_brand_lines(theme: &Theme, g: &Glyphs) -> Vec<Line<'static>> {
-    let box_w = if g.ascii { 9 } else { 11 };
+    // "[ WF ]" (6) in ASCII; the 9-cell bubble chip in Unicode.
+    let box_w = if g.ascii { 6 } else { 9 };
     let gap = TEXT_COL.saturating_sub(MARK_PAD + box_w);
     login_mark_rows(theme, g)
         .into_iter()

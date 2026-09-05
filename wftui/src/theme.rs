@@ -64,11 +64,6 @@ pub struct Theme {
     /// `[ICODE]` / `[CODE]`.
     pub code_fg: Color,
     pub code_bg: Color,
-    /// The four-pane mark, clockwise from top-left: red, green, blue, yellow.
-    pub mark_r: Color,
-    pub mark_g: Color,
-    pub mark_b: Color,
-    pub mark_y: Color,
 }
 
 impl Theme {
@@ -96,10 +91,6 @@ impl Theme {
             ok: Color::Rgb(0x81, 0xB8, 0x00),
             code_fg: Color::Rgb(0xF0, 0xC6, 0x74),
             code_bg: Color::Rgb(0x1A, 0x20, 0x28),
-            mark_r: Color::Rgb(0xF5, 0x4E, 0x25),
-            mark_g: Color::Rgb(0x81, 0xB8, 0x00),
-            mark_b: Color::Rgb(0x01, 0xA4, 0xEE),
-            mark_y: Color::Rgb(0xFF, 0xB9, 0x02),
         }
     }
 
@@ -127,10 +118,6 @@ impl Theme {
             ok: Color::Indexed(106),
             code_fg: Color::Indexed(221),
             code_bg: Color::Indexed(234),
-            mark_r: Color::Indexed(202),
-            mark_g: Color::Indexed(106),
-            mark_b: Color::Indexed(45),
-            mark_y: Color::Indexed(214),
         }
     }
 
@@ -159,10 +146,6 @@ impl Theme {
             ok: Color::Green,
             code_fg: Color::Yellow,
             code_bg: Color::Reset,
-            mark_r: Color::Red,
-            mark_g: Color::Green,
-            mark_b: Color::Cyan,
-            mark_y: Color::Yellow,
         }
     }
 
@@ -192,10 +175,6 @@ impl Theme {
             ok: Color::Reset,
             code_fg: Color::Reset,
             code_bg: Color::Reset,
-            mark_r: Color::Reset,
-            mark_g: Color::Reset,
-            mark_b: Color::Reset,
-            mark_y: Color::Reset,
         }
     }
 
@@ -478,8 +457,7 @@ mod tests {
         for c in [
             t.dim, t.accent, t.link, t.header, t.warn, t.error, t.selected_bg, t.faint,
             t.accent_bg, t.accent_fg, t.keycap_bg, t.keycap_fg, t.chrome_bg, t.chrome_fg,
-            t.chrome_dim, t.badge_bg, t.badge_fg, t.ok, t.code_fg, t.code_bg, t.mark_r,
-            t.mark_g, t.mark_b, t.mark_y,
+            t.chrome_dim, t.badge_bg, t.badge_fg, t.ok, t.code_fg, t.code_bg,
         ] {
             assert_eq!(c, Color::Reset);
         }

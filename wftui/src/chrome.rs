@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
 
@@ -64,7 +64,12 @@ pub enum GateState {
 }
 
 const ELLIPSIS: &str = "\u{2026}"; // …
-const HALF_BLOCK: &str = "\u{2580}"; // ▀
+/// The header mark: a white bubble chip, echoing the rounded speech-bubble
+/// logo (`wf-logo.png`) without the four-color glyph inside it — bare
+/// red/green/blue/yellow quadrants read as the Microsoft Windows logo with no
+/// other context around them, which is a trademark problem out of context.
+/// Pure letters, so ASCII and Unicode share the same chip.
+const MARK_CHIP: &str = " WF ";
 /// Cells the countdown bar occupies.
 const GATE_BAR_CELLS: usize = 10;
 
@@ -159,7 +164,7 @@ pub fn header_line(
     width: u16,
 ) -> Line<'static> {
     let w = width as usize;
-    let brand = brand_spans(theme, g);
+    let brand = brand_spans(theme);
     let brand_w = spans_width(&brand);
     // One leading space before the mark, one minimum gap before the right side.
     const LEAD: usize = 1;
@@ -227,31 +232,25 @@ pub fn header_line(
     Line::from(clip_spans(spans, w))
 }
 
-fn brand_spans(theme: &Theme, g: &Glyphs) -> Vec<Span<'static>> {
-    let mut spans = mark_spans(theme, g);
+fn brand_spans(theme: &Theme) -> Vec<Span<'static>> {
+    let mut spans = mark_spans(theme);
     spans.push(Span::styled(" ", theme.chrome()));
     spans.push(Span::styled("Windows", theme.chrome_bold()));
     spans.push(Span::styled("Forum", theme.chrome()));
     spans
 }
 
-/// The four-pane mark in two cells: `▀` red-on-blue then `▀` green-on-yellow,
-/// so the upper half-block paints the top row (red/green) and the cell
-/// background paints the bottom row (blue/yellow).
-fn mark_spans(theme: &Theme, g: &Glyphs) -> Vec<Span<'static>> {
-    if g.ascii {
-        return vec![Span::styled("WF", theme.chrome_bold())];
-    }
-    vec![
-        Span::styled(
-            HALF_BLOCK,
-            Style::new().fg(theme.mark_r).bg(theme.mark_b),
-        ),
-        Span::styled(
-            HALF_BLOCK,
-            Style::new().fg(theme.mark_g).bg(theme.mark_y),
-        ),
-    ]
+/// The mark: one `MARK_CHIP` cell, background chrome_fg (white) foreground
+/// chrome_bg (brand blue), bold — the same chip in both glyph sets, since it
+/// is letters rather than block-drawing characters.
+fn mark_spans(theme: &Theme) -> Vec<Span<'static>> {
+    vec![Span::styled(
+        MARK_CHIP,
+        Style::new()
+            .fg(theme.chrome_bg)
+            .bg(theme.chrome_fg)
+            .add_modifier(Modifier::BOLD),
+    )]
 }
 
 fn right_spans(
@@ -504,12 +503,12 @@ fn hash_color(theme: &Theme, name: &str) -> ratatui::style::Color {
         h = h.wrapping_mul(0x1000_0000_01b3);
     }
     let palette = [
-        theme.mark_b,
-        theme.mark_g,
-        theme.mark_y,
-        theme.mark_r,
         theme.accent,
         theme.accent_bg,
+        theme.ok,
+        theme.warn,
+        theme.error,
+        theme.chrome_bg,
     ];
     palette[(h % palette.len() as u64) as usize]
 }
@@ -604,20 +603,20 @@ mod tests {
     }
 
     #[test]
-    fn header_mark_is_two_cells_unicode_and_ascii() {
+    fn header_mark_is_a_four_cell_chip_unicode_and_ascii() {
         let t = Theme::truecolor();
         let uni = header_line(&t, &UNICODE, &[], None, 0, 0, None, 80);
-        // lead space + two mark cells
-        assert_eq!(uni.spans[1].content.as_ref(), HALF_BLOCK);
-        assert_eq!(uni.spans[2].content.as_ref(), HALF_BLOCK);
-        assert_eq!(uni.spans[1].style.fg, Some(t.mark_r));
-        assert_eq!(uni.spans[1].style.bg, Some(t.mark_b));
-        assert_eq!(uni.spans[2].style.fg, Some(t.mark_g));
-        assert_eq!(uni.spans[2].style.bg, Some(t.mark_y));
+        // lead space + the chip, one span: " WF " white-on-blue, bold.
+        assert_eq!(uni.spans[1].content.as_ref(), MARK_CHIP);
+        assert_eq!(uni.spans[1].width(), 4);
+        assert_eq!(uni.spans[1].style.fg, Some(t.chrome_bg));
+        assert_eq!(uni.spans[1].style.bg, Some(t.chrome_fg));
+        assert!(uni.spans[1].style.add_modifier.contains(Modifier::BOLD));
 
+        // Pure letters: ASCII draws the identical chip, not a shrunken one.
         let ascii = header_line(&t, &ASCII, &[], None, 0, 0, None, 80);
-        assert_eq!(ascii.spans[1].content.as_ref(), "WF");
-        assert_eq!(ascii.spans[1].width(), 2);
+        assert_eq!(ascii.spans[1].content.as_ref(), MARK_CHIP);
+        assert_eq!(ascii.spans[1].width(), 4);
     }
 
     #[test]

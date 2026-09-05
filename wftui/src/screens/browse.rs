@@ -215,7 +215,7 @@ fn type_mark(t: &Thread, theme: &Theme, g: &Glyphs) -> (&'static str, Style) {
     } else if t.is_question() {
         (g.question, Style::new().fg(theme.warn))
     } else if t.is_article() {
-        (g.article, Style::new().fg(theme.mark_b))
+        (g.article, Style::new().fg(theme.chrome_bg))
     } else if t.is_suggestion() {
         (g.heading, Style::new().fg(theme.accent))
     } else if t.is_poll() {

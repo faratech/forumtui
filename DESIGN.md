@@ -12,9 +12,17 @@ they are the pixel-exact reference for column widths and copy.
 ## Principle
 
 **Brand in the chrome, content in the reader's own colors.** The header band, key caps,
-selection band and unread marks carry WindowsForum blue and the four-pane mark. Body
-text, backgrounds and borders defer to the terminal (`Color::Reset`), so the client
-looks right in light and dark terminals. Hard rules 1–7 in CLAUDE.md are unchanged.
+selection band and unread marks carry WindowsForum blue and the white bubble mark (a
+` WF ` chip, chrome_fg on chrome_bg, echoing the rounded speech-bubble shape of
+`wf-logo.png`). Body text, backgrounds and borders defer to the terminal
+(`Color::Reset`), so the client looks right in light and dark terminals. Hard rules
+1–7 in CLAUDE.md are unchanged.
+
+The mark was originally a bare four-color (red/green/blue/yellow) quadrant glyph —
+dropped 2026-09 for trademark reasons: shown on its own, with no bubble outline or
+wordmark around it for context, it read as the Microsoft Windows logo. The `mark_r` /
+`mark_g` / `mark_b` / `mark_y` theme roles that carried those colors are gone; nothing
+should reintroduce a red+green+blue+yellow set as a reusable role.
 
 ## Colors by role (theme.rs)
 
@@ -33,7 +41,10 @@ looks right in light and dark terminals. Hard rules 1–7 in CLAUDE.md are uncha
 | warn | #FFB902 | 214 | Yellow | open question, gate counting down, watching star |
 | error | #F54E25 | 202 | Red | errors only |
 | code_fg / code_bg | #F0C674 / #1A2028 | 221 / 234 | Yellow / Reset | [ICODE] and [CODE] |
-| mark (r, g, b, y) | #F54E25 #81B800 #01A4EE #FFB902 | 202 106 45 214 | Red Green Cyan Yellow | the four-pane mark |
+
+There is no separate mark role: the header and sign-in marks are drawn straight from
+`chrome_bg`/`chrome_fg` (see below). The four-color `mark (r, g, b, y)` role this table
+used to list here is gone — dropped for the trademark reason above.
 
 Tier detection: `NO_COLOR` → Mono (everything Reset, as today); `COLORTERM` =
 `truecolor`/`24bit` → TrueColor; `TERM` containing `256color` → Ansi256; else Ansi16.
@@ -75,15 +86,17 @@ double-width in some terminals and blank in others — they misalign lists today
 ## Three zones (app.rs `draw`)
 
 ```
-row 0        header band: " ▀▀ WindowsForum  ›  crumb  ›  crumb(bold) … right: user   Inbox [2]   Alerts [5] "
+row 0        header band: "  WF  WindowsForum  ›  crumb  ›  crumb(bold) … right: user   Inbox [2]   Alerts [5] "
 rows 1..n-3  body (screen renders here; one or two panels)
 row n-2      key bar:  " [Enter] open  [j/k] move  [Tab] pane  … "  — exactly one primary (accent_bg) cap
 row n-1      status:   " left text / toast                                   write gate ● ready "
 ```
 
-* The mark is two cells: `▀` fg mark.r bg mark.b, then `▀` fg mark.g bg mark.y
-  (top row red/green, bottom row blue/yellow). Then `Windows` bold + `Forum` regular.
-  In ASCII mode the mark is `WF` on chrome_bg.
+* The mark is a single ` WF ` chip (4 cells): chrome_fg (white) on chrome_bg (brand
+  blue), bold — the white bubble chip, same in both glyph sets since it is letters
+  rather than block-drawing characters. Then `Windows` bold + `Forum` regular. (The
+  mark used to be two `▀` cells painting a four-color red/green/blue/yellow quadrant;
+  that reads as the Microsoft Windows logo out of context, so it was dropped.)
 * Crumbs = titles of the screen stack (Login excluded). Overflow: drop the online
   count, then replace middle crumbs with `…`, then clip the last crumb with `…`.
 * Badges render only when the count is > 0; otherwise `Inbox 0` in chrome_dim.
@@ -158,9 +171,10 @@ Narrow (< 90): drop Started by, author 9 wide, age 6.
   the draft through common::bbcode; editor bottom line = BBCode caps ^B ^I ^K ^Q ^U
   and char count. Keys: ^S send · ^O preview on/off · ^Y paste · ^A attach · Tab
   field · Esc discard.
-* **Sign in** (`c3.png` top, `c5.png` bottom): centered 72-wide panel with the block
-  mark in a bubble box (rounded corners, square bottom-right `┘`), steps 1-2-3, the
-  short link in its own box, spinner while polling.
+* **Sign in** (`c3.png` top, `c5.png` bottom): centered 72-wide panel with the white
+  bubble mark (rounded top-left/top-right/bottom-left, square bottom-right — matching
+  `wf-logo.png` — carrying bold blue `WF`), steps 1-2-3, the short link in its own box,
+  spinner while polling.
 * **Inbox** (`c3.png` bottom): `Inbox` panel 50 wide with tab row `Conversations 2 |
   Alerts 5`, two-line conversation rows; view panel 70 wide with message cards.
 * **Search** (`c4.png` top): `/ query` line with `author` and `in` on the right,
