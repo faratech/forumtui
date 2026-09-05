@@ -88,9 +88,36 @@ impl WfApiClient {
                 *guard = None;
             }
         })?;
-        self.store.save(&refreshed)?;
+        // Update the live session first: XF's refresh grant rotates the
+        // refresh token (revokes the old one server-side in the same
+        // request), so once `oauth::refresh` above has succeeded the old
+        // token set is already dead. If persisting the new one to disk then
+        // fails (ENOSPC, a permission change, a read-only remount), that
+        // must cost only durability across a restart, not the live session —
+        // demoting it to a warning avoids stranding the revoked refresh
+        // token in `*guard`/the store, which would otherwise force a full
+        // browser re-login on the very next call (see issue #513).
         *guard = Some(refreshed.clone());
+        if let Err(e) = self.store.save(&refreshed) {
+            tracing::warn!("token refresh persisted in memory but not to disk: {e}");
+        }
         Ok(refreshed.access_token)
+    }
+
+    /// A 429's `Retry-After` (or, absent one, a conservative fallback) must
+    /// actually extend the gate it came from — otherwise the very next call
+    /// is spaced only by the normal politeness slot and can hit the same
+    /// ceiling again (issue #514). `gates` is every gate the failing call
+    /// consumed, so a rate limit on a write path extends both the global and
+    /// write cool-downs.
+    fn note_rate_limit(&self, err: &Error, gates: &[&Gate]) {
+        if let Error::RateLimited { retry_after } = err {
+            let dur =
+                retry_after.unwrap_or(Duration::from_secs(config::DEFAULT_RATE_LIMIT_RETRY_SECS));
+            for gate in gates {
+                gate.penalize(dur);
+            }
+        }
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, String)]) -> Result<T> {
@@ -98,7 +125,7 @@ impl WfApiClient {
         let token = self.valid_token().await?;
         let url = format!("{}{path}", config::api_base());
         let resp = self.http.get(url).query(query).bearer_auth(&token).send().await?;
-        decode(resp).await
+        decode(resp).await.inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate]))
     }
 
     /// Flood-checked write (posts/threads/conversations): consumes the write
@@ -119,6 +146,8 @@ impl WfApiClient {
             self.write_gate.penalize(
                 success_penalty.unwrap_or(Duration::from_millis(config::WRITE_COOLDOWN_MS)),
             );
+        } else if let Err(e) = &out {
+            self.note_rate_limit(e, &[&self.api_gate, &self.write_gate]);
         }
         out
     }
@@ -130,7 +159,9 @@ impl WfApiClient {
         let token = self.valid_token().await?;
         let url = format!("{}{path}", config::api_base());
         let resp = self.http.post(url).form(form).bearer_auth(&token).send().await?;
-        check_status(resp).await
+        check_status(resp)
+            .await
+            .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate, &self.write_gate]))
     }
 
     async fn post_unit_path(&self, path: &str) -> Result<()> {
@@ -306,6 +337,35 @@ async fn error_from_response(resp: reqwest::Response) -> Error {
     }
 }
 
+/// XF's plain `/nodes` endpoint never emits `depth` (only
+/// `/nodes/flattened` does, in an incompatible envelope — see issue #509).
+/// Derive it locally by walking each node's `parent_node_id` chain, bounded
+/// and cycle-guarded so a malformed tree can never spin or panic.
+fn derive_node_depths(mut nodes: Vec<Node>) -> Vec<Node> {
+    use std::collections::HashMap;
+
+    let parent_of: HashMap<u32, u32> = nodes.iter().map(|n| (n.node_id, n.parent_node_id)).collect();
+
+    for node in &mut nodes {
+        let mut depth = 0u32;
+        let mut current = node.node_id;
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(current);
+        while let Some(&parent) = parent_of.get(&current) {
+            if parent == 0 || !seen.insert(parent) {
+                break;
+            }
+            depth += 1;
+            current = parent;
+            if depth >= 64 {
+                break;
+            }
+        }
+        node.depth = depth;
+    }
+    nodes
+}
+
 #[async_trait]
 pub trait WfApi: Send + Sync {
     async fn nodes(&self) -> Result<Vec<Node>>;
@@ -349,7 +409,7 @@ pub trait WfApi: Send + Sync {
 impl WfApi for WfApiClient {
     async fn nodes(&self) -> Result<Vec<Node>> {
         let reply: NodesReply = self.get("/nodes", &[]).await?;
-        Ok(reply.nodes)
+        Ok(derive_node_depths(reply.nodes))
     }
 
     async fn forum(&self, node_id: u32, page: u32) -> Result<ForumReply> {
@@ -541,7 +601,9 @@ impl WfApi for WfApiClient {
             .bearer_auth(&token)
             .send()
             .await?;
-        let created: SearchCreated = decode(resp).await?;
+        let created: SearchCreated = decode(resp)
+            .await
+            .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate, &self.search_gate]))?;
         let Some(search) = created.search else {
             return Ok(SearchResultsReply::default());
         };
@@ -585,7 +647,9 @@ impl WfApi for WfApiClient {
             .bearer_auth(&token)
             .send()
             .await?;
-        let created: SearchCreated = decode(resp).await?;
+        let created: SearchCreated = decode(resp)
+            .await
+            .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate, &self.search_gate]))?;
         let Some(search) = created.search else {
             return Ok(SearchResultsReply::default());
         };
@@ -681,6 +745,56 @@ mod tests {
         c
     }
 
+    #[test]
+    fn derive_node_depths_walks_the_parent_chain() {
+        // Category 0 / Forum 1 / sub-Forum 2, XF's real "/nodes" shape (no
+        // `depth` key at all — see issue #509).
+        let nodes = vec![
+            Node {
+                node_id: 10,
+                parent_node_id: 0,
+                title: "Category".into(),
+                ..Default::default()
+            },
+            Node {
+                node_id: 11,
+                parent_node_id: 10,
+                title: "Forum".into(),
+                ..Default::default()
+            },
+            Node {
+                node_id: 12,
+                parent_node_id: 11,
+                title: "Sub-forum".into(),
+                ..Default::default()
+            },
+        ];
+        let derived = derive_node_depths(nodes);
+        assert_eq!(derived[0].depth, 0);
+        assert_eq!(derived[1].depth, 1);
+        assert_eq!(derived[2].depth, 2);
+    }
+
+    #[test]
+    fn derive_node_depths_is_cycle_safe() {
+        // A malformed/circular parent chain must not spin or panic.
+        let nodes = vec![
+            Node {
+                node_id: 1,
+                parent_node_id: 2,
+                ..Default::default()
+            },
+            Node {
+                node_id: 2,
+                parent_node_id: 1,
+                ..Default::default()
+            },
+        ];
+        let derived = derive_node_depths(nodes);
+        assert!(derived[0].depth < 64);
+        assert!(derived[1].depth < 64);
+    }
+
     #[tokio::test]
     async fn thread_read_maps_posts_and_pagination() {
         let server = MockServer::start().await;
@@ -742,6 +856,29 @@ mod tests {
             Error::RateLimited { retry_after: Some(d) } => assert_eq!(d.as_secs(), 7),
             other => panic!("wrong error: {other}"),
         }
+    }
+
+    /// A 429's `Retry-After` must actually extend the gate it came from, not
+    /// just decorate the returned error: the very next caller must see the
+    /// server's requested backoff, not just the normal ~250ms politeness
+    /// slot (issue #514).
+    #[tokio::test]
+    async fn rate_limit_extends_the_gate_the_call_used() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-429-gate");
+        Mock::given(method("GET"))
+            .and(path("/api/nodes"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "30"))
+            .mount(&server)
+            .await;
+        let c = logged_in_client("tok-1").await;
+        assert!(c.api_gate.pending_wait() < Duration::from_secs(1), "no penalty yet");
+        c.nodes().await.unwrap_err();
+        let waited = c.api_gate.pending_wait();
+        assert!(
+            waited >= Duration::from_secs(28),
+            "429's Retry-After: 30 must extend api_gate, got {waited:?}"
+        );
     }
 
     #[tokio::test]
@@ -850,6 +987,66 @@ mod tests {
             .unwrap();
         assert_eq!(stored.access_token, "tok-2");
         assert_eq!(stored.refresh_token, "refresh-2");
+    }
+
+    /// A `store.save()` failure after a successful (rotating) refresh must
+    /// not strand the now-revoked refresh token in the live session: the
+    /// in-memory guard has to hold the new token set even when persisting it
+    /// to disk fails, so the very next call reuses the new access token
+    /// instead of retrying the refresh endpoint with a token the server has
+    /// already revoked (issue #513).
+    #[tokio::test]
+    async fn refresh_survives_a_store_save_failure_without_losing_the_new_token() {
+        let server = MockServer::start().await;
+        let dir = "/tmp/wftui-t-refresh-savefail";
+        // A prior run's blocker file survives `EnvGuard`'s `remove_dir_all`
+        // (that call no-ops on a plain file), so clear it explicitly first.
+        let _ = std::fs::remove_file(dir);
+        let _env = EnvGuard::hold(&server.uri(), dir);
+        // Exactly one refresh call: if the stranded-old-token bug returns,
+        // the second `valid_token()` below retries refresh with the
+        // already-consumed `refresh-1` and this expectation fails.
+        Mock::given(method("POST"))
+            .and(path("/api/oauth2/token"))
+            .and(wiremock::matchers::body_string_contains(
+                "grant_type=refresh_token",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "tok-2", "refresh_token": "refresh-2",
+                "expires_in": 7200, "token_type": "bearer", "scope": "test"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = WfApiClient::new().unwrap();
+        c.set_tokens(TokenSet {
+            access_token: "expired".into(),
+            refresh_token: "refresh-1".into(),
+            expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
+            scope: "test".into(),
+        })
+        .await
+        .unwrap();
+
+        // Sabotage the store *after* the initial save succeeded: replace the
+        // config dir with a plain file, so the next `save()`'s
+        // `create_dir_all` fails deterministically (no reliance on
+        // permission bits, which root ignores).
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::write(dir, b"blocker").unwrap();
+
+        let token = c.valid_token().await.expect("refresh must still succeed");
+        assert_eq!(token, "tok-2", "the live session must see the new token");
+
+        // The new token is not expired, so this must NOT hit the refresh
+        // endpoint again — if the guard had kept the old (now-revoked)
+        // refresh_token, this would retry with it and the mock's `expect(1)`
+        // would fail on drop.
+        let token2 = c.valid_token().await.expect("must reuse the in-memory token");
+        assert_eq!(token2, "tok-2");
+
+        let _ = std::fs::remove_file(dir);
     }
 
     #[tokio::test]

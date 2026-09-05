@@ -80,6 +80,10 @@ pub const SEARCH_MIN_INTERVAL_MS: u64 = 3_000;
 pub const WRITE_COOLDOWN_MS: u64 = 30_000;
 pub const NEW_THREAD_COOLDOWN_MS: u64 = 180_000;
 
+/// Floor applied to the relevant gate when a 429 carries no `Retry-After`
+/// header at all — a conservative fallback, not a measured value.
+pub const DEFAULT_RATE_LIMIT_RETRY_SECS: u64 = 30;
+
 pub const ALERT_POLL_SECS: u64 = 45;
 pub const CONVERSATION_POLL_SECS: u64 = 90;
 

@@ -308,7 +308,7 @@ impl App {
             loop {
                 tokio::time::sleep(Duration::from_secs(common::config::ALERT_POLL_SECS)).await;
                 if let Ok(page) = api.alerts(1).await {
-                    let unread = page.alerts.iter().filter(|a| !a.viewed).count() as u32;
+                    let unread = page.alerts.iter().filter(|a| !a.viewed()).count() as u32;
                     tx.send(Msg::Notice(format!("alerts:{unread}"))).ok();
                 }
             }
@@ -2174,7 +2174,7 @@ impl App {
                     match result {
                         Ok(page) => {
                             new_unread =
-                                Some(page.alerts.iter().filter(|a| !a.viewed).count() as u32);
+                                Some(page.alerts.iter().filter(|a| !a.viewed()).count() as u32);
                             alerts.alerts = page.alerts;
                             alerts.loading = false;
                             alerts.sel = alerts.sel.min(alerts.alerts.len().saturating_sub(1));

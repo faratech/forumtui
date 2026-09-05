@@ -479,20 +479,37 @@ pub struct MessagesReply {
 pub struct Alert {
     #[serde(default)]
     pub alert_id: u32,
-    #[serde(default)]
-    pub alert_date: i64,
+    /// XF's real API column (`UserAlert::getStructure`, `'api' => true`) —
+    /// the old `alert_date` key never appears in the payload at all.
+    #[serde(default, rename = "event_date")]
+    pub event_date: i64,
     #[serde(default)]
     pub user_id: u32,
     #[serde(default)]
     pub username: String,
+    /// XF emits `view_date` (a timestamp, 0 when unread), not a `viewed`
+    /// bool — see `Alert::viewed()` below.
     #[serde(default)]
-    pub viewed: bool,
+    pub view_date: i64,
     #[serde(default, rename = "content_type")]
     pub content_type: String,
     #[serde(default, rename = "content_id")]
     pub content_id: u64,
-    #[serde(default, rename = "view_url")]
-    pub view_url: Option<String>,
+    /// The human-readable alert text, built server-side from the alert
+    /// handler's push template (`AbstractHandler::getApiOutput`).
+    #[serde(default)]
+    pub alert_text: String,
+    /// The click-through link for this alert; XF's `UserAlert` has no
+    /// `view_url` key, only `alert_url`.
+    #[serde(default)]
+    pub alert_url: Option<String>,
+}
+
+impl Alert {
+    /// `view_date > 0` means the member has already seen this alert.
+    pub fn viewed(&self) -> bool {
+        self.view_date > 0
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -859,6 +876,46 @@ mod tests {
         let r: ThreadsReply = serde_json::from_value(body).unwrap();
         assert_eq!(r.threads[0].title, "T");
         assert!(r.threads[0].view_url.is_none());
+    }
+
+    /// Fixture shaped exactly like `UserAlert::getStructure()` +
+    /// `setupApiResultData()` (public_html/src/XF/Entity/UserAlert.php:193-230):
+    /// `event_date`/`view_date` (timestamps, not `alert_date`/`viewed`), plus
+    /// the handler-rendered `alert_text`/`alert_url` — never `view_url`.
+    #[test]
+    fn alert_deserializes_real_xf_useralert_shape() {
+        let body = serde_json::json!({
+            "alert_id": 501,
+            "alerted_user_id": 7,
+            "user_id": 42,
+            "username": "kemical",
+            "content_type": "post",
+            "content_id": 123456,
+            "action": "post_reply",
+            "event_date": 1_700_000_000,
+            "view_date": 0,
+            "read_date": 0,
+            "auto_read": true,
+            "alert_text": "kemical replied to your thread Hello World",
+            "alert_url": "/threads/hello-world.440365/#post-123456"
+        });
+        let a: Alert = serde_json::from_value(body).unwrap();
+        assert_eq!(a.alert_id, 501);
+        assert_eq!(a.event_date, 1_700_000_000);
+        assert!(!a.viewed(), "view_date == 0 means unread");
+        assert_eq!(a.alert_text, "kemical replied to your thread Hello World");
+        assert_eq!(
+            a.alert_url.as_deref(),
+            Some("/threads/hello-world.440365/#post-123456")
+        );
+
+        // A later view marks it read via view_date, not a bare bool.
+        let mut viewed_body = serde_json::json!({
+            "alert_id": 501, "event_date": 1_700_000_000, "view_date": 1_700_000_500
+        });
+        viewed_body["alert_text"] = serde_json::Value::String(String::new());
+        let a: Alert = serde_json::from_value(viewed_body).unwrap();
+        assert!(a.viewed());
     }
 
     #[test]

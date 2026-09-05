@@ -364,7 +364,11 @@ pub fn status_line(
             spans.push(Span::raw(" ".repeat(keep - used)));
         }
         spans.extend(right);
-        Line::from(spans)
+        // Safety net matching header_line's last statement: whatever `left`
+        // contained (wide characters included), the combined line can never
+        // exceed `w` cells, so the write gate can never be pushed off the
+        // Rect at render time.
+        Line::from(clip_spans(spans, w))
     } else {
         Line::from(clip_spans(spans, w))
     }
@@ -437,23 +441,49 @@ fn spans_width(spans: &[Span<'static>]) -> usize {
     spans.iter().map(Span::width).sum()
 }
 
+/// Display width in terminal cells — ratatui's own unicode-width measure,
+/// the one the buffer bills a run of cells at. Shared by every "fits exactly
+/// W cells" computation in the chrome and overlay modules so a CJK/emoji
+/// character (2 cells) is never billed as 1 (see issues #511/#512/#516).
+pub(crate) fn cell_width(s: &str) -> usize {
+    Span::raw(s).width()
+}
+
+/// Take a prefix of `s` whose total display width does not exceed `max`
+/// cells — never characters — so a double-width character never straddles
+/// the boundary and gets counted as narrower than it renders.
+pub(crate) fn take_cells(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let mut buf = [0u8; 4];
+        let w = cell_width(ch.encode_utf8(&mut buf));
+        if used + w > max {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out
+}
+
 fn crumbs_width(g: &Glyphs, crumbs: &[String]) -> usize {
     // Each crumb is " > " plus its text.
     crumbs
         .iter()
-        .map(|c| c.chars().count() + 2 + g.crumb.chars().count())
+        .map(|c| cell_width(c) + 2 + cell_width(g.crumb))
         .sum()
 }
 
 /// Truncate to `max` cells, spending the last cell on `…` when it cuts.
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if cell_width(s) <= max {
         return s.to_string();
     }
     if max == 0 {
         return String::new();
     }
-    let cut: String = s.chars().take(max - 1).collect();
+    let cut = take_cells(s, max - 1);
     format!("{cut}{ELLIPSIS}")
 }
 
@@ -470,7 +500,7 @@ fn clip_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
         }
         let room = max - used;
         if room > 0 {
-            let text: String = s.content.chars().take(room).collect();
+            let text = take_cells(&s.content, room);
             out.push(Span::styled(text, s.style));
         }
         break;
@@ -544,6 +574,23 @@ mod tests {
                 line.width(),
                 w as usize,
                 "header at width {w} is {} cells",
+                line.width()
+            );
+        }
+    }
+
+    /// A wide-character (CJK) crumb must still be billed by cell width, not
+    /// char count, in every rung of the overflow ladder (issue #516).
+    #[test]
+    fn header_fills_exactly_the_width_with_cjk_crumbs() {
+        let t = Theme::truecolor();
+        let c = crumbs(&["视频编辑软件推荐帮助教程升级指南", "第二个论坛版块名称"]);
+        for w in [40u16, 60, 80, 100, 120, 200] {
+            let line = header_line(&t, &UNICODE, &c, Some("Mike"), 2, 5, Some(1384), w);
+            assert_eq!(
+                line.width(),
+                w as usize,
+                "CJK header at width {w} is {} cells",
                 line.width()
             );
         }
@@ -746,6 +793,32 @@ mod tests {
         assert!(squeezed.width() <= 40);
         let text: String = squeezed.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("ready"), "{text}");
+    }
+
+    /// CJK `left` text must be clipped by cell width, not char count (issue
+    /// #512): the gate is exactly 29 cells wide with `Waiting{24s}`, so at
+    /// width 40 the middle branch clips the wide-character left text — a
+    /// char-count clip would keep too many cells and push the gate past the
+    /// Rect at render time.
+    #[test]
+    fn status_line_clips_wide_left_text_by_cell_not_char_and_keeps_the_gate() {
+        let t = Theme::truecolor();
+        let cjk = "视频视频视频视频视频"; // 10 chars, 20 cells
+        let line = status_line(
+            &t,
+            &UNICODE,
+            cjk,
+            t.dim(),
+            GateState::Waiting {
+                left: Duration::from_secs(24),
+                total: Duration::from_secs(30),
+            },
+            40,
+        );
+        assert_eq!(line.width(), 40, "must land exactly on the requested width");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("write gate"), "{text}");
+        assert!(text.contains("24 s"), "{text}");
     }
 
     #[test]

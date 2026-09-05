@@ -100,10 +100,28 @@ impl Grammar {
 }
 
 /// Right-align `s` in `w` cells, clipping from the left if it cannot fit.
+///
+/// Measured in terminal cells, not chars: a CJK/emoji author name or column
+/// value is 2 cells per character, so skipping by char count under-clips it
+/// and the column overflows (issue #511).
 fn rj(s: &str, w: usize) -> String {
-    let n = s.chars().count();
+    let n = cell_width(s);
     if n >= w {
-        return s.chars().skip(n - w).collect();
+        // Keep the trailing `w` cells: walk from the back until the
+        // remaining suffix's width is within budget.
+        let chars: Vec<char> = s.chars().collect();
+        let mut start = chars.len();
+        let mut kept = 0usize;
+        for ch in chars.iter().rev() {
+            let mut buf = [0u8; 4];
+            let cw = cell_width(ch.encode_utf8(&mut buf));
+            if kept + cw > w {
+                break;
+            }
+            kept += cw;
+            start -= 1;
+        }
+        return chars[start..].iter().collect();
     }
     format!("{}{s}", " ".repeat(w - n))
 }
@@ -111,7 +129,7 @@ fn rj(s: &str, w: usize) -> String {
 /// Left-align `s` in `w` cells, clipping with `…`.
 fn lj(s: &str, w: usize) -> String {
     let t = truncate(s, w);
-    let n = t.chars().count();
+    let n = cell_width(&t);
     format!("{t}{}", " ".repeat(w.saturating_sub(n)))
 }
 
@@ -184,7 +202,7 @@ pub(crate) fn thread_row(
         }
     }
     let title = truncate(&t.title, tw - used);
-    let tlen = title.chars().count();
+    let tlen = cell_width(&title);
     spans.push(Span::styled(title, title_style));
     spans.push(Span::raw(" ".repeat(tw - used - tlen)));
 
@@ -1820,12 +1838,24 @@ pub fn render_thread_view(
 }
 
 pub(crate) fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if cell_width(s) <= max {
         s.to_string()
     } else if max == 0 {
         String::new()
     } else {
-        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+        // Cells, not chars: reserve exactly one cell for the ellipsis so a
+        // wide character never straddles it (issue #511).
+        let mut cut = String::new();
+        let mut used = 0usize;
+        for ch in s.chars() {
+            let mut buf = [0u8; 4];
+            let w = cell_width(ch.encode_utf8(&mut buf));
+            if used + w > max.saturating_sub(1) {
+                break;
+            }
+            cut.push(ch);
+            used += w;
+        }
         format!("{cut}\u{2026}")
     }
 }
@@ -1926,6 +1956,25 @@ mod tests {
         assert_eq!(col(&row, "How do I"), Some(13));
         assert_eq!(col(&row, "HItest"), Some(51));
         assert_eq!(col(&row, "27"), Some(70));
+    }
+
+    /// A CJK title must still be billed by cell width, not char count: 17
+    /// ideographs are 34 cells, not 17, so the row must clip further than an
+    /// ASCII title of the same char length would, and the row's own
+    /// exact-width contract must still hold (issue #511).
+    #[test]
+    fn thread_row_keeps_exact_width_with_a_cjk_title() {
+        let theme = Theme::truecolor();
+        let t = Thread {
+            title: "视频编辑软件推荐帮助教程升级指南".into(),
+            username: "HItest".into(),
+            reply_count: 27,
+            is_unread: true,
+            discussion_open: true,
+            ..Default::default()
+        };
+        let line = thread_row(&t, &theme, &UNICODE, Grammar::Wide, 81);
+        assert_eq!(line.width(), 81, "{}", text(&line));
     }
 
     #[test]

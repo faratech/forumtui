@@ -458,7 +458,7 @@ impl Palette {
         selected: bool,
         w: usize,
     ) -> Line<'static> {
-        let key_w = item.key.map(|k| k.chars().count() + 4).unwrap_or(0);
+        let key_w = item.key.map(|k| chrome::cell_width(k) + 4).unwrap_or(0);
         let title_w = w.saturating_sub(1 + KIND_COL + 3 + key_w);
         let mut spans = vec![
             Span::raw(" "),
@@ -468,7 +468,7 @@ impl Palette {
         spans.extend(highlight(theme, &item.title, positions, title_w));
         let used: usize = spans.iter().map(Span::width).sum();
         if let Some(key) = item.key {
-            let pad = w.saturating_sub(used + key.chars().count() + 4);
+            let pad = w.saturating_sub(used + chrome::cell_width(key) + 4);
             spans.push(Span::raw(" ".repeat(pad)));
             spans.push(Span::styled(key.to_string(), theme.dim()));
             spans.push(Span::raw("    "));
@@ -497,17 +497,27 @@ fn hit_style(theme: &Theme) -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-/// Title spans with the matched characters bold, truncated to `max` cells.
+/// Title spans with the matched characters bold, truncated to `max` cells —
+/// cells, not chars, so a CJK/emoji title is not billed at half its real
+/// width (issue #516). `positions` are char indices into `title`, matching
+/// `chars` below.
 fn highlight(theme: &Theme, title: &str, positions: &[usize], max: usize) -> Vec<Span<'static>> {
     let hit = hit_style(theme);
     let base = theme.base();
     let chars: Vec<char> = title.chars().collect();
-    let truncated = chars.len() > max && max > 0;
-    let take = if truncated { max - 1 } else { max };
+    let truncated = chrome::cell_width(title) > max && max > 0;
+    let budget = if truncated { max - 1 } else { max };
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut buf = String::new();
     let mut buf_hit = false;
-    for (i, c) in chars.iter().take(take).enumerate() {
+    let mut used = 0usize;
+    for (i, c) in chars.iter().enumerate() {
+        let mut char_buf = [0u8; 4];
+        let cw = chrome::cell_width(c.encode_utf8(&mut char_buf));
+        if used + cw > budget {
+            break;
+        }
+        used += cw;
         let is_hit = positions.contains(&i);
         if is_hit != buf_hit && !buf.is_empty() {
             spans.push(Span::styled(
@@ -873,6 +883,9 @@ pub fn dim_body(f: &mut Frame, area: Rect, theme: &Theme) {
     }
 }
 
+/// Hard-clip a span run to `max` cells, keeping each span's style — cells,
+/// not chars, so a wide (CJK/emoji) character never straddles the boundary
+/// and gets counted narrower than it renders (issue #516).
 fn clip(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
     let mut out = Vec::with_capacity(spans.len());
     let mut used = 0usize;
@@ -885,7 +898,7 @@ fn clip(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
         }
         let room = max - used;
         if room > 0 {
-            let text: String = s.content.chars().take(room).collect();
+            let text = chrome::take_cells(&s.content, room);
             out.push(Span::styled(text, s.style));
         }
         break;
@@ -955,6 +968,21 @@ mod tests {
 
     fn press(p: &mut Palette, c: char) -> PaletteEvent {
         p.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    /// A CJK forum title (plausible: a foreign-language sub-forum) must
+    /// still be billed by cell width, not char count, so the row lands
+    /// exactly on `w` and the right-aligned key hint is never pushed off
+    /// (issue #516).
+    #[test]
+    fn palette_row_fits_exactly_w_with_a_cjk_title() {
+        let theme = Theme::truecolor();
+        let p = palette();
+        let item = Item::forum(4, "视频编辑软件推荐帮助教程升级指南论坛".to_string());
+        for w in [20usize, 30, 40, 60, 80] {
+            let line = p.row(&theme, &item, &[], false, w);
+            assert_eq!(line.width(), w, "w={w}: {:?}", line.spans);
+        }
     }
 
     #[test]

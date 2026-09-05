@@ -180,7 +180,7 @@ fn alerts_list_key(a: &mut AlertsState, key: KeyEvent) -> Action {
             Some(al) => Action::MarkAlertRead(al.alert_id),
             None => Action::None,
         },
-        KeyCode::Char('o') => match a.alerts.get(a.sel).and_then(|al| al.view_url.clone()) {
+        KeyCode::Char('o') => match a.alerts.get(a.sel).and_then(|al| al.alert_url.clone()) {
             Some(url) => Action::OpenUrl(url),
             None => Action::None,
         },
@@ -259,7 +259,7 @@ fn tab_row(theme: &Theme, s: &InboxState) -> Vec<Line<'static>> {
         .iter()
         .filter(|c| c.is_unread_conv())
         .count();
-    let unread_alerts = s.alerts.alerts.iter().filter(|a| !a.viewed).count();
+    let unread_alerts = s.alerts.alerts.iter().filter(|a| !a.viewed()).count();
     let conv_label = format!("Conversations {unread_convos}");
     let alert_label = format!("Alerts {unread_alerts}");
     let (conv_chip, alert_chip) = match s.tab {
@@ -301,7 +301,7 @@ fn alerts_range(s: &AlertsState) -> Option<String> {
     if s.alerts.is_empty() {
         return None;
     }
-    let unread = s.alerts.iter().filter(|a| !a.viewed).count();
+    let unread = s.alerts.iter().filter(|a| !a.viewed()).count();
     Some(format!("{unread} of {} unread", s.alerts.len()))
 }
 
@@ -414,7 +414,7 @@ fn render_alerts_rows(
         .alerts
         .iter()
         .map(|a| {
-            let (marker, style) = if a.viewed {
+            let (marker, style) = if a.viewed() {
                 (Span::raw(" "), theme.dim())
             } else {
                 (
@@ -430,14 +430,22 @@ fn render_alerts_rows(
             } else {
                 g.reply_alert
             };
+            // `alert_text` is the server-rendered human-readable body (built
+            // from the alert handler's push template); fall back to the raw
+            // content_type for a payload that hasn't populated it.
+            let body = if a.alert_text.is_empty() {
+                a.content_type.replace('_', " ")
+            } else {
+                a.alert_text.clone()
+            };
             ListItem::new(Line::from(vec![
                 Span::raw(" "),
                 marker,
                 Span::raw(" "),
                 Span::styled(format!("{kind_glyph} "), theme.dim()),
                 Span::styled(a.username.clone(), style),
-                Span::styled(format!("  {} ", a.content_type.replace('_', " ")), theme.dim()),
-                Span::styled(fmt_age(a.alert_date), theme.dim()),
+                Span::styled(format!("  {body} "), theme.dim()),
+                Span::styled(fmt_age(a.event_date), theme.dim()),
             ]))
         })
         .collect();
@@ -540,6 +548,13 @@ fn justify_line(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usiz
 /// cousin of ThreadView's wrapper (also private to `browse`). Good enough for
 /// a compact preview card; it does not try to preserve exact inter-word
 /// spacing beyond a single space.
+///
+/// `width` is terminal *cells* — measured with `chrome::cell_width`, not
+/// `chars().count()` — because the body is drawn via `Paragraph::scroll`
+/// with no `Wrap`, so a line this function judges to fit is never re-checked
+/// by ratatui: a CJK/emoji body billed one cell per (2-cell) character would
+/// silently lose roughly half of every line to the panel's own clipping
+/// (issue #515).
 fn wrap_line(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
     let width = width.max(1);
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
@@ -547,20 +562,29 @@ fn wrap_line(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
     let mut used = 0usize;
     for sp in spans {
         for word in sp.content.split_whitespace() {
-            let wlen = word.chars().count();
+            let wlen = chrome::cell_width(word);
             if wlen > width {
                 if used > 0 {
                     out.push(std::mem::take(&mut line));
                 }
                 let mut rest = word;
-                while rest.chars().count() > width {
-                    let head: String = rest.chars().take(width).collect();
+                while chrome::cell_width(rest) > width {
+                    let mut head = chrome::take_cells(rest, width);
+                    if head.is_empty() {
+                        // A single character wider than the whole line: take
+                        // it anyway so the loop always makes progress
+                        // (mirrors browse::wrap_spans's identical hard-split
+                        // case).
+                        if let Some(c) = rest.chars().next() {
+                            head.push(c);
+                        }
+                    }
                     let bytes = head.len();
                     out.push(vec![Span::styled(head, sp.style)]);
                     rest = &rest[bytes..];
                 }
                 line.push(Span::styled(rest.to_string(), sp.style));
-                used = rest.chars().count();
+                used = chrome::cell_width(rest);
                 continue;
             }
             if used > 0 && used + 1 + wlen > width {
@@ -1234,6 +1258,24 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
 
+    /// A CJK DM body has no whitespace, so it takes the hard-break path;
+    /// every returned line must still fit in `width` *cells* (issue #515) —
+    /// a char-count budget would let a 20-ideograph body overflow to twice
+    /// the requested width and get silently clipped by the un-`Wrap`ped
+    /// Paragraph that renders it.
+    #[test]
+    fn wrap_line_measures_cjk_bodies_in_cells_not_chars() {
+        let body = "视频编辑软件推荐帮助教程升级指南论坛社区管理".to_string(); // 22 ideographs, no whitespace
+        let spans = vec![Span::raw(body)];
+        for width in [10usize, 20, 30, 45] {
+            let lines = wrap_line(&spans, width);
+            for line in &lines {
+                let w: usize = line.iter().map(Span::width).sum();
+                assert!(w <= width, "width {width}: line is {w} cells: {line:?}");
+            }
+        }
+    }
+
     /// `q` in the inline view pane is one level out, not quit — the same step
     /// the pushed `ConversationView` takes below the dual-layout threshold.
     #[test]
@@ -1308,7 +1350,7 @@ mod tests {
             alert_id: 1,
             username: "kemical".into(),
             content_type: "post_quote".into(),
-            viewed: false,
+            view_date: 0,
             ..Default::default()
         }];
         let rows = render_rows_inbox(&mut s, 120, 36);
