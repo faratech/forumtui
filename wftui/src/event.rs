@@ -14,6 +14,7 @@ use ratatui::crossterm::event::{
 pub enum Input {
     Key(KeyEvent),
     Mouse(MouseEvent),
+    Paste(String),
     Resize,
 }
 
@@ -32,6 +33,11 @@ pub fn spawn_reader() -> Receiver<Input> {
                 }
                 Ok(TEvent::Mouse(m)) => {
                     if tx.send(Input::Mouse(m)).is_err() {
+                        break;
+                    }
+                }
+                Ok(TEvent::Paste(p)) => {
+                    if tx.send(Input::Paste(p)).is_err() {
                         break;
                     }
                 }

@@ -1,7 +1,7 @@
 //! Social screens: conversations (DMs), conversation view, new conversation,
 //! alerts.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -248,18 +248,121 @@ pub fn render_conversation_view(
 // ================= new conversation =================
 
 pub fn new_conversation_key(s: &mut super::NewConversationState, key: KeyEvent) -> Action {
+    if s.busy {
+        return Action::None;
+    }
+    if key.code == KeyCode::Esc {
+        return Action::PopScreen;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('v') => return Action::PasteClipboard,
+            KeyCode::Char('a') => {
+                let (text, cursor) = match s.field {
+                    0 => (&mut s.recipients, &mut s.recipients_cursor),
+                    1 => (&mut s.title, &mut s.title_cursor),
+                    _ => (&mut s.body, &mut s.body_cursor),
+                };
+                crate::editor::move_home(text, cursor);
+                return Action::None;
+            }
+            KeyCode::Char('e') => {
+                let (text, cursor) = match s.field {
+                    0 => (&mut s.recipients, &mut s.recipients_cursor),
+                    1 => (&mut s.title, &mut s.title_cursor),
+                    _ => (&mut s.body, &mut s.body_cursor),
+                };
+                crate::editor::move_end(text, cursor);
+                return Action::None;
+            }
+            KeyCode::Char('w') => {
+                let (text, cursor) = match s.field {
+                    0 => (&mut s.recipients, &mut s.recipients_cursor),
+                    1 => (&mut s.title, &mut s.title_cursor),
+                    _ => (&mut s.body, &mut s.body_cursor),
+                };
+                crate::editor::delete_word_back(text, cursor);
+                return Action::None;
+            }
+            KeyCode::Char('u') => {
+                let (text, cursor) = match s.field {
+                    0 => (&mut s.recipients, &mut s.recipients_cursor),
+                    1 => (&mut s.title, &mut s.title_cursor),
+                    _ => (&mut s.body, &mut s.body_cursor),
+                };
+                crate::editor::kill_to_start(text, cursor);
+                return Action::None;
+            }
+            KeyCode::Char('k') => {
+                let (text, cursor) = match s.field {
+                    0 => (&mut s.recipients, &mut s.recipients_cursor),
+                    1 => (&mut s.title, &mut s.title_cursor),
+                    _ => (&mut s.body, &mut s.body_cursor),
+                };
+                crate::editor::kill_to_end(text, cursor);
+                return Action::None;
+            }
+            _ => {}
+        }
+    }
+
     match key.code {
         KeyCode::Tab => {
             s.field = (s.field + 1) % 3;
             Action::None
         }
         KeyCode::Backspace => {
-            let field = match s.field {
-                0 => &mut s.recipients,
-                1 => &mut s.title,
-                _ => &mut s.body,
+            let (text, cursor) = match s.field {
+                0 => (&mut s.recipients, &mut s.recipients_cursor),
+                1 => (&mut s.title, &mut s.title_cursor),
+                _ => (&mut s.body, &mut s.body_cursor),
             };
-            field.pop();
+            crate::editor::delete_back(text, cursor);
+            Action::None
+        }
+        KeyCode::Delete => {
+            let (text, cursor) = match s.field {
+                0 => (&mut s.recipients, &mut s.recipients_cursor),
+                1 => (&mut s.title, &mut s.title_cursor),
+                _ => (&mut s.body, &mut s.body_cursor),
+            };
+            crate::editor::delete_forward(text, cursor);
+            Action::None
+        }
+        KeyCode::Left => {
+            let cursor = match s.field {
+                0 => &mut s.recipients_cursor,
+                1 => &mut s.title_cursor,
+                _ => &mut s.body_cursor,
+            };
+            crate::editor::move_left(cursor);
+            Action::None
+        }
+        KeyCode::Right => {
+            let (text, cursor) = match s.field {
+                0 => (&mut s.recipients, &mut s.recipients_cursor),
+                1 => (&mut s.title, &mut s.title_cursor),
+                _ => (&mut s.body, &mut s.body_cursor),
+            };
+            crate::editor::move_right(text, cursor);
+            Action::None
+        }
+        KeyCode::Home => {
+            let (text, cursor) = match s.field {
+                0 => (&mut s.recipients, &mut s.recipients_cursor),
+                1 => (&mut s.title, &mut s.title_cursor),
+                _ => (&mut s.body, &mut s.body_cursor),
+            };
+            crate::editor::move_home(text, cursor);
+            Action::None
+        }
+        KeyCode::End => {
+            let (text, cursor) = match s.field {
+                0 => (&mut s.recipients, &mut s.recipients_cursor),
+                1 => (&mut s.title, &mut s.title_cursor),
+                _ => (&mut s.body, &mut s.body_cursor),
+            };
+            crate::editor::move_end(text, cursor);
             Action::None
         }
         KeyCode::Enter => {
@@ -270,13 +373,16 @@ pub fn new_conversation_key(s: &mut super::NewConversationState, key: KeyEvent) 
                 Action::None
             }
         }
-        KeyCode::Char(c) => {
-            let field = match s.field {
-                0 => &mut s.recipients,
-                1 => &mut s.title,
-                _ => &mut s.body,
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            let (text, cursor) = match s.field {
+                0 => (&mut s.recipients, &mut s.recipients_cursor),
+                1 => (&mut s.title, &mut s.title_cursor),
+                _ => (&mut s.body, &mut s.body_cursor),
             };
-            field.push(c);
+            crate::editor::insert_char(text, cursor, c);
             Action::None
         }
         _ => Action::None,
@@ -319,29 +425,52 @@ pub fn render_new_conversation(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let cursor = |active: bool| if active { "◀" } else { "" };
     let text = vec![
         Line::from(vec![
             Span::styled("To (usernames, comma-separated): ", theme.dim()),
-            Span::styled(
-                format!("{} {}", s.recipients, cursor(s.field == 0)),
-                theme.base(),
-            ),
+            Span::styled(s.recipients.clone(), theme.base()),
         ]),
         Line::from(vec![
             Span::styled("Title: ", theme.dim()),
-            Span::styled(format!("{} {}", s.title, cursor(s.field == 1)), theme.base()),
+            Span::styled(s.title.clone(), theme.base()),
         ]),
         Line::from(Span::styled("Message (Tab to next field):", theme.dim())),
-        Line::from(Span::styled(
-            format!("{} {}", s.body, cursor(s.field == 2)),
-            theme.base(),
-        )),
+        Line::from(Span::styled(s.body.clone(), theme.base())),
     ];
     f.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: false }),
         inner,
     );
+
+    let cur_pos = match s.field {
+        0 => {
+            let col = s.recipients.chars().take(s.recipients_cursor).count() as u16;
+            let prefix_len = 32u16;
+            Some((
+                (inner.x + prefix_len + col).min(inner.x + inner.width.saturating_sub(1)),
+                inner.y,
+            ))
+        }
+        1 => {
+            let col = s.title.chars().take(s.title_cursor).count() as u16;
+            let prefix_len = 7u16;
+            Some((
+                (inner.x + prefix_len + col).min(inner.x + inner.width.saturating_sub(1)),
+                inner.y + 1,
+            ))
+        }
+        2 => {
+            let (col, row) = crate::editor::cursor_coords(&s.body, s.body_cursor);
+            Some((
+                (inner.x + col).min(inner.x + inner.width.saturating_sub(1)),
+                (inner.y + 3 + row).min(inner.y + inner.height.saturating_sub(2)),
+            ))
+        }
+        _ => None,
+    };
+    if let Some((x, y)) = cur_pos {
+        f.set_cursor_position((x, y));
+    }
 
     let mut status_lines: Vec<Line> = Vec::new();
     for e in &s.errors {

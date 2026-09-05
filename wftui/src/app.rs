@@ -99,6 +99,9 @@ pub struct App {
     /// In-app clipboard: last copied selection, pasteable with Ctrl+Y in the
     /// composer — works even when the terminal declines OSC 52.
     clipboard: String,
+    last_click_instant: Option<std::time::Instant>,
+    last_click_pos: (u16, u16),
+    click_count: u8,
     should_quit: bool,
 }
 
@@ -123,29 +126,42 @@ pub struct TerminalGuard;
 
 impl TerminalGuard {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        use ratatui::crossterm::event::EnableMouseCapture;
+        use ratatui::crossterm::event::{
+            EnableBracketedPaste, EnableMouseCapture, KeyboardEnhancementFlags,
+            PushKeyboardEnhancementFlags,
+        };
         use ratatui::crossterm::terminal::*;
         enable_raw_mode()?;
         ratatui::crossterm::execute!(
             std::io::stdout(),
             EnterAlternateScreen,
-            EnableMouseCapture
+            EnableMouseCapture,
+            EnableBracketedPaste,
         )?;
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
         Ok(TerminalGuard)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        use ratatui::crossterm::event::{
+            DisableBracketedPaste, DisableMouseCapture, PopKeyboardEnhancementFlags,
+        };
         use ratatui::crossterm::execute;
         use ratatui::crossterm::terminal::*;
-        let _ = disable_raw_mode();
         let _ = execute!(
             std::io::stdout(),
+            PopKeyboardEnhancementFlags,
+            DisableBracketedPaste,
             LeaveAlternateScreen,
-            ratatui::crossterm::event::DisableMouseCapture,
+            DisableMouseCapture,
             ratatui::crossterm::cursor::Show
         );
+        let _ = disable_raw_mode();
     }
 }
 
@@ -191,8 +207,34 @@ pub async fn run() -> u8 {
         screen_rows: Vec::new(),
         screen_cols: Vec::new(),
         clipboard: String::new(),
+        last_click_instant: None,
+        last_click_pos: (0, 0),
+        click_count: 0,
         should_quit: false,
     };
+    #[cfg(unix)]
+    {
+        let tx = app.tx.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut hup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            tokio::select! {
+                _ = term.recv() => {
+                    tx.send(Msg::Notice("quit".into())).ok();
+                }
+                _ = hup.recv() => {
+                    tx.send(Msg::Notice("quit".into())).ok();
+                }
+            }
+        });
+    }
     app.bootstrap().await;
     let reader = crate::event::spawn_reader();
     let outcome = app.event_loop(&mut terminal, reader).await;
@@ -279,6 +321,9 @@ impl App {
                     crate::event::Input::Resize => {}
                     crate::event::Input::Mouse(me) => {
                         self.handle_mouse(me);
+                    }
+                    crate::event::Input::Paste(text) => {
+                        self.handle_paste(text);
                     }
                     crate::event::Input::Key(k) => {
                         if event::is_ctrl_c(k) {
@@ -552,16 +597,10 @@ impl App {
             Action::PasteClipboard => {
                 let text = self.clipboard.clone();
                 if text.is_empty() {
-                    self.status = "Nothing copied yet — drag to select text.".into();
+                    self.status = "Nothing copied yet — drag or double-click to select text.".into();
                     return;
                 }
-                if let Some(crate::screens::Screen::Compose(cs)) = self.screens.last_mut() {
-                    if cs.title_field {
-                        cs.title.push_str(&text);
-                    } else {
-                        cs.body.push_str(&text);
-                    }
-                }
+                self.handle_paste(text);
             }
             Action::OscCopy(value) => {
                 emit_raw(&common::osc::set_clipboard(&value));
@@ -590,7 +629,70 @@ impl App {
         });
     }
 
-    // ---- mouse: selection + wheel scrolling ----
+    // ---- paste handling (bracketed paste and clipboard) ----
+
+    pub fn handle_paste(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        self.clipboard = text.clone();
+        if let Some(screen) = self.screens.last_mut() {
+            match screen {
+                Screen::Compose(cs) => {
+                    if cs.title_field {
+                        let sanitized = text.replace(['\r', '\n'], " ");
+                        crate::editor::insert_str(&mut cs.title, &mut cs.title_cursor, &sanitized);
+                    } else {
+                        let sanitized = text.replace('\r', "");
+                        crate::editor::insert_str(&mut cs.body, &mut cs.body_cursor, &sanitized);
+                    }
+                    self.status = format!("Pasted {} characters", text.chars().count());
+                }
+                Screen::Search(ss) => {
+                    let sanitized = text.replace(['\r', '\n'], " ");
+                    crate::editor::insert_str(&mut ss.query, &mut ss.cursor, &sanitized);
+                    self.status = format!("Pasted {} characters into search", text.chars().count());
+                }
+                Screen::NewConversation(ncs) => {
+                    match ncs.field {
+                        0 => {
+                            let sanitized = text.replace(['\r', '\n'], " ");
+                            crate::editor::insert_str(
+                                &mut ncs.recipients,
+                                &mut ncs.recipients_cursor,
+                                &sanitized,
+                            );
+                        }
+                        1 => {
+                            let sanitized = text.replace(['\r', '\n'], " ");
+                            crate::editor::insert_str(
+                                &mut ncs.title,
+                                &mut ncs.title_cursor,
+                                &sanitized,
+                            );
+                        }
+                        _ => {
+                            let sanitized = text.replace('\r', "");
+                            crate::editor::insert_str(
+                                &mut ncs.body,
+                                &mut ncs.body_cursor,
+                                &sanitized,
+                            );
+                        }
+                    }
+                    self.status = format!("Pasted {} characters", text.chars().count());
+                }
+                _ => {
+                    self.status = format!(
+                        "Pasted {} characters into clipboard (press Ctrl+Y to insert)",
+                        text.chars().count()
+                    );
+                }
+            }
+        }
+    }
+
+    // ---- mouse: selection + multi-click + wheel scrolling ----
 
     fn handle_mouse(&mut self, me: ratatui::crossterm::event::MouseEvent) {
         use ratatui::crossterm::event::{KeyCode, MouseEventKind as K};
@@ -598,7 +700,58 @@ impl App {
         let pos = (me.column, me.row);
         match me.kind {
             K::Down(ratatui::crossterm::event::MouseButton::Left, ..) => {
-                self.selection = Some(Selection { anchor: pos, end: pos });
+                let now = std::time::Instant::now();
+                let is_rapid = self.last_click_instant.is_some_and(|t| {
+                    now.duration_since(t) < Duration::from_millis(400)
+                }) && self.last_click_pos.0.abs_diff(pos.0) <= 2
+                    && self.last_click_pos.1 == pos.1;
+
+                if is_rapid {
+                    self.click_count = (self.click_count % 3) + 1;
+                } else {
+                    self.click_count = 1;
+                }
+                self.last_click_instant = Some(now);
+                self.last_click_pos = pos;
+
+                if self.click_count == 2 {
+                    // Double-click: select word
+                    if let Some((start_col, end_col)) = self.find_word_bounds(pos.0, pos.1) {
+                        self.selection = Some(Selection {
+                            anchor: (start_col, pos.1),
+                            end: (end_col, pos.1),
+                        });
+                        let text = self.extract_selection_text(start_col, pos.1, end_col, pos.1);
+                        if !text.is_empty() {
+                            emit_raw(&common::osc::set_clipboard(&text));
+                            self.clipboard = text;
+                            let n = self.clipboard.chars().count();
+                            self.status =
+                                format!("Copied word ({n} chars) to clipboard (and Ctrl+Y)");
+                        }
+                    }
+                } else if self.click_count == 3 {
+                    // Triple-click: select line
+                    if let Some((start_col, end_col)) = self.find_line_bounds(pos.1) {
+                        self.selection = Some(Selection {
+                            anchor: (start_col, pos.1),
+                            end: (end_col, pos.1),
+                        });
+                        let text = self.extract_selection_text(start_col, pos.1, end_col, pos.1);
+                        if !text.is_empty() {
+                            emit_raw(&common::osc::set_clipboard(&text));
+                            self.clipboard = text;
+                            let n = self.clipboard.chars().count();
+                            self.status =
+                                format!("Copied line ({n} chars) to clipboard (and Ctrl+Y)");
+                        }
+                    }
+                } else {
+                    self.selection = Some(Selection {
+                        anchor: pos,
+                        end: pos,
+                    });
+                }
             }
             K::Drag(ratatui::crossterm::event::MouseButton::Left, ..) => {
                 if let Some(sel) = &mut self.selection {
@@ -606,6 +759,9 @@ impl App {
                 }
             }
             K::Up(ratatui::crossterm::event::MouseButton::Left, ..) => {
+                if self.click_count > 1 {
+                    return;
+                }
                 if let Some(sel) = self.selection.take() {
                     let (x0, y0, x1, y1) = sel.rect();
                     if (x0, y0) == (x1, y1) {
@@ -633,6 +789,84 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn find_word_bounds(&self, x: u16, y: u16) -> Option<(u16, u16)> {
+        let y_idx = y as usize;
+        if y_idx >= self.screen_rows.len() || y_idx >= self.screen_cols.len() {
+            return None;
+        }
+        let row = &self.screen_rows[y_idx];
+        let offsets = &self.screen_cols[y_idx];
+        if offsets.len() < 2 {
+            return None;
+        }
+        let max_col = (offsets.len().saturating_sub(2)) as u16;
+        let x = x.min(max_col);
+
+        let get_char = |col: u16| -> Option<char> {
+            let idx = col as usize;
+            if idx + 1 >= offsets.len() {
+                return None;
+            }
+            let s = offsets[idx];
+            let e = offsets[idx + 1];
+            row.get(s..e)?.chars().next()
+        };
+
+        let target = get_char(x)?;
+        if target.is_whitespace() {
+            return None;
+        }
+        let is_word_char = |c: char| {
+            c.is_alphanumeric()
+                || c == '_'
+                || c == '-'
+                || c == '.'
+                || c == '/'
+                || c == ':'
+                || c == '@'
+        };
+        let target_is_word = is_word_char(target);
+
+        let mut start_col = x;
+        while start_col > 0 {
+            if let Some(c) = get_char(start_col - 1)
+                && !c.is_whitespace()
+                && is_word_char(c) == target_is_word
+            {
+                start_col -= 1;
+                continue;
+            }
+            break;
+        }
+
+        let mut end_col = x;
+        while end_col < max_col {
+            if let Some(c) = get_char(end_col + 1)
+                && !c.is_whitespace()
+                && is_word_char(c) == target_is_word
+            {
+                end_col += 1;
+                continue;
+            }
+            break;
+        }
+
+        Some((start_col, end_col))
+    }
+
+    fn find_line_bounds(&self, y: u16) -> Option<(u16, u16)> {
+        let y_idx = y as usize;
+        if y_idx >= self.screen_rows.len() || y_idx >= self.screen_cols.len() {
+            return None;
+        }
+        let offsets = &self.screen_cols[y_idx];
+        if offsets.len() < 2 {
+            return None;
+        }
+        let max_col = (offsets.len().saturating_sub(2)) as u16;
+        Some((0, max_col))
     }
 
     fn extract_selection_text(&self, x0: u16, y0: u16, x1: u16, y1: u16) -> String {
@@ -879,7 +1113,9 @@ impl App {
                 }
             }
             Msg::Notice(n) => {
-                if let Some(v) = n.strip_prefix("alerts:") {
+                if n == "quit" {
+                    self.should_quit = true;
+                } else if let Some(v) = n.strip_prefix("alerts:") {
                     self.alerts_unread = v.parse().unwrap_or(0);
                 } else if let Some(v) = n.strip_prefix("convos:") {
                     self.convos_unread = v.parse().unwrap_or(0);
@@ -1002,11 +1238,11 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        if let Some(idx) = compose_idx {
-                            if let Screen::Compose(compose) = &mut self.screens[idx] {
-                                compose.busy = false;
-                                compose.error = Some(e.message);
-                            }
+                        if let Some(idx) = compose_idx
+                            && let Screen::Compose(compose) = &mut self.screens[idx]
+                        {
+                            compose.busy = false;
+                            compose.error = Some(e.message);
                         }
                     }
                 }
@@ -1025,11 +1261,11 @@ impl App {
                         self.load_forum(thread.node_id, 1);
                     }
                     Err(e) => {
-                        if let Some(idx) = compose_idx {
-                            if let Screen::Compose(compose) = &mut self.screens[idx] {
-                                compose.busy = false;
-                                compose.error = Some(e.message);
-                            }
+                        if let Some(idx) = compose_idx
+                            && let Screen::Compose(compose) = &mut self.screens[idx]
+                        {
+                            compose.busy = false;
+                            compose.error = Some(e.message);
                         }
                     }
                 }
@@ -1117,11 +1353,11 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        if let Some(idx) = compose_idx {
-                            if let Screen::Compose(compose) = &mut self.screens[idx] {
-                                compose.busy = false;
-                                compose.error = Some(e.message);
-                            }
+                        if let Some(idx) = compose_idx
+                            && let Screen::Compose(compose) = &mut self.screens[idx]
+                        {
+                            compose.busy = false;
+                            compose.error = Some(e.message);
                         }
                     }
                 }

@@ -5,6 +5,7 @@
 //! during unwind). This is why the workspace profile pins panic = "unwind".
 
 mod app;
+pub mod editor;
 mod event;
 mod screens;
 mod theme;

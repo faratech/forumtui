@@ -114,6 +114,8 @@ pub struct ComposeState {
     pub target: Option<ComposeTarget>,
     pub title: String,
     pub body: String,
+    pub title_cursor: usize,
+    pub body_cursor: usize,
     pub title_field: bool,
     pub busy: bool,
     pub error: Option<String>,
@@ -146,6 +148,9 @@ pub struct NewConversationState {
     pub recipients: String,
     pub title: String,
     pub body: String,
+    pub recipients_cursor: usize,
+    pub title_cursor: usize,
+    pub body_cursor: usize,
     pub field: usize,
     pub resolving: usize,
     pub resolved_ids: Vec<u32>,
@@ -164,6 +169,7 @@ pub struct AlertsState {
 #[derive(Default)]
 pub struct SearchState {
     pub query: String,
+    pub cursor: usize,
     pub input_mode: bool,
     pub results: Vec<SearchHit>,
     pub page: u32,
