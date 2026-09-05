@@ -92,25 +92,43 @@ pub fn render_conversations(
         .conversations
         .iter()
         .map(|c| {
-            let marker = if c.conversation_unread { "● " } else { "  " };
-            let style = if c.conversation_unread {
+            let unread = c.is_unread_conv();
+            let marker = if unread { "● " } else { "  " };
+            let style = if unread {
                 theme.base().add_modifier(Modifier::BOLD)
             } else {
                 theme.base()
             };
-            ListItem::new(Line::from(vec![
+            let mut line1 = vec![
                 Span::styled(marker, theme.accent),
                 Span::styled(c.title.clone(), style),
-                Span::styled(
+            ];
+            if c.is_starred_conv() {
+                line1.push(Span::styled(" ★", theme.warn));
+            }
+            line1.push(Span::styled(
+                format!("  ({} replies)", c.reply_count),
+                theme.dim(),
+            ));
+
+            let participants = c.participants_display();
+            let mut line2 = vec![
+                Span::raw("    "),
+                Span::styled("👥 ", theme.accent),
+                Span::styled("Participants: ", theme.dim()),
+                Span::styled(participants, theme.base()),
+            ];
+            if !c.last_message_username.is_empty() {
+                line2.push(Span::styled(
                     format!(
-                        "  · {} · last {} ({})",
+                        " · last by {} ({})",
                         c.last_message_username,
-                        fmt_time(c.last_message_date),
-                        c.reply_count,
+                        fmt_time(c.last_message_date)
                     ),
                     theme.dim(),
-                ),
-            ]))
+                ));
+            }
+            ListItem::new(vec![Line::from(line1), Line::from(line2)])
         })
         .collect();
     let mut state = ListState::default().with_selected(Some(s.sel));
@@ -136,16 +154,76 @@ pub fn render_conversations(
 // ================= conversation view =================
 
 impl ConversationViewState {
+    pub fn all_participants(&self) -> Vec<String> {
+        let mut names = self.conversation.participant_names();
+        for msg in &self.messages {
+            if !msg.username.is_empty()
+                && !names.iter().any(|n| n.eq_ignore_ascii_case(&msg.username))
+            {
+                names.push(msg.username.clone());
+            }
+        }
+        names
+    }
+
+    pub fn participants_display(&self) -> String {
+        let starter = self.conversation.starter();
+        let all = self.all_participants();
+        if all.is_empty() {
+            return "No participants listed".to_string();
+        }
+        let mut parts = Vec::new();
+        if !starter.is_empty() {
+            parts.push(format!("{starter} (starter)"));
+        }
+        for name in all {
+            if !starter.eq_ignore_ascii_case(&name) {
+                parts.push(name);
+            }
+        }
+        parts.join(", ")
+    }
+
     pub fn rebuild_lines(&mut self, theme: &Theme) {
         let mut lines: Vec<Line<'static>> = Vec::new();
-        for msg in &self.messages {
+        let mut msg_offsets: Vec<u16> = Vec::new();
+
+        // Prominent participants callout header at the top
+        let starter = self.conversation.starter();
+        let participants_str = self.participants_display();
+        lines.push(Line::from(vec![
+            Span::styled("┌── 👥 CONVERSATION PARTICIPANTS ──", theme.dim()),
+            Span::styled("──────────────────────────────────────────", theme.dim()),
+        ]));
+        if !starter.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("│ ", theme.dim()),
+                Span::styled("Started by: ", theme.dim()),
+                Span::styled(starter.to_string(), theme.title().add_modifier(Modifier::BOLD)),
+            ]));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("│ ", theme.dim()),
+            Span::styled("All Participants: ", theme.dim()),
+            Span::styled(participants_str, theme.base().add_modifier(Modifier::BOLD)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "└──────────────────────────────────────────────────────────────────────────",
+            theme.dim(),
+        )));
+        lines.push(Line::from(Span::raw("")));
+
+        for (i, msg) in self.messages.iter().enumerate() {
+            let offset = lines.len() as u16;
+            msg_offsets.push(offset);
+            let num = i + 1 + ((self.page.saturating_sub(1)) as usize * 20);
             lines.push(Line::from(vec![
                 Span::styled("■ ", theme.accent),
                 Span::styled(
                     msg.username.clone(),
                     theme.base().add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("  {}", fmt_time(msg.message_date)), theme.dim()),
+                Span::styled(format!(" · #{num} · {}", fmt_time(msg.message_date)), theme.dim()),
             ]));
             let mut sink: Vec<Line<'static>> = Vec::new();
             let mut links = Vec::new();
@@ -154,6 +232,7 @@ impl ConversationViewState {
             lines.push(Line::from(Span::raw("")));
         }
         self.lines = lines;
+        self.msg_line_offsets = msg_offsets;
     }
 }
 
@@ -194,6 +273,36 @@ pub fn conversation_view_key(s: &mut ConversationViewState, key: KeyEvent) -> Ac
                 Action::None
             }
         }
+        KeyCode::Char('n') => {
+            if !s.msg_line_offsets.is_empty() && s.sel_msg + 1 < s.msg_line_offsets.len() {
+                s.sel_msg += 1;
+                s.scroll = s.msg_line_offsets[s.sel_msg];
+            }
+            Action::None
+        }
+        KeyCode::Char('N') => {
+            if s.sel_msg > 0 && !s.msg_line_offsets.is_empty() {
+                s.sel_msg -= 1;
+                s.scroll = s.msg_line_offsets[s.sel_msg];
+            }
+            Action::None
+        }
+        KeyCode::Char('p') => {
+            if let Some(msg) = s.messages.get(s.sel_msg).or_else(|| s.messages.first()) {
+                Action::OpenProfile(msg.user_id, msg.username.clone())
+            } else {
+                Action::None
+            }
+        }
+        KeyCode::Char('P') => {
+            let uid = s.conversation.starter_id();
+            let name = s.conversation.starter().to_string();
+            if !name.is_empty() {
+                Action::OpenProfile(uid, name)
+            } else {
+                Action::None
+            }
+        }
         KeyCode::Char('r') => Action::StartReplyConversation(s.conversation.clone()),
         _ => Action::None,
     }
@@ -205,9 +314,11 @@ pub fn render_conversation_view(
     area: ratatui::layout::Rect,
     theme: &Theme,
 ) {
+    let parts_summary = s.all_participants().join(", ");
     let title = format!(
-        " ✉ {} — {}/{} ",
-        super::browse::truncate(&s.conversation.title, 50),
+        " ✉ {} [👥 {}] — {}/{} ",
+        super::browse::truncate(&s.conversation.title, 32),
+        super::browse::truncate(&parts_summary, 28),
         s.page,
         s.last_page
     );
@@ -230,8 +341,30 @@ pub fn render_conversation_view(
         return;
     }
 
-    let body = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
-    let view = body[0];
+    let body = Layout::vertical([
+        Constraint::Length(2), // Persistent participant header
+        Constraint::Min(1),    // Scrollable message body
+        Constraint::Length(1), // Hints footer
+    ])
+    .split(inner);
+
+    // Persistent participant header bar
+    let header_lines = vec![
+        Line::from(vec![
+            Span::styled("👥 Participants: ", theme.accent),
+            Span::styled(
+                s.participants_display(),
+                theme.base().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "─".repeat(inner.width as usize),
+            theme.dim(),
+        )),
+    ];
+    f.render_widget(Paragraph::new(header_lines), body[0]);
+
+    let view = body[1];
     let total = s.lines.len() as u16;
     let max_scroll = total.saturating_sub(view.height);
     if s.scroll > max_scroll {
@@ -246,9 +379,17 @@ pub fn render_conversation_view(
     );
     let hints = footer_line(
         theme,
-        &[("↑↓/PgUp/PgDn", "scroll"), ("[/]", "page"), ("r", "reply")],
+        &[
+            ("↑↓/PgUp/PgDn", "scroll"),
+            ("n/N", "next/prev msg"),
+            ("r", "reply"),
+            ("p", "author profile"),
+            ("P", "starter profile"),
+            ("[/]", "page"),
+            ("Esc", "back"),
+        ],
     );
-    f.render_widget(Paragraph::new(hints), body[1]);
+    f.render_widget(Paragraph::new(hints), body[2]);
 }
 
 // ================= new conversation =================
@@ -597,4 +738,115 @@ pub fn render_alerts(
         1,
     );
     f.render_widget(Paragraph::new(hints), hint_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::models::{Conversation, ConversationMessage, ConversationRecipient};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn conversation_participants_and_view_actions() {
+        let conv = Conversation {
+            conversation_id: 55,
+            title: "Security Review".into(),
+            start_user_id: 1,
+            start_username: "Alice".into(),
+            recipients: vec![
+                ConversationRecipient {
+                    user_id: 2,
+                    username: "Bob".into(),
+                },
+                ConversationRecipient {
+                    user_id: 3,
+                    username: "Charlie".into(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let messages = vec![
+            ConversationMessage {
+                message_id: 501,
+                conversation_id: 55,
+                user_id: 1,
+                username: "Alice".into(),
+                message: "Shall we audit the firewall?".into(),
+                ..Default::default()
+            },
+            ConversationMessage {
+                message_id: 502,
+                conversation_id: 55,
+                user_id: 4,
+                username: "Dave_Auditor".into(),
+                message: "I can help review the logs.".into(),
+                ..Default::default()
+            },
+        ];
+
+        let mut state = ConversationViewState {
+            conversation: conv,
+            messages,
+            page: 1,
+            last_page: 1,
+            ..Default::default()
+        };
+
+        // Check that all participants include starter, recipients, and new message senders
+        let all = state.all_participants();
+        assert_eq!(all, vec!["Alice", "Bob", "Charlie", "Dave_Auditor"]);
+        assert_eq!(
+            state.participants_display(),
+            "Alice (starter), Bob, Charlie, Dave_Auditor"
+        );
+
+        let theme = Theme::dark();
+        state.rebuild_lines(&theme);
+
+        // Verify the rendered lines contain CONVERSATION PARTICIPANTS
+        let text: String = state
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("CONVERSATION PARTICIPANTS"));
+        assert!(text.contains("Alice (starter), Bob, Charlie, Dave_Auditor"));
+
+        // 'p': open profile of active message author (msg 0: Alice)
+        let act = conversation_view_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+        assert!(matches!(act, Action::OpenProfile(uid, name) if uid == 1 && name == "Alice"));
+
+        // 'n': advance to next message (msg 1: Dave_Auditor)
+        let act = conversation_view_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        assert!(matches!(act, Action::None));
+        assert_eq!(state.sel_msg, 1);
+
+        // 'p': open profile of Dave_Auditor
+        let act = conversation_view_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+        assert!(matches!(act, Action::OpenProfile(uid, name) if uid == 4 && name == "Dave_Auditor"));
+
+        // 'P': open starter profile (Alice)
+        let act = conversation_view_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT),
+        );
+        assert!(matches!(act, Action::OpenProfile(uid, name) if uid == 1 && name == "Alice"));
+
+        // 'r': start reply to conversation
+        let act = conversation_view_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        );
+        assert!(matches!(act, Action::StartReplyConversation(c) if c.conversation_id == 55));
+    }
 }

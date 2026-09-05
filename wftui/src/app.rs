@@ -1178,10 +1178,12 @@ impl App {
     }
 
     pub fn reply_to_conversation(&mut self, conv: &Conversation) {
+        let participants = conv.participants_display();
         self.push_screen(Screen::Compose(screens::ComposeState {
             target: Some(ComposeTarget::ConversationReply {
                 conversation_id: conv.conversation_id,
                 conversation_title: conv.title.clone(),
+                participants,
             }),
             ..Default::default()
         }));
@@ -1477,6 +1479,9 @@ impl App {
                 if let Some(view) = view {
                     match result {
                         Ok(reply) => {
+                            if reply.conversation.conversation_id > 0 {
+                                view.conversation = reply.conversation;
+                            }
                             view.messages = reply.messages;
                             view.page = page;
                             view.last_page = reply.pagination.last_page.max(1);

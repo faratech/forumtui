@@ -4,7 +4,7 @@
 //! API change can never brick the client. List replies follow XF's envelope
 //! `<collection> + pagination` (AbstractController::getPaginationData).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub fn r<T: Default>() -> T {
     T::default()
@@ -226,28 +226,188 @@ pub struct PostsReply {
     pub pagination: Pagination,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ConversationRecipient {
+    #[serde(default)]
+    pub user_id: u32,
+    #[serde(default)]
+    pub username: String,
+}
+
+pub fn deserialize_recipients<'de, D>(deserializer: D) -> Result<Vec<ConversationRecipient>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = serde_json::Value::deserialize(deserializer)?;
+    let mut recipients = Vec::new();
+    match val {
+        serde_json::Value::Object(map) => {
+            for (key, v) in map {
+                let user_id = key.parse::<u32>().unwrap_or(0);
+                match v {
+                    serde_json::Value::String(username) => {
+                        if !username.is_empty() {
+                            recipients.push(ConversationRecipient { user_id, username });
+                        }
+                    }
+                    serde_json::Value::Object(obj) => {
+                        let uid = obj
+                            .get("user_id")
+                            .and_then(|u| u.as_u64())
+                            .map(|u| u as u32)
+                            .unwrap_or(user_id);
+                        let uname = obj
+                            .get("username")
+                            .and_then(|u| u.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !uname.is_empty() {
+                            recipients.push(ConversationRecipient {
+                                user_id: uid,
+                                username: uname,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                match item {
+                    serde_json::Value::String(s) => {
+                        if !s.is_empty() {
+                            recipients.push(ConversationRecipient {
+                                user_id: 0,
+                                username: s,
+                            });
+                        }
+                    }
+                    serde_json::Value::Object(obj) => {
+                        let uid = obj
+                            .get("user_id")
+                            .and_then(|u| u.as_u64())
+                            .map(|u| u as u32)
+                            .unwrap_or(0);
+                        let uname = obj
+                            .get("username")
+                            .and_then(|u| u.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !uname.is_empty() {
+                            recipients.push(ConversationRecipient {
+                                user_id: uid,
+                                username: uname,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    recipients.sort_by_key(|a| a.username.to_lowercase());
+    Ok(recipients)
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Conversation {
     #[serde(default)]
     pub conversation_id: u32,
     #[serde(default)]
     pub title: String,
+    #[serde(default, rename = "user_id")]
+    pub user_id: u32,
+    #[serde(default, rename = "username")]
+    pub username: String,
     #[serde(default, rename = "start_user_id")]
     pub start_user_id: u32,
     #[serde(default, rename = "start_username")]
     pub start_username: String,
     #[serde(default, rename = "reply_count")]
     pub reply_count: u64,
+    #[serde(default, rename = "recipient_count")]
+    pub recipient_count: u32,
     #[serde(default, rename = "last_message_date")]
     pub last_message_date: i64,
     #[serde(default, rename = "last_message_username")]
     pub last_message_username: String,
     #[serde(default, rename = "conversation_unread")]
     pub conversation_unread: bool,
+    #[serde(default, rename = "is_unread")]
+    pub is_unread: bool,
+    #[serde(default, rename = "is_starred")]
+    pub is_starred: bool,
     #[serde(default)]
     pub starred: bool,
     #[serde(default, rename = "view_url")]
     pub view_url: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_recipients")]
+    pub recipients: Vec<ConversationRecipient>,
+}
+
+impl Conversation {
+    pub fn is_unread_conv(&self) -> bool {
+        self.conversation_unread || self.is_unread
+    }
+
+    pub fn is_starred_conv(&self) -> bool {
+        self.starred || self.is_starred
+    }
+
+    pub fn starter(&self) -> &str {
+        if !self.start_username.is_empty() {
+            &self.start_username
+        } else if !self.username.is_empty() {
+            &self.username
+        } else {
+            ""
+        }
+    }
+
+    pub fn starter_id(&self) -> u32 {
+        if self.start_user_id > 0 {
+            self.start_user_id
+        } else {
+            self.user_id
+        }
+    }
+
+    /// Returns all participant usernames (starter first, then recipients), deduplicated.
+    pub fn participant_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        let starter = self.starter();
+        if !starter.is_empty() {
+            names.push(starter.to_string());
+        }
+        for r in &self.recipients {
+            if !r.username.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(&r.username)) {
+                names.push(r.username.clone());
+            }
+        }
+        names
+    }
+
+    /// Formats all participants as a human-readable list:
+    /// "Alice (starter), Bob, Charlie"
+    pub fn participants_display(&self) -> String {
+        let starter = self.starter();
+        let mut parts = Vec::new();
+        if !starter.is_empty() {
+            parts.push(format!("{starter} (starter)"));
+        }
+        for r in &self.recipients {
+            if !r.username.is_empty() && !starter.eq_ignore_ascii_case(&r.username) {
+                parts.push(r.username.clone());
+            }
+        }
+        if parts.is_empty() {
+            "No participants listed".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -692,5 +852,53 @@ mod tests {
         assert_eq!(user.trophy_points, 450);
         assert!(user.is_staff && user.is_admin);
         assert_eq!(user.location, "Redmond, WA");
+    }
+
+    #[test]
+    fn conversation_participants_deserialization_and_helpers() {
+        // Native XenForo map format
+        let conv_json = serde_json::json!({
+            "conversation_id": 100,
+            "title": "Group Discussion",
+            "start_user_id": 1,
+            "start_username": "StarterAlice",
+            "reply_count": 4,
+            "recipients": {
+                "2": "Bob",
+                "3": "Charlie"
+            }
+        });
+        let conv: Conversation = serde_json::from_value(conv_json).unwrap();
+        assert_eq!(conv.starter(), "StarterAlice");
+        assert_eq!(conv.recipients.len(), 2);
+        let names = conv.participant_names();
+        assert_eq!(names, vec!["StarterAlice", "Bob", "Charlie"]);
+        assert_eq!(
+            conv.participants_display(),
+            "StarterAlice (starter), Bob, Charlie"
+        );
+
+        // Array format
+        let conv_arr_json = serde_json::json!({
+            "conversation_id": 101,
+            "title": "1-on-1",
+            "username": "Dave",
+            "recipients": [{"user_id": 5, "username": "Eve"}]
+        });
+        let conv_arr: Conversation = serde_json::from_value(conv_arr_json).unwrap();
+        assert_eq!(conv_arr.starter(), "Dave");
+        assert_eq!(conv_arr.participant_names(), vec!["Dave", "Eve"]);
+        assert_eq!(conv_arr.participants_display(), "Dave (starter), Eve");
+
+        // Empty array format (standard PHP empty json_encode)
+        let conv_empty_json = serde_json::json!({
+            "conversation_id": 102,
+            "title": "Solo Note",
+            "username": "SelfUser",
+            "recipients": []
+        });
+        let conv_empty: Conversation = serde_json::from_value(conv_empty_json).unwrap();
+        assert_eq!(conv_empty.participant_names(), vec!["SelfUser"]);
+        assert_eq!(conv_empty.participants_display(), "SelfUser (starter)");
     }
 }

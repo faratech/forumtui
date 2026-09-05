@@ -329,6 +329,15 @@ pub fn render_compose(
             theme.dim(),
         )));
     }
+    if let Some(ComposeTarget::ConversationReply { participants, .. }) = &s.target
+        && !participants.is_empty()
+    {
+        lines.push(Line::from(vec![
+            Span::styled("👥 Participants: ", theme.accent),
+            Span::styled(participants.clone(), theme.base().add_modifier(Modifier::BOLD)),
+        ]));
+        lines.push(Line::from(Span::raw("")));
+    }
     for line in s.body.split('\n') {
         lines.push(Line::from(Span::styled(line.to_string(), theme.base())));
     }

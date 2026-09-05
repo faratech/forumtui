@@ -94,7 +94,11 @@ pub struct ThreadViewState {
 pub enum ComposeTarget {
     ThreadReply { thread_id: u32, thread_title: String },
     NewThread { node_id: u32 },
-    ConversationReply { conversation_id: u32, conversation_title: String },
+    ConversationReply {
+        conversation_id: u32,
+        conversation_title: String,
+        participants: String,
+    },
 }
 
 impl ComposeTarget {
@@ -105,8 +109,16 @@ impl ComposeTarget {
             }
             ComposeTarget::NewThread { node_id } => format!("New thread in node {node_id}"),
             ComposeTarget::ConversationReply {
-                conversation_title, ..
-            } => format!("Reply to conversation: {conversation_title}"),
+                conversation_title,
+                participants,
+                ..
+            } => {
+                if participants.is_empty() {
+                    format!("Reply to: {conversation_title}")
+                } else {
+                    format!("Reply to: {conversation_title} ({participants})")
+                }
+            }
         }
     }
 }
@@ -141,6 +153,8 @@ pub struct ConversationViewState {
     pub last_page: u32,
     pub lines: Vec<ratatui::text::Line<'static>>,
     pub scroll: u16,
+    pub sel_msg: usize,
+    pub msg_line_offsets: Vec<u16>,
     pub loading: bool,
     pub error: Option<String>,
 }
