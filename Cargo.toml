@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["common", "wftui"]
+
+# TUI, not a hot proxy: thin LTO and parallel codegen keep link times sane.
+# panic MUST stay "unwind": main.rs wraps the run loop in catch_unwind and a
+# TerminalGuard Drop restores raw mode / alternate screen during unwind. A TUI
+# that aborts leaves the user's terminal broken. Same precedent as deltamud.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+panic = "unwind"
+strip = "symbols"

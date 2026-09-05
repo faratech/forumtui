@@ -1,0 +1,19 @@
+[package]
+name = "wftui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+description = "WindowsForum.com terminal UI client (Linux + Windows)"
+
+[[bin]]
+name = "wftui"
+path = "src/main.rs"
+
+[dependencies]
+common = { path = "../common" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "signal"] }
+ratatui = "0.29"
+crossterm = "0.28"
+time = { version = "0.3", features = ["formatting", "macros"] }
+tracing = "0.1"
