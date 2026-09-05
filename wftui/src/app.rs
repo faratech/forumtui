@@ -2522,13 +2522,18 @@ impl App {
                 return;
             }
             // Every caller that was queued behind the refresh which failed
-            // reports the same rejection, so an OAuth error arriving while
-            // the recheck is still in flight describes the grant that
-            // recheck is already replacing — stale. Ending the session on
-            // it would kick a member whose sibling instance merely rotated
-            // the shared `token.json` (issue #568); the recheck's own
-            // outcome decides, one way or the other.
-            if self.session_recovery_pending && err.kind == TaskErrorKind::OAuth {
+            // reports the same rejection, so an OAuth error — or a second
+            // NoToken, once `valid_token` clears the in-memory guard for
+            // every other queued caller (round 7 regression, issue #580) —
+            // arriving while the recheck is still in flight describes the
+            // grant that recheck is already replacing — stale. Ending the
+            // session on it would kick a member whose sibling instance
+            // merely rotated the shared `token.json` (issue #568); the
+            // recheck's own outcome (`Bootstrap`/`SessionLost`) decides, one
+            // way or the other.
+            if self.session_recovery_pending
+                && matches!(err.kind, TaskErrorKind::OAuth | TaskErrorKind::NoToken)
+            {
                 return;
             }
             self.end_session(&format!("Session expired ({reason}); log in again."));
@@ -2643,8 +2648,38 @@ impl App {
                 self.bootstrap_retry_needed = false;
                 self.session_recovery_tried = false;
                 self.session_recovery_pending = false;
+                // Issue #581: the token recheck (issue #573) re-verifies
+                // identity via `/me` before adopting a foreign token set,
+                // but this arm used to act on it unconditionally — an open
+                // Inbox showing the OLD user's DMs, a Compose draft written
+                // as them, a write still waiting on the politeness gates,
+                // all carried straight over to the new identity with only
+                // "Session restored." A different `user_id` here means the
+                // token store now holds a different account, not just a
+                // rotated grant for the same one — tear the session-shaped
+                // state down the way `end_session` would (short of actually
+                // ending it: the new identity IS signed in).
+                let previous_user_id = self.me.as_ref().map(|u| u.user_id);
+                let identity_changed = previous_user_id.is_some_and(|id| id != user.user_id);
+                if identity_changed {
+                    self.abort_writes();
+                    self.screens.retain(|s| matches!(s, Screen::Home(_) | Screen::ForumTree(_)));
+                    if self.screens.is_empty() {
+                        self.screens.push(screens::home_state(false));
+                    }
+                    self.keep_thread_position = None;
+                    self.palette = None;
+                    self.prefix = Prefix::default();
+                }
+                let username = user.username.clone();
                 self.me = Some(user);
-                self.set_status("Session restored.");
+                if identity_changed {
+                    self.set_hint(format!(
+                        "Token file changed elsewhere \u{2014} now signed in as {username}."
+                    ));
+                } else {
+                    self.set_status("Session restored.");
+                }
                 self.start_pollers();
                 if matches!(self.screens.last(), Some(Screen::Login(_))) {
                     self.screens.pop();
@@ -4033,6 +4068,11 @@ mod tests {
         /// waits on `api_gate`/`write_gate` before it even looks at the
         /// token. Zero by default, so every other test is unaffected.
         write_delay: Duration,
+        /// Overrides `me()`'s default `NoToken` so a test can make the
+        /// bootstrap/recheck `/me` call succeed — issue #580's pinning test
+        /// needs the recheck to actually answer `Bootstrap { Ok }` so it can
+        /// assert that answer is honoured rather than swallowed.
+        me_ok: std::sync::Mutex<Option<User>>,
     }
 
     impl RecordingApi {
@@ -4146,7 +4186,10 @@ mod tests {
             Err(common::error::Error::NoToken)
         }
         async fn me(&self) -> common::error::Result<User> {
-            Err(common::error::Error::NoToken)
+            match self.me_ok.lock().expect("lock").clone() {
+                Some(user) => Ok(user),
+                None => Err(common::error::Error::NoToken),
+            }
         }
         async fn user(&self, _: u32) -> common::error::Result<User> {
             Err(common::error::Error::NoToken)
@@ -4945,6 +4988,98 @@ mod tests {
         });
         assert!(app.me.is_none());
         assert!(app.status.contains("Session expired"), "status: {:?}", app.status);
+    }
+
+    /// Round 7 regression, issue #580: `valid_token()` clearing the
+    /// in-memory guard on a rejected refresh (common/src/api.rs) means every
+    /// OTHER caller queued behind that same refresh reports `NoToken`, not
+    /// just `OAuth` — the 45 s alerts poller and 90 s conversations poller
+    /// fire together, so two `NoToken`s land back-to-back while the first
+    /// one's recheck is still in flight. The old code only swallowed
+    /// `OAuth` in that window, so the second `NoToken` ran `end_session()`
+    /// anyway: it bumped `bootstrap_generation`, so the recheck's own
+    /// `Bootstrap { Ok }` (a sibling's rotated-but-valid token) then arrived
+    /// under the OLD generation and was silently dropped, leaving the
+    /// client holding a live adopted token in memory under a Login screen.
+    #[tokio::test]
+    async fn a_second_no_token_mid_recheck_does_not_end_the_session_and_the_recheck_still_wins() {
+        // A client of our own (not `test_app()`'s shared scratch store) so
+        // we can plant a sibling-rotated token set on disk without racing
+        // any other test that also touches `offline_client()`'s file.
+        let store_path = scratch_config_dir().join("token-580.json");
+        let _ = std::fs::remove_file(&store_path);
+        let store = common::token::Store::with_path(store_path.clone());
+        let client = Arc::new(WfApiClient::with_store(store, OFFLINE_BASE).expect("client init"));
+        client
+            .set_tokens(common::token::TokenSet {
+                access_token: "old-access".into(),
+                refresh_token: "old-refresh".into(),
+                expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                scope: "test".into(),
+            })
+            .await
+            .unwrap();
+        // A sibling instance rotated the refresh token on disk without this
+        // process's knowledge — written straight to the store, bypassing
+        // `client`, exactly like a second `wftui` sharing the config dir.
+        common::token::Store::with_path(store_path)
+            .save(&common::token::TokenSet {
+                access_token: "sibling-access".into(),
+                refresh_token: "sibling-refresh".into(),
+                expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                scope: "test".into(),
+            })
+            .unwrap();
+
+        let expected_user = User { user_id: 7, username: "kemical".into(), ..Default::default() };
+        let mut app = test_app();
+        app.client = client;
+        app.api = Arc::new(RecordingApi {
+            me_ok: std::sync::Mutex::new(Some(expected_user.clone())),
+            ..Default::default()
+        });
+        app.me = Some(expected_user.clone());
+        app.screens.push(screens::home_state(false));
+        let generation_before = app.bootstrap_generation;
+
+        // Two `NoToken`s, back-to-back, with nothing drained from `rx` in
+        // between — exactly the alerts-poller-then-convos-poller race.
+        app.handle_msg(Msg::NodesLoaded(Err(TaskError {
+            message: "not logged in".into(),
+            code: None,
+            max_page: None,
+            kind: TaskErrorKind::NoToken,
+        })));
+        assert!(app.session_recovery_pending, "test setup: the recheck must be in flight");
+        app.handle_msg(Msg::AlertsLoaded(Err(TaskError {
+            message: "not logged in".into(),
+            code: None,
+            max_page: None,
+            kind: TaskErrorKind::NoToken,
+        })));
+
+        assert!(app.me.is_some(), "a second NoToken mid-recheck must not end the session");
+        assert!(!matches!(app.screens.last(), Some(Screen::Login(_))));
+        assert_eq!(
+            app.bootstrap_generation, generation_before,
+            "the second NoToken must not bump the generation the recheck is answering under"
+        );
+
+        // Drain rx: the recheck adopted the sibling's token and its `/me`
+        // (stubbed to succeed) reports the same identity back.
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(1), app.rx.recv())
+            .await
+            .expect("the recheck must report back")
+            .expect("channel open");
+        assert!(matches!(sent, Msg::Bootstrap { result: Ok(_), .. }), "expected Bootstrap {{ Ok }}");
+        app.handle_msg(sent);
+
+        assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(7), "the recheck's Ok must be honoured");
+        assert!(!matches!(app.screens.last(), Some(Screen::Login(_))));
+        assert!(
+            !(app.client.has_tokens().await && matches!(app.screens.last(), Some(Screen::Login(_)))),
+            "must never hold a live adopted token under a Login screen"
+        );
     }
 
     /// Issue #557: `Error::NoToken` in a live session may only mean a second
