@@ -1,67 +1,348 @@
-//! Theme: one palette, dark and light terminal friendly (CSS-var-like roles,
-//! not raw "blue because blue"). `NO_COLOR` flattens everything.
+//! Theme: one role table, four fidelity tiers.
+//!
+//! Principle (DESIGN.md): **brand in the chrome, content in the reader's own
+//! colors**. `text` is `Color::Reset` in every tier so body text, list rows and
+//! post bodies inherit the terminal's own foreground — the client then looks
+//! right in a light terminal and a dark one without a "light theme". Only the
+//! chrome (header band, key caps, selection band, unread marks, badges) carries
+//! WindowsForum blue.
+//!
+//! Tier detection: `NO_COLOR` → Mono; `COLORTERM` = truecolor/24bit →
+//! TrueColor; `TERM` containing `256color` → Ansi256; otherwise Ansi16.
+//! Ansi16 and Mono have no usable selection background, so `selected()` swaps
+//! to the REVERSED modifier there instead of a background color.
 
 use ratatui::style::{Color, Modifier, Style};
 
+/// Color fidelity of the attached terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    TrueColor,
+    Ansi256,
+    Ansi16,
+    Mono,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
+    pub tier: Tier,
+
+    // ---- roles the screens already used (kept, remapped) ----
+    /// All content. Always `Reset` — the reader's own foreground.
     pub text: Color,
+    /// Meta, hints, column headers.
     pub dim: Color,
+    /// Focused border, unread dot, links, headings, spinner.
     pub accent: Color,
+    /// Alias of `accent` (DESIGN.md: "`header` and `link` both map to accent").
     pub link: Color,
+    /// Alias of `accent`.
+    pub header: Color,
     pub warn: Color,
     pub error: Color,
-    pub header: Color,
+    /// Selected row band. `Reset` on Ansi16/Mono — see `selected()`.
     pub selected_bg: Color,
+
+    // ---- new roles ----
+    /// Unfocused borders, rules, quote gutters.
+    pub faint: Color,
+    /// The ONE primary key cap per bar, and the active chip.
+    pub accent_bg: Color,
+    pub accent_fg: Color,
+    /// Every other key cap.
+    pub keycap_bg: Color,
+    pub keycap_fg: Color,
+    /// The header band.
+    pub chrome_bg: Color,
+    pub chrome_fg: Color,
+    pub chrome_dim: Color,
+    /// Unread counts in the header, only when > 0.
+    pub badge_bg: Color,
+    pub badge_fg: Color,
+    /// Solved, gate ready, success toast.
+    pub ok: Color,
+    /// `[ICODE]` / `[CODE]`.
+    pub code_fg: Color,
+    pub code_bg: Color,
+    /// The four-pane mark, clockwise from top-left: red, green, blue, yellow.
+    pub mark_r: Color,
+    pub mark_g: Color,
+    pub mark_b: Color,
+    pub mark_y: Color,
 }
 
 impl Theme {
-    pub const fn dark() -> Self {
+    pub const fn truecolor() -> Self {
         Theme {
-            text: Color::White,
+            tier: Tier::TrueColor,
+            text: Color::Reset,
+            dim: Color::Rgb(0x6F, 0x7C, 0x8B),
+            accent: Color::Rgb(0x4D, 0xA3, 0xF5),
+            link: Color::Rgb(0x4D, 0xA3, 0xF5),
+            header: Color::Rgb(0x4D, 0xA3, 0xF5),
+            warn: Color::Rgb(0xFF, 0xB9, 0x02),
+            error: Color::Rgb(0xF5, 0x4E, 0x25),
+            selected_bg: Color::Rgb(0x17, 0x30, 0x4A),
+            faint: Color::Rgb(0x31, 0x3B, 0x47),
+            accent_bg: Color::Rgb(0x00, 0x78, 0xD4),
+            accent_fg: Color::Rgb(0xFF, 0xFF, 0xFF),
+            keycap_bg: Color::Rgb(0x23, 0x2C, 0x38),
+            keycap_fg: Color::Rgb(0xE6, 0xED, 0xF3),
+            chrome_bg: Color::Rgb(0x0F, 0x6C, 0xBD),
+            chrome_fg: Color::Rgb(0xFF, 0xFF, 0xFF),
+            chrome_dim: Color::Rgb(0xBC, 0xD6, 0xEE),
+            badge_bg: Color::Rgb(0xFF, 0xB9, 0x02),
+            badge_fg: Color::Rgb(0x1A, 0x13, 0x00),
+            ok: Color::Rgb(0x81, 0xB8, 0x00),
+            code_fg: Color::Rgb(0xF0, 0xC6, 0x74),
+            code_bg: Color::Rgb(0x1A, 0x20, 0x28),
+            mark_r: Color::Rgb(0xF5, 0x4E, 0x25),
+            mark_g: Color::Rgb(0x81, 0xB8, 0x00),
+            mark_b: Color::Rgb(0x01, 0xA4, 0xEE),
+            mark_y: Color::Rgb(0xFF, 0xB9, 0x02),
+        }
+    }
+
+    pub const fn ansi256() -> Self {
+        Theme {
+            tier: Tier::Ansi256,
+            text: Color::Reset,
+            dim: Color::Indexed(243),
+            accent: Color::Indexed(75),
+            link: Color::Indexed(75),
+            header: Color::Indexed(75),
+            warn: Color::Indexed(214),
+            error: Color::Indexed(202),
+            selected_bg: Color::Indexed(236),
+            faint: Color::Indexed(238),
+            accent_bg: Color::Indexed(31),
+            accent_fg: Color::Indexed(231),
+            keycap_bg: Color::Indexed(236),
+            keycap_fg: Color::Indexed(254),
+            chrome_bg: Color::Indexed(24),
+            chrome_fg: Color::Indexed(231),
+            chrome_dim: Color::Indexed(153),
+            badge_bg: Color::Indexed(214),
+            badge_fg: Color::Indexed(16),
+            ok: Color::Indexed(106),
+            code_fg: Color::Indexed(221),
+            code_bg: Color::Indexed(234),
+            mark_r: Color::Indexed(202),
+            mark_g: Color::Indexed(106),
+            mark_b: Color::Indexed(45),
+            mark_y: Color::Indexed(214),
+        }
+    }
+
+    pub const fn ansi16() -> Self {
+        Theme {
+            tier: Tier::Ansi16,
+            text: Color::Reset,
             dim: Color::DarkGray,
-            accent: Color::Cyan,
-            link: Color::Blue,
+            accent: Color::LightBlue,
+            link: Color::LightBlue,
+            header: Color::LightBlue,
             warn: Color::Yellow,
             error: Color::Red,
-            header: Color::LightBlue,
-            selected_bg: Color::DarkGray,
+            // No usable 16-color selection band: `selected()` reverses instead.
+            selected_bg: Color::Reset,
+            faint: Color::DarkGray,
+            accent_bg: Color::Blue,
+            accent_fg: Color::White,
+            keycap_bg: Color::DarkGray,
+            keycap_fg: Color::White,
+            chrome_bg: Color::Blue,
+            chrome_fg: Color::White,
+            chrome_dim: Color::Gray,
+            badge_bg: Color::Yellow,
+            badge_fg: Color::Black,
+            ok: Color::Green,
+            code_fg: Color::Yellow,
+            code_bg: Color::Reset,
+            mark_r: Color::Red,
+            mark_g: Color::Green,
+            mark_b: Color::Cyan,
+            mark_y: Color::Yellow,
         }
     }
 
-    pub fn detect() -> Self {
-        if std::env::var_os("NO_COLOR").is_some() {
-            return Theme::no_color();
-        }
-        Theme::dark()
-    }
-
-    pub const fn no_color() -> Self {
+    /// `NO_COLOR`: every role is `Reset`. Emphasis survives as BOLD/REVERSED,
+    /// which is not color.
+    pub const fn mono() -> Self {
         Theme {
+            tier: Tier::Mono,
             text: Color::Reset,
             dim: Color::Reset,
             accent: Color::Reset,
             link: Color::Reset,
+            header: Color::Reset,
             warn: Color::Reset,
             error: Color::Reset,
-            header: Color::Reset,
             selected_bg: Color::Reset,
+            faint: Color::Reset,
+            accent_bg: Color::Reset,
+            accent_fg: Color::Reset,
+            keycap_bg: Color::Reset,
+            keycap_fg: Color::Reset,
+            chrome_bg: Color::Reset,
+            chrome_fg: Color::Reset,
+            chrome_dim: Color::Reset,
+            badge_bg: Color::Reset,
+            badge_fg: Color::Reset,
+            ok: Color::Reset,
+            code_fg: Color::Reset,
+            code_bg: Color::Reset,
+            mark_r: Color::Reset,
+            mark_g: Color::Reset,
+            mark_b: Color::Reset,
+            mark_y: Color::Reset,
         }
     }
+
+    /// Back-compat alias for the pre-redesign constructor used by tests.
+    pub const fn dark() -> Self {
+        Theme::truecolor()
+    }
+
+    /// Back-compat alias for the pre-redesign `NO_COLOR` constructor.
+    pub const fn no_color() -> Self {
+        Theme::mono()
+    }
+
+    pub fn detect() -> Self {
+        if std::env::var_os("NO_COLOR").is_some() {
+            return Theme::mono();
+        }
+        let colorterm = std::env::var("COLORTERM").unwrap_or_default();
+        let colorterm = colorterm.to_ascii_lowercase();
+        if colorterm.contains("truecolor") || colorterm.contains("24bit") {
+            return Theme::truecolor();
+        }
+        let term = std::env::var("TERM").unwrap_or_default();
+        if term.contains("256color") {
+            return Theme::ansi256();
+        }
+        Theme::ansi16()
+    }
+
+    /// True where no selection background exists, so bands must be reversed.
+    fn reverses(&self) -> bool {
+        matches!(self.tier, Tier::Ansi16 | Tier::Mono)
+    }
+
+    // ---- style helpers ----
 
     pub fn base(&self) -> Style {
         Style::new().fg(self.text)
     }
+
     pub fn dim(&self) -> Style {
         Style::new().fg(self.dim)
     }
+
+    pub fn faint(&self) -> Style {
+        Style::new().fg(self.faint)
+    }
+
+    /// The existing no-arg panel title: accent + bold. Kept for callers that
+    /// do not know about focus; `panel_title(focused)` is the new form.
     pub fn title(&self) -> Style {
         Style::new().fg(self.header).add_modifier(Modifier::BOLD)
     }
+
+    /// DESIGN.md calls this `title(focused)`; Rust has no overloading and the
+    /// no-arg `title()` above must keep working, so the focus-aware variant
+    /// carries a distinct name.
+    pub fn panel_title(&self, focused: bool) -> Style {
+        if focused {
+            Style::new().fg(self.text).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(self.dim).add_modifier(Modifier::BOLD)
+        }
+    }
+
+    pub fn border(&self, focused: bool) -> Style {
+        if focused {
+            Style::new().fg(self.accent)
+        } else {
+            Style::new().fg(self.faint)
+        }
+    }
+
     pub fn selected(&self) -> Style {
+        let st = Style::new().add_modifier(Modifier::BOLD);
+        if self.reverses() {
+            st.add_modifier(Modifier::REVERSED)
+        } else {
+            st.bg(self.selected_bg)
+        }
+    }
+
+    /// One key cap. Exactly one cap per key bar is `primary`.
+    pub fn keycap(&self, primary: bool) -> Style {
+        if primary {
+            let st = Style::new()
+                .fg(self.accent_fg)
+                .bg(self.accent_bg)
+                .add_modifier(Modifier::BOLD);
+            if self.reverses() && self.tier == Tier::Mono {
+                return Style::new()
+                    .add_modifier(Modifier::BOLD)
+                    .add_modifier(Modifier::REVERSED);
+            }
+            st
+        } else {
+            let st = Style::new().fg(self.keycap_fg).bg(self.keycap_bg);
+            if self.tier == Tier::Mono {
+                return Style::new().add_modifier(Modifier::BOLD);
+            }
+            st
+        }
+    }
+
+    /// The header band.
+    pub fn chrome(&self) -> Style {
+        let st = Style::new().fg(self.chrome_fg).bg(self.chrome_bg);
+        if self.tier == Tier::Mono {
+            return Style::new().add_modifier(Modifier::REVERSED);
+        }
+        st
+    }
+
+    pub fn chrome_bold(&self) -> Style {
+        self.chrome().add_modifier(Modifier::BOLD)
+    }
+
+    pub fn chrome_dim(&self) -> Style {
+        let st = Style::new().fg(self.chrome_dim).bg(self.chrome_bg);
+        if self.tier == Tier::Mono {
+            return Style::new().add_modifier(Modifier::REVERSED);
+        }
+        st
+    }
+
+    /// Unread counts in the header — render only when the count is > 0.
+    pub fn badge(&self) -> Style {
+        let st = Style::new()
+            .fg(self.badge_fg)
+            .bg(self.badge_bg)
+            .add_modifier(Modifier::BOLD);
+        if self.tier == Tier::Mono {
+            return Style::new()
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::REVERSED);
+        }
+        st
+    }
+
+    pub fn link(&self) -> Style {
         Style::new()
-            .bg(self.selected_bg)
-            .add_modifier(Modifier::BOLD)
+            .fg(self.link)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+
+    pub fn code(&self) -> Style {
+        Style::new().fg(self.code_fg).bg(self.code_bg)
     }
 }
 
@@ -83,5 +364,159 @@ pub fn fmt_time(ts: i64) -> String {
         format!("{}h ago", age / 3600)
     } else {
         format!("{}", t.date())
+    }
+}
+
+/// The list-column age (DESIGN.md row grammar): `14h` under a day, `6d` under
+/// a month, `Jul 26` within the current year, then the bare year.
+///
+/// Never wider than 6 cells, which is what lets the `Active` column be a fixed
+/// right-aligned 6 — a longer spelling would push the whole row.
+pub fn fmt_age(ts: i64) -> String {
+    fmt_age_at(ts, time::OffsetDateTime::now_utc())
+}
+
+/// `fmt_age` with an injected "now", so the ladder is testable without
+/// freezing the clock.
+pub fn fmt_age_at(ts: i64, now: time::OffsetDateTime) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let Ok(t) = time::OffsetDateTime::from_unix_timestamp(ts) else {
+        return String::new();
+    };
+    let age = now.unix_timestamp() - ts;
+    if age < 0 {
+        // A clock skew or a scheduled post: fall back to the date rather than
+        // printing a negative age.
+        return format!("{} {}", MONTHS[t.month() as usize - 1], t.day());
+    }
+    if age < 60 {
+        return "now".into();
+    }
+    if age < 3_600 {
+        return format!("{}m", age / 60);
+    }
+    if age < 86_400 {
+        return format!("{}h", age / 3_600);
+    }
+    if age < 30 * 86_400 {
+        return format!("{}d", age / 86_400);
+    }
+    if t.year() == now.year() {
+        return format!("{} {}", MONTHS[t.month() as usize - 1], t.day());
+    }
+    t.year().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(y: i32, m: time::Month, d: u8) -> time::OffsetDateTime {
+        time::OffsetDateTime::new_utc(
+            time::Date::from_calendar_date(y, m, d).expect("date"),
+            time::Time::from_hms(12, 0, 0).expect("time"),
+        )
+    }
+
+    #[test]
+    fn fmt_age_walks_the_design_ladder() {
+        let now = at(2026, time::Month::August, 30);
+        let n = now.unix_timestamp();
+        assert_eq!(fmt_age_at(n - 5, now), "now");
+        assert_eq!(fmt_age_at(n - 60, now), "1m");
+        assert_eq!(fmt_age_at(n - 45 * 60, now), "45m");
+        assert_eq!(fmt_age_at(n - 14 * 3600, now), "14h");
+        assert_eq!(fmt_age_at(n - 23 * 3600, now), "23h");
+        assert_eq!(fmt_age_at(n - 24 * 3600, now), "1d");
+        assert_eq!(fmt_age_at(n - 6 * 86_400, now), "6d");
+        assert_eq!(fmt_age_at(n - 29 * 86_400, now), "29d");
+        // Past a month, the same calendar year reads as a date…
+        assert_eq!(fmt_age_at(at(2026, time::Month::July, 26).unix_timestamp(), now), "Jul 26");
+        assert_eq!(fmt_age_at(at(2026, time::Month::February, 27).unix_timestamp(), now), "Feb 27");
+        // …and an older year as the year alone.
+        assert_eq!(fmt_age_at(at(2025, time::Month::November, 2).unix_timestamp(), now), "2025");
+        assert_eq!(fmt_age_at(at(2013, time::Month::May, 1).unix_timestamp(), now), "2013");
+    }
+
+    #[test]
+    fn fmt_age_never_exceeds_the_six_cell_active_column() {
+        let now = at(2026, time::Month::August, 30);
+        let n = now.unix_timestamp();
+        let samples = [
+            n, n - 30, n - 3600, n - 59 * 60, n - 23 * 3600, n - 29 * 86_400,
+            at(2026, time::Month::December, 31).unix_timestamp(),
+            at(2026, time::Month::January, 1).unix_timestamp(),
+            at(1999, time::Month::January, 1).unix_timestamp(),
+            n + 5_000, // clock skew
+        ];
+        for s in samples {
+            let out = fmt_age_at(s, now);
+            assert!(
+                out.chars().count() <= 6,
+                "{out:?} is wider than the Active column"
+            );
+        }
+    }
+
+    #[test]
+    fn every_tier_leaves_body_text_to_the_terminal() {
+        for t in [
+            Theme::truecolor(),
+            Theme::ansi256(),
+            Theme::ansi16(),
+            Theme::mono(),
+        ] {
+            assert_eq!(t.text, Color::Reset, "{:?} must not paint body text", t.tier);
+        }
+    }
+
+    #[test]
+    fn mono_paints_nothing() {
+        let t = Theme::mono();
+        for c in [
+            t.dim, t.accent, t.link, t.header, t.warn, t.error, t.selected_bg, t.faint,
+            t.accent_bg, t.accent_fg, t.keycap_bg, t.keycap_fg, t.chrome_bg, t.chrome_fg,
+            t.chrome_dim, t.badge_bg, t.badge_fg, t.ok, t.code_fg, t.code_bg, t.mark_r,
+            t.mark_g, t.mark_b, t.mark_y,
+        ] {
+            assert_eq!(c, Color::Reset);
+        }
+        // Emphasis survives without color.
+        assert!(t.selected().add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn low_color_tiers_reverse_the_selection_band_instead_of_tinting_it() {
+        assert!(
+            Theme::ansi16()
+                .selected()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            !Theme::truecolor()
+                .selected()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(Theme::truecolor().selected().bg, Some(Theme::truecolor().selected_bg));
+    }
+
+    #[test]
+    fn focus_changes_border_and_title() {
+        let t = Theme::truecolor();
+        assert_eq!(t.border(true).fg, Some(t.accent));
+        assert_eq!(t.border(false).fg, Some(t.faint));
+        assert_eq!(t.panel_title(true).fg, Some(t.text));
+        assert_eq!(t.panel_title(false).fg, Some(t.dim));
+    }
+
+    #[test]
+    fn primary_keycap_is_the_only_accent_background() {
+        let t = Theme::truecolor();
+        assert_eq!(t.keycap(true).bg, Some(t.accent_bg));
+        assert_eq!(t.keycap(false).bg, Some(t.keycap_bg));
     }
 }

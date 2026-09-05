@@ -2,22 +2,35 @@
 name = "common"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.98"
 publish = false
 description = "Core library for the wftui WindowsForum terminal client: OAuth login, API client, throttling, BBCode rendering"
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "signal"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "gzip", "brotli", "multipart", "json"] }
+# reqwest 0.13 renamed the TLS features and split `form`/`query` out of the
+# always-on core. Its plain `rustls` feature now hard-wires the **aws-lc-rs**
+# provider, which vendors a ~70 MB AWS-LC C source tree and needs a C toolchain
+# (plus NASM on windows-msvc, since aws-lc-rs's `prebuilt-nasm` is opt-in) —
+# that would break the "native `cargo build --release`, no C library" Windows
+# story. `rustls-no-provider` keeps rustls and the platform certificate
+# verifier but leaves the crypto provider to us, so we install *ring* (the
+# provider reqwest 0.12's `rustls-tls` used) in `http::build`. Root store note:
+# 0.12's `rustls-tls` bundled the webpki roots; 0.13 always uses
+# `rustls-platform-verifier`, i.e. the OS trust store.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "gzip", "brotli", "multipart", "json", "form", "query"] }
+# Direct dependency only to pick the crypto provider; must stay in lockstep
+# with the rustls reqwest resolves (`cargo tree -i rustls` shows one version).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-dirs = "5"
+dirs = "6"
 time = { version = "0.3", features = ["formatting", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sha2 = "0.10"
+sha2 = "0.11"
 base64ct = { version = "1", features = ["alloc"] }
-rand = "0.8"
+rand = "0.10"
 async-trait = "0.1"
 
 [dev-dependencies]

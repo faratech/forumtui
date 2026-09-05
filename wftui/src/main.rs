@@ -5,8 +5,12 @@
 //! during unwind). This is why the workspace profile pins panic = "unwind".
 
 mod app;
+pub mod chrome;
 pub mod editor;
 mod event;
+pub mod glyph;
+pub mod images;
+mod overlay;
 mod screens;
 mod theme;
 
@@ -29,12 +33,22 @@ fn main() -> std::process::ExitCode {
         original_hook(panic_info);
     }));
 
+    // Graphics tier detection FIRST, while this thread is still the only
+    // reader of stdin. The query writes capability escapes and blocks reading
+    // the terminal's replies; CLAUDE.md hard rule 3 says input comes from the
+    // one dedicated blocking reader thread (`event::spawn_reader`, started
+    // inside `app::run`), and two readers racing stdin would split the reply
+    // exactly the way the login-corruption incident split escape sequences.
+    // It also runs before raw mode and the alternate screen: the query drives
+    // termios itself, which is the ordering ratatui-image's own binary uses.
+    let images = images::Images::detect();
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rt.block_on(app::run())
+        rt.block_on(app::run(images))
     }));
     match result {
         Ok(code) => code.into(),

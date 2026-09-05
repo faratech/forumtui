@@ -11,7 +11,7 @@ deployed.
 ```bash
 cd /web/wftui_app
 cargo build --release                 # release binary
-cargo test                            # unit + wiremock (49 tests)
+cargo test --workspace                # unit + wiremock (188 tests; 110 with --no-default-features)
 cargo clippy --all-targets --release -- -D warnings   # gate — must stay at 0
 cp target/release/wftui bin/wftui     # stable artifact location
 cp bin/wftui /usr/local/bin/wftui     # deploy on the server (also on PATH)
@@ -20,7 +20,18 @@ cp bin/wftui /usr/local/bin/wftui     # deploy on the server (also on PATH)
 Release binary is also committed at `bin/wftui` so non-developer machines can
 grab it without a toolchain. `scripts/` is reserved for an optional
 cargo-xwin Windows cross-build — the supported Windows story is a native
-`cargo build --release` (the dep set is pure-Rust: rustls, not OpenSSL).
+`cargo build --release` with no external C library to find: TLS is rustls, not
+OpenSSL, and its crypto provider is *ring*, which ships pre-generated
+windows-msvc objects. reqwest 0.13's plain `rustls` feature would instead
+hard-wire **aws-lc-rs**, whose `aws-lc-sys` vendors a ~70 MB AWS-LC C source
+tree and needs NASM on windows-msvc (its `prebuilt-nasm` escape hatch is
+opt-in), so `common/` takes `rustls-no-provider` and installs the ring provider
+itself in `http::build`. Don't "simplify" that back to `rustls`.
+
+Both crates carry `rust-version = "1.98"`. Nothing in the graph forces that —
+the highest transitive MSRV is 1.90 (`quantette`/`ordered-float`, via the image
+decoder chain), with ratatui 0.30, image and time at 1.88 — it is simply the
+toolchain the client is developed and released against.
 
 ## Architecture
 
@@ -43,6 +54,7 @@ Two-crate workspace (house style from `services/mirror`: resolver 2, edition
     `WFTUI_OAUTH_CLIENT_ID`, `WFTUI_CONFIG_DIR`, `WFTUI_LOG`).
 - `wftui/` — the binary: `app.rs` (event loop, message pump, mouse selection),
   `event.rs` (dedicated blocking reader thread), `theme.rs`,
+  `images.rs` (graphics tiers, sizing, LRU + `cache/img/` disk cache),
   `screens/` (browse/social/misc renderers + key handlers).
 
 ## Hard rules (each closes a real bug — do not regress)
@@ -107,10 +119,46 @@ set -g mouse on                # forward mouse events to the TUI (drag-select, w
   (`\x1b[<0;x;yM` / `m`) and keys, and assert on the rendered screen. A raw
   byte dump is NOT enough — frames are diffed.
 
+## Inline graphics (cargo feature `images`, default on)
+
+`images.rs` maps DESIGN.md's five tiers onto `ratatui-image` 11.x, which tracks
+`ratatui = "^0.30.1"` — the same major we pin — so exactly one ratatui
+resolves, and its `crossterm` feature routes through `ratatui-crossterm`'s
+default `crossterm_0_29`, so exactly one crossterm resolves. Assert both with
+`cargo tree -i ratatui` and `cargo tree -i crossterm`; a second copy of either
+is a build that will not link the widget against our buffer.
+
+`default-features = false` is load-bearing, and it is what keeps the dep set
+pure-Rust: `chafa-dyn` and `chafa-static` are the only ratatui-image features
+that reach for a C library (they add a `pkg-config` build-dependency whose
+`build.rs` probes libchafa and panics the build without it), and `chafa-dyn` is
+on by default. `crossterm` + `image-defaults` is the whole feature set we want:
+kitty, sixel (pure-Rust `icy_sixel`), iTerm2 and half-blocks are not
+feature-gated — they are always compiled and chosen at runtime by `Picker` —
+and `image-defaults` is what gives us PNG/GIF/WEBP instead of JPEG only.
+`cargo build --no-default-features` drops the decoder entirely and leaves tier 5.
+
+The capability query reads stdin, so it runs in `main.rs` **before**
+`app::run` spawns the reader thread (hard rule 3). Image escapes are written
+only by the crate's widget, through ratatui's sanctioned diff-option path: the
+whole payload goes in one anchor `Cell`'s symbol, flagged
+`CellDiffOption::ForcedWidth(1)` so ratatui bills it one column instead of its
+byte width, and every cell the image covers is flagged `CellDiffOption::Skip`.
+(ratatui 0.30 replaced the old `Cell::skip` bool with `Cell::diff_option`, and
+`Cell::skip`/`set_skip` are deprecated — reading `skip` now silently misses
+every image cell.) That is why `capture_screen`, `paint_selection` and the
+overlays all have to leave those cells alone: `app::is_image_cell` is the
+shared probe and it tests `diff_option != None`, the kitty-tier test in
+`images.rs` pins the marking, and images are suppressed entirely while an
+overlay is up. `WFTUI_NO_IMAGES=1` or `NO_COLOR` forces tier 5.
+
 ## Known gaps
 
 - Attachment upload is implemented in `common` but not wired into the compose
-  screen; attachment viewing is via URLs only.
+  screen; attachment *viewing* is inline on tiers 1-4 (thumbnails, ≤ 40 % of
+  the panel and ≤ 12 rows) and `1`–`9` opens the nth image in a browser on
+  every tier. Enter-to-expand is not implemented: it needs a second, larger
+  encode inside an overlay, and overlays deliberately suppress image draws.
 - Double-click word-select / triple-click line-select not implemented (drag +
   release = copy is).
 - Windows packaging is documentation-only (native build; no CI).

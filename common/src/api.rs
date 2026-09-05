@@ -196,6 +196,64 @@ impl WfApiClient {
         let resp = self.http.get(url).bearer_auth(&token).send().await?.error_for_status()?;
         Ok(resp.bytes().await?.to_vec())
     }
+
+    /// Fetch raw bytes from an absolute URL — the images tier
+    /// (`wftui/src/images.rs`) uses this for `thumbnail_url`/`direct_url`/
+    /// `avatar_urls` values off `Attachment`/`User`. Inherent, not on
+    /// `WfApi`: same reasoning as `attachment_data` above — this is a raw-HTTP
+    /// concern, not a forum-data operation the trait's mock implementations
+    /// need to fake.
+    ///
+    /// Goes through `api_gate` like every other call (one shared politeness
+    /// budget), and the request carries the client UA because it's the same
+    /// pooled `reqwest::Client` every other method uses — `http::build()`
+    /// bakes `config::user_agent()` in at construction (hard rule 6), so
+    /// there is nothing extra to set per-request.
+    ///
+    /// Refuses anything whose `Content-Type` doesn't start with `image/`, and
+    /// caps the body at `max_bytes`: first cheaply, via `Content-Length` if
+    /// the server sent one; then for real, by checking the length of the
+    /// bytes actually received (a lying or missing `Content-Length` must not
+    /// bypass the cap — the buffer is still fully read either way, same as
+    /// `attachment_data` above, but thumbnails are small enough that this is
+    /// not worth a streaming dependency).
+    pub async fn fetch_bytes(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        self.api_gate.wait().await;
+        let resp = self.http.get(url).send().await?.error_for_status()?;
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if !content_type.starts_with("image/") {
+            return Err(Error::FetchRejected(format!(
+                "refusing non-image content-type {content_type:?} from {url}"
+            )));
+        }
+
+        if let Some(len) = resp.content_length()
+            && len as usize > max_bytes
+        {
+            return Err(Error::FetchRejected(format!(
+                "Content-Length {len} exceeds cap {max_bytes} for {url}"
+            )));
+        }
+
+        let bytes = resp.bytes().await?;
+        if bytes.len() > max_bytes {
+            return Err(Error::FetchRejected(format!(
+                "response body {} bytes exceeds cap {max_bytes} for {url}",
+                bytes.len()
+            )));
+        }
+        Ok(bytes.to_vec())
+    }
 }
 
 pub(crate) async fn check_status(resp: reqwest::Response) -> Result<()> {
@@ -916,6 +974,219 @@ mod tests {
         let res = c.search_member(42, "thread", 1).await.unwrap();
         assert_eq!(res.results.len(), 1);
         assert_eq!(res.results[0].title, "Member Thread");
+    }
+
+    #[tokio::test]
+    async fn post_with_two_attachments_and_author_avatar_deserializes() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-postattach");
+        Mock::given(method("GET"))
+            .and(path("/api/threads/500"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "thread": {"thread_id": 500, "title": "Screens"},
+                "posts": [{
+                    "post_id": 1,
+                    "thread_id": 500,
+                    "user_id": 10,
+                    "username": "op",
+                    "message": "[IMG]1[/IMG] [IMG]2[/IMG]",
+                    "attach_count": 2,
+                    "User": {
+                        "user_id": 10,
+                        "username": "op",
+                        "avatar_urls": {
+                            "s": "https://windowsforum.com/data/avatars/s/0/10.jpg",
+                            "m": "https://windowsforum.com/data/avatars/m/0/10.jpg",
+                            "l": "https://windowsforum.com/data/avatars/l/0/10.jpg",
+                            "h": "https://windowsforum.com/data/avatars/h/0/10.jpg",
+                            "o": "https://windowsforum.com/data/avatars/o/0/10.jpg"
+                        }
+                    },
+                    "Attachments": [
+                        {
+                            "attachment_id": 101,
+                            "content_type": "post",
+                            "content_id": 1,
+                            "attach_date": 1700000000,
+                            "view_count": 3,
+                            "filename": "screenshot.png",
+                            "file_size": 204800,
+                            "width": 1920,
+                            "height": 1080,
+                            "is_video": false,
+                            "is_audio": false,
+                            "thumbnail_url": "https://windowsforum.com/attachments/screenshot-png.101/thumb",
+                            "direct_url": "https://windowsforum.com/attachments/screenshot-png.101/"
+                        },
+                        {
+                            "attachment_id": 102,
+                            "content_type": "post",
+                            "content_id": 1,
+                            "attach_date": 1700000001,
+                            "view_count": 0,
+                            "filename": "log.txt",
+                            "file_size": 512,
+                            "width": null,
+                            "height": null,
+                            "is_video": false,
+                            "is_audio": false,
+                            "direct_url": "https://windowsforum.com/attachments/log-txt.102/"
+                        }
+                    ]
+                }],
+                "pagination": {"current_page": 1, "last_page": 1, "total": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let reply = c.thread(500, 1).await.unwrap();
+        let post = &reply.posts[0];
+
+        assert_eq!(post.attachments.len(), 2);
+        let img = &post.attachments[0];
+        assert_eq!(img.attachment_id, 101);
+        assert_eq!(img.filename, "screenshot.png");
+        assert_eq!(img.extension(), "png");
+        assert!(img.is_image());
+        assert_eq!(img.width, Some(1920));
+        assert_eq!(img.height, Some(1080));
+        assert_eq!(img.file_size, 204800);
+        assert!(img.thumbnail_url.as_deref().unwrap().ends_with("/thumb"));
+        assert!(img.direct_url.is_some());
+        assert!(img.view_url.is_none());
+
+        let file = &post.attachments[1];
+        assert_eq!(file.extension(), "txt");
+        assert!(!file.is_image());
+        assert!(file.thumbnail_url.is_none(), "non-image has no thumbnail");
+        assert!(file.width.is_none());
+
+        let author = post.user.as_ref().expect("post carries its author");
+        assert_eq!(author.username, "op");
+        let avatars = author.avatar_urls.as_ref().expect("avatar_urls present");
+        assert!(avatars.s.as_deref().unwrap().contains("/s/"));
+        assert!(avatars.m.as_deref().unwrap().contains("/m/"));
+        assert!(avatars.l.as_deref().unwrap().contains("/l/"));
+        assert!(avatars.h.as_deref().unwrap().contains("/h/"));
+        assert!(avatars.o.as_deref().unwrap().contains("/o/"));
+    }
+
+    #[tokio::test]
+    async fn post_with_no_attachments_defaults_to_empty_vec() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-postnoattach");
+        Mock::given(method("GET"))
+            .and(path("/api/threads/501"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "thread": {"thread_id": 501, "title": "No pics"},
+                // Real XF omits the "Attachments" key entirely when
+                // attach_count is 0 (setupApiResultData only calls
+                // includeRelation when $this->attach_count is truthy).
+                "posts": [{"post_id": 2, "thread_id": 501, "username": "op", "message": "text only"}],
+                "pagination": {"current_page": 1, "last_page": 1, "total": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let reply = c.thread(501, 1).await.unwrap();
+        assert!(reply.posts[0].attachments.is_empty());
+        assert!(reply.posts[0].user.is_none());
+    }
+
+    #[tokio::test]
+    async fn user_avatar_urls_parse_all_five_sizes() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-useravatar");
+        Mock::given(method("GET"))
+            .and(path("/api/users/77"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user": {
+                    "user_id": 77,
+                    "username": "Aria",
+                    "avatar_urls": {
+                        "s": "https://windowsforum.com/data/avatars/s/0/77.jpg",
+                        "m": "https://windowsforum.com/data/avatars/m/0/77.jpg",
+                        "l": "https://windowsforum.com/data/avatars/l/0/77.jpg",
+                        "h": "https://windowsforum.com/data/avatars/h/0/77.jpg",
+                        "o": "https://windowsforum.com/data/avatars/o/0/77.jpg"
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let user = c.user(77).await.unwrap();
+        let avatars = user.avatar_urls.unwrap();
+        assert_eq!(avatars.s.as_deref(), Some("https://windowsforum.com/data/avatars/s/0/77.jpg"));
+        assert_eq!(avatars.o.as_deref(), Some("https://windowsforum.com/data/avatars/o/0/77.jpg"));
+    }
+
+    #[tokio::test]
+    async fn fetch_bytes_refuses_non_image_content_type() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-fetchbadtype");
+        Mock::given(method("GET"))
+            .and(path("/not-an-image"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/html; charset=utf-8")
+                    .set_body_bytes(b"<html>nope</html>".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let url = format!("{}/not-an-image", server.uri());
+        match c.fetch_bytes(&url, 1_000_000).await.unwrap_err() {
+            Error::FetchRejected(msg) => assert!(msg.contains("text/html"), "{msg}"),
+            other => panic!("wrong error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_bytes_enforces_size_cap() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-fetchtoobig");
+        Mock::given(method("GET"))
+            .and(path("/big.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "image/png")
+                    .set_body_bytes(vec![0u8; 2048]),
+            )
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let url = format!("{}/big.png", server.uri());
+        match c.fetch_bytes(&url, 1024).await.unwrap_err() {
+            Error::FetchRejected(msg) => assert!(msg.contains("1024"), "{msg}"),
+            other => panic!("wrong error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_bytes_returns_image_body_under_cap() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-fetchok");
+        Mock::given(method("GET"))
+            .and(path("/thumb.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "image/png")
+                    .set_body_bytes(vec![7u8; 256]),
+            )
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let url = format!("{}/thumb.png", server.uri());
+        let bytes = c.fetch_bytes(&url, 1024).await.unwrap();
+        assert_eq!(bytes.len(), 256);
+        assert!(bytes.iter().all(|&b| b == 7));
     }
 
     #[tokio::test]

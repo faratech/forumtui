@@ -5,8 +5,7 @@ use std::time::Duration;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::style::Style;
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use tokio::sync::mpsc;
@@ -15,7 +14,10 @@ use common::api::{WfApi, WfApiClient};
 use common::error::Error;
 use common::models::*;
 
+use crate::chrome::{self, GateState};
 use crate::event;
+use crate::glyph::{self, Glyphs};
+use crate::overlay::{self, GoTarget, Palette, PaletteEvent, Prefix, PrefixEvent};
 use crate::screens::{self, Action, ComposeTarget, Screen};
 use crate::theme::Theme;
 
@@ -59,7 +61,11 @@ pub enum Msg {
     LoginFailed(String),
     LoginComplete(Result<User, TaskError>),
     NodesLoaded(TaskResult<Vec<Node>>),
-    ForumLoaded { page: u32, result: TaskResult<ForumReply> },
+    /// A forum page came back. `node_id` is the forum that was asked for, so
+    /// a reply that outraced a newer request is dropped instead of landing in
+    /// whichever list happens to be on top (`Gate::wait` only spaces request
+    /// *starts*, so two `load_forum` calls can finish out of order).
+    ForumLoaded { node_id: u32, page: u32, result: TaskResult<ForumReply> },
     ThreadLoaded { id: u32, page: u32, result: TaskResult<ThreadReply> },
     ReplySent(TaskResult<Post>),
     ThreadCreated(TaskResult<Thread>),
@@ -68,12 +74,25 @@ pub enum Msg {
     ConversationLoaded { id: u32, page: u32, result: TaskResult<ConversationReply> },
     ConvoReplySent(TaskResult<()>),
     ConvoCreated(TaskResult<Conversation>),
+    ConversationMarked(TaskResult<()>),
     RecipientResolved { name: String, id: Option<u32> },
     AlertsLoaded(TaskResult<AlertsReply>),
     AlertMarked(TaskResult<()>),
     SearchDone { page: u32, result: TaskResult<SearchResultsReply> },
+    /// A go-to palette member lookup came back. `query` is the palette query
+    /// that asked, so a stale answer to an edited query is dropped.
+    PaletteMember { query: String, user: Option<User> },
     ProfileLoaded(TaskResult<User>),
     LoggedOut(Result<(), String>),
+    /// A thumbnail / avatar / the sign-in logo finished loading off-thread.
+    /// Only sent by the `images` feature's loader.
+    /// `key` is `images::store_key(url, cols, rows)` — decoded payloads are
+    /// sized for one exact rect, so a resize re-encodes rather than stretches.
+    #[cfg_attr(not(feature = "images"), allow(dead_code))]
+    ImageLoaded {
+        key: String,
+        result: Result<crate::images::Decoded, String>,
+    },
     Notice(String),
 }
 
@@ -83,12 +102,19 @@ pub struct App {
     pub tx: mpsc::UnboundedSender<Msg>,
     rx: mpsc::UnboundedReceiver<Msg>,
     pub theme: Theme,
+    pub glyphs: Glyphs,
+    /// Inline graphics: detected tier, decoded-protocol LRU, disk cache.
+    pub images: crate::images::Images,
     pub screens: Vec<Screen>,
     pub me: Option<User>,
     pub alerts_unread: u32,
     pub convos_unread: u32,
     pub status: String,
     show_help: bool,
+    /// The go-to palette, when it is open. It owns the keyboard while it is.
+    palette: Option<Palette>,
+    /// The `g` chord: armed by `g`, resolved (or cancelled) by the next key.
+    prefix: Prefix,
     /// Mouse drag selection (anchor cell, end cell).
     selection: Option<Selection>,
     /// Mirror of the last drawn frame's cell symbols per row + byte offsets
@@ -167,7 +193,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub async fn run() -> u8 {
+pub async fn run(images: crate::images::Images) -> u8 {
     let _guard = match TerminalGuard::new() {
         Ok(g) => g,
         Err(e) => {
@@ -199,12 +225,16 @@ pub async fn run() -> u8 {
         tx,
         rx,
         theme: Theme::detect(),
+        glyphs: glyph::detect(),
+        images,
         screens: Vec::new(),
         me: None,
         alerts_unread: 0,
         convos_unread: 0,
         status: "Starting…".into(),
         show_help: false,
+        palette: None,
+        prefix: Prefix::default(),
         selection: None,
         screen_rows: Vec::new(),
         screen_cols: Vec::new(),
@@ -254,10 +284,7 @@ pub async fn run() -> u8 {
 
 impl App {
     async fn bootstrap(&mut self) {
-        self.screens.push(Screen::ForumTree(screens::ForumTreeState {
-            loading: true,
-            ..Default::default()
-        }));
+        self.screens.push(screens::home_state(true));
         if self.client.has_tokens().await {
             self.status = "Restoring session…".into();
             let api = self.api.clone();
@@ -324,6 +351,9 @@ impl App {
             if self.should_quit {
                 return 0;
             }
+            // Debounced palette member lookup: the loop's idle path is the
+            // only place with a clock, and typing must not fan out requests.
+            self.poll_palette_member();
             // Wait up to 50ms for input; yields periodically to allow background tasks / pollers to refresh status.
             if let Some(first) = crate::event::next(&reader, Duration::from_millis(50)) {
                 let mut inputs = vec![first];
@@ -370,39 +400,122 @@ impl App {
     }
 
     fn draw(&mut self, f: &mut Frame) {
-        let [top, body, status] = Layout::vertical([
+        // The three zones of DESIGN.md: header band, body, key bar + status.
+        let [top, body, keys, status] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
+            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .areas(f.area());
 
-        let me_name = self
-            .me
-            .as_ref()
-            .map(|u| u.username.as_str())
-            .unwrap_or("anonymous");
-        let top_line = Line::from(vec![
-            Span::styled(" wftui ", self.theme.title()),
-            Span::styled(me_name.to_string(), self.theme.dim()),
-            Span::raw("  "),
-            Span::styled(
-                format!("✉ {} unread", self.convos_unread),
-                self.theme.dim(),
-            ),
-            Span::raw("  "),
-            Span::styled(format!("🔔 {} new", self.alerts_unread), self.theme.dim()),
-        ]);
-        f.render_widget(Paragraph::new(top_line), top);
+        // Crumbs are the screen stack's own names. Login is excluded: it is a
+        // gate, not a place, and it owns the whole screen while it is up.
+        // Home is one screen but two places: `Forums › <current forum>`. Every
+        // other screen contributes exactly its own crumb; Login contributes
+        // none (it is a gate, not a place).
+        let mut crumbs: Vec<String> = Vec::with_capacity(self.screens.len() + 1);
+        for s in &self.screens {
+            match s {
+                Screen::Login(_) => {}
+                Screen::Home(h) => {
+                    crumbs.push("Forums".to_string());
+                    if !h.list.title.is_empty() {
+                        crumbs.push(h.list.title.clone());
+                    }
+                }
+                other => crumbs.push(other.crumb()),
+            }
+        }
+        let me_name = self.me.as_ref().map(|u| u.username.as_str());
+        f.render_widget(
+            Paragraph::new(chrome::header_line(
+                &self.theme,
+                &self.glyphs,
+                &crumbs,
+                me_name,
+                self.convos_unread,
+                self.alerts_unread,
+                None,
+                top.width,
+            )),
+            top,
+        );
 
         // Render the top screen; popups handled inside renderers.
+        // The graphics policy is stamped on first: the thread view reserves
+        // rows for inline images while it wraps text, so a tier change has to
+        // reach it before `render` rebuilds the lines.
+        let policy = self.images.policy();
         let screen = self.screens.last_mut().expect("screen stack never empty");
+        screen.set_image_policy(policy);
         let screen_title = screen.title().to_string();
-        screen.render(f, body, &self.theme);
+        let screen_hints = screen.hints();
+        let keys_group = screen.keys_group();
+        screen.render(f, body, &self.theme, &self.glyphs);
+
+        // Inline images, painted over the rects the screen just reserved.
+        // Suppressed while any overlay is up: `overlay::dim_body` re-styles
+        // every body cell (kitty's placeholders encode the image id in the
+        // cell colours) and the overlay's own `Clear` erases the rect for that
+        // frame. Closing the overlay makes the cells differ again, so the next
+        // frame re-emits the image without any extra bookkeeping.
+        let overlay_open = self.palette.is_some()
+            || self.show_help
+            || self.prefix.armed()
+            || capture_active(self);
+        if !overlay_open {
+            let reqs: Vec<crate::images::Request> = self
+                .screens
+                .last()
+                .map(|s| s.image_requests().to_vec())
+                .unwrap_or_default();
+            for pending in self.images.paint(f, &reqs) {
+                self.spawn_image_load(pending);
+            }
+        }
+
+        // Overlays cover the body only: the header band, the key bar and the
+        // status row always keep saying what is true. An overlay that owns the
+        // keyboard also owns the key bar and the status text.
+        let mut bar: Option<chrome::Hints> = None;
+        let mut status_left = self.status.clone();
+        if self.palette.is_some() || self.show_help {
+            overlay::dim_body(f, body, &self.theme);
+        }
+        if let Some(p) = &self.palette {
+            p.render(f, body, &self.theme, &self.glyphs);
+            bar = Some(Palette::hints(&self.glyphs));
+            status_left = Palette::status().to_string();
+        }
+        if self.prefix.armed() {
+            overlay::render_which_key(f, body, &self.theme, &self.glyphs);
+        }
+        if self.show_help {
+            overlay::render_keys_card(
+                f,
+                body,
+                &self.theme,
+                &self.glyphs,
+                keys_group,
+                &screen_hints,
+            );
+            bar = Some(overlay::keys_card_hints());
+            status_left = overlay::keys_card_status().to_string();
+        }
+
+        f.render_widget(
+            Paragraph::new(chrome::key_bar(
+                &self.theme,
+                bar.as_ref().unwrap_or(&screen_hints),
+                keys.width,
+            )),
+            keys,
+        );
 
         let new_title = if self.alerts_unread > 0 || self.convos_unread > 0 {
             format!(
-                "wftui · {screen_title} [✉ {} · 🔔 {}]",
+                "wftui · {screen_title} [{} DM · {} alerts]",
                 self.convos_unread, self.alerts_unread
             )
         } else {
@@ -413,41 +526,28 @@ impl App {
             self.last_title = new_title;
         }
 
-        let status_line = Line::from(Span::styled(
-            format!(" {} ", self.status),
-            Style::new().fg(self.theme.dim),
-        ));
-        f.render_widget(Paragraph::new(status_line), status);
-
-        if self.show_help {
-            let area = crate::screens::centered_box(f.area(), 64, 17);
-            f.render_widget(ratatui::widgets::Clear, area);
-            let block = ratatui::widgets::Block::default()
-                .borders(ratatui::widgets::Borders::ALL)
-                .border_style(self.theme.accent)
-                .title(Span::styled(" Keys (? closes) ", self.theme.title()));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
-            let keys = [
-                "Enter/1/2/3  open forum · news · alerts · tutorials",
-                "j/k ↑↓       move            Enter open",
-                "[ ] PgUp/Dn  page            r refresh",
-                "r reply      N new thread    m mark read",
-                "o links      u open in web   p OP profile",
-                "c DMs        a alerts        s search",
-                "i edit query (search)        n new DM",
-                "Ctrl+S send (compose)        Tab next field",
-                "Esc back     q quit          Ctrl+L logout",
-                "drag mouse   select + copy   wheel scroll  Ctrl+Y paste",
-                "Ctrl+C copy selection (quits if none selected)",
-                "Shift/Option+drag bypass capture for native select",
-            ];
-            let lines: Vec<Line> = keys
-                .iter()
-                .map(|k| Line::from(Span::styled((*k).to_string(), self.theme.base())))
-                .collect();
-            f.render_widget(Paragraph::new(lines), inner);
-        }
+        // The write gate is the one thing on the status row that must always
+        // be readable: it is the difference between "wait" and "we 429ed".
+        let pending = self.client.write_gate.pending_wait();
+        let gate = if pending.is_zero() {
+            GateState::Ready
+        } else {
+            GateState::Waiting {
+                left: pending,
+                total: Duration::from_millis(common::config::WRITE_COOLDOWN_MS),
+            }
+        };
+        f.render_widget(
+            Paragraph::new(chrome::status_line(
+                &self.theme,
+                &self.glyphs,
+                &status_left,
+                Style::new().fg(self.theme.dim),
+                gate,
+                status.width,
+            )),
+            status,
+        );
 
         self.paint_selection(f);
         self.capture_screen(f);
@@ -465,7 +565,17 @@ impl App {
             let mut offsets = Vec::with_capacity(area.width as usize + 1);
             for x in 0..area.width {
                 offsets.push(row.len());
-                row.push_str(f.buffer_mut()[(x, y)].symbol());
+                let cell = &f.buffer_mut()[(x, y)];
+                // Image cells are not text: `ratatui-image` puts a whole
+                // escape payload in one anchor cell's symbol and marks the
+                // rest of the rect `Skip`. Copying either into the selection
+                // mirror would put raw escape bytes on the user's clipboard
+                // and desync every byte offset on the row.
+                if is_image_cell(cell) {
+                    row.push(' ');
+                } else {
+                    row.push_str(cell.symbol());
+                }
             }
             offsets.push(row.len());
             rows.push(row);
@@ -482,6 +592,23 @@ impl App {
             self.logout();
             return;
         }
+        // The palette owns every key while it is up, including `?` and Esc.
+        // The event is taken first so the arms can borrow `self` again.
+        if let Some(event) = self.palette.as_mut().map(|p| p.key(k)) {
+            match event {
+                PaletteEvent::None => {}
+                PaletteEvent::Close => {
+                    self.palette = None;
+                    self.status.clear();
+                }
+                PaletteEvent::Run(target) => {
+                    self.palette = None;
+                    self.status.clear();
+                    self.run_palette_target(target);
+                }
+            }
+            return;
+        }
         if k.code == KeyCode::Char('?') && !self.input_active() {
             self.show_help = !self.show_help;
             return;
@@ -493,19 +620,50 @@ impl App {
                 return;
             }
         }
+        // The key after `g` resolves the chord or cancels it; either way it is
+        // consumed, so a mistyped chord never fires a stray command.
+        if self.prefix.armed() {
+            if let PrefixEvent::Go(target) = self.prefix.resolve(k) {
+                self.go(target);
+            }
+            return;
+        }
         let capture = self.screens.last().map(|s| s.input_capture()).unwrap_or(false);
+        // `Ctrl+K` / `:` / `g` / `G` only when no input field owns the keyboard
+        // (`^K` is BBCode `[ICODE]` in the composer) and only once there is a
+        // session to navigate — the login screen is a gate, not a place.
+        let plain = k.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+        if self.me.is_some() && !capture && !self.input_active() {
+            let palette_key = (k.modifiers.contains(KeyModifiers::CONTROL)
+                && k.code == KeyCode::Char('k'))
+                || (plain && k.code == KeyCode::Char(':'));
+            if palette_key {
+                self.open_palette();
+                return;
+            }
+            if plain && k.code == KeyCode::Char('g') {
+                self.prefix.arm();
+                return;
+            }
+            if plain && k.code == KeyCode::Char('G') {
+                if let Some(screen) = self.screens.last_mut() {
+                    screen.goto_bottom();
+                }
+                return;
+            }
+        }
         // Global navigation only when no input field owns the keyboard.
         if k.modifiers.is_empty() && !capture && !self.input_active() {
             match k.code {
                 KeyCode::Char('c') => {
-                    self.open_conversations();
+                    self.open_inbox(screens::InboxTab::Conversations);
                     return;
                 }
                 KeyCode::Char('a') => {
-                    self.open_alerts();
+                    self.open_inbox(screens::InboxTab::Alerts);
                     return;
                 }
-                KeyCode::Char('s') => {
+                KeyCode::Char('s') | KeyCode::Char('/') => {
                     self.push_screen(screens::search_state());
                     return;
                 }
@@ -513,6 +671,23 @@ impl App {
             }
         }
         if k.code == KeyCode::Esc && !capture {
+            // Home is the root screen, so a bare Esc there would quit. In the
+            // list pane it means "back to the forums", which is what Esc means
+            // everywhere else in the client.
+            if let Some(Screen::Home(h)) = self.screens.last_mut()
+                && h.focus == screens::Pane::List
+            {
+                h.focus = screens::Pane::Tree;
+                return;
+            }
+            // Same idea for the Inbox: Esc from the inline view pane returns
+            // to the tabbed list rather than leaving the screen entirely.
+            if let Some(Screen::Inbox(ib)) = self.screens.last_mut()
+                && ib.focus == screens::InboxPane::View
+            {
+                ib.focus = screens::InboxPane::List;
+                return;
+            }
             if self.screens.len() > 1 {
                 self.screens.pop();
                 self.status.clear();
@@ -540,10 +715,8 @@ impl App {
             Action::Quit => self.should_quit = true,
             Action::OpenThreadList(mut node_id, mut title) => {
                 let mut target_url = None;
-                if let Some(tree) = self.screens.iter().find_map(|s| match s {
-                    Screen::ForumTree(tree) => Some(tree),
-                    _ => None,
-                }) && let Some(node) = tree.nodes.iter().find(|n| n.node_id == node_id)
+                if let Some(tree) = self.tree()
+                    && let Some(node) = tree.nodes.iter().find(|n| n.node_id == node_id)
                 {
                     if node.node_type == "Category" {
                         if let Some(child) = tree.nodes.iter().find(|c| {
@@ -560,26 +733,10 @@ impl App {
                 if let Some(url) = target_url {
                     self.open_url(&url);
                 } else {
-                    self.push_screen(Screen::ThreadList(screens::ThreadListState {
-                        node_id,
-                        title,
-                        page: 1,
-                        loading: true,
-                        ..Default::default()
-                    }));
-                    self.load_forum(node_id, 1);
+                    self.open_list(node_id, title);
                 }
             }
-            Action::OpenLatestThreads => {
-                self.push_screen(Screen::ThreadList(screens::ThreadListState {
-                    node_id: 0,
-                    title: "Latest Threads".to_string(),
-                    page: 1,
-                    loading: true,
-                    ..Default::default()
-                }));
-                self.load_forum(0, 1);
-            }
+            Action::OpenLatestThreads => self.open_list(0, "Latest posts".to_string()),
             Action::OpenThread(thread) => self.open_thread(&thread),
             Action::OpenProfile(user_id, name) => self.open_profile(user_id, &name),
             Action::OpenMemberContent {
@@ -606,23 +763,14 @@ impl App {
                     tx.send(Msg::SearchDone { page: 1, result }).ok();
                 });
             }
-            Action::OpenConversation(conv) => {
-                let cid = conv.conversation_id;
-                self.push_screen(Screen::ConversationView(screens::ConversationViewState {
-                    conversation: conv,
-                    page: 1,
-                    loading: true,
-                    ..Default::default()
-                }));
-                self.load_conversation(cid, 1);
-            }
+            Action::OpenConversation(conv) => self.open_conversation(conv),
             Action::LoadForum(node_id, page) => self.load_forum(node_id, page),
             Action::LoadThread(id, page) => self.load_thread(id, page),
             Action::LoadConversations(page) => self.load_conversations(page),
             Action::LoadConversation(id, page) => self.load_conversation(id, page),
             Action::LoadAlerts => self.load_alerts(),
             Action::LoadNodes => {
-                if let Some(Screen::ForumTree(tree)) = self.screens.last_mut() {
+                if let Some(tree) = self.tree_mut() {
                     tree.loading = true;
                     tree.error = None;
                 }
@@ -642,6 +790,7 @@ impl App {
                 });
             }
             Action::MarkAlertRead(id) => self.mark_alert_read(id),
+            Action::MarkConversationRead(id) => self.mark_conversation_read(id),
             Action::ReactPost(post_id) => {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
@@ -752,6 +901,161 @@ impl App {
         }
     }
 
+    // ---- the go-to palette and the `g` chord ----
+
+    /// The forum "here" means right now: the open thread's forum, else the
+    /// thread list's, else the forum under the tree cursor. `None` when the
+    /// answer would be "latest posts", which is not a forum you can post to.
+    fn current_forum(&self) -> Option<(u32, String)> {
+        for s in self.screens.iter().rev() {
+            match s {
+                Screen::ThreadView(v) if v.thread.node_id > 0 => {
+                    let title = if v.forum_title.is_empty() {
+                        "this forum".to_string()
+                    } else {
+                        v.forum_title.clone()
+                    };
+                    return Some((v.thread.node_id, title));
+                }
+                Screen::ThreadList(l) if l.node_id > 0 => {
+                    return Some((l.node_id, l.title.clone()));
+                }
+                Screen::Home(h) if h.list.node_id > 0 => {
+                    return Some((h.list.node_id, h.list.title.clone()));
+                }
+                _ => {}
+            }
+        }
+        self.tree()
+            .and_then(|t| t.nodes.get(t.sel))
+            .filter(|n| n.node_type == "Forum")
+            .map(|n| (n.node_id, n.title.clone()))
+    }
+
+    /// Build the palette: actions first (so the unfiltered list is a list of
+    /// verbs), then every forum the cached tree knows. Members arrive later,
+    /// from `poll_palette_member`.
+    fn open_palette(&mut self) {
+        use overlay::{Item, Target};
+        let mut items = Vec::new();
+        if let Some((node_id, title)) = self.current_forum() {
+            items.push(Item::action(
+                format!("New thread in {title}"),
+                "N",
+                Target::NewThread(node_id),
+            ));
+            items.push(Item::action(
+                "Mark forum read".to_string(),
+                "m",
+                Target::MarkForumRead(node_id),
+            ));
+        }
+        items.push(Item::action(
+            "Latest posts".to_string(),
+            "L",
+            Target::Latest,
+        ));
+        for (id, title, key) in [
+            (screens::NEWS_NODE, "Windows News", "1"),
+            (screens::SECURITY_NODE, "Security Alerts", "2"),
+            (screens::TUTORIALS_NODE, "Windows Tutorials", "3"),
+        ] {
+            items.push(Item::action(
+                title.to_string(),
+                key,
+                Target::QuickNode(id, title.to_string()),
+            ));
+        }
+        items.push(Item::action("Inbox".to_string(), "c", Target::Inbox));
+        items.push(Item::action("Alerts".to_string(), "a", Target::Alerts));
+        items.push(Item::action("Search".to_string(), "/", Target::Search));
+        items.push(Item::action("Sign out".to_string(), "^L", Target::SignOut));
+        items.push(Item::action("Quit".to_string(), "q", Target::Quit));
+        if let Some(tree) = self.tree() {
+            for node in &tree.nodes {
+                // Categories are not destinations (`/forums/{id}` 404s for
+                // them); `open_node_action` resolves the rest.
+                if node.node_type != "Category" {
+                    items.push(Item::forum(node.node_id, node.title.clone()));
+                }
+            }
+        }
+        self.palette = Some(Palette::new(items));
+    }
+
+    /// Ask the site about a member the palette query might name. Exact-name
+    /// lookup (`/users/find-name`) is the only member API `WfApi` exposes, so
+    /// the palette resolves a typed handle rather than offering suggestions.
+    /// `Palette::member_query_due` debounces and de-duplicates.
+    fn poll_palette_member(&mut self) {
+        let Some(query) = self.palette.as_mut().and_then(|p| p.member_query_due()) else {
+            return;
+        };
+        let api = self.api.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let user = api.find_user(&query).await.unwrap_or(None);
+            tx.send(Msg::PaletteMember { query, user }).ok();
+        });
+    }
+
+    fn run_palette_target(&mut self, target: overlay::Target) {
+        use overlay::Target as T;
+        match target {
+            T::Forum(node_id, title) => self.execute_action(Action::OpenThreadList(node_id, title)),
+            T::QuickNode(node_id, title) => self.open_quick_node(node_id, &title),
+            T::Latest => self.execute_action(Action::OpenLatestThreads),
+            T::NewThread(node_id) => self.execute_action(Action::StartNewThread(node_id)),
+            T::MarkForumRead(node_id) => self.execute_action(Action::MarkForumRead(node_id)),
+            T::Inbox => self.open_inbox(screens::InboxTab::Conversations),
+            T::Alerts => self.open_inbox(screens::InboxTab::Alerts),
+            T::Search => self.push_screen(screens::search_state()),
+            T::SignOut => self.logout(),
+            T::Quit => self.should_quit = true,
+            T::Member(user_id, name) => self.open_profile(user_id, &name),
+        }
+    }
+
+    /// One of the `1`/`2`/`3` destinations, resolved through the loaded tree so
+    /// a category opens its first forum and a link-forum opens its URL.
+    fn open_quick_node(&mut self, node_id: u32, title: &str) {
+        let nodes = self
+            .tree()
+            .map(|t| t.nodes.clone())
+            .unwrap_or_default();
+        let action = screens::open_node_action(&nodes, node_id, title);
+        self.execute_action(action);
+    }
+
+    /// Run a `g <key>` chord.
+    fn go(&mut self, target: GoTarget) {
+        match target {
+            GoTarget::News => self.open_quick_node(screens::NEWS_NODE, "Windows News"),
+            GoTarget::Security => self.open_quick_node(screens::SECURITY_NODE, "Security Alerts"),
+            GoTarget::Tutorials => {
+                self.open_quick_node(screens::TUTORIALS_NODE, "Windows Tutorials")
+            }
+            GoTarget::Latest => self.execute_action(Action::OpenLatestThreads),
+            GoTarget::Inbox => self.open_inbox(screens::InboxTab::Conversations),
+            GoTarget::Alerts => self.open_inbox(screens::InboxTab::Alerts),
+            GoTarget::Home => {
+                self.screens.truncate(1);
+                self.status.clear();
+            }
+            GoTarget::Profile => {
+                if let Some(me) = &self.me {
+                    let (id, name) = (me.user_id, me.username.clone());
+                    self.open_profile(id, &name);
+                }
+            }
+            GoTarget::Top => {
+                if let Some(screen) = self.screens.last_mut() {
+                    screen.goto_top();
+                }
+            }
+        }
+    }
+
     /// Copy text via OSC 52 (remote terminal), local system clipboard tools, and in-app clipboard.
     pub fn copy_text(&mut self, text: &str) {
         emit_raw(&common::osc::set_clipboard(text));
@@ -782,6 +1086,13 @@ impl App {
             return;
         }
         self.clipboard = text.clone();
+        // The palette owns the keyboard while it is up, so it owns pastes too.
+        if let Some(palette) = self.palette.as_mut() {
+            let sanitized = text.replace(['\r', '\n'], " ");
+            crate::editor::insert_str(&mut palette.query, &mut palette.cursor, &sanitized);
+            palette.after_paste();
+            return;
+        }
         if let Some(screen) = self.screens.last_mut() {
             match screen {
                 Screen::Compose(cs) => {
@@ -1047,6 +1358,12 @@ impl App {
         for y in y0..=y1.min(area.height.saturating_sub(1)) {
             for x in x0..=x1.min(area.width.saturating_sub(1)) {
                 let cell = &mut f.buffer_mut()[(x, y)];
+                // The selection band must never touch an image: kitty encodes
+                // the image id in the cell's foreground colour, so re-styling
+                // the anchor cell would repaint a different image (or none).
+                if is_image_cell(cell) {
+                    continue;
+                }
                 cell.set_style(style);
             }
         }
@@ -1068,12 +1385,80 @@ impl App {
 
     // ---- screen openers / actions ----
 
-    fn open_conversations(&mut self) {
-        self.push_screen(Screen::Conversations(screens::ConversationsState {
-            loading: true,
+    /// Open the Inbox on `tab`, or — if it is already the top screen — just
+    /// switch to that tab in place (so `c`/`a` from anywhere never stacks a
+    /// second Inbox on top of the first).
+    fn open_inbox(&mut self, tab: screens::InboxTab) {
+        if let Some(Screen::Inbox(inbox)) = self.screens.last_mut() {
+            inbox.tab = tab;
+            return;
+        }
+        self.push_screen(Screen::Inbox(screens::InboxState {
+            tab,
+            convos: screens::ConversationsState {
+                loading: true,
+                ..Default::default()
+            },
+            alerts: screens::AlertsState {
+                loading: true,
+                ..Default::default()
+            },
             ..Default::default()
         }));
         self.load_conversations(1);
+        self.load_alerts();
+    }
+
+    /// The topmost Inbox screen, if any — the router other Inbox-related
+    /// message handlers use to find where conversations/alerts data lives.
+    fn inbox_mut(&mut self) -> Option<&mut screens::InboxState> {
+        self.screens.iter_mut().rev().find_map(|s| match s {
+            Screen::Inbox(inbox) => Some(inbox),
+            _ => None,
+        })
+    }
+
+    /// The `ConversationViewState` a `ConversationLoaded`/reply-sent message
+    /// belongs to: the topmost standalone `ConversationView`, or the Inbox's
+    /// inline view pane — whichever currently holds this conversation.
+    fn conversation_view_mut(&mut self, id: u32) -> Option<&mut screens::ConversationViewState> {
+        self.screens.iter_mut().rev().find_map(|s| match s {
+            Screen::ConversationView(view) if view.conversation.conversation_id == id => {
+                Some(view)
+            }
+            Screen::Inbox(inbox) => inbox
+                .view
+                .as_mut()
+                .filter(|v| v.conversation.conversation_id == id),
+            _ => None,
+        })
+    }
+
+    /// Open a conversation: into the Inbox's view pane when it is the top
+    /// screen and dual, otherwise as a pushed `ConversationView` exactly as
+    /// before.
+    pub fn open_conversation(&mut self, conv: Conversation) {
+        let cid = conv.conversation_id;
+        if let Some(Screen::Inbox(inbox)) = self.screens.last_mut()
+            && inbox.dual
+        {
+            inbox.view = Some(screens::ConversationViewState {
+                conversation: conv,
+                page: 1,
+                loading: true,
+                ..Default::default()
+            });
+            inbox.focus = screens::InboxPane::View;
+            self.load_conversation(cid, 1);
+            return;
+        }
+        self.push_screen(Screen::ConversationView(screens::ConversationViewState {
+            conversation: conv,
+            page: 1,
+            loading: true,
+            ..Default::default()
+        }));
+        self.load_conversation(cid, 1);
     }
 
     pub fn load_conversations(&mut self, page: u32) {
@@ -1085,20 +1470,24 @@ impl App {
         });
     }
 
-    fn open_alerts(&mut self) {
-        self.push_screen(Screen::Alerts(screens::AlertsState {
-            loading: true,
-            ..Default::default()
-        }));
-        self.load_alerts();
-    }
-
     pub fn load_alerts(&mut self) {
         let api = self.api.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = api.alerts(1).await.map_err(|e| TaskError::of(&e));
             tx.send(Msg::AlertsLoaded(result)).ok();
+        });
+    }
+
+    pub fn mark_conversation_read(&mut self, id: u32) {
+        let api = self.api.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = api
+                .mark_conversation_read(id)
+                .await
+                .map_err(|e| TaskError::of(&e));
+            tx.send(Msg::ConversationMarked(result)).ok();
         });
     }
 
@@ -1112,7 +1501,7 @@ impl App {
                     .map(|r| ForumReply {
                         forum: Forum {
                             node_id: 0,
-                            title: "Latest Threads".to_string(),
+                            title: "Latest posts".to_string(),
                             ..Default::default()
                         },
                         threads: r.threads,
@@ -1122,13 +1511,115 @@ impl App {
             } else {
                 api.forum(node_id, page).await.map_err(|e| TaskError::of(&e))
             };
-            tx.send(Msg::ForumLoaded { page, result }).ok();
+            tx.send(Msg::ForumLoaded { node_id, page, result }).ok();
         });
     }
 
+    // ---- where forum/thread-list state lives ----
+    //
+    // Home owns both a tree and a list; the pre-redesign ForumTree/ThreadList
+    // screens still exist for pushes from search, alerts and the narrow
+    // layout. These three helpers are the single place that knows both shapes,
+    // so a message handler never has to.
+
+    /// The node tree, wherever it is: the topmost `ForumTree`, else Home's.
+    fn tree(&self) -> Option<&screens::ForumTreeState> {
+        self.screens.iter().rev().find_map(|s| match s {
+            Screen::ForumTree(tree) => Some(tree),
+            Screen::Home(h) => Some(&h.tree),
+            _ => None,
+        })
+    }
+
+    fn tree_mut(&mut self) -> Option<&mut screens::ForumTreeState> {
+        self.screens.iter_mut().rev().find_map(|s| match s {
+            Screen::ForumTree(tree) => Some(tree),
+            Screen::Home(h) => Some(&mut h.tree),
+            _ => None,
+        })
+    }
+
+    /// The live thread list, whatever it is showing: the topmost `ThreadList`,
+    /// or Home's list pane — whichever is higher on the stack, so a pushed
+    /// list is never overwritten by the Home pane underneath it. For anything
+    /// answering a specific request, use `list_mut_for`.
+    fn list_mut(&mut self) -> Option<&mut screens::ThreadListState> {
+        self.screens.iter_mut().rev().find_map(|s| match s {
+            Screen::ThreadList(list) => Some(list),
+            Screen::Home(h) => Some(&mut h.list),
+            _ => None,
+        })
+    }
+
+    /// The same list, but only if it is showing `node_id`.
+    fn list_mut_for(&mut self, node_id: u32) -> Option<&mut screens::ThreadListState> {
+        list_showing(&mut self.screens, node_id)
+    }
+
+    /// Fill Home's list pane with the latest posts as soon as we are signed
+    /// in, so the two-pane Home has something to read on arrival instead of an
+    /// empty right half. Only ever runs against a pane nobody has loaded yet.
+    fn prime_home_list(&mut self) {
+        let should = matches!(
+            self.screens.first(),
+            Some(Screen::Home(h))
+                if h.list.threads.is_empty() && !h.list.loading && h.list.node_id == 0
+        );
+        if !should {
+            return;
+        }
+        if let Some(Screen::Home(h)) = self.screens.first_mut() {
+            h.list.title = "Latest posts".to_string();
+            h.list.page = 1;
+            h.list.loading = true;
+        }
+        self.load_forum(0, 1);
+    }
+
+    /// Open a forum: into Home's right-hand pane when the two-pane layout is
+    /// up, otherwise as a pushed screen exactly as before.
+    fn open_list(&mut self, node_id: u32, title: String) {
+        if let Some(Screen::Home(h)) = self.screens.last_mut()
+            && h.dual
+        {
+            h.list.node_id = node_id;
+            h.list.title = title;
+            h.list.page = 1;
+            h.list.last_page = 1;
+            h.list.total = 0;
+            h.list.threads.clear();
+            h.list.sel = 0;
+            h.list.error = None;
+            h.list.loading = true;
+            h.focus = screens::Pane::List;
+            self.load_forum(node_id, 1);
+            return;
+        }
+        self.push_screen(Screen::ThreadList(screens::ThreadListState {
+            node_id,
+            title,
+            page: 1,
+            loading: true,
+            ..Default::default()
+        }));
+        self.load_forum(node_id, 1);
+    }
+
     pub fn open_thread(&mut self, thread: &Thread) {
+        // `Thread` carries only `node_id`; the card stack wants the forum's
+        // name, and the loaded tree is the only place that has it.
+        let forum_title = self
+            .tree()
+            .and_then(|t| {
+                t.nodes
+                    .iter()
+                    .find(|n| n.node_id == thread.node_id)
+                    .map(|n| n.title.clone())
+            })
+            .unwrap_or_default();
         self.push_screen(Screen::ThreadView(screens::ThreadViewState {
             thread: thread.clone(),
+            forum_title,
             page: 1,
             loading: true,
             ..Default::default()
@@ -1159,12 +1650,25 @@ impl App {
         });
     }
 
+    /// The signed-in member's name, for the composer's `as <user>` segment.
+    fn me_name(&self) -> String {
+        self.me
+            .as_ref()
+            .map(|u| u.username.clone())
+            .unwrap_or_default()
+    }
+
     pub fn reply_to_thread(&mut self, thread: &Thread) {
+        // `reply_count` counts replies, so the thread holds `reply_count + 1`
+        // posts and this draft becomes the next one after that.
+        let reply_number = u32::try_from(thread.reply_count.saturating_add(2)).ok();
         self.push_screen(Screen::Compose(screens::ComposeState {
             target: Some(ComposeTarget::ThreadReply {
                 thread_id: thread.thread_id,
                 thread_title: thread.title.clone(),
             }),
+            author: self.me_name(),
+            reply_number,
             ..Default::default()
         }));
     }
@@ -1173,6 +1677,7 @@ impl App {
         self.push_screen(Screen::Compose(screens::ComposeState {
             target: Some(ComposeTarget::NewThread { node_id }),
             title_field: true,
+            author: self.me_name(),
             ..Default::default()
         }));
     }
@@ -1185,6 +1690,7 @@ impl App {
                 conversation_title: conv.title.clone(),
                 participants,
             }),
+            author: self.me_name(),
             ..Default::default()
         }));
     }
@@ -1222,7 +1728,8 @@ impl App {
             tx.send(Msg::LoggedOut(result.map_err(|e| e.to_string()))).ok();
         });
         self.me = None;
-        self.screens.retain(|s| matches!(s, Screen::ForumTree(_)));
+        self.screens
+            .retain(|s| matches!(s, Screen::Home(_) | Screen::ForumTree(_)));
         self.screens.push(screens::login_state());
         self.status = "Logged out.".into();
     }
@@ -1268,6 +1775,7 @@ impl App {
                 );
                 self.start_pollers();
                 self.load_nodes();
+                self.prime_home_list();
             }
             Msg::LoginComplete(Err(e)) => {
                 if let Some(Screen::Login(ls)) = self.screens.last_mut() {
@@ -1275,6 +1783,9 @@ impl App {
                     ls.error = Some(e.message);
                     ls.stage = crate::screens::LoginStage::Idle;
                 }
+            }
+            Msg::ImageLoaded { key, result } => {
+                self.images.on_loaded(key, result);
             }
             Msg::Notice(n) => {
                 if n == "quit" {
@@ -1295,6 +1806,7 @@ impl App {
                     self.screens.pop();
                 }
                 self.load_nodes();
+                self.prime_home_list();
             }
             Msg::Bootstrap(Err(e)) => {
                 // Dead token → login screen (only if none is up already —
@@ -1305,10 +1817,7 @@ impl App {
                 self.status = format!("Session expired ({e}); log in again.");
             }
             Msg::NodesLoaded(result) => {
-                let tree = self.screens.iter_mut().find_map(|s| match s {
-                    Screen::ForumTree(tree) => Some(tree),
-                    _ => None,
-                });
+                let tree = self.tree_mut();
                 if let Some(tree) = tree {
                     match result {
                         Ok(nodes) => {
@@ -1329,11 +1838,8 @@ impl App {
                     }
                 }
             }
-            Msg::ForumLoaded { page, result } => {
-                let list = self.screens.iter_mut().rev().find_map(|s| match s {
-                    Screen::ThreadList(list) => Some(list),
-                    _ => None,
-                });
+            Msg::ForumLoaded { node_id, page, result } => {
+                let list = self.list_mut_for(node_id);
                 if let Some(list) = list {
                     match result {
                         Ok(reply) => {
@@ -1343,6 +1849,7 @@ impl App {
                             list.threads = reply.threads;
                             list.page = page;
                             list.last_page = reply.pagination.last_page.max(1);
+                            list.total = reply.pagination.total;
                             list.loading = false;
                             list.sel = list.sel.min(list.threads.len().saturating_sub(1));
                         }
@@ -1367,9 +1874,11 @@ impl App {
                             view.posts = reply.posts;
                             view.page = page;
                             view.last_page = reply.pagination.last_page.max(1);
+                            view.total = reply.pagination.total;
                             view.loading = false;
                             view.scroll = 0;
-                            view.rebuild_lines(&self.theme);
+                            view.sel_post = 0;
+                            view.rebuild_lines(&self.theme, &self.glyphs);
                         }
                         Err(e) => {
                             view.loading = false;
@@ -1434,7 +1943,18 @@ impl App {
                             self.screens.remove(idx);
                         }
                         self.status = "Thread created.".into();
-                        self.load_forum(thread.node_id, 1);
+                        // The list we are about to refresh may be showing a
+                        // different forum (Home's pane, say) — point it at the
+                        // new thread's forum before the reply lands in it.
+                        let node_id = thread.node_id;
+                        if let Some(list) = self.list_mut()
+                            && list.node_id != node_id
+                        {
+                            list.node_id = node_id;
+                            list.page = 1;
+                            list.total = 0;
+                        }
+                        self.load_forum(node_id, 1);
                     }
                     Err(e) => {
                         if let Some(idx) = compose_idx
@@ -1449,34 +1969,64 @@ impl App {
             Msg::MarkedRead(Ok(())) => self.status = "Marked read.".into(),
             Msg::MarkedRead(Err(e)) => self.status = format!("Mark-read failed: {e}"),
             Msg::ConversationsLoaded { page, result } => {
-                let convs = self.screens.iter_mut().rev().find_map(|s| match s {
-                    Screen::Conversations(convs) => Some(convs),
-                    _ => None,
-                });
-                if let Some(convs) = convs {
+                let mut new_unread: Option<u32> = None;
+                let mut auto_load: Option<u32> = None;
+                if let Some(inbox) = self.inbox_mut() {
                     match result {
                         Ok(reply) => {
-                            convs.conversations = reply.conversations;
-                            convs.page = page;
-                            convs.last_page = reply.pagination.last_page.max(1);
-                            convs.loading = false;
-                            convs.sel = convs.sel.min(convs.conversations.len().saturating_sub(1));
+                            inbox.convos.conversations = reply.conversations;
+                            inbox.convos.page = page;
+                            inbox.convos.last_page = reply.pagination.last_page.max(1);
+                            inbox.convos.total = reply.pagination.total;
+                            inbox.convos.loading = false;
+                            inbox.convos.sel = inbox
+                                .convos
+                                .sel
+                                .min(inbox.convos.conversations.len().saturating_sub(1));
+                            new_unread = Some(
+                                inbox
+                                    .convos
+                                    .conversations
+                                    .iter()
+                                    .filter(|c| c.is_unread_conv())
+                                    .count() as u32,
+                            );
+                            // Prime the view pane with the first conversation
+                            // so a dual Inbox never opens onto an empty right
+                            // panel.
+                            if inbox.dual
+                                && inbox.view.is_none()
+                                && inbox.tab == screens::InboxTab::Conversations
+                                && let Some(first) = inbox.convos.conversations.first().cloned()
+                            {
+                                let cid = first.conversation_id;
+                                inbox.view = Some(screens::ConversationViewState {
+                                    conversation: first,
+                                    page: 1,
+                                    loading: true,
+                                    ..Default::default()
+                                });
+                                auto_load = Some(cid);
+                            }
                         }
                         Err(e) => {
-                            convs.loading = false;
-                            convs.error = Some(e.message);
+                            inbox.convos.loading = false;
+                            inbox.convos.error = Some(e.message);
                         }
                     }
                 }
+                if let Some(n) = new_unread {
+                    self.convos_unread = n;
+                }
+                if let Some(cid) = auto_load {
+                    self.load_conversation(cid, 1);
+                }
             }
             Msg::ConversationLoaded { id, page, result } => {
-                let view = self.screens.iter_mut().rev().find_map(|s| match s {
-                    Screen::ConversationView(view) if view.conversation.conversation_id == id => {
-                        Some(view)
-                    }
-                    _ => None,
-                });
-                if let Some(view) = view {
+                let theme = self.theme;
+                let glyphs = self.glyphs;
+                let mut mark_read: Option<u32> = None;
+                if let Some(view) = self.conversation_view_mut(id) {
                     match result {
                         Ok(reply) => {
                             if reply.conversation.conversation_id > 0 {
@@ -1486,20 +2036,22 @@ impl App {
                             view.page = page;
                             view.last_page = reply.pagination.last_page.max(1);
                             view.loading = false;
-                            view.rebuild_lines(&self.theme);
-                            let cid = view.conversation.conversation_id;
-                            let api = self.api.clone();
-                            let tx = self.tx.clone();
-                            tokio::spawn(async move {
-                                let _ = api.mark_conversation_read(cid).await;
-                                let _ = tx;
-                            });
+                            view.rebuild_lines(&theme, &glyphs);
+                            mark_read = Some(view.conversation.conversation_id);
                         }
                         Err(e) => {
                             view.loading = false;
                             view.error = Some(e.message);
                         }
                     }
+                }
+                if let Some(cid) = mark_read {
+                    let api = self.api.clone();
+                    let tx = self.tx.clone();
+                    tokio::spawn(async move {
+                        let _ = api.mark_conversation_read(cid).await;
+                        let _ = tx;
+                    });
                 }
             }
             Msg::ConvoReplySent(result) => {
@@ -1590,23 +2142,19 @@ impl App {
             }
             Msg::ConvoCreated(result) => match result {
                 Ok(conv) => {
-                    // Unwind back to the conversations list, then show the new one.
+                    // Unwind back to the Inbox (or the root, if this started
+                    // from somewhere that never opened one — e.g. a Profile's
+                    // "message" action), then show the new conversation.
                     while self.screens.len() > 1
-                        && !matches!(self.screens.last(), Some(Screen::Conversations(_)))
+                        && !matches!(self.screens.last(), Some(Screen::Inbox(_)))
                     {
                         self.screens.pop();
                     }
                     self.status = "Conversation started.".into();
-                    let cid = conv.conversation_id;
-                    self.push_screen(Screen::ConversationView(
-                        screens::ConversationViewState {
-                            conversation: conv,
-                            page: 1,
-                            loading: true,
-                            ..Default::default()
-                        },
-                    ));
-                    self.load_conversation(cid, 1);
+                    if let Some(inbox) = self.inbox_mut() {
+                        inbox.tab = screens::InboxTab::Conversations;
+                    }
+                    self.open_conversation(conv);
                 }
                 Err(e) => {
                     let nc = self.screens.iter_mut().rev().find_map(|s| match s {
@@ -1620,15 +2168,13 @@ impl App {
                 }
             },
             Msg::AlertsLoaded(result) => {
-                let alerts = self.screens.iter_mut().rev().find_map(|s| match s {
-                    Screen::Alerts(alerts) => Some(alerts),
-                    _ => None,
-                });
-                if let Some(alerts) = alerts {
+                let mut new_unread: Option<u32> = None;
+                if let Some(inbox) = self.inbox_mut() {
+                    let alerts = &mut inbox.alerts;
                     match result {
                         Ok(page) => {
-                            self.alerts_unread =
-                                page.alerts.iter().filter(|a| !a.viewed).count() as u32;
+                            new_unread =
+                                Some(page.alerts.iter().filter(|a| !a.viewed).count() as u32);
                             alerts.alerts = page.alerts;
                             alerts.loading = false;
                             alerts.sel = alerts.sel.min(alerts.alerts.len().saturating_sub(1));
@@ -1639,11 +2185,21 @@ impl App {
                         }
                     }
                 }
+                if let Some(n) = new_unread {
+                    self.alerts_unread = n;
+                }
             }
             Msg::AlertMarked(result) => match result {
                 Ok(()) => {
                     self.load_alerts();
                     self.status = "Alert marked read.".into();
+                }
+                Err(e) => self.status = format!("Mark failed: {e}"),
+            },
+            Msg::ConversationMarked(result) => match result {
+                Ok(()) => {
+                    self.load_conversations(1);
+                    self.status = "Conversation marked read.".into();
                 }
                 Err(e) => self.status = format!("Mark failed: {e}"),
             },
@@ -1658,6 +2214,7 @@ impl App {
                             search.results = reply.results;
                             search.page = page;
                             search.last_page = reply.pagination.last_page.max(1);
+                            search.total = reply.pagination.total;
                             search.loading = false;
                             search.sel = 0;
                         }
@@ -1666,6 +2223,14 @@ impl App {
                             search.error = Some(e.message);
                         }
                     }
+                }
+            }
+            Msg::PaletteMember { query, user } => {
+                if let Some(found) = user
+                    && let Some(palette) = self.palette.as_mut()
+                    && palette.query.trim() == query
+                {
+                    palette.push_member(&found);
                 }
             }
             Msg::ProfileLoaded(result) => {
@@ -1728,6 +2293,27 @@ impl App {
         });
     }
 
+    /// Load one image off the UI thread: disk cache first, then the site
+    /// through `api_gate`, then decode + encode on a blocking task. Only the
+    /// finished payload crosses back, as `Msg::ImageLoaded`.
+    #[cfg(feature = "images")]
+    fn spawn_image_load(&mut self, pending: crate::images::Pending) {
+        let Some(picker) = self.images.picker() else {
+            return;
+        };
+        let client = self.client.clone();
+        let disk = self.images.disk();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let key = pending.store_key();
+            let result = crate::images::load(&client, &disk, picker, &pending).await;
+            tx.send(Msg::ImageLoaded { key, result }).ok();
+        });
+    }
+
+    #[cfg(not(feature = "images"))]
+    fn spawn_image_load(&mut self, _pending: crate::images::Pending) {}
+
     pub fn open_url(&mut self, url: &str) {
         if url.is_empty() {
             return;
@@ -1759,17 +2345,19 @@ fn emit_raw(s: &str) {
     let _ = out.flush();
 }
 
-/// Shared footer hint lines used by list screens.
-pub fn footer_line(theme: &Theme, hints: &[(&str, &str)]) -> Line<'static> {
-    let mut spans = Vec::new();
-    for (key, desc) in hints {
-        spans.push(Span::styled(
-            format!(" {key} "),
-            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled((*desc).to_string(), theme.dim()));
-    }
-    Line::from(spans)
+/// True for a cell owned by an inline image: either the anchor cell holding
+/// the protocol's escape payload, or one of the covered cells filling out the
+/// rest of the image rect. Text-extraction and restyling must both leave these
+/// alone (CLAUDE.md hard rules 1 and 5).
+///
+/// ratatui 0.30 replaced the `Cell::skip` bool with `Cell::diff_option`, and
+/// ratatui-image 11 uses two of its variants: `ForcedWidth(1)` on the anchor
+/// cell that carries the escape payload, `Skip` on every cell the image
+/// covers. Nothing in ratatui-widgets sets a diff option on ordinary text, so
+/// "diff option is not `None`" is exactly "this cell is not text".
+fn is_image_cell(cell: &ratatui::buffer::Cell) -> bool {
+    !matches!(cell.diff_option, ratatui::buffer::CellDiffOption::None)
+        || cell.symbol().contains('\u{1b}')
 }
 
 /// The screens' input-capture probe, free of `self` borrow entanglement.
@@ -1839,5 +2427,99 @@ async fn finish_login(
         Err(e) => {
             tx.send(Msg::LoginComplete(Err(TaskError::of(&e)))).ok();
         }
+    }
+}
+
+/// The thread list a `ForumLoaded` for `node_id` is addressed to: the topmost
+/// `ThreadList` — or Home's list pane — that is actually showing that forum.
+///
+/// Every caller points a list at a node *before* calling `load_forum`, and
+/// `Gate::wait` only spaces request starts, so two in-flight loads can finish
+/// out of order. Matching on the node is what stops the slower reply from
+/// overwriting the list that the faster one already filled — the same
+/// discipline `Msg::ThreadLoaded` applies with `thread_id`. `None` means the
+/// reply is stale: drop it.
+fn list_showing(screens: &mut [Screen], node_id: u32) -> Option<&mut screens::ThreadListState> {
+    screens.iter_mut().rev().find_map(|s| match s {
+        Screen::ThreadList(list) if list.node_id == node_id => Some(list),
+        Screen::Home(h) if h.list.node_id == node_id => Some(&mut h.list),
+        _ => None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::{Cell, CellDiffOption};
+
+    /// Image cells are not text. `ratatui-image` puts a whole escape payload
+    /// in one anchor cell's symbol (marked `ForcedWidth(1)`, because the
+    /// payload's display width is not its byte width) and marks every cell the
+    /// image covers `Skip`; all of them must be invisible to the selection
+    /// mirror and to the selection band's restyling (CLAUDE.md hard rules 1
+    /// and 5).
+    #[test]
+    fn image_cells_are_recognised_by_both_the_anchor_and_the_covered_cells() {
+        let mut plain = Cell::new("a");
+        assert!(!is_image_cell(&plain));
+
+        // The rest of an image rect: no symbol of its own, just `Skip`.
+        let mut skipped = Cell::new(" ");
+        skipped.set_diff_option(CellDiffOption::Skip);
+        assert!(is_image_cell(&skipped));
+
+        // The anchor cell: the protocol's payload lives in its symbol, and the
+        // widget forces its width to one column.
+        let mut anchor = Cell::new("\x1b_Gf=100,i=7;AAAA\x1b\\");
+        anchor.set_diff_option(CellDiffOption::ForcedWidth(
+            std::num::NonZeroU16::new(1).unwrap(),
+        ));
+        assert!(is_image_cell(&anchor));
+        // ...and it is caught by the escape probe alone, too.
+        assert!(is_image_cell(&Cell::new("\x1b_Gf=100,i=7;AAAA\x1b\\")));
+
+        // A cell that merely *looks* busy is still text.
+        plain.set_symbol("\u{2503}");
+        assert!(!is_image_cell(&plain));
+    }
+
+    /// Two `load_forum` calls can finish out of order (the rate-limit gate
+    /// spaces starts, not completions). The slower reply must not land in the
+    /// list the faster one already filled.
+    #[test]
+    fn a_forum_reply_only_reaches_the_list_that_asked_for_it() {
+        let home = |node_id: u32| {
+            Screen::Home(screens::HomeState {
+                list: screens::ThreadListState {
+                    node_id,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        };
+        let pushed = |node_id: u32| {
+            Screen::ThreadList(screens::ThreadListState {
+                node_id,
+                title: format!("node {node_id}"),
+                ..Default::default()
+            })
+        };
+
+        // Home on Latest (0), Security (46) pushed on top; News (4) is in
+        // flight from the screen the user already popped.
+        let mut stack = vec![home(0), pushed(46)];
+        assert!(list_showing(&mut stack, 4).is_none(), "stale News reply must be dropped");
+        assert_eq!(
+            list_showing(&mut stack, 46).map(|l| l.node_id),
+            Some(46),
+            "the Security reply still lands"
+        );
+        assert_eq!(list_showing(&mut stack, 0).map(|l| l.node_id), Some(0));
+
+        // Topmost wins when two lists show the same forum.
+        let mut same = vec![home(4), pushed(4)];
+        list_showing(&mut same, 4).unwrap().title = "hit".into();
+        assert!(matches!(&same[1], Screen::ThreadList(l) if l.title == "hit"));
+        assert!(matches!(&same[0], Screen::Home(h) if h.list.title.is_empty()));
     }
 }

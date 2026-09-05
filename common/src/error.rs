@@ -32,6 +32,9 @@ pub enum Error {
     TokenStore(String),
     /// Loopback redirect listener failed or timed out.
     Handshake(String),
+    /// `WfApiClient::fetch_bytes` refused the response: not an image
+    /// content-type, or over the caller's size cap.
+    FetchRejected(String),
 }
 
 impl std::fmt::Display for Error {
@@ -60,6 +63,7 @@ impl std::fmt::Display for Error {
             Error::Io(e) => write!(f, "io error: {e}"),
             Error::TokenStore(m) => write!(f, "token store: {m}"),
             Error::Handshake(m) => write!(f, "login handshake: {m}"),
+            Error::FetchRejected(m) => write!(f, "fetch rejected: {m}"),
         }
     }
 }

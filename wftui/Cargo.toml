@@ -2,7 +2,7 @@
 name = "wftui"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.98"
 publish = false
 description = "WindowsForum.com terminal UI client (Linux + Windows)"
 
@@ -10,11 +10,32 @@ description = "WindowsForum.com terminal UI client (Linux + Windows)"
 name = "wftui"
 path = "src/main.rs"
 
+[features]
+default = ["images"]
+# Inline graphics (DESIGN.md tiers 1-4). Optional so the binary can be built
+# without an image decoder at all; the text tier (5) is always compiled.
+images = ["dep:ratatui-image", "dep:image"]
+
 [dependencies]
 common = { path = "../common" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "signal"] }
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 time = { version = "0.3", features = ["formatting", "macros"] }
 tracing = "0.1"
 serde_json = "1"
+sha2 = "0.11"
+# 11.x tracks `ratatui = "^0.30.1"`, the same major as ours, so exactly one
+# ratatui resolves (assert with `cargo tree -i ratatui`), and its `crossterm`
+# feature routes through ratatui-crossterm's default `crossterm_0_29` so
+# exactly one crossterm resolves too (`cargo tree -i crossterm`).
+# `default-features = false` is load-bearing: `chafa-dyn` and `chafa-static`
+# are the ONLY features that reach for a C library — they add the `pkg-config`
+# build-dependency whose build.rs probes libchafa and panics the build without
+# it. With just `crossterm` + `image-defaults` the whole graph stays pure Rust
+# (icy_sixel, base64-simd, self_cell, rustix). kitty, sixel, iterm2 and
+# halfblocks are not feature-gated — they are always compiled and chosen at
+# runtime by `Picker`. `image-defaults` is what gives us PNG/GIF/WEBP; without
+# it only JPEG decodes.
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"], optional = true }
+image = { version = "0.25", default-features = false, optional = true }

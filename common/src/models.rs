@@ -10,6 +10,15 @@ pub fn r<T: Default>() -> T {
     T::default()
 }
 
+/// Serde default for booleans whose *absent* meaning is `true`.
+///
+/// `#[serde(default)]` on a `bool` yields `false`, which for
+/// `Thread::discussion_open` reads as "closed" and would stamp the locked
+/// glyph on every row of a partial payload. Absent means open.
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Pagination {
     #[serde(default, rename = "current_page")]
@@ -101,7 +110,7 @@ pub struct Thread {
     pub last_post_username: String,
     #[serde(default)]
     pub sticky: bool,
-    #[serde(default, rename = "discussion_open")]
+    #[serde(default = "default_true", rename = "discussion_open")]
     pub discussion_open: bool,
     #[serde(default, rename = "discussion_type")]
     pub discussion_type: String,
@@ -188,6 +197,20 @@ pub struct Post {
     pub is_first_post: bool,
     #[serde(default, rename = "view_url")]
     pub view_url: Option<String>,
+    /// `XF\Entity\Post::setupApiResultData()` only calls
+    /// `$result->includeRelation('Attachments')` when `attach_count` is
+    /// non-zero, so the key is simply absent (not `[]`) on a post with none —
+    /// `#[serde(default)]` covers that.
+    #[serde(default, rename = "Attachments")]
+    pub attachments: Vec<Attachment>,
+    /// The post author, when the payload carries one. `Post`'s `api`
+    /// with-alias always includes `User`/`User.api` (the relation is flagged
+    /// `'api' => true` in `XF\Entity\Post::getStructure()`), so this is
+    /// populated on every real API response; kept `Option` for lenient
+    /// parsing of hand-built test fixtures and the (unlikely) case of a
+    /// missing/deleted author.
+    #[serde(default, rename = "User")]
+    pub user: Option<User>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -514,6 +537,31 @@ pub struct User {
     pub website: String,
     #[serde(default, rename = "view_url")]
     pub view_url: Option<String>,
+    /// `XF\Entity\User::setupApiResultData()` builds this from
+    /// `avatarSizeMap` (`App.php`: `o`/`h`/`l`/`m`/`s`, largest to smallest);
+    /// each value is `getAvatarUrl($size)`, which is `string|null` (`null`
+    /// when the user has neither a gravatar nor an uploaded avatar) — never
+    /// absent as a whole object for a real user, but `Option` here so a
+    /// guest stub or hand-built fixture without it still parses.
+    #[serde(default, rename = "avatar_urls")]
+    pub avatar_urls: Option<AvatarUrls>,
+}
+
+/// Keys match `avatarSizeMap` in `XF/App.php` exactly: `o` (384px) → `h`
+/// (384px, "huge" cropped) → `l` (192px) → `m` (96px) → `s` (48px, DESIGN.md's
+/// 2-row × 5-cell avatar tier).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AvatarUrls {
+    #[serde(default)]
+    pub s: Option<String>,
+    #[serde(default)]
+    pub m: Option<String>,
+    #[serde(default)]
+    pub l: Option<String>,
+    #[serde(default)]
+    pub h: Option<String>,
+    #[serde(default)]
+    pub o: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -714,19 +762,77 @@ pub struct SearchResultsReply {
     pub pagination: Pagination,
 }
 
+/// Mirrors the wire shape from `XF\Entity\Attachment::setupApiResultData()` +
+/// `getStructure()` exactly — nothing guessed. Real fields present on every
+/// attachment: `attachment_id` (`autoIncrement`, always emitted regardless of
+/// `api` flags), `content_type`/`content_id`/`attach_date`/`view_count`
+/// (columns flagged `'api' => true`), `filename`/`file_size`/`height`/`width`/
+/// `is_video`/`is_audio`/`direct_url` (always set as `extra` in
+/// `setupApiResultData`). `thumbnail_url`/`retina_thumbnail_url` are set only
+/// `if ($this->has_thumbnail)` / `has_retina_thumbnail` — genuinely absent,
+/// not just empty, on a non-image attachment.
+///
+/// Two things XF does **not** emit that it would be easy to assume it does:
+/// there is no MIME-type field (`content_type` is the entity this attachment
+/// is *attached to*, e.g. `"post"` — not a media type), and there is no
+/// `view_url`. Use `extension()` below to classify the file for the images
+/// tier; `view_url` is kept as a lenient `Option` purely so a future XF
+/// field/hand-built fixture with that key still parses — real responses will
+/// leave it `None` and callers should fall back to `direct_url`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Attachment {
     #[serde(default)]
     pub attachment_id: u32,
     #[serde(default)]
     pub filename: String,
+    /// XF's own `content_type`: the type of content this attachment is
+    /// attached to (`"post"`, `"conversation_message"`, ...), NOT a MIME
+    /// type. See `extension()`.
+    #[serde(default, rename = "content_type")]
+    pub content_type: String,
     #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(default, rename = "file_size")]
     pub file_size: u64,
-    #[serde(default)]
-    pub mime_type: String,
-    /// Direct URL where guests/members can view the attachment.
+    #[serde(default, rename = "thumbnail_url")]
+    pub thumbnail_url: Option<String>,
+    #[serde(default, rename = "direct_url")]
+    pub direct_url: Option<String>,
+    /// Not part of XF's attachment wire format (see struct docs above); kept
+    /// for lenient forward-compat only.
     #[serde(default, rename = "view_url")]
     pub view_url: Option<String>,
+}
+
+impl Attachment {
+    /// Lower-cased file extension parsed from `filename` — XF's attachment
+    /// API exposes no MIME type or extension field directly, so this is the
+    /// only way to classify the file client-side.
+    pub fn extension(&self) -> String {
+        match self.filename.rsplit_once('.') {
+            Some((_, ext)) if !ext.is_empty() => ext.to_ascii_lowercase(),
+            _ => String::new(),
+        }
+    }
+
+    /// True for extensions the images tier (`wftui/src/images.rs`) can decode
+    /// and render inline; anything else stays a text placeholder / browser
+    /// open target.
+    pub fn is_image(&self) -> bool {
+        matches!(
+            self.extension().as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "avif"
+        )
+    }
+
+    /// Best URL to open in a browser (`u` key / digit keys 1-9): prefer the
+    /// real `direct_url` XF emits, fall back to the non-standard `view_url`
+    /// if some future response carries one.
+    pub fn open_url(&self) -> Option<&str> {
+        self.direct_url.as_deref().or(self.view_url.as_deref())
+    }
 }
 
 #[cfg(test)]
@@ -900,5 +1006,25 @@ mod tests {
         let conv_empty: Conversation = serde_json::from_value(conv_empty_json).unwrap();
         assert_eq!(conv_empty.participant_names(), vec!["SelfUser"]);
         assert_eq!(conv_empty.participants_display(), "SelfUser (starter)");
+    }
+
+    #[test]
+    fn absent_discussion_open_deserializes_as_open() {
+        // A partial payload (search hits, embedded thread stubs) omits the
+        // field; absent must mean OPEN, or every row gets the locked glyph.
+        let t: Thread = serde_json::from_value(serde_json::json!({
+            "thread_id": 1,
+            "title": "A thread"
+        }))
+        .unwrap();
+        assert!(t.discussion_open);
+
+        // An explicit false still closes it.
+        let closed: Thread = serde_json::from_value(serde_json::json!({
+            "thread_id": 1,
+            "discussion_open": false
+        }))
+        .unwrap();
+        assert!(!closed.discussion_open);
     }
 }

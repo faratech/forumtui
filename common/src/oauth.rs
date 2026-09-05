@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use base64ct::{Base64UrlUnpadded, Encoding};
-use rand::RngCore;
+use rand::TryRng;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,7 +30,7 @@ pub struct Pkce {
 /// (64 random bytes, base64url).
 pub fn generate_pkce() -> Pkce {
     let mut bytes = [0u8; 64];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    fill_from_os(&mut bytes);
     let verifier = Base64UrlUnpadded::encode_string(&bytes);
     let digest = Sha256::digest(verifier.as_bytes());
     let challenge = Base64UrlUnpadded::encode_string(&digest);
@@ -42,8 +42,21 @@ pub fn generate_pkce() -> Pkce {
 
 pub fn generate_state() -> String {
     let mut bytes = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    fill_from_os(&mut bytes);
     Base64UrlUnpadded::encode_string(&bytes)
+}
+
+/// Fill `dst` straight from the OS entropy source.
+///
+/// rand 0.10 replaced the infallible `rngs::OsRng` with `rngs::SysRng`, which
+/// only implements the fallible `TryRng`. Panicking on failure is exactly what
+/// rand 0.8's `OsRng::fill_bytes` did, and it is the right behaviour here:
+/// these bytes are the PKCE verifier and the OAuth state parameter, so a
+/// degraded fallback would be a security bug, not a graceful degradation.
+fn fill_from_os(dst: &mut [u8]) {
+    rand::rngs::SysRng
+        .try_fill_bytes(dst)
+        .expect("the OS entropy source must be available to start a login");
 }
 
 fn authorize_endpoint() -> String {
