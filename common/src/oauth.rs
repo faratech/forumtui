@@ -351,6 +351,27 @@ async fn token_request(client: &reqwest::Client, form: &[(&str, &str)]) -> Resul
                 status,
             });
         }
+        // XenForo's API answers a rejected refresh with its own envelope,
+        // not RFC 6749's `{"error": "..."}` — `{"errors":[{"code":
+        // "invalid_grant","message":"…"}]}` (see
+        // XF\Api\Controller\OAuth2Controller and `api::error_from_response`'s
+        // identical parse for every other XF endpoint). Without this, every
+        // XF-shaped rejection — including a stale/rotated refresh token,
+        // the exact case that ends a session — fell through to the
+        // `http_error` fallback below with the whole raw JSON body as the
+        // message, and `TaskError::ends_session()` treats `http_error` as
+        // non-session-ending, so the client never reached the Login screen.
+        if let Some(first) = serde_json::from_slice::<crate::models::ApiErrorBody>(&body)
+            .ok()
+            .and_then(|b| b.errors.into_iter().next())
+            .filter(|i| !i.code.is_empty())
+        {
+            return Err(Error::OAuth {
+                code: first.code,
+                message: first.message,
+                status,
+            });
+        }
         return Err(Error::OAuth {
             code: "http_error".into(),
             message: String::from_utf8_lossy(&body).to_string(),
@@ -613,5 +634,116 @@ mod tests {
             .unwrap();
         let err = waiter.await.unwrap().unwrap_err();
         assert!(err.to_string().contains("state mismatch"));
+    }
+
+    /// Env overrides are process-global (`config::base_url`); hold the lock
+    /// for the whole test, mirroring `api::tests::EnvGuard`.
+    struct BaseUrlGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl BaseUrlGuard {
+        fn hold(base: &str) -> Self {
+            let lock = config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            unsafe { std::env::set_var("WFTUI_BASE_URL", base) };
+            BaseUrlGuard { _lock: lock }
+        }
+    }
+
+    impl Drop for BaseUrlGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("WFTUI_BASE_URL") };
+        }
+    }
+
+    /// A stale/rotated refresh token is rejected by XenForo's own API
+    /// envelope (`{"errors":[{"code":"invalid_grant",...}]}`), not RFC
+    /// 6749's `{"error": "..."}`. Before this fix that shape fell through to
+    /// the `http_error` fallback with the whole JSON body as the message —
+    /// and `TaskError::ends_session()` treats `code == "http_error"` as
+    /// never session-ending, so a genuinely dead refresh token never sent
+    /// the user back to the Login screen (the bug this test pins).
+    #[tokio::test]
+    async fn token_request_parses_the_xf_api_error_envelope() {
+        let server = wiremock::MockServer::start().await;
+        let _env = BaseUrlGuard::hold(&server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(config::OAUTH_TOKEN_PATH))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "errors": [{
+                    "code": "invalid_grant",
+                    "message": "The provided authorization code or refresh token is invalid, expired, revoked, does not match the redirection URI used in the authorization request, or was issued to another client."
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = crate::http::build().unwrap();
+        let err = refresh(&client, "stale-refresh-token").await.unwrap_err();
+        match err {
+            Error::OAuth { code, message, status } => {
+                assert_eq!(code, "invalid_grant");
+                assert!(message.contains("invalid"), "{message}");
+                assert_eq!(status, 400);
+            }
+            other => panic!("expected Error::OAuth, got {other:?}"),
+        }
+    }
+
+    /// The RFC 6749 shape (a real OAuth server, or a future non-XF one) must
+    /// keep working — the XF-envelope parse is tried only after this one
+    /// fails to match.
+    #[tokio::test]
+    async fn token_request_still_parses_the_rfc_error_shape() {
+        let server = wiremock::MockServer::start().await;
+        let _env = BaseUrlGuard::hold(&server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(config::OAUTH_TOKEN_PATH))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "Token expired"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = crate::http::build().unwrap();
+        let err = refresh(&client, "stale-refresh-token").await.unwrap_err();
+        match err {
+            Error::OAuth { code, message, status } => {
+                assert_eq!(code, "invalid_grant");
+                assert_eq!(message, "Token expired");
+                assert_eq!(status, 400);
+            }
+            other => panic!("expected Error::OAuth, got {other:?}"),
+        }
+    }
+
+    /// A non-JSON rejection (Cloudflare 5xx/WAF HTML page) must still fall
+    /// back to the synthetic `"http_error"` code — that is the signal
+    /// `TaskError::ends_session()` uses to keep a merely-transient failure
+    /// from being mistaken for a dead grant.
+    #[tokio::test]
+    async fn token_request_falls_back_to_http_error_for_non_json_bodies() {
+        let server = wiremock::MockServer::start().await;
+        let _env = BaseUrlGuard::hold(&server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(config::OAUTH_TOKEN_PATH))
+            .respond_with(
+                wiremock::ResponseTemplate::new(502)
+                    .set_body_string("<html>bad gateway</html>")
+                    .insert_header("content-type", "text/html"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = crate::http::build().unwrap();
+        let err = refresh(&client, "whatever").await.unwrap_err();
+        match err {
+            Error::OAuth { code, status, .. } => {
+                assert_eq!(code, "http_error");
+                assert_eq!(status, 502);
+            }
+            other => panic!("expected Error::OAuth, got {other:?}"),
+        }
     }
 }

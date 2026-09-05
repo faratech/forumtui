@@ -261,11 +261,23 @@ fn right_spans(
     online: Option<u32>,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    if let Some(u) = user {
-        spans.push(Span::styled(u.to_string(), theme.chrome_bold()));
+    match user {
+        // Signed in: name plus the Inbox/Alerts badges.
+        Some(u) => {
+            spans.push(Span::styled(u.to_string(), theme.chrome_bold()));
+            spans.extend(counter(theme, "Inbox", inbox));
+            spans.extend(counter(theme, "Alerts", alerts));
+        }
+        // Logged out (no stored session, or one that just ended): say so
+        // explicitly rather than leaving a blank where the member's name
+        // goes, and never show unread badges — they would be either 0 (from
+        // a `Default` state that never had a session) or a stale carry-over
+        // from the session that just ended, either way meaningless with
+        // nobody signed in (issue #561).
+        None => {
+            spans.push(Span::styled("not signed in", theme.chrome_dim()));
+        }
     }
-    spans.extend(counter(theme, "Inbox", inbox));
-    spans.extend(counter(theme, "Alerts", alerts));
     if let Some(n) = online {
         spans.push(Span::styled(
             format!("   {} online", thousands(n)),
@@ -679,6 +691,21 @@ mod tests {
 
         let without = header_line(&t, &UNICODE, &[], Some("Mike"), 0, 0, None, 80);
         assert!(!without.spans.iter().any(is_badge));
+    }
+
+    /// Issue #561: a logged-out header (no stored session, or one that just
+    /// ended) used to render a blank where the username goes and still show
+    /// `Inbox 0`/`Alerts 0` — indistinguishable from a signed-in member with
+    /// an empty inbox. `user: None` must say "not signed in" and must never
+    /// show the unread badges at all (not even the zero form).
+    #[test]
+    fn header_says_not_signed_in_and_hides_badges_when_logged_out() {
+        let t = Theme::truecolor();
+        let line = header_line(&t, &UNICODE, &[], None, 3, 5, None, 80);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("not signed in"), "{text}");
+        assert!(!text.contains("Inbox"), "{text}");
+        assert!(!text.contains("Alerts"), "{text}");
     }
 
     #[test]

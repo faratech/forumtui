@@ -73,6 +73,27 @@ pub struct TaskError {
     pub kind: TaskErrorKind,
 }
 
+/// Hard cap on how much of an *unstructured* error message ever reaches a
+/// status line. `Error::Api`/`Error::OAuth`'s `"http_error"` fallback (and,
+/// in principle, any opaque `Display` in the `Other` bucket) hands back
+/// whatever the server sent verbatim — a raw JSON envelope, a Cloudflare
+/// challenge page, a WAF HTML block — and that is exactly what pushed
+/// "press r to retry" off the end of a 120-column terminal (issue #561).
+/// A genuinely parsed server message (a real `code`) is left untouched:
+/// this only guards the fallback case.
+const RAW_MESSAGE_CAP: usize = 80;
+
+/// Truncate `s` to at most `max` *chars* (not bytes, so a multi-byte
+/// codepoint is never split), appending `…` when it was longer.
+fn cap_message(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
 impl TaskError {
     /// True only when the failure means the stored session itself is
     /// invalid. This refines `TaskErrorKind::ends_session()` (which only
@@ -89,13 +110,21 @@ impl TaskError {
     pub fn of(e: &Error) -> Self {
         match e {
             Error::Api { code, message, status, max_page } => TaskError {
-                message: message.clone(),
+                message: if code == "http_error" {
+                    cap_message(message, RAW_MESSAGE_CAP)
+                } else {
+                    message.clone()
+                },
                 code: Some(code.clone()),
                 max_page: *max_page,
                 kind: TaskErrorKind::Api(*status),
             },
             Error::OAuth { code, message, .. } => TaskError {
-                message: message.clone(),
+                message: if code == "http_error" {
+                    cap_message(message, RAW_MESSAGE_CAP)
+                } else {
+                    message.clone()
+                },
                 code: Some(code.clone()),
                 max_page: None,
                 kind: TaskErrorKind::OAuth,
@@ -107,7 +136,7 @@ impl TaskError {
                 kind: TaskErrorKind::NoToken,
             },
             other => TaskError {
-                message: other.to_string(),
+                message: cap_message(&other.to_string(), RAW_MESSAGE_CAP),
                 code: None,
                 max_page: None,
                 kind: TaskErrorKind::Other,
@@ -2429,7 +2458,34 @@ impl App {
                 // server 5xx, which must not throw away a token that would
                 // work the moment the network/server recovers (issue #551).
                 self.bootstrap_retry_needed = true;
-                self.status = format!("Can't reach windowsforum.com ({e}) — press r to retry.");
+                // The Forums panel must not spin on "Loading forums…"
+                // forever for a failure that will never resolve on its own
+                // (no `NodesLoaded` is coming — bootstrap never got that
+                // far) — show the same retry hint there `render_forum_panel`
+                // already knows how to draw for `NodesLoaded`'s own Err arm,
+                // instead of leaving the priming spinner up with no session
+                // and no way to tell the user anything went wrong (issue
+                // #561).
+                if let Some(tree) = self.tree_mut() {
+                    tree.loading = false;
+                    tree.error = Some(cap_message(&e.message, RAW_MESSAGE_CAP));
+                }
+                // `chrome::status_line` clips an overlong `left` string from
+                // the *right* to keep the write-gate widget on screen — so
+                // an uncapped raw HTTP body here is exactly what pushed
+                // " — press r to retry." off the end of a 120-column
+                // terminal (issue #561, the reported bug). `TaskError::of`
+                // already caps the synthetic `"http_error"` fallback at
+                // construction (`RAW_MESSAGE_CAP` = 80), but this wrapper's
+                // own fixed text already spends ~50 cells before the message
+                // even starts, so re-cap tighter here: this line's tail is
+                // load-bearing and must survive regardless of how the
+                // `TaskError` was built.
+                const BOOTSTRAP_STATUS_MSG_CAP: usize = 30;
+                self.status = format!(
+                    "Can't reach windowsforum.com ({}) — press r to retry.",
+                    cap_message(&e.message, BOOTSTRAP_STATUS_MSG_CAP)
+                );
             }
             Msg::NodesLoaded(result) => {
                 let tree = self.tree_mut();
@@ -4279,6 +4335,99 @@ mod tests {
         assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
         assert!(!app.bootstrap_retry_needed);
         assert!(app.status.contains("Session expired"));
+    }
+
+    /// Issue #561: a stale/rotated refresh token now surfaces as
+    /// `Error::OAuth{code: "invalid_grant"}` (once `token_request` parses
+    /// XenForo's own `{"errors":[...]}` envelope instead of falling back to
+    /// the synthetic `"http_error"`) — this is the app-side half: whatever
+    /// arrives on `Msg::Bootstrap` with that real code must take the
+    /// session-ending path (Login screen up, `me` cleared, no retry armed),
+    /// exactly like the pre-existing `NoToken`/401/403 cases already do.
+    #[test]
+    fn bootstrap_invalid_grant_ends_the_session_and_shows_login() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(true));
+        app.me = Some(User { user_id: 3, username: "stale".into(), ..Default::default() });
+
+        app.handle_msg(Msg::Bootstrap {
+            generation: app.bootstrap_generation,
+            result: Err(TaskError::of(&Error::OAuth {
+                code: "invalid_grant".into(),
+                message: "The provided authorization code or refresh token is invalid.".into(),
+                status: 400,
+            })),
+        });
+
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Login(_))),
+            "a genuine invalid_grant must end the session"
+        );
+        assert!(app.me.is_none(), "me must be cleared once the session ends");
+        assert!(!app.bootstrap_retry_needed, "there is no session left to retry restoring");
+    }
+
+    /// Issue #561: the converse of the test above — a genuinely transient
+    /// bootstrap failure (a Cloudflare 5xx/gateway page, wrapped by
+    /// `token_request`'s http-error fallback as `Error::OAuth{code:
+    /// "http_error"}` with the whole raw body as the message) must neither
+    /// end the session nor leave the Forums panel spinning "Loading
+    /// forums…" forever, and the status line must keep "press r to retry"
+    /// on screen rather than pushed off by an uncapped raw body.
+    #[test]
+    fn bootstrap_transient_http_error_shows_retry_in_forums_panel_and_status() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(true));
+
+        // A realistic Cloudflare gateway page — much longer than any status
+        // row, which is exactly what the operator hit (issue #561).
+        let raw_body = "<html><head><title>502 Bad Gateway</title></head><body><center>\
+            <h1>502 Bad Gateway</h1></center><hr><center>cloudflare</center></body></html>"
+            .repeat(2);
+        app.handle_msg(Msg::Bootstrap {
+            generation: app.bootstrap_generation,
+            result: Err(TaskError::of(&Error::OAuth {
+                code: "http_error".into(),
+                message: raw_body,
+                status: 502,
+            })),
+        });
+
+        assert!(
+            !app.screens.iter().any(|s| matches!(s, Screen::Login(_))),
+            "a transient failure must not push the login screen"
+        );
+        assert!(app.bootstrap_retry_needed);
+        assert!(!app.status.contains('\n'), "status must be one line: {:?}", app.status);
+        assert!(app.status.contains("press r to retry"), "{:?}", app.status);
+        assert!(
+            app.status.chars().count() < 100,
+            "status must comfortably fit a 120-column terminal alongside the \
+             write-gate widget: {} chars: {:?}",
+            app.status.chars().count(),
+            app.status
+        );
+
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            let screen = app.screens.last_mut().expect("screen");
+            screen.render(f, area, &app.theme, &app.glyphs);
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let screen_text: String = (0..24)
+            .map(|y| (0..80).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect();
+        assert!(
+            !screen_text.contains("Loading forums"),
+            "the spinner must not still be showing:\n{screen_text}"
+        );
+        assert!(
+            screen_text.contains("Press r to retry."),
+            "the Forums panel must show the retry hint instead of spinning forever:\n{screen_text}"
+        );
     }
 
     /// Issue #557: a refresh rejected with `invalid_grant` mid-session (XF
