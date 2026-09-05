@@ -453,15 +453,14 @@ pub fn render_thread_view(
         return;
     }
 
-    let content_height = inner.height as usize;
+    let body = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let view = body[0];
     let total = s.lines.len() as u16;
-    let max_scroll = total.saturating_sub(content_height as u16);
+    let max_scroll = total.saturating_sub(view.height);
     if s.scroll > max_scroll {
         s.scroll = max_scroll;
     }
 
-    let body = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
-    let view = body[0];
     f.render_widget(
         Paragraph::new(s.lines.clone())
             .scroll((s.scroll, 0))

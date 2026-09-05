@@ -224,18 +224,19 @@ pub fn render_conversation_view(
         return;
     }
 
+    let body = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let view = body[0];
     let total = s.lines.len() as u16;
-    let max_scroll = total.saturating_sub(inner.height);
+    let max_scroll = total.saturating_sub(view.height);
     if s.scroll > max_scroll {
         s.scroll = max_scroll;
     }
 
-    let body = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
     f.render_widget(
         Paragraph::new(s.lines.clone())
             .scroll((s.scroll, 0))
             .wrap(Wrap { trim: false }),
-        body[0],
+        view,
     );
     let hints = footer_line(
         theme,
