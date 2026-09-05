@@ -368,14 +368,17 @@ impl WfApi for WfApiClient {
     }
 
     async fn reply_conversation(&self, id: u32, message: &str) -> Result<()> {
-        self.post_unit(
-            "/conversation-messages",
-            &[
-                ("conversation_id", id.to_string()),
-                ("message", message.to_string()),
-            ],
-        )
-        .await
+        let _: serde_json::Value = self
+            .post_form(
+                "/conversation-messages",
+                &[
+                    ("conversation_id", id.to_string()),
+                    ("message", message.to_string()),
+                ],
+                None,
+            )
+            .await?;
+        Ok(())
     }
 
     async fn create_conversation(
@@ -718,5 +721,30 @@ mod tests {
 
         let not_found = c.find_user("unknown").await.unwrap();
         assert!(not_found.is_none());
+    }
+
+    #[tokio::test]
+    async fn reply_conversation_succeeds_and_posts_message() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-replyconv");
+        Mock::given(method("POST"))
+            .and(path("/api/conversation-messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "message": {
+                    "message_id": 100,
+                    "conversation_id": 5,
+                    "message_date": 1700000000,
+                    "user_id": 1,
+                    "username": "tester",
+                    "message": "hello conversation"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let res = c.reply_conversation(5, "hello conversation").await;
+        assert!(res.is_ok());
     }
 }
