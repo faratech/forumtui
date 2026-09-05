@@ -776,6 +776,7 @@ impl App {
     pub fn new_thread(&mut self, node_id: u32) {
         self.push_screen(Screen::Compose(screens::ComposeState {
             target: Some(ComposeTarget::NewThread { node_id }),
+            title_field: true,
             ..Default::default()
         }));
     }

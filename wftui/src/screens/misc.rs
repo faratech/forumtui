@@ -111,14 +111,22 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
         Some(t) => t.clone(),
         None => return Action::None,
     };
+    let is_new_thread = matches!(target, ComposeTarget::NewThread { .. });
+    if !is_new_thread {
+        s.title_field = false;
+    }
     match key.code {
         KeyCode::Esc => Action::PopScreen,
         KeyCode::Tab => {
-            s.title_field = !s.title_field;
+            if is_new_thread {
+                s.title_field = !s.title_field;
+            } else {
+                s.body.push_str("    ");
+            }
             Action::None
         }
         KeyCode::Backspace => {
-            if s.title_field {
+            if s.title_field && is_new_thread {
                 s.title.pop();
             } else {
                 s.body.pop();
@@ -126,7 +134,11 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
             Action::None
         }
         KeyCode::Enter => {
-            s.body.push('\n');
+            if s.title_field && is_new_thread {
+                s.title_field = false;
+            } else {
+                s.body.push('\n');
+            }
             Action::None
         }
         KeyCode::Char('y')
@@ -169,7 +181,7 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
             }
         }
         KeyCode::Char(c) => {
-            if s.title_field {
+            if s.title_field && is_new_thread {
                 s.title.push(c);
             } else {
                 s.body.push(c);
@@ -457,4 +469,43 @@ pub fn render_profile(
         1,
     );
     f.render_widget(Paragraph::new(hints), hint_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::screens::ComposeState;
+
+    #[test]
+    fn new_thread_enter_in_title_advances_to_body() {
+        let mut s = ComposeState {
+            target: Some(ComposeTarget::NewThread { node_id: 4 }),
+            title_field: true,
+            title: "Test Title".into(),
+            body: String::new(),
+            ..Default::default()
+        };
+        compose_key(&mut s, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!s.title_field, "Enter in title field should advance to body");
+        assert!(s.body.is_empty(), "Enter in title should not push newline to body");
+    }
+
+    #[test]
+    fn reply_tab_does_not_divert_to_title() {
+        let mut s = ComposeState {
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 1,
+                thread_title: "Thread".into(),
+            }),
+            title_field: false,
+            title: String::new(),
+            body: String::new(),
+            ..Default::default()
+        };
+        compose_key(&mut s, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(!s.title_field, "Reply mode should never focus title");
+        compose_key(&mut s, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(s.body, "    a");
+        assert!(s.title.is_empty());
+    }
 }
