@@ -1313,10 +1313,15 @@ impl App {
         if url.is_empty() {
             return;
         }
-        let target = if url.starts_with("http") {
+        let target = if url.starts_with("http://") || url.starts_with("https://") {
             url.to_string()
         } else {
-            format!("{}{}", common::config::BASE_URL, url)
+            let base = common::config::base_url();
+            if url.starts_with('/') {
+                format!("{base}{url}")
+            } else {
+                format!("{base}/{url}")
+            }
         };
         // Remote sessions: even if the opener targets the wrong machine, the
         // URL is now in the user's local clipboard.
