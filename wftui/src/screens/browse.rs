@@ -382,6 +382,7 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
         KeyCode::Char('m') => Action::MarkThreadRead(s.thread.thread_id),
         KeyCode::Char('o') => {
             if !s.links.is_empty() {
+                s.sel_local = s.sel_local.min(s.links.len().saturating_sub(1));
                 s.link_popup = true;
             }
             Action::None
@@ -395,6 +396,11 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
 }
 
 fn link_popup_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
+    if s.links.is_empty() {
+        s.link_popup = false;
+        return Action::None;
+    }
+    s.sel_local = s.sel_local.min(s.links.len().saturating_sub(1));
     match key.code {
         KeyCode::Esc => {
             s.link_popup = false;
@@ -410,13 +416,11 @@ fn link_popup_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
             }
             Action::None
         }
-        KeyCode::Enter => match s.links.get(s.sel_local) {
-            Some(url) => {
-                s.link_popup = false;
-                Action::OpenUrl(url.clone())
-            }
-            None => Action::None,
-        },
+        KeyCode::Enter => {
+            let sel = s.sel_local.min(s.links.len().saturating_sub(1));
+            s.link_popup = false;
+            Action::OpenUrl(s.links[sel].clone())
+        }
         _ => Action::None,
     }
 }
@@ -552,5 +556,32 @@ mod tests {
             &theme,
         );
         assert_eq!(lines.len(), 4);
+    }
+
+    #[test]
+    fn link_popup_clamps_out_of_bounds_selection() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = ThreadViewState {
+            links: vec!["https://example.com/1".into(), "https://example.com/2".into()],
+            sel_local: 10,
+            link_popup: false,
+            ..Default::default()
+        };
+
+        let act = thread_view_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+        );
+        assert!(matches!(act, Action::None));
+        assert!(state.link_popup);
+        assert_eq!(state.sel_local, 1);
+
+        let act = thread_view_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(act, Action::OpenUrl(url) if url == "https://example.com/2"));
+        assert!(!state.link_popup);
     }
 }
