@@ -96,6 +96,7 @@ pub fn forum_tree_key(s: &mut super::ForumTreeState, key: KeyEvent) -> Action {
         KeyCode::Char('1') => open_node_action(&s.nodes, NEWS_NODE, "Windows News"),
         KeyCode::Char('2') => open_node_action(&s.nodes, SECURITY_NODE, "Security Alerts"),
         KeyCode::Char('3') => open_node_action(&s.nodes, TUTORIALS_NODE, "Windows Tutorials"),
+        KeyCode::Char('L') => Action::OpenLatestThreads,
         KeyCode::Char('r') => {
             s.loading = true;
             Action::LoadNodes
@@ -314,17 +315,47 @@ pub fn render_thread_list(
             if t.sticky {
                 spans.push(Span::styled("📌 ", theme.warn));
             }
+            if t.has_solution() {
+                spans.push(Span::styled(
+                    "✓ [Solved] ",
+                    Style::new()
+                        .fg(ratatui::style::Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else if t.is_question() {
+                spans.push(Span::styled(
+                    "❓ [Question] ",
+                    Style::new().fg(ratatui::style::Color::Yellow),
+                ));
+            } else if t.is_article() {
+                spans.push(Span::styled(
+                    "📰 [Article] ",
+                    Style::new().fg(ratatui::style::Color::Cyan),
+                ));
+            } else if t.is_suggestion() {
+                spans.push(Span::styled(
+                    "💡 [Suggestion] ",
+                    Style::new().fg(ratatui::style::Color::Magenta),
+                ));
+            } else if t.is_poll() {
+                spans.push(Span::styled(
+                    "📊 [Poll] ",
+                    Style::new().fg(ratatui::style::Color::Blue),
+                ));
+            }
+            if let Some(prefix) = &t.prefix {
+                spans.push(Span::styled(format!("[{prefix}] "), theme.accent));
+            }
             spans.push(Span::styled(t.title.clone(), theme.base()));
-            spans.push(Span::styled(
-                format!(
-                    "  {} by {} · {} replies · last {}",
-                    fmt_time(t.post_date),
-                    t.username,
-                    t.reply_count,
-                    t.last_post_username
-                ),
-                theme.dim(),
+            let mut meta = format!("  {} by {}", fmt_time(t.post_date), t.username);
+            if t.vote_score != 0 {
+                meta.push_str(&format!(" · ▲ {}", t.vote_score));
+            }
+            meta.push_str(&format!(
+                " · {} replies · last {}",
+                t.reply_count, t.last_post_username
             ));
+            spans.push(Span::styled(meta, theme.dim()));
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -360,6 +391,8 @@ impl ThreadViewState {
     pub fn rebuild_lines(&mut self, theme: &Theme) {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut links: Vec<String> = Vec::new();
+        let mut offsets: Vec<usize> = Vec::new();
+
         if let Some(url) = &self.thread.view_url {
             links.push(url.clone());
             lines.push(Line::from(Span::styled(
@@ -367,23 +400,101 @@ impl ThreadViewState {
                 link_style(theme),
             )));
         }
+
+        if self.thread.is_article() {
+            lines.push(Line::from(Span::styled(
+                format!("📰 ARTICLE: {}", self.thread.title),
+                theme.title().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "Published by {} · {}",
+                    self.thread.username,
+                    fmt_time(self.thread.post_date)
+                ),
+                theme.dim(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "────────────────────────────────────────────────────────────",
+                theme.dim(),
+            )));
+            lines.push(Line::from(Span::raw("")));
+        } else if self.thread.is_question() {
+            if self.thread.has_solution() {
+                lines.push(Line::from(Span::styled(
+                    "✓ QUESTION THREAD — MARKED SOLUTION AVAILABLE",
+                    Style::new()
+                        .fg(ratatui::style::Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "❓ QUESTION THREAD — AWAITING SOLUTION",
+                    Style::new()
+                        .fg(ratatui::style::Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+            lines.push(Line::from(Span::raw("")));
+        }
+
+        let solution_id = self.thread.solution_post_id();
+
         for post in &self.posts {
-            lines.push(Line::from(vec![
+            offsets.push(lines.len());
+            let is_solution = solution_id == Some(post.post_id);
+            if is_solution {
+                lines.push(Line::from(Span::styled(
+                    "┌── ✓ MARKED SOLUTION ──────────────────────────────────────────────",
+                    Style::new()
+                        .fg(ratatui::style::Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+
+            let mut header_spans = vec![
                 Span::styled("■ ", theme.accent),
                 Span::styled(
                     post.username.clone(),
                     theme.base().add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!("  {}  · {}", fmt_time(post.post_date), post.post_id),
+            ];
+            if post.vote_score != 0 {
+                let col = if post.vote_score > 0 {
+                    ratatui::style::Color::Green
+                } else {
+                    ratatui::style::Color::Red
+                };
+                header_spans.push(Span::styled(
+                    format!("  ▲ {} ", post.vote_score),
+                    Style::new().fg(col),
+                ));
+            }
+            if post.reaction_score > 0 {
+                header_spans.push(Span::styled(
+                    format!("  ❤️ {} ", post.reaction_score),
                     theme.dim(),
-                ),
-            ]));
+                ));
+            }
+            header_spans.push(Span::styled(
+                format!("  {} · #{}", fmt_time(post.post_date), post.post_id),
+                theme.dim(),
+            ));
+            lines.push(Line::from(header_spans));
+
             push_bbcode(&mut lines, &mut links, &post.message, theme);
+
+            if is_solution {
+                lines.push(Line::from(Span::styled(
+                    "└── ✓ END OF MARKED SOLUTION ───────────────────────────────────────",
+                    Style::new().fg(ratatui::style::Color::Green),
+                )));
+            }
             lines.push(Line::from(Span::raw("")));
         }
         self.lines = lines;
         self.links = links;
+        self.post_line_offsets = offsets;
     }
 }
 
@@ -481,7 +592,53 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
         }
         KeyCode::Char('r') => Action::StartReply(s.thread.clone()),
         KeyCode::Char('p') => {
-            Action::OpenProfile(s.thread.user_id, s.thread.username.clone())
+            if let Some(post) = s.posts.get(s.sel_post) {
+                Action::OpenProfile(post.user_id, post.username.clone())
+            } else {
+                Action::OpenProfile(s.thread.user_id, s.thread.username.clone())
+            }
+        }
+        KeyCode::Char('P') => Action::OpenProfile(s.thread.user_id, s.thread.username.clone()),
+        KeyCode::Char('l') => {
+            if let Some(post) = s.posts.get(s.sel_post) {
+                Action::ReactPost(post.post_id)
+            } else if let Some(first) = s.posts.first() {
+                Action::ReactPost(first.post_id)
+            } else {
+                Action::None
+            }
+        }
+        KeyCode::Char('v') => {
+            if let Some(post) = s.posts.get(s.sel_post) {
+                Action::VotePost(post.post_id, "up".into())
+            } else {
+                Action::None
+            }
+        }
+        KeyCode::Char('V') => {
+            if let Some(post) = s.posts.get(s.sel_post) {
+                Action::VotePost(post.post_id, "down".into())
+            } else {
+                Action::None
+            }
+        }
+        KeyCode::Char('n') => {
+            if s.sel_post + 1 < s.posts.len() {
+                s.sel_post += 1;
+                if let Some(&line) = s.post_line_offsets.get(s.sel_post) {
+                    s.scroll = line as u16;
+                }
+            }
+            Action::None
+        }
+        KeyCode::Char('N') => {
+            if s.sel_post > 0 {
+                s.sel_post -= 1;
+                if let Some(&line) = s.post_line_offsets.get(s.sel_post) {
+                    s.scroll = line as u16;
+                }
+            }
+            Action::None
         }
         KeyCode::Char('m') => Action::MarkThreadRead(s.thread.thread_id),
         KeyCode::Char('o') => {
@@ -579,12 +736,15 @@ pub fn render_thread_view(
     let hints = footer_line(
         theme,
         &[
-            ("↑↓/PgUp/PgDn", "scroll"),
+            ("↑↓/n/N", "scroll/post"),
             ("[/]", "post page"),
             ("r", "reply"),
+            ("l", "like"),
+            ("v/V", "vote up/dn"),
+            ("p/P", "post/OP profile"),
             ("m", "mark read"),
             ("o", "links"),
-            ("u", "open in browser"),
+            ("u", "web"),
         ],
     );
     f.render_widget(Paragraph::new(hints), body[1]);
@@ -763,5 +923,97 @@ mod tests {
         // open_node_action on Category should resolve to child forum
         let act = open_node_action(&nodes, 301, "Windows Forums");
         assert!(matches!(act, Action::OpenThreadList(id, _) if id == 302));
+
+        // 'L' opens latest threads
+        let act = forum_tree_key(&mut state, KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
+        assert!(matches!(act, Action::OpenLatestThreads));
+    }
+
+    #[test]
+    fn thread_view_shortcuts_and_type_rendering() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use common::models::{Post, Thread};
+
+        let mut thread = Thread {
+            thread_id: 101,
+            title: "How do I fix BSOD on Windows 11?".into(),
+            username: "Alice".into(),
+            user_id: 10,
+            discussion_type: "question".into(),
+            vote_score: 5,
+            highlighted_post_ids: vec![202],
+            ..Default::default()
+        };
+        thread.type_data = serde_json::json!({ "solution_post_id": 202 });
+
+        let posts = vec![
+            Post {
+                post_id: 201,
+                thread_id: 101,
+                user_id: 10,
+                username: "Alice".into(),
+                message: "Here is my crash dump...".into(),
+                vote_score: 0,
+                is_first_post: true,
+                ..Default::default()
+            },
+            Post {
+                post_id: 202,
+                thread_id: 101,
+                user_id: 20,
+                username: "Bob_Guru".into(),
+                message: "Update your GPU driver to v550+.".into(),
+                vote_score: 12,
+                is_first_post: false,
+                ..Default::default()
+            },
+        ];
+
+        let theme = Theme::dark();
+        let mut state = ThreadViewState {
+            thread,
+            posts,
+            ..Default::default()
+        };
+        state.rebuild_lines(&theme);
+
+        // Verify solution callout box is rendered in the lines
+        let rendered_text: String = state.lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref())).collect();
+        assert!(rendered_text.contains("MARKED SOLUTION"), "Expected MARKED SOLUTION callout in question thread lines");
+        assert!(rendered_text.contains("Bob_Guru"), "Expected solution author Bob_Guru");
+
+        // Key 'p': open author profile of active post (initially post 0: Alice)
+        let act = thread_view_key(&mut state, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(matches!(act, Action::OpenProfile(uid, name) if uid == 10 && name == "Alice"));
+
+        // Key 'n': navigate to next post (post 1: Bob_Guru)
+        let act = thread_view_key(&mut state, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(matches!(act, Action::None));
+        assert_eq!(state.sel_post, 1);
+
+        // Key 'p': open author profile of Bob_Guru
+        let act = thread_view_key(&mut state, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(matches!(act, Action::OpenProfile(uid, name) if uid == 20 && name == "Bob_Guru"));
+
+        // Key 'P': open thread OP profile (Alice)
+        let act = thread_view_key(&mut state, KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+        assert!(matches!(act, Action::OpenProfile(uid, name) if uid == 10 && name == "Alice"));
+
+        // Key 'l': react to active post (post 202)
+        let act = thread_view_key(&mut state, KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(matches!(act, Action::ReactPost(pid) if pid == 202));
+
+        // Key 'v': vote up on active post
+        let act = thread_view_key(&mut state, KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(matches!(act, Action::VotePost(pid, vt) if pid == 202 && vt == "up"));
+
+        // Key 'V': vote down on active post
+        let act = thread_view_key(&mut state, KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT));
+        assert!(matches!(act, Action::VotePost(pid, vt) if pid == 202 && vt == "down"));
+
+        // Key 'N': navigate back to previous post (post 0)
+        let act = thread_view_key(&mut state, KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+        assert!(matches!(act, Action::None));
+        assert_eq!(state.sel_post, 0);
     }
 }

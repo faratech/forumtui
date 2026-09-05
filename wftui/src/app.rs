@@ -570,8 +570,42 @@ impl App {
                     self.load_forum(node_id, 1);
                 }
             }
+            Action::OpenLatestThreads => {
+                self.push_screen(Screen::ThreadList(screens::ThreadListState {
+                    node_id: 0,
+                    title: "Latest Threads".to_string(),
+                    page: 1,
+                    loading: true,
+                    ..Default::default()
+                }));
+                self.load_forum(0, 1);
+            }
             Action::OpenThread(thread) => self.open_thread(&thread),
             Action::OpenProfile(user_id, name) => self.open_profile(user_id, &name),
+            Action::OpenMemberContent {
+                user_id,
+                username,
+                content,
+            } => {
+                let display_title = format!("{username}'s {content}");
+                let s = screens::SearchState {
+                    query: format!("by: {username} ({content})"),
+                    input_mode: false,
+                    loading: true,
+                    ..Default::default()
+                };
+                self.push_screen(Screen::Search(s));
+                let api = self.api.clone();
+                let tx = self.tx.clone();
+                self.status = format!("Searching {display_title}…");
+                tokio::spawn(async move {
+                    let result = api
+                        .search_member(user_id, &content, 1)
+                        .await
+                        .map_err(|e| TaskError::of(&e));
+                    tx.send(Msg::SearchDone { page: 1, result }).ok();
+                });
+            }
             Action::OpenConversation(conv) => {
                 let cid = conv.conversation_id;
                 self.push_screen(Screen::ConversationView(screens::ConversationViewState {
@@ -594,7 +628,7 @@ impl App {
                 }
                 self.load_nodes();
             }
-            Action::RunSearch(query, page) => self.run_search(query, page),
+            Action::RunSearchQuery(query) => self.run_search_query(query),
             Action::MarkThreadRead(id) => self.mark_thread_read(id),
             Action::MarkForumRead(node_id) => {
                 let api = self.api.clone();
@@ -608,11 +642,46 @@ impl App {
                 });
             }
             Action::MarkAlertRead(id) => self.mark_alert_read(id),
+            Action::ReactPost(post_id) => {
+                let api = self.api.clone();
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    match api.react_post(post_id, 1).await {
+                        Ok(()) => {
+                            tx.send(Msg::Notice("Post liked!".into())).ok();
+                        }
+                        Err(e) => {
+                            tx.send(Msg::Notice(format!("Like failed: {e}"))).ok();
+                        }
+                    }
+                });
+            }
+            Action::VotePost(post_id, vote_type) => {
+                let api = self.api.clone();
+                let tx = self.tx.clone();
+                let vt = vote_type.clone();
+                tokio::spawn(async move {
+                    match api.vote_post(post_id, &vote_type).await {
+                        Ok(()) => {
+                            tx.send(Msg::Notice(format!("Voted {vt}!"))).ok();
+                        }
+                        Err(e) => {
+                            tx.send(Msg::Notice(format!("Vote failed: {e}"))).ok();
+                        }
+                    }
+                });
+            }
             Action::StartReply(thread) => self.reply_to_thread(&thread),
             Action::StartReplyConversation(conv) => self.reply_to_conversation(&conv),
             Action::StartNewThread(node_id) => self.new_thread(node_id),
-            Action::StartNewConversation => {
-                self.push_screen(Screen::NewConversation(screens::NewConversationState::default()));
+            Action::StartNewConversation(recipient) => {
+                let mut state = screens::NewConversationState::default();
+                if let Some(r) = recipient {
+                    state.recipients = format!("{r}, ");
+                    state.recipients_cursor = state.recipients.len();
+                    state.field = 1;
+                }
+                self.push_screen(Screen::NewConversation(state));
             }
             Action::SubmitReply { thread_id, message } => {
                 let api = self.api.clone();
@@ -727,7 +796,11 @@ impl App {
                 }
                 Screen::Search(ss) => {
                     let sanitized = text.replace(['\r', '\n'], " ");
-                    crate::editor::insert_str(&mut ss.query, &mut ss.cursor, &sanitized);
+                    if ss.active_field == 1 {
+                        crate::editor::insert_str(&mut ss.author, &mut ss.author_cursor, &sanitized);
+                    } else {
+                        crate::editor::insert_str(&mut ss.query, &mut ss.query_cursor, &sanitized);
+                    }
                     self.status = format!("Pasted {} characters into search", text.chars().count());
                 }
                 Screen::NewConversation(ncs) => {
@@ -1033,7 +1106,22 @@ impl App {
         let api = self.api.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = api.forum(node_id, page).await.map_err(|e| TaskError::of(&e));
+            let result = if node_id == 0 {
+                api.threads(page)
+                    .await
+                    .map(|r| ForumReply {
+                        forum: Forum {
+                            node_id: 0,
+                            title: "Latest Threads".to_string(),
+                            ..Default::default()
+                        },
+                        threads: r.threads,
+                        pagination: r.pagination,
+                    })
+                    .map_err(|e| TaskError::of(&e))
+            } else {
+                api.forum(node_id, page).await.map_err(|e| TaskError::of(&e))
+            };
             tx.send(Msg::ForumLoaded { page, result }).ok();
         });
     }
@@ -1193,6 +1281,8 @@ impl App {
                     self.alerts_unread = v.parse().unwrap_or(0);
                 } else if let Some(v) = n.strip_prefix("convos:") {
                     self.convos_unread = v.parse().unwrap_or(0);
+                } else {
+                    self.status = n;
                 }
             }
             Msg::Bootstrap(Ok(user)) => {
@@ -1228,6 +1318,7 @@ impl App {
                             }
                             tree.nodes = nodes;
                             tree.loading = false;
+                            tree.sel = tree.sel.min(tree.nodes.len().saturating_sub(1));
                         }
                         Err(e) => {
                             tree.loading = false;
@@ -1244,6 +1335,9 @@ impl App {
                 if let Some(list) = list {
                     match result {
                         Ok(reply) => {
+                            if !reply.forum.title.is_empty() {
+                                list.title = reply.forum.title;
+                            }
                             list.threads = reply.threads;
                             list.page = page;
                             list.last_page = reply.pagination.last_page.max(1);
@@ -1265,8 +1359,8 @@ impl App {
                 if let Some(view) = view {
                     match result {
                         Ok(reply) => {
-                            if !reply.thread.title.is_empty() {
-                                view.thread.title = reply.thread.title.clone();
+                            if reply.thread.thread_id > 0 || !reply.thread.title.is_empty() {
+                                view.thread = reply.thread;
                             }
                             view.posts = reply.posts;
                             view.page = page;
@@ -1615,12 +1709,16 @@ impl App {
         });
     }
 
-    pub fn run_search(&mut self, query: String, page: u32) {
+    pub fn run_search_query(&mut self, query: SearchQuery) {
         let api = self.api.clone();
         let tx = self.tx.clone();
+        let page = query.page;
         self.status = "Searching…".into();
         tokio::spawn(async move {
-            let result = api.search(&query, page).await.map_err(|e| TaskError::of(&e));
+            let result = api
+                .search_advanced(&query)
+                .await
+                .map_err(|e| TaskError::of(&e));
             tx.send(Msg::SearchDone { page, result }).ok();
         });
     }

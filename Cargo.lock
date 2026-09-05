@@ -2151,6 +2151,7 @@ dependencies = [
  "common",
  "crossterm",
  "ratatui",
+ "serde_json",
  "time",
  "tokio",
  "tracing",

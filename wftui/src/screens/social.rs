@@ -51,7 +51,7 @@ pub fn conversations_key(s: &mut super::ConversationsState, key: KeyEvent) -> Ac
             Some(c) => Action::OpenConversation(c.clone()),
             None => Action::None,
         },
-        KeyCode::Char('n') => Action::StartNewConversation,
+        KeyCode::Char('n') => Action::StartNewConversation(None),
         KeyCode::Char('r') => {
             s.loading = true;
             Action::LoadConversations(s.page)

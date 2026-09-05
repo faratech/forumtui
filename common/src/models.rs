@@ -103,8 +103,64 @@ pub struct Thread {
     pub sticky: bool,
     #[serde(default, rename = "discussion_open")]
     pub discussion_open: bool,
+    #[serde(default, rename = "discussion_type")]
+    pub discussion_type: String,
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default, rename = "vote_score")]
+    pub vote_score: i64,
+    #[serde(default, rename = "highlighted_post_ids")]
+    pub highlighted_post_ids: Vec<u32>,
+    #[serde(default, rename = "type_data")]
+    pub type_data: serde_json::Value,
+    #[serde(default, rename = "is_unread")]
+    pub is_unread: bool,
+    #[serde(default, rename = "is_watching")]
+    pub is_watching: bool,
     #[serde(default, rename = "view_url")]
     pub view_url: Option<String>,
+}
+
+impl Thread {
+    pub fn is_question(&self) -> bool {
+        self.discussion_type == "question"
+    }
+
+    pub fn is_article(&self) -> bool {
+        self.discussion_type == "article"
+    }
+
+    pub fn is_suggestion(&self) -> bool {
+        self.discussion_type == "suggestion"
+    }
+
+    pub fn is_poll(&self) -> bool {
+        self.discussion_type == "poll"
+    }
+
+    pub fn has_solution(&self) -> bool {
+        !self.highlighted_post_ids.is_empty()
+            || self
+                .type_data
+                .get("solution_post_id")
+                .and_then(|v| v.as_u64())
+                .is_some_and(|id| id > 0)
+    }
+
+    pub fn solution_post_id(&self) -> Option<u32> {
+        self.highlighted_post_ids
+            .first()
+            .copied()
+            .or_else(|| {
+                self.type_data
+                    .get("solution_post_id")
+                    .and_then(|v| v.as_u64())
+                    .map(|id| id as u32)
+            })
+            .filter(|&id| id > 0)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -126,6 +182,10 @@ pub struct Post {
     pub attach_count: u32,
     #[serde(default, rename = "reaction_score")]
     pub reaction_score: i64,
+    #[serde(default, rename = "vote_score")]
+    pub vote_score: i64,
+    #[serde(default, rename = "is_first_post")]
+    pub is_first_post: bool,
     #[serde(default, rename = "view_url")]
     pub view_url: Option<String>,
 }
@@ -272,6 +332,26 @@ pub struct User {
     pub register_date: i64,
     #[serde(default, rename = "custom_title")]
     pub custom_title: String,
+    #[serde(default, rename = "reaction_score")]
+    pub reaction_score: i64,
+    #[serde(default, rename = "trophy_points")]
+    pub trophy_points: u32,
+    #[serde(default, rename = "is_staff")]
+    pub is_staff: bool,
+    #[serde(default, rename = "is_admin")]
+    pub is_admin: bool,
+    #[serde(default, rename = "is_moderator")]
+    pub is_moderator: bool,
+    #[serde(default, rename = "last_activity")]
+    pub last_activity: i64,
+    #[serde(default)]
+    pub about: String,
+    #[serde(default)]
+    pub signature: String,
+    #[serde(default)]
+    pub location: String,
+    #[serde(default)]
+    pub website: String,
     #[serde(default, rename = "view_url")]
     pub view_url: Option<String>,
 }
@@ -296,22 +376,174 @@ pub struct MeReply {
     pub me: User,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchHit {
-    #[serde(default)]
     pub title: String,
-    #[serde(default, rename = "view_url")]
     pub view_url: Option<String>,
-    #[serde(default)]
     pub message: String,
-    #[serde(default)]
     pub username: String,
-    #[serde(default)]
     pub date: i64,
-    #[serde(default, rename = "content_type")]
     pub content_type: String,
-    #[serde(default, rename = "content_id")]
     pub content_id: u64,
+    pub thread_id: Option<u32>,
+}
+
+impl<'de> serde::Deserialize<'de> for SearchHit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let val = serde_json::Value::deserialize(deserializer)?;
+        // Case 1: XenForo native search result format:
+        // { "type": "...", "id": ..., "result": { ... } }
+        if let Some(result_obj) = val.get("result").and_then(|r| r.as_object()) {
+            let content_type = val
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("thread")
+                .to_string();
+            let content_id = val
+                .get("id")
+                .and_then(|id| id.as_u64())
+                .unwrap_or_default();
+
+            let username = result_obj
+                .get("username")
+                .and_then(|u| u.as_str())
+                .unwrap_or_default()
+                .to_string();
+
+            let date = result_obj
+                .get("post_date")
+                .or_else(|| result_obj.get("date"))
+                .and_then(|d| d.as_i64())
+                .unwrap_or_default();
+
+            let view_url = result_obj
+                .get("view_url")
+                .and_then(|u| u.as_str())
+                .map(|s| s.to_string());
+
+            let message = result_obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or_default()
+                .to_string();
+
+            let (title, thread_id) = if content_type == "post" {
+                let tid = result_obj
+                    .get("thread_id")
+                    .and_then(|t| t.as_u64())
+                    .map(|t| t as u32);
+                let thread_title = result_obj
+                    .get("Thread")
+                    .and_then(|t| t.get("title"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default();
+                let post_title = if !thread_title.is_empty() {
+                    thread_title.to_string()
+                } else {
+                    result_obj
+                        .get("title")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                (post_title, tid)
+            } else {
+                let tid = if content_id > 0 {
+                    Some(content_id as u32)
+                } else {
+                    None
+                };
+                let t_title = result_obj
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                (t_title, tid)
+            };
+
+            return Ok(SearchHit {
+                title,
+                view_url,
+                message,
+                username,
+                date,
+                content_type,
+                content_id,
+                thread_id,
+            });
+        }
+
+        // Case 2: Flat JSON format (mock tests or simple endpoints)
+        let title = val
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let view_url = val
+            .get("view_url")
+            .and_then(|u| u.as_str())
+            .map(|s| s.to_string());
+        let message = val
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let username = val
+            .get("username")
+            .and_then(|u| u.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let date = val
+            .get("date")
+            .or_else(|| val.get("post_date"))
+            .and_then(|d| d.as_i64())
+            .unwrap_or_default();
+        let content_type = val
+            .get("content_type")
+            .or_else(|| val.get("type"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("thread")
+            .to_string();
+        let content_id = val
+            .get("content_id")
+            .or_else(|| val.get("id"))
+            .and_then(|id| id.as_u64())
+            .unwrap_or_default();
+        let thread_id = val
+            .get("thread_id")
+            .and_then(|t| t.as_u64())
+            .map(|t| t as u32)
+            .or_else(|| {
+                if content_type == "thread" && content_id > 0 {
+                    Some(content_id as u32)
+                } else {
+                    None
+                }
+            });
+
+        Ok(SearchHit {
+            title,
+            view_url,
+            message,
+            username,
+            date,
+            content_type,
+            content_id,
+            thread_id,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchQuery {
+    pub keywords: String,
+    pub user: Option<String>,
+    pub content_type: Option<String>,
+    pub order: Option<String>,
+    pub page: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -371,5 +603,94 @@ mod tests {
         let e: ApiErrorBody = serde_json::from_value(body).unwrap();
         assert_eq!(e.errors[0].code, "invalid_page");
         assert_eq!(e.errors[0].params["max"], 4);
+    }
+
+    #[test]
+    fn question_thread_solution_and_article_helpers() {
+        let q_json = serde_json::json!({
+            "thread_id": 42,
+            "title": "How do I fix this BSOD?",
+            "discussion_type": "question",
+            "vote_score": 12,
+            "highlighted_post_ids": [101],
+            "type_data": {"solution_post_id": 101}
+        });
+        let thread: Thread = serde_json::from_value(q_json).unwrap();
+        assert!(thread.is_question());
+        assert!(!thread.is_article());
+        assert!(thread.has_solution());
+        assert_eq!(thread.solution_post_id(), Some(101));
+
+        let art_json = serde_json::json!({
+            "thread_id": 99,
+            "title": "Windows 11 24H2 Deep Dive",
+            "discussion_type": "article",
+            "prefix": "Guide"
+        });
+        let art: Thread = serde_json::from_value(art_json).unwrap();
+        assert!(art.is_article());
+        assert!(!art.is_question());
+        assert!(!art.has_solution());
+        assert_eq!(art.prefix.as_deref(), Some("Guide"));
+    }
+
+    #[test]
+    fn native_xenforo_search_hit_deserialization() {
+        let post_hit_json = serde_json::json!({
+            "type": "post",
+            "id": 555,
+            "result": {
+                "post_id": 555,
+                "thread_id": 789,
+                "username": "SysAdmin",
+                "post_date": 1720000000,
+                "message": "Run sfc /scannow in cmd",
+                "view_url": "https://windowsforum.com/posts/555/",
+                "Thread": {
+                    "thread_id": 789,
+                    "title": "Corrupt system files"
+                }
+            }
+        });
+        let hit: SearchHit = serde_json::from_value(post_hit_json).unwrap();
+        assert_eq!(hit.content_type, "post");
+        assert_eq!(hit.content_id, 555);
+        assert_eq!(hit.thread_id, Some(789));
+        assert_eq!(hit.title, "Corrupt system files");
+        assert_eq!(hit.username, "SysAdmin");
+        assert!(hit.message.contains("sfc /scannow"));
+
+        let flat_hit_json = serde_json::json!({
+            "title": "Flat Thread",
+            "content_type": "thread",
+            "content_id": 123,
+            "username": "User1"
+        });
+        let flat_hit: SearchHit = serde_json::from_value(flat_hit_json).unwrap();
+        assert_eq!(flat_hit.title, "Flat Thread");
+        assert_eq!(flat_hit.thread_id, Some(123));
+    }
+
+    #[test]
+    fn user_full_profile_parses() {
+        let u_json = serde_json::json!({
+            "user_id": 10,
+            "username": "AdminMike",
+            "message_count": 5000,
+            "reaction_score": 12500,
+            "trophy_points": 450,
+            "is_staff": true,
+            "is_admin": true,
+            "custom_title": "Administrator",
+            "about": "Windows enthusiast",
+            "location": "Redmond, WA",
+            "website": "https://windowsforum.com"
+        });
+        let user: User = serde_json::from_value(u_json).unwrap();
+        assert_eq!(user.username, "AdminMike");
+        assert_eq!(user.reaction_score, 12500);
+        assert_eq!(user.trophy_points, 450);
+        assert!(user.is_staff && user.is_admin);
+        assert_eq!(user.location, "Redmond, WA");
     }
 }

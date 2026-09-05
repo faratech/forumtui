@@ -273,6 +273,15 @@ pub trait WfApi: Send + Sync {
     async fn alerts(&self, page: u32) -> Result<AlertsReply>;
     async fn mark_alert_read(&self, id: u32) -> Result<()>;
     async fn search(&self, keywords: &str, page: u32) -> Result<SearchResultsReply>;
+    async fn search_advanced(&self, query: &SearchQuery) -> Result<SearchResultsReply>;
+    async fn search_member(
+        &self,
+        user_id: u32,
+        content: &str,
+        page: u32,
+    ) -> Result<SearchResultsReply>;
+    async fn react_post(&self, post_id: u32, reaction_id: u32) -> Result<()>;
+    async fn vote_post(&self, post_id: u32, vote: &str) -> Result<()>;
     async fn me(&self) -> Result<User>;
     async fn user(&self, id: u32) -> Result<User>;
     async fn find_user(&self, username: &str) -> Result<Option<User>>;
@@ -423,6 +432,15 @@ impl WfApi for WfApiClient {
     }
 
     async fn search(&self, keywords: &str, page: u32) -> Result<SearchResultsReply> {
+        self.search_advanced(&SearchQuery {
+            keywords: keywords.to_string(),
+            page,
+            ..Default::default()
+        })
+        .await
+    }
+
+    async fn search_advanced(&self, query: &SearchQuery) -> Result<SearchResultsReply> {
         self.search_gate.wait().await;
         #[derive(serde::Deserialize)]
         struct SearchInfo {
@@ -437,10 +455,31 @@ impl WfApi for WfApiClient {
         self.api_gate.wait().await;
         let token = self.valid_token().await?;
         let url = format!("{}/search", config::api_base());
+        let mut form: Vec<(&str, String)> = Vec::new();
+        if !query.keywords.trim().is_empty() {
+            form.push(("keywords", query.keywords.trim().to_string()));
+        }
+        if let Some(user) = &query.user
+            && !user.trim().is_empty()
+        {
+            form.push(("c[users]", user.trim().to_string()));
+        }
+        if let Some(ct) = &query.content_type
+            && !ct.trim().is_empty()
+            && ct != "all"
+        {
+            form.push(("search_type", ct.trim().to_string()));
+        }
+        if let Some(order) = &query.order
+            && !order.trim().is_empty()
+        {
+            form.push(("order", order.trim().to_string()));
+        }
+        let form_slices: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let resp = self
             .http
             .post(url)
-            .form(&[("keywords", keywords)])
+            .form(&form_slices)
             .bearer_auth(&token)
             .send()
             .await?;
@@ -449,8 +488,71 @@ impl WfApi for WfApiClient {
             return Ok(SearchResultsReply::default());
         };
         let search_id = search.search_id;
-        self.get(&format!("/search/{search_id}"), &[("page", page.to_string())])
-            .await
+        self.get(
+            &format!("/search/{search_id}"),
+            &[("page", query.page.to_string())],
+        )
+        .await
+    }
+
+    async fn search_member(
+        &self,
+        user_id: u32,
+        content: &str,
+        page: u32,
+    ) -> Result<SearchResultsReply> {
+        self.search_gate.wait().await;
+        #[derive(serde::Deserialize)]
+        struct SearchInfo {
+            #[serde(default)]
+            search_id: u32,
+        }
+        #[derive(serde::Deserialize)]
+        struct SearchCreated {
+            #[serde(default)]
+            search: Option<SearchInfo>,
+        }
+        self.api_gate.wait().await;
+        let token = self.valid_token().await?;
+        let url = format!("{}/search/member", config::api_base());
+        let mut form: Vec<(&str, String)> = vec![("user_id", user_id.to_string())];
+        if !content.is_empty() && content != "all" {
+            form.push(("content", content.to_string()));
+        }
+        let form_slices: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let resp = self
+            .http
+            .post(url)
+            .form(&form_slices)
+            .bearer_auth(&token)
+            .send()
+            .await?;
+        let created: SearchCreated = decode(resp).await?;
+        let Some(search) = created.search else {
+            return Ok(SearchResultsReply::default());
+        };
+        let search_id = search.search_id;
+        self.get(
+            &format!("/search/{search_id}"),
+            &[("page", page.to_string())],
+        )
+        .await
+    }
+
+    async fn react_post(&self, post_id: u32, reaction_id: u32) -> Result<()> {
+        self.post_unit(
+            &format!("/posts/{post_id}/react"),
+            &[("reaction_id", reaction_id.to_string())],
+        )
+        .await
+    }
+
+    async fn vote_post(&self, post_id: u32, vote: &str) -> Result<()> {
+        self.post_unit(
+            &format!("/posts/{post_id}/vote"),
+            &[("type", vote.to_string())],
+        )
+        .await
     }
 
     async fn me(&self) -> Result<User> {
@@ -745,6 +847,93 @@ mod tests {
 
         let c = logged_in_client("tok-1").await;
         let res = c.reply_conversation(5, "hello conversation").await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn search_advanced_sends_filters() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-searchadv");
+        Mock::given(method("POST"))
+            .and(path("/api/search"))
+            .and(wiremock::matchers::body_string_contains("keywords=windows"))
+            .and(wiremock::matchers::body_string_contains("c%5Busers%5D=Alice"))
+            .and(wiremock::matchers::body_string_contains("search_type=thread"))
+            .and(wiremock::matchers::body_string_contains("order=date"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"success": true, "search": {"search_id": 88}}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/search/88"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{"type": "thread", "id": 12, "result": {"title": "Windows Tip", "username": "Alice"}}],
+                "pagination": {"current_page": 1, "last_page": 1, "total": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let res = c
+            .search_advanced(&SearchQuery {
+                keywords: "windows".into(),
+                user: Some("Alice".into()),
+                content_type: Some("thread".into()),
+                order: Some("date".into()),
+                page: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(res.results.len(), 1);
+        assert_eq!(res.results[0].title, "Windows Tip");
+        assert_eq!(res.results[0].username, "Alice");
+    }
+
+    #[tokio::test]
+    async fn search_member_queries_member_endpoint() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-searchmem");
+        Mock::given(method("POST"))
+            .and(path("/api/search/member"))
+            .and(wiremock::matchers::body_string_contains("user_id=42"))
+            .and(wiremock::matchers::body_string_contains("content=thread"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"success": true, "search": {"search_id": 99}}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/search/99"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{"type": "thread", "id": 15, "result": {"title": "Member Thread"}}],
+                "pagination": {"current_page": 1, "last_page": 1, "total": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let res = c.search_member(42, "thread", 1).await.unwrap();
+        assert_eq!(res.results.len(), 1);
+        assert_eq!(res.results[0].title, "Member Thread");
+    }
+
+    #[tokio::test]
+    async fn react_post_sends_reaction_id() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-react");
+        Mock::given(method("POST"))
+            .and(path("/api/posts/101/react"))
+            .and(wiremock::matchers::body_string_contains("reaction_id=1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "action": "insert"
+            })))
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let res = c.react_post(101, 1).await;
         assert!(res.is_ok());
     }
 }
