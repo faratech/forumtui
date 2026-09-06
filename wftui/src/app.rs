@@ -650,6 +650,22 @@ pub async fn run(images: crate::images::Images) -> u8 {
         }
     };
     let (tx, rx) = mpsc::unbounded_channel();
+
+    // Signal handling is armed as the very first thing after raw mode is
+    // entered. It used to spawn only after the whole `App` was built; a
+    // SIGTERM/SIGHUP arriving before the handlers registered took the
+    // default disposition and killed the process with the terminal left in
+    // raw mode on the alternate screen. The loop is deliberate too: the old
+    // `select!` served exactly one signal and then the task ended, so a
+    // second signal delivered while teardown was still in progress reverted
+    // to the default disposition and bricked the terminal anyway. Every
+    // delivery just sends "quit" — acting on it is idempotent.
+    #[cfg(unix)]
+    {
+        let tx = tx.clone();
+        tokio::spawn(forward_signals(tx));
+    }
+
     let mut app = App {
         api: client.clone(),
         client,
@@ -693,41 +709,46 @@ pub async fn run(images: crate::images::Images) -> u8 {
         body_rect: ratatui::layout::Rect::default(),
         hits: HitMap::new(common::config::mouse_enabled()),
     };
-    #[cfg(unix)]
-    {
-        let tx = app.tx.clone();
-        tokio::spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut term = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let mut hup = match signal(SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let mut int = match signal(SignalKind::interrupt()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            tokio::select! {
-                _ = term.recv() => {
-                    tx.send(Msg::Notice("quit".into())).ok();
-                }
-                _ = hup.recv() => {
-                    tx.send(Msg::Notice("quit".into())).ok();
-                }
-                _ = int.recv() => {
-                    tx.send(Msg::Notice("quit".into())).ok();
-                }
-            }
-        });
-    }
     app.bootstrap().await;
     let reader = crate::event::spawn_reader();
     let outcome = app.event_loop(&mut terminal, reader).await;
     drop(_guard);
     outcome
+}
+
+/// Deliver SIGTERM/SIGHUP/SIGINT as `Msg::Notice("quit")`, forever — a
+/// signal can arrive while an earlier one's teardown is still running, and
+/// the process must keep opting out of the default (terminal-bricking)
+/// disposition until it is actually gone. Spawned by `run` the moment raw
+/// mode is entered; ends only if a stream fails to register.
+#[cfg(unix)]
+async fn forward_signals(tx: mpsc::UnboundedSender<Msg>) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut hup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut int = match signal(SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    loop {
+        tokio::select! {
+            _ = term.recv() => {
+                tx.send(Msg::Notice("quit".into())).ok();
+            }
+            _ = hup.recv() => {
+                tx.send(Msg::Notice("quit".into())).ok();
+            }
+            _ = int.recv() => {
+                tx.send(Msg::Notice("quit".into())).ok();
+            }
+        }
+    }
 }
 
 impl App {
@@ -7459,6 +7480,51 @@ mod tests {
             !msgs.iter().any(|m| matches!(m, Msg::PostToggled { .. })),
             "no PostToggled may land on the sign-in screen"
         );
+    }
+
+    /// The signal forwarder keeps opting the process out of the default
+    /// disposition for as long as it runs: a second SIGTERM delivered while
+    /// the first one's teardown is still in progress must arrive as another
+    /// "quit", not revert to default disposition and kill the process with
+    /// the terminal still raw. (Registered streams are process-global, so
+    /// this test leaves a handler behind — nothing else in the suite relies
+    /// on the default one.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signals_keep_arriving_as_quit_after_the_first_one() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(forward_signals(tx));
+        // Let the spawned task run its first poll: the three `signal()`
+        // registrations happen there, before the first await. The settle
+        // time is the guard against killing our own process while the
+        // default disposition is still in force.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // SAFETY: kills this test process with SIGTERM. The handler was
+        // registered by `forward_signals` above, so the default disposition
+        // (die, terminal raw) is no longer in force.
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGTERM);
+        }
+        let first = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            matches!(first, Ok(Some(Msg::Notice(ref n))) if n == "quit"),
+            "the first SIGTERM must arrive as quit"
+        );
+
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGTERM);
+        }
+        let second = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            matches!(second, Ok(Some(Msg::Notice(ref n))) if n == "quit"),
+            "the second SIGTERM must arrive as quit too — the loop must not end"
+        );
+
+        task.abort();
     }
 
     /// An abort cannot stop a `PostToggled` that is already sitting in the
