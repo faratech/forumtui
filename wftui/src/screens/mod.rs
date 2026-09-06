@@ -1604,6 +1604,104 @@ mod dispatch_tests {
                 skip: &["Tab", "Esc"],
             },
             Case {
+                // `end_session` and every first run land here: Enter begins
+                // sign-in, q quits — both worked, and this pins them so a
+                // hint change cannot silently advertise a dead key (#658).
+                name: "Login (Idle)",
+                factory: || Screen::Login(LoginState::default()),
+                skip: &[],
+            },
+            Case {
+                // The new-thread flow: `Tab` switches fields and `^O`/`^Y`
+                // are screen-state toggles (no `Action`), like the
+                // ThreadReply compose; `^S` with a non-empty draft submits.
+                name: "Compose (new thread)",
+                factory: || Screen::Compose(ComposeState {
+                    target: Some(ComposeTarget::NewThread { node_id: 4 }),
+                    title: "A title".into(),
+                    body: "A body".into(),
+                    title_field: true,
+                    ..Default::default()
+                }),
+                skip: &["Tab", "^O", "^Y"],
+            },
+            Case {
+                // The view pane focused (#605's state): `r` replies and `p`
+                // opens the open message's author — the bar's keys must work
+                // from this pane, not just the list's.
+                name: "Inbox (view focused)",
+                factory: || Screen::Inbox(InboxState {
+                    focus: InboxPane::View,
+                    view: Some(ConversationViewState {
+                        conversation: Conversation {
+                            conversation_id: 3,
+                            title: "A DM".into(),
+                            username: "kemical".into(),
+                            ..Default::default()
+                        },
+                        messages: vec![ConversationMessage {
+                            message_id: 1,
+                            user_id: 7,
+                            username: "kemical".into(),
+                            ..Default::default()
+                        }],
+                        lines: vec![ratatui::text::Line::raw("hello")],
+                        msg_line_offsets: vec![0],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                skip: &["Tab", "Esc"],
+            },
+            Case {
+                // The Alerts tab: Enter/m mark read, `n` starts a message,
+                // `R` refreshes — and `r` is hidden (no view pane; see
+                // "Inbox (no view pane)").
+                name: "Inbox (Alerts tab)",
+                factory: || Screen::Inbox(InboxState {
+                    tab: InboxTab::Alerts,
+                    alerts: AlertsState {
+                        alerts: vec![Alert {
+                            alert_id: 1,
+                            username: "kemical".into(),
+                            content_type: "post_quote".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    view: None,
+                    ..Default::default()
+                }),
+                skip: &["Tab", "Esc"],
+            },
+            Case {
+                // Typing in the query field: only the editor's own keys are
+                // advertised (the browse-mode caps type text there).
+                name: "Search (input mode)",
+                factory: || Screen::Search(SearchState {
+                    query: "edge".into(),
+                    input_mode: true,
+                    ..Default::default()
+                }),
+                // `Esc` leaves edit mode — screen state, no `Action`.
+                skip: &["Esc"],
+            },
+            Case {
+                // A member's content list (profile `t`/`p`): `t` flips
+                // threads/posts through search_member; with no results,
+                // "Enter open" is not advertised at all.
+                name: "Search (member mode)",
+                factory: || Screen::Search(SearchState {
+                    query: "by: kemical (thread)".into(),
+                    member: Some((42, "thread".into())),
+                    content_type: 1,
+                    ..Default::default()
+                }),
+                // `Esc` pops; `i` clears the label and flips into query edit
+                // — screen state, no `Action`.
+                skip: &["Esc", "i"],
+            },
+            Case {
                 name: "ConversationView",
                 factory: || Screen::ConversationView(ConversationViewState {
                     conversation: Conversation {

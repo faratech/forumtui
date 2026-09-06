@@ -25,8 +25,15 @@ use crate::theme::{fmt_time, Theme};
 // ================= login =================
 
 pub fn login_key(s: &mut super::LoginState, key: KeyEvent) -> Action {
+    // While a register/poll round-trip is busy every other key is inert —
+    // the bar hides them (#658) — but quit must always work: process exit
+    // simply aborts the in-flight flow.
     if s.busy {
-        return Action::None;
+        return if key.code == KeyCode::Char('q') {
+            Action::Quit
+        } else {
+            Action::None
+        };
     }
     match (&s.stage, key.code) {
         // The key bar advertises "restart login" on the whole screen, so Enter
@@ -53,6 +60,11 @@ pub fn login_key(s: &mut super::LoginState, key: KeyEvent) -> Action {
 }
 
 pub fn login_hints(s: &super::LoginState) -> Hints {
+    // Busy: the flow owns the screen and every key but q is inert —
+    // advertise only what works (#658; the never-a-silent-no-op rule).
+    if s.busy {
+        return Hints::new(&[("q", "quit")], 0);
+    }
     match s.stage {
         LoginStage::Idle => Hints::new(&[("Enter", "begin sign-in"), ("q", "quit")], 0),
         LoginStage::Waiting => Hints::new(
@@ -1369,7 +1381,9 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
                 let q = s.query.trim().to_string();
                 let a = s.author.trim().to_string();
                 if q.is_empty() && a.is_empty() {
-                    return Action::None;
+                    // "Enter search" is advertised while typing; an empty
+                    // submit refuses out loud instead of doing nothing (#658).
+                    return Action::Notice("Type something to search.".into());
                 }
                 if s.loading {
                     return Action::Notice("Already searching — one moment.".into());
@@ -1704,31 +1718,45 @@ fn member_label(current: &str, content: &str) -> String {
 }
 
 pub fn search_hints(s: &super::SearchState) -> Hints {
+    // While a field owns the keyboard the browse-mode caps type text —
+    // advertising them there was a lie (#658). Only the two keys that work
+    // in the editor are shown.
+    if s.input_mode {
+        return Hints::new(&[("Enter", "search"), ("Esc", "done")], 0);
+    }
     // Member content has no order and no author filter (issue #548), so the
     // bar must not advertise them there — `t` still flips threads/posts.
+    // "Enter open" and "[ ] page" are only advertised when they can act:
+    // with no results, or nothing to page through, they were inert (#658,
+    // the #604 rule).
+    let openable = !s.results.is_empty();
+    let paged = s.last_page > 1;
     if s.member.is_some() {
-        return Hints::new(
-            &[
-                ("Enter", "open"),
-                ("t", "threads/posts"),
-                ("[ ]", "page"),
-                ("i", "new search"),
-                ("Esc", "back"),
-            ],
-            0,
-        );
+        let mut keys: Vec<(&str, &str)> = Vec::new();
+        if openable {
+            keys.push(("Enter", "open"));
+        }
+        keys.push(("t", "threads/posts"));
+        if paged {
+            keys.push(("[ ]", "page"));
+        }
+        keys.push(("i", "new search"));
+        keys.push(("Esc", "back"));
+        Hints::new(&keys, 0)
+    } else {
+        let mut keys: Vec<(&str, &str)> = Vec::new();
+        if openable {
+            keys.push(("Enter", "open"));
+        }
+        keys.push(("i", "edit query"));
+        keys.push(("t", "type"));
+        keys.push(("o", "order"));
+        if paged {
+            keys.push(("[ ]", "page"));
+        }
+        keys.push(("Esc", "back"));
+        Hints::new(&keys, 0)
     }
-    Hints::new(
-        &[
-            ("Enter", "open"),
-            ("i", "edit query"),
-            ("t", "type"),
-            ("o", "order"),
-            ("[ ]", "page"),
-            ("Esc", "back"),
-        ],
-        0,
-    )
 }
 
 pub fn search_crumb(s: &super::SearchState) -> String {

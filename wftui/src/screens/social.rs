@@ -925,7 +925,9 @@ fn conversation_view_key_inner(s: &mut ConversationViewState, key: KeyEvent) -> 
             if let Some(msg) = s.messages.get(s.sel_msg).or_else(|| s.messages.first()) {
                 Action::OpenProfile(msg.user_id, msg.username.clone())
             } else {
-                Action::None
+                // Advertised on the bar with nothing to act on — refuse out
+                // loud, never silently (#658).
+                Action::Notice("No message to open a profile for.".into())
             }
         }
         KeyCode::Char('P') => {
