@@ -55,27 +55,23 @@ pub fn inbox_hints(s: &InboxState) -> Hints {
             0,
         );
     }
-    Hints::with_short(
-        &[
-            ("Enter", "open"),
-            ("Tab", "alerts/conversations"),
-            ("n", "new message"),
-            ("r", "reply"),
-            ("m", "mark read"),
-            ("R", "refresh"),
-            ("Esc", "back"),
-        ],
-        &[
-            ("Enter", "open"),
-            ("Tab", "tabs"),
-            ("n", "new"),
-            ("r", "reply"),
-            ("m", "read"),
-            ("R", ""),
-            ("Esc", "back"),
-        ],
-        0,
-    )
+    // `r` replies to whatever the view pane has open, so it can only be
+    // advertised while there is one: with `view: None` (a narrow terminal,
+    // or the Alerts tab, where nothing auto-primes the pane) the key was a
+    // silent no-op (issue class #561/#605 — never advertise a dead key).
+    let mut keys = vec![
+        ("Enter", "open"),
+        ("Tab", "alerts/conversations"),
+        ("n", "new message"),
+    ];
+    let mut short = vec![("Enter", "open"), ("Tab", "tabs"), ("n", "new")];
+    if s.view.is_some() {
+        keys.push(("r", "reply"));
+        short.push(("r", "reply"));
+    }
+    keys.extend_from_slice(&[("m", "mark read"), ("R", "refresh"), ("Esc", "back")]);
+    short.extend_from_slice(&[("m", "read"), ("R", ""), ("Esc", "back")]);
+    Hints::with_short(&keys, &short, 0)
 }
 
 /// `Tab` means two different things depending on which half has the
@@ -1955,6 +1951,24 @@ mod tests {
             !view_hints.keys.iter().any(|(_, d)| *d == "new message"),
             "the list pane's own bar must not show once the view has focus: {names:?}"
         );
+    }
+
+    /// `r` replies to whatever the view pane has open, so with `view: None`
+    /// (a narrow terminal, or the Alerts tab where nothing auto-primes the
+    /// pane) the cap must vanish — advertising it there was a silent no-op
+    /// (issue class #561/#605).
+    #[test]
+    fn inbox_hints_hide_reply_while_no_conversation_is_open() {
+        let mut s = sample_inbox_state();
+        assert!(inbox_hints(&s).keys.iter().any(|(k, _)| *k == "r"));
+
+        s.view = None;
+        assert!(
+            !inbox_hints(&s).keys.iter().any(|(k, _)| *k == "r"),
+            "no open conversation means no reply cap"
+        );
+        // The key itself stays inert — it is simply no longer advertised.
+        assert!(matches!(inbox_key(&mut s, key('r')), Action::None));
     }
 
     /// Issue #601: the alert kind glyph must come from `action` (XF's real
