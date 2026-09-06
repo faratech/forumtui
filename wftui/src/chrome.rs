@@ -462,7 +462,11 @@ pub fn status_line(
         // Rect at render time.
         Line::from(clip_spans(spans, w))
     } else {
-        Line::from(clip_spans(spans, w))
+        // Narrower still (the gate alone will not fit beside any text): the
+        // gates are the row, the status text is what gets dropped. The old
+        // else kept the text and discarded the gate — the exact inverse of
+        // this row's own contract (#662).
+        Line::from(clip_spans(right, w))
     }
 }
 
@@ -979,6 +983,13 @@ mod tests {
         assert!(squeezed.width() <= 40);
         let text: String = squeezed.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("ready"), "{text}");
+
+        // #662: below the width where text and gate cannot both fit, the
+        // gate alone IS the row — the status text is what gets dropped.
+        let tiny = status_line(&t, &UNICODE, &long, t.dim(), GateState::Ready, 24);
+        let text: String = tiny.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("gate"), "the gate must survive a 24-column row: {text}");
+        assert!(!text.contains(&"x".repeat(24)), "the status text is what yields: {text}");
     }
 
     /// CJK `left` text must be clipped by cell width, not char count (issue
