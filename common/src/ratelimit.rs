@@ -38,7 +38,7 @@ impl Gate {
     /// Reserve the next slot and sleep until it starts.
     pub async fn wait(&self) {
         let target = {
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let now = Instant::now();
             let mut target = s.next_free.max(now);
             if let Some(penalty) = s.penalty_until {
@@ -63,7 +63,7 @@ impl Gate {
     /// clock to represent falls back to a generous but safe 24h penalty
     /// rather than ever panicking.
     pub fn penalize(&self, dur: Duration) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         const FALLBACK: Duration = Duration::from_secs(24 * 3600);
         let until = now
@@ -78,7 +78,7 @@ impl Gate {
 
     /// Test/diagnostic hook: current enforced wait for a caller starting now.
     pub fn pending_wait(&self) -> Duration {
-        let s = self.state.lock().unwrap();
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         let mut target = s.next_free.max(now);
         if let Some(penalty) = s.penalty_until {
@@ -136,5 +136,23 @@ mod tests {
         // Must land on *some* future wait, not panic and not silently do
         // nothing.
         assert!(gate.pending_wait() > Duration::ZERO);
+    }
+
+    /// A panic while some caller holds the lock poisons it; the gate must
+    /// keep serving later waiters from the intact state instead of
+    /// cascading the panic into every request that follows (#646).
+    #[test]
+    fn waiters_survive_a_poisoned_mutex() {
+        let gate = Gate::new(250);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = gate.state.lock().unwrap();
+            panic!("poison the gate lock");
+        }));
+        assert!(
+            gate.pending_wait() <= Duration::from_millis(250),
+            "pending_wait must answer through the poisoned lock"
+        );
+        gate.penalize(Duration::from_secs(1));
+        assert!(gate.pending_wait() >= Duration::from_millis(500));
     }
 }
