@@ -256,7 +256,9 @@ enum Frame {
     Italic,
     Underline,
     Strike,
-    Quote { byline: Option<String> },
+    Quote {
+        byline: Option<String>,
+    },
     List(ListKind),
     Spoiler,
     InlineCode,
@@ -306,7 +308,10 @@ pub fn decode_html_entities(input: &str) -> String {
                 "nbsp" | "#160" => Some(" ".into()),
                 _ if entity.starts_with('#') => {
                     let num_str = &entity[1..];
-                    let ch = if let Some(hex) = num_str.strip_prefix('x').or_else(|| num_str.strip_prefix('X')) {
+                    let ch = if let Some(hex) = num_str
+                        .strip_prefix('x')
+                        .or_else(|| num_str.strip_prefix('X'))
+                    {
                         u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
                     } else {
                         num_str.parse::<u32>().ok().and_then(char::from_u32)
@@ -332,12 +337,11 @@ pub fn decode_html_entities(input: &str) -> String {
 fn parse_quote_byline(raw: &str) -> (String, Option<u32>) {
     let unquoted = strip_quotes(raw);
     if let Some((author, rest)) = unquoted.split_once(',') {
-        let post_id = rest
-            .split(',')
-            .find_map(|part| {
-                let part = part.trim();
-                part.strip_prefix("post:").and_then(|p| p.trim().parse::<u32>().ok())
-            });
+        let post_id = rest.split(',').find_map(|part| {
+            let part = part.trim();
+            part.strip_prefix("post:")
+                .and_then(|p| p.trim().parse::<u32>().ok())
+        });
         (author.trim().to_string(), post_id)
     } else {
         (unquoted.to_string(), None)
@@ -372,7 +376,10 @@ fn resolve_media(site: &str, media_id: &str) -> (String, String) {
             if clean_id.starts_with("http://") || clean_id.starts_with("https://") {
                 (format!("[media: {other}]"), clean_id.to_string())
             } else {
-                (format!("[media: {other}]"), format!("https://{other}.com/{clean_id}"))
+                (
+                    format!("[media: {other}]"),
+                    format!("https://{other}.com/{clean_id}"),
+                )
             }
         }
     }
@@ -411,7 +418,9 @@ pub fn render(src: &str) -> Vec<Chunk> {
     // The open [URL] href, innermost last — the O(1) sibling of the frame
     // stack, so emit_text doesn't walk the stack per text run (#622).
     let mut links: Vec<String> = Vec::new();
-    // `(buffered label, href)` for the open [URL] frame (#620).
+    // `(buffered label, href, out.len() at open)` for the open [URL]
+    // frame (#620, #663): out_at is what makes the href-as-label fallback
+    // fire only for a body that produced no chunks at all.
     let mut link_label: Option<(String, String, usize)> = None;
     // Text runs buffered for the open [URL] frame, flushed as ONE
     // Chunk::Link when it closes (#620): XF renders one anchor around the
@@ -444,7 +453,9 @@ pub fn render(src: &str) -> Vec<Chunk> {
                     "b" => push_frame(&mut stack, &mut counts, &mut style, Frame::Bold),
                     "i" => push_frame(&mut stack, &mut counts, &mut style, Frame::Italic),
                     "u" => push_frame(&mut stack, &mut counts, &mut style, Frame::Underline),
-                    "s" | "strike" => push_frame(&mut stack, &mut counts, &mut style, Frame::Strike),
+                    "s" | "strike" => {
+                        push_frame(&mut stack, &mut counts, &mut style, Frame::Strike)
+                    }
                     "sub" | "sup" => push_frame(&mut stack, &mut counts, &mut style, Frame::Italic),
                     "highlight" => push_frame(&mut stack, &mut counts, &mut style, Frame::Bold),
                     "icode" | "inlinecode" => {
@@ -523,13 +534,33 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         }
                         push_frame(&mut stack, &mut counts, &mut style, Frame::Spoiler);
                     }
-                    "color" => push_frame(&mut stack, &mut counts, &mut style, Frame::Color(value.unwrap_or_default())),
-                    "size" => push_frame(&mut stack, &mut counts, &mut style, Frame::Size(value.unwrap_or_default())),
-                    "font" => push_frame(&mut stack, &mut counts, &mut style, Frame::Font(value.unwrap_or_default())),
+                    "color" => push_frame(
+                        &mut stack,
+                        &mut counts,
+                        &mut style,
+                        Frame::Color(value.unwrap_or_default()),
+                    ),
+                    "size" => push_frame(
+                        &mut stack,
+                        &mut counts,
+                        &mut style,
+                        Frame::Size(value.unwrap_or_default()),
+                    ),
+                    "font" => push_frame(
+                        &mut stack,
+                        &mut counts,
+                        &mut style,
+                        Frame::Font(value.unwrap_or_default()),
+                    ),
                     "left" | "center" | "right" | "justify" => {
                         push_frame(&mut stack, &mut counts, &mut style, Frame::Align(tag_lower))
                     }
-                    "indent" => push_frame(&mut stack, &mut counts, &mut style, Frame::Align("indent".into())),
+                    "indent" => push_frame(
+                        &mut stack,
+                        &mut counts,
+                        &mut style,
+                        Frame::Align("indent".into()),
+                    ),
                     "heading" => {
                         let level = value
                             .as_deref()
@@ -567,7 +598,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text("\n".into(), style.clone()));
                         }
-                        flush_link_label(&mut out, &mut link_label, &style);
+                        flush_before_chunk(&mut out, &mut link_label, &style);
                         out.push(Chunk::Text("───\n".into(), style.clone()));
                     }
                     "table" => {
@@ -594,18 +625,20 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         Some(href) => {
                             flush_link_label(&mut out, &mut link_label, &style);
                             let href = decode_html_entities(strip_quotes(&href));
-                            flush_link_label(&mut out, &mut link_label, &style);
-                            flush_link_label(&mut out, &mut link_label, &style);
-                        link_label = Some((String::new(), href.clone(), out.len()));
+                            link_label = Some((String::new(), href.clone(), out.len()));
                             links.push(href.clone());
                             push_frame(&mut stack, &mut counts, &mut style, Frame::Link(href));
                         }
                         None => {
                             flush_link_label(&mut out, &mut link_label, &style);
-                            flush_link_label(&mut out, &mut link_label, &style);
-                        link_label = Some((String::new(), String::new(), out.len()));
+                            link_label = Some((String::new(), String::new(), out.len()));
                             links.push(String::new());
-                            push_frame(&mut stack, &mut counts, &mut style, Frame::Link(String::new()));
+                            push_frame(
+                                &mut stack,
+                                &mut counts,
+                                &mut style,
+                                Frame::Link(String::new()),
+                            );
                         }
                     },
                     "email" => match value.filter(|v| !v.trim().is_empty()) {
@@ -617,8 +650,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                                 format!("mailto:{clean}")
                             };
                             flush_link_label(&mut out, &mut link_label, &style);
-                            flush_link_label(&mut out, &mut link_label, &style);
-                        link_label = Some((String::new(), href.clone(), out.len()));
+                            link_label = Some((String::new(), href.clone(), out.len()));
                             links.push(href.clone());
                             push_frame(&mut stack, &mut counts, &mut style, Frame::Link(href));
                         }
@@ -638,7 +670,12 @@ pub fn render(src: &str) -> Vec<Chunk> {
                                 rest = &rest[close_len..];
                             } else {
                                 links.push(String::new());
-                                push_frame(&mut stack, &mut counts, &mut style, Frame::Link(String::new()));
+                                push_frame(
+                                    &mut stack,
+                                    &mut counts,
+                                    &mut style,
+                                    Frame::Link(String::new()),
+                                );
                             }
                         }
                     },
@@ -678,7 +715,11 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             } else {
                                 let link = links.last().filter(|h| **h != trimmed).cloned();
                                 flush_before_chunk(&mut out, &mut link_label, &style);
-                                out.push(Chunk::Image { url: trimmed, link, style: st });
+                                out.push(Chunk::Image {
+                                    url: trimmed,
+                                    link,
+                                    style: st,
+                                });
                             }
                             rest = &rest[close_len..];
                         } else if let Some(v) = &value {
@@ -686,7 +727,11 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             let url = decode_html_entities(strip_quotes(v));
                             let link = links.last().filter(|h| **h != url).cloned();
                             flush_before_chunk(&mut out, &mut link_label, &style);
-                            out.push(Chunk::Image { url, link, style: st });
+                            out.push(Chunk::Image {
+                                url,
+                                link,
+                                style: st,
+                            });
                         } else {
                             emit_text(&mut out, raw_tag, style.clone(), &mut link_label);
                         }
@@ -742,6 +787,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         }
                     }
                     "*" => {
+                        flush_before_chunk(&mut out, &mut link_label, &style);
                         emit_list_marker(&mut out, &mut stack, style.clone());
                     }
                     _ => {
@@ -765,7 +811,8 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         }
                     }
                     "td" | "th" => {
-                        if pop_matching(&mut stack, &mut counts, &mut style, &mut links, &tag_lower) {
+                        if pop_matching(&mut stack, &mut counts, &mut style, &mut links, &tag_lower)
+                        {
                             flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text(" | ".into(), style.clone()));
                         }
@@ -795,7 +842,8 @@ pub fn render(src: &str) -> Vec<Chunk> {
                     "hr" => {}
                     _ => {
                         let links_before = links.len();
-                        if pop_matching(&mut stack, &mut counts, &mut style, &mut links, &tag_lower) {
+                        if pop_matching(&mut stack, &mut counts, &mut style, &mut links, &tag_lower)
+                        {
                             // A [URL] frame just closed: flush its buffered
                             // label as the one Link chunk (#620).
                             if links.len() < links_before {
@@ -850,7 +898,10 @@ pub fn to_plain(src: &str) -> String {
             Chunk::Attach(id, _) => s.push_str(&format!("[attachment {id}]")),
         }
     }
-    s.replace('\n', " ").split_whitespace().collect::<Vec<_>>().join(" ")
+    s.replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 enum TagEvent {
@@ -889,7 +940,9 @@ fn tag_close(src: &str, s: &str, brackets: &mut CloseBracket) -> Option<usize> {
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'=' {
-            let Some(&delim) = bytes.get(i + 1) else { break };
+            let Some(&delim) = bytes.get(i + 1) else {
+                break;
+            };
             if delim != b'"' && delim != b'\'' {
                 break;
             }
@@ -937,9 +990,7 @@ fn tag_close(src: &str, s: &str, brackets: &mut CloseBracket) -> Option<usize> {
     }
     // The memo speaks in src-absolute offsets (so a hit survives the render
     // loop's forward motion); tag_close's contract is relative to `s`.
-    brackets
-        .find(src, s)
-        .map(|abs| abs - (src.len() - s.len()))
+    brackets.find(src, s).map(|abs| abs - (src.len() - s.len()))
 }
 
 /// First `]` at or after `from` that sits outside a quoted attribute value,
@@ -1081,9 +1132,7 @@ fn parse_tag(src: &str, s: &str, brackets: &mut CloseBracket) -> Option<TagEvent
 fn is_tag_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 16
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Does this attribute-form remainder carry at least one `key=` option?
@@ -1092,10 +1141,7 @@ fn is_tag_name(name: &str) -> bool {
 fn has_tag_option(words: &str) -> bool {
     let b = words.as_bytes();
     for (i, &c) in b.iter().enumerate() {
-        if c == b'='
-            && i > 0
-            && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')
-        {
+        if c == b'=' && i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_') {
             return true;
         }
     }
@@ -1218,7 +1264,7 @@ fn flush_link_label(
         // [IMG] inside the anchor) already carries its own anchor via
         // `Chunk::Image::link`, and a second self-link here was a phantom
         // marker plus a printed URL under every wrapped thumbnail (#663).
-        let body_empty = out.len() == out_at && label.is_empty();
+        let body_empty = out.len() == out_at && label.trim().is_empty();
         if body_empty && href.is_empty() {
             return;
         }
@@ -1298,7 +1344,11 @@ fn split_url(s: &str, pos: usize) -> (&str, &str, &str) {
     let end = rest
         .char_indices()
         .find(|&(i, c)| {
-            i > 0 && matches!(c, ' ' | '\t' | '\n' | '\r' | ')' | ']' | '"' | '\'' | '<' | '>')
+            i > 0
+                && matches!(
+                    c,
+                    ' ' | '\t' | '\n' | '\r' | ')' | ']' | '"' | '\'' | '<' | '>'
+                )
         })
         .map(|(i, _)| i)
         .unwrap_or(rest.len());
@@ -1326,7 +1376,10 @@ mod tests {
         let urls_4k = "see https://example.com/a here ".repeat(4000);
         let urls_16k = "see https://example.com/a here ".repeat(16000);
         let t4 = parse_ms(&urls_4k);
-        assert!(t4 < 400.0, "4 000 URLs took {t4:.1} ms — the URL scan is not linear");
+        assert!(
+            t4 < 400.0,
+            "4 000 URLs took {t4:.1} ms — the URL scan is not linear"
+        );
         let t16 = parse_ms(&urls_16k);
         assert!(
             t16 < 8.0 * t4.max(1.0),
@@ -1466,13 +1519,20 @@ mod tests {
             assert!(!s.bold, "no option, no stray frame: {s:?}");
         }
         let all = texts(&chunks).concat();
-        assert!(all.contains("[i removed it]"), "still visible verbatim: {all:?}");
+        assert!(
+            all.contains("[i removed it]"),
+            "still visible verbatim: {all:?}"
+        );
 
         // `[QUOTE = Trouble; 235284]` (space before `=`, no `key=`): literal.
         let chunks = render("[QUOTE = Trouble; 235284] body");
         let all = texts(&chunks).concat();
         assert!(all.contains("[QUOTE = Trouble; 235284]"), "{all:?}");
-        assert!(!chunks.iter().any(|c| matches!(c, Chunk::Text(_, s) if s.quote_depth > 0)));
+        assert!(
+            !chunks
+                .iter()
+                .any(|c| matches!(c, Chunk::Text(_, s) if s.quote_depth > 0))
+        );
     }
 
     /// #615: attribute-form values may contain `]` inside quotes (news alt
@@ -1496,7 +1556,11 @@ mod tests {
         // Per #539, the attribute form has no tag *value*: the href falls
         // back to the link text itself.
         let chunks = render("[url unfurl=\"true\"]site[/url]");
-        assert!(matches!(&chunks[0], Chunk::Link(l, h, _) if l == "site" && h == "site"), "{:?}", chunks[0]);
+        assert!(
+            matches!(&chunks[0], Chunk::Link(l, h, _) if l == "site" && h == "site"),
+            "{:?}",
+            chunks[0]
+        );
     }
 
     /// #620: a [URL] frame is ONE anchor around its whole body. An empty
@@ -1515,13 +1579,17 @@ mod tests {
         );
 
         let chunks = render("[URL=https://example.com][I]Jaws[/I] swims[/URL]");
-        let links = chunks.iter().filter(|c| matches!(c, Chunk::Link(..))).count();
+        let links = chunks
+            .iter()
+            .filter(|c| matches!(c, Chunk::Link(..)))
+            .count();
         assert_eq!(links, 1, "one anchor, not one per run: {chunks:?}");
         if let Chunk::Link(label, _, _) = &chunks[0] {
             assert_eq!(label, "Jaws swims");
         }
 
-        let chunks = render("[URL=https://example.com/full][IMG]https://example.com/thumb[/IMG][/URL]");
+        let chunks =
+            render("[URL=https://example.com/full][IMG]https://example.com/thumb[/IMG][/URL]");
         match &chunks[0] {
             Chunk::Image { url, link, .. } => {
                 assert_eq!(url.as_str(), "https://example.com/thumb");
@@ -1713,7 +1781,10 @@ mod tests {
         let all = texts(&chunks).concat();
         assert!(all.contains("[hun]tobias88 wrote:"), "{all:?}");
         assert!(all.contains("hi"), "{all:?}");
-        assert!(!all.contains("member: 2"), "the byline must not leak: {all:?}");
+        assert!(
+            !all.contains("member: 2"),
+            "the byline must not leak: {all:?}"
+        );
     }
 
     /// An unterminated quote must still parse the way it always did — the
@@ -1750,7 +1821,10 @@ mod tests {
             .expect("code chunk");
         match code {
             Chunk::Text(t, s) => {
-                assert_eq!(t, "con2fb_map[i]", "the literal [i] must survive, not open Italic");
+                assert_eq!(
+                    t, "con2fb_map[i]",
+                    "the literal [i] must survive, not open Italic"
+                );
                 assert!(s.code);
             }
             other => panic!("expected text, got {other:?}"),
@@ -1948,7 +2022,10 @@ mod tests {
             Chunk::Image { url, .. } => assert_eq!(url, "https://example.com/pic.png"),
             other => panic!("expected an image chunk, got {other:?}"),
         }
-        assert_eq!(to_plain("[IMG]https://example.com/pic.png[/IMG]"), "[image] (https://example.com/pic.png)");
+        assert_eq!(
+            to_plain("[IMG]https://example.com/pic.png[/IMG]"),
+            "[image] (https://example.com/pic.png)"
+        );
     }
 
     #[test]
@@ -1998,7 +2075,10 @@ mod tests {
             vec![ImageRef::Url("https://a.example/in-quote.png".into())]
         );
         // Duplicates are separate references; de-duplication is the caller's.
-        assert_eq!(image_refs("[IMG]https://a/x.png[/IMG][IMG]https://a/x.png[/IMG]").len(), 2);
+        assert_eq!(
+            image_refs("[IMG]https://a/x.png[/IMG][IMG]https://a/x.png[/IMG]").len(),
+            2
+        );
 
         // Non-http schemes never become a fetchable reference.
         for src in [
@@ -2046,7 +2126,9 @@ mod tests {
 
     #[test]
     fn table_and_heading_rendering() {
-        let chunks = render("[HEADING=2]Section[/HEADING][TABLE][TR][TH]Header[/TH][/TR][TR][TD]Data[/TD][/TR][/TABLE]");
+        let chunks = render(
+            "[HEADING=2]Section[/HEADING][TABLE][TR][TH]Header[/TH][/TR][TR][TD]Data[/TD][/TR][/TABLE]",
+        );
         let all = texts(&chunks).concat();
         assert!(all.contains("Section"));
         assert!(all.contains("Header |"));
@@ -2113,7 +2195,9 @@ mod tests {
     #[test]
     fn every_whitespace_code_point_is_char_boundary_safe() {
         for cp in 0u32..0x11_0000 {
-            let Some(c) = char::from_u32(cp) else { continue };
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            };
             if !c.is_whitespace() {
                 continue;
             }
@@ -2122,4 +2206,3 @@ mod tests {
         }
     }
 }
-
