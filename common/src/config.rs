@@ -100,6 +100,11 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Attachment uploads bypass the default total timeout.
 pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Ceiling for one attachment download (`attachment_data`): XF caps uploads
+/// well below this, so anything larger is a mistake or an attack. Enforced
+/// at `Content-Length` and again on the streamed body, like `fetch_bytes`.
+pub const MAX_ATTACHMENT_BYTES: usize = 32 * 1024 * 1024;
+
 pub fn user_agent() -> String {
     format!("wftui/{} (+{})", env!("CARGO_PKG_VERSION"), BASE_URL)
 }

@@ -380,7 +380,9 @@ impl WfApiClient {
         struct NewKey {
             attachment_key: String,
         }
-        let new_key: NewKey = decode(key_resp).await?;
+        let new_key: NewKey = decode(key_resp)
+            .await
+            .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate, &self.write_gate]))?;
 
         self.api_gate.wait().await;
         let upload_url = format!("{}/attachments/", self.api_base());
@@ -397,16 +399,56 @@ impl WfApiClient {
             .timeout(config::UPLOAD_TIMEOUT)
             .send()
             .await?;
-        decode(resp).await
+        let out: Result<Attachment> = decode(resp).await;
+        if out.is_ok() {
+            // Anchor the following post's cool-down here, like `post_form`
+            // does: the attachment is a flood-checked write, so the reply it
+            // belongs to must not find the write gate slot wide open after a
+            // slow upload ate the last one (#644).
+            self.write_gate
+                .penalize(Duration::from_millis(config::WRITE_COOLDOWN_MS));
+        } else if let Err(e) = &out {
+            self.note_rate_limit(e, &[&self.api_gate, &self.write_gate]);
+        }
+        out
     }
 
     /// Fetch attachment bytes (the TUI writes them to a temp file and opens).
-    pub async fn attachment_data(&self, attachment_id: u32) -> Result<Vec<u8>> {
+    ///
+    /// The body is capped the way `fetch_bytes` caps thumbnails (#526's
+    /// streaming discipline): refused at `Content-Length` and again at the
+    /// running total — the old `resp.bytes().await` buffered a hostile or
+    /// simply enormous attachment whole before anything looked at it. A 429
+    /// classifies through the same path as every other call, so
+    /// `Retry-After` reaches the gates instead of dying as a plain
+    /// `Error::Http` (#643).
+    pub async fn attachment_data(&self, attachment_id: u32, max_bytes: usize) -> Result<Vec<u8>> {
         self.api_gate.wait().await;
         let token = self.valid_token().await?;
         let url = format!("{}/attachments/{attachment_id}/data", self.api_base());
-        let resp = self.http.get(url).bearer_auth(&token).send().await?.error_for_status()?;
-        Ok(resp.bytes().await?.to_vec())
+        let mut resp = self.http.get(&url).bearer_auth(&token).send().await?;
+        if !resp.status().is_success() {
+            let err = error_from_response(resp).await;
+            self.note_rate_limit(&err, &[&self.api_gate]);
+            return Err(err);
+        }
+        if let Some(len) = resp.content_length()
+            && len as usize > max_bytes
+        {
+            return Err(Error::FetchRejected(format!(
+                "Content-Length {len} exceeds cap {max_bytes} for {url}"
+            )));
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            buf.extend_from_slice(&chunk);
+            if buf.len() > max_bytes {
+                return Err(Error::FetchRejected(format!(
+                    "response body exceeds cap {max_bytes} for {url}"
+                )));
+            }
+        }
+        Ok(buf)
     }
 
     /// Fetch raw bytes from an absolute URL — the images tier
@@ -2105,9 +2147,83 @@ mod tests {
         }
     }
 
+    /// #643: a 429 from the attachment-data endpoint must classify as
+    /// `RateLimited` (Retry-After reaching the gate), not die as a plain
+    /// `Error::Http` from `error_for_status`.
     #[tokio::test]
-    async fn react_and_vote_report_the_servers_delete_action_as_a_removal() {
+    async fn attachment_data_429_extends_the_gate_and_keeps_retry_after() {
         let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-att-429");
+        Mock::given(method("GET"))
+            .and(path("/api/attachments/9/data"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "12"))
+            .mount(&server)
+            .await;
+        let c = logged_in_client("tok-1").await;
+        match c.attachment_data(9, config::MAX_ATTACHMENT_BYTES).await.unwrap_err() {
+            Error::RateLimited { retry_after: Some(d) } => assert_eq!(d.as_secs(), 12),
+            other => panic!("wrong error: {other:?}"),
+        }
+        assert!(
+            c.api_gate.pending_wait() >= Duration::from_secs(10),
+            "Retry-After must reach the gate"
+        );
+    }
+
+    /// #643: the download is capped at `Content-Length` and again on the
+    /// streamed body, like `fetch_bytes` (#526) — never buffered whole.
+    #[tokio::test]
+    async fn attachment_data_enforces_the_byte_cap() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-att-cap");
+        Mock::given(method("GET"))
+            .and(path("/api/attachments/9/data"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![3u8; 4096]))
+            .mount(&server)
+            .await;
+        let c = logged_in_client("tok-1").await;
+        match c.attachment_data(9, 1024).await.unwrap_err() {
+            Error::FetchRejected(msg) => assert!(msg.contains("1024"), "{msg}"),
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    /// #644: an upload is a flood-checked write — on success the write gate
+    /// is re-anchored (like `post_form`), so the reply this attachment
+    /// belongs to cannot fire with the slot wide open after a slow upload.
+    #[tokio::test]
+    async fn upload_attachment_re_anchors_the_write_gate_on_success() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-upload-gate");
+        Mock::given(method("POST"))
+            .and(path("/api/attachments/new-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "attachment_key": "key-1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/attachments/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "attachment": {"attachment_id": 55, "filename": "shot.png"}
+            })))
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let before = c.write_gate.pending_wait();
+        c.upload_attachment("post", &[], "shot.png".into(), vec![1, 2, 3], "image/png")
+            .await
+            .unwrap();
+        let after = c.write_gate.pending_wait();
+        assert!(
+            after >= before + Duration::from_secs(29),
+            "success must anchor a 30s write cool-down, went {before:?} -> {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn react_and_vote_report_the_servers_delete_action_as_a_removal() {        let server = MockServer::start().await;
         let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-react-del");
         // Sending the reaction/type that is already set is XF's *undo*; the
         // body is the only thing that says so (issue #538).
