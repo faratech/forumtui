@@ -86,12 +86,39 @@ pub async fn wait_for_redirect(
     timeout: Duration,
 ) -> Result<String> {
     let fut = async {
+        // A favicon request or browser preconnect that resets mid-read (a
+        // local port probe, a RST race) must not kill the whole handshake:
+        // loop on per-connection failures and only give up after a run of
+        // consecutive ones, which means the listener itself is broken.
+        let mut consecutive_failures = 0u32;
+        const MAX_CONSECUTIVE_FAILURES: u32 = 25;
         loop {
-            let (mut stream, _) = listener
-                .accept()
-                .await
-                .map_err(|e| Error::Handshake(format!("listener: {e}")))?;
-            let raw = read_request_head(&mut stream).await?;
+            let (mut stream, _) = match listener.accept().await {
+                Ok(pair) => {
+                    consecutive_failures = 0;
+                    pair
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        return Err(Error::Handshake(format!("listener: {e}")));
+                    }
+                    continue;
+                }
+            };
+            let raw = match read_request_head(&mut stream).await {
+                Ok(raw) => {
+                    consecutive_failures = 0;
+                    raw
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        return Err(e);
+                    }
+                    continue;
+                }
+            };
             // Browser favicon/noise requests get a quiet 404 and another wait.
             let path = raw.split_whitespace().nth(1).unwrap_or("");
             if !path.starts_with("/callback") {
