@@ -850,6 +850,20 @@ fn tag_close(src: &str, s: &str, brackets: &mut CloseBracket) -> Option<usize> {
             if b == b'[' {
                 return None;
             }
+            if b.is_ascii_whitespace() {
+                // Attribute form (`[NAME attr="v" …]`): the tag ends at the
+                // first `]` OUTSIDE a quoted value — XF's attribute regex
+                // allows `]` inside `"`/`'` quotes, and the news bot writes
+                // alt text containing `[ICODE]…[/ICODE]`. The plain first-`]`
+                // find ended such tags inside the alt text (#615). The memo
+                // pre-check keeps bracket-dense posts with no `]` at all
+                // from paying the scan per bracket.
+                if brackets.find(src, s).is_some()
+                    && let Some(pos) = scan_attr_close(bytes, i, QUOTED_VALUE_SCAN)
+                {
+                    return Some(pos);
+                }
+            }
             break;
         }
         i += 1;
@@ -859,6 +873,29 @@ fn tag_close(src: &str, s: &str, brackets: &mut CloseBracket) -> Option<usize> {
     brackets
         .find(src, s)
         .map(|abs| abs - (src.len() - s.len()))
+}
+
+/// First `]` at or after `from` that sits outside a quoted attribute value,
+/// the walk capped like the value-form scan (#615). A quote that never
+/// closes exhausts the cap and the caller falls back to the plain find.
+fn scan_attr_close(bytes: &[u8], from: usize, cap: usize) -> Option<usize> {
+    let limit = bytes.len().min(from + cap);
+    let mut quote: Option<u8> = None;
+    let mut i = from;
+    while i < limit {
+        let b = bytes[i];
+        match quote {
+            // Byte scanning is safe: quotes and `]` are ASCII and never
+            // appear inside a multi-byte UTF-8 sequence.
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b']' => return Some(i),
+            None => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Per-render memo of the last `first-']'-at-or-after` scan.
@@ -1318,6 +1355,18 @@ mod tests {
         let all = texts(&chunks).concat();
         assert!(all.contains("[QUOTE = Trouble; 235284]"), "{all:?}");
         assert!(!chunks.iter().any(|c| matches!(c, Chunk::Text(_, s) if s.quote_depth > 0)));
+    }
+
+    /// #615: attribute-form values may contain `]` inside quotes (news alt
+    /// text carries [ICODE]…[/ICODE]); the tag ends at the first `]`
+    /// outside quotes, so the attachment id is the body, not the alt tail.
+    #[test]
+    fn attribute_form_close_skips_quoted_values() {
+        let src = "[ATTACH alt=\"specs [ICODE]cmd[/ICODE] stats.\"]150883[/ATTACH]";
+        match &render(src)[0] {
+            Chunk::Attach(id, _) => assert_eq!(id, "150883", "src: {src}"),
+            other => panic!("expected the attachment id, got {other:?}"),
+        }
     }
 
     /// …and the attribute form with a real option still opens (#539's
