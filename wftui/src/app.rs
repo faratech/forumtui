@@ -1525,11 +1525,12 @@ impl App {
             return;
         }
         if self.show_help {
-            // Any other key closes the overlay.
+            // The card is modal like the palette: "any key closes" means the
+            // key is CONSUMED by closing, never also dispatched to the
+            // screen underneath — `q` used to quit the client and `j`/`k`
+            // moved the hidden list through the card (#612).
             self.show_help = false;
-            if k.code == KeyCode::Esc {
-                return;
-            }
+            return;
         }
         // The key after `g` resolves the chord or cancels it; either way it is
         // consumed, so a mistyped chord never fires a stray command.
@@ -7641,6 +7642,58 @@ mod tests {
             _ => panic!("expected the Login screen to survive untouched"),
         }
         assert_ne!(app.status, "Logged out.", "no sign-out happened, so no such status");
+    }
+
+    /// #612: the keys card is modal — "any key closes" means the key is
+    /// consumed by closing, never also dispatched to the screen underneath.
+    /// `q` on Home used to quit the client through the card, and `j`/`k`
+    /// moved the hidden list behind it.
+    #[tokio::test]
+    async fn the_keys_card_consumes_its_dismissing_key() {
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.screens.push(screens::home_state(false));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(app.show_help, "test setup: the card is open");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.show_help, "the card closed");
+        assert!(!app.should_quit, "q closed the card — it must not quit the client");
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Home(_))),
+            "the screen underneath is untouched"
+        );
+    }
+
+    /// #613: the profile's DM key used to be `c`, which the global-nav
+    /// block intercepted to open the Inbox first — the advertised "send DM"
+    /// key could never fire. Rebound to `d`: through the real handle_key
+    /// path it now pushes the DM composer with the member pre-filled, while
+    /// the global `c` still opens the Inbox.
+    #[tokio::test]
+    async fn the_profile_dm_key_opens_the_dm_composer() {
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.open_profile(42, "SysAdmin");
+        if let Some(Screen::Profile(p)) = app.screens.last_mut() {
+            p.user = Some(User { user_id: 42, username: "SysAdmin".into(), ..Default::default() });
+        }
+
+        // The global `c` still opens the Inbox from the profile...
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Inbox(_))),
+            "the global `c` is untouched"
+        );
+        app.screens.pop();
+
+        // ...and `d` reaches the profile's own DM action.
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        let Some(Screen::NewConversation(state)) = app.screens.last() else {
+            panic!("expected the DM composer, got {:?}", app.screens.last().map(|s| s.title()));
+        };
+        assert_eq!(state.recipients, "SysAdmin, ", "the member is pre-filled");
     }
 
     /// Issue #559: a pasted tab must not desync the caret from the drawn

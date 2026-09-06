@@ -629,6 +629,11 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
                         }
                     }
+                    // XF's hr is self-contained: the news template writes
+                    // `[HR][/HR]` around every rule, and the close tag fell
+                    // through to the unopened-closer arm and was emitted
+                    // verbatim as a stray `[/HR]` line under the rule (#610).
+                    "hr" => {}
                     _ => {
                         if !pop_matching(&mut stack, &tag_lower) {
                             // Closing tag for an unknown/unopened tag: keep it visible.
@@ -1199,6 +1204,21 @@ mod tests {
             "{:?}",
             img[0]
         );
+    }
+
+    /// #610: the news template writes `[HR][/HR]` before every heading; the
+    /// close tag fell through to the unopened-closer arm and rendered as a
+    /// literal `[/HR]` line under every rule. XF's hr is self-contained —
+    /// the close is consumed silently.
+    #[test]
+    fn hr_close_tag_is_consumed_not_rendered() {
+        let text = texts(&render("[HR][/HR]\nText after")).concat();
+        assert!(!text.contains("[/HR]"), "{text:?}");
+        assert!(text.contains("───"), "{text:?}");
+        assert!(text.contains("Text after"), "{text:?}");
+        // Search snippets go through `to_plain` and must not carry it either
+        // (the rule text itself survives, space-joined by to_plain).
+        assert_eq!(to_plain("[HR][/HR]rule"), "─── rule");
     }
 
     /// The depth cap must not change what a normally-nested post renders as.

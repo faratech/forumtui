@@ -711,7 +711,12 @@ impl<'de> serde::Deserialize<'de> for SearchHit {
                 };
                 (post_title, tid)
             } else {
-                let tid = if content_id > 0 {
+                // Only a `thread` hit names a thread (#611): type-less
+                // searches mix in profile-post/media/… hits whose content_id
+                // frequently collides with a real thread id, and the client
+                // used to fabricate `thread_id` from it — Enter opened an
+                // unrelated thread. Anything else opens through `view_url`.
+                let tid = if content_type == "thread" && content_id > 0 {
                     Some(content_id as u32)
                 } else {
                     None
@@ -1067,6 +1072,38 @@ mod tests {
         let flat_hit: SearchHit = serde_json::from_value(flat_hit_json).unwrap();
         assert_eq!(flat_hit.title, "Flat Thread");
         assert_eq!(flat_hit.thread_id, Some(123));
+    }
+
+    /// #611: only a `thread` hit names a thread. Type-less searches return
+    /// profile-post/media/… hits whose `content_id` frequently equals a real
+    /// thread id — fabricating `thread_id` from it made Enter open an
+    /// unrelated thread instead of the hit's `view_url`.
+    #[test]
+    fn non_thread_hits_never_fabricate_a_thread_id() {
+        let comment = serde_json::json!({
+            "type": "profile_post_comment",
+            "id": 575,
+            "result": {
+                "username": "someone",
+                "message": "welcome!",
+                "view_url": "https://windowsforum.com/profile-posts/575/"
+            }
+        });
+        let hit: SearchHit = serde_json::from_value(comment).unwrap();
+        assert_eq!(hit.content_type, "profile_post_comment");
+        assert_eq!(
+            hit.thread_id, None,
+            "a profile-post comment id must not become a thread id"
+        );
+        assert_eq!(hit.view_url.as_deref(), Some("https://windowsforum.com/profile-posts/575/"));
+
+        let media = serde_json::json!({
+            "type": "xfmg_media",
+            "id": 35661,
+            "result": { "title": "A screenshot" }
+        });
+        let hit: SearchHit = serde_json::from_value(media).unwrap();
+        assert_eq!(hit.thread_id, None);
     }
 
     #[test]

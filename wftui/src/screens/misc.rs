@@ -2233,11 +2233,13 @@ pub fn profile_key(s: &mut super::ProfileState, key: KeyEvent) -> Action {
                 Action::None
             }
         }
-        KeyCode::Char('c') => {
+        KeyCode::Char('d') => {
+            // `d`, not `c`: the global `c` (open Inbox) ran first, so the
+            // advertised "send DM" key could never fire (#613).
             if let Some(u) = &s.user {
                 Action::StartNewConversation(Some(u.username.clone()))
             } else {
-                Action::None
+                Action::Notice("No member loaded yet.".into())
             }
         }
         KeyCode::Char('o') => match s.user.as_ref().and_then(|u| u.view_url.clone()) {
@@ -2257,7 +2259,7 @@ pub fn profile_hints() -> Hints {
         &[
             ("t", "member threads"),
             ("p", "member posts"),
-            ("c", "send DM"),
+            ("d", "send DM"),
             ("o", "open web"),
             ("y", "copy link"),
             ("Esc", "back"),
@@ -2265,7 +2267,7 @@ pub fn profile_hints() -> Hints {
         &[
             ("t", "threads"),
             ("p", "posts"),
-            ("c", "DM"),
+            ("d", "DM"),
             ("o", "web"),
             ("Esc", "back"),
         ],
@@ -3211,8 +3213,9 @@ mod tests {
         let act = profile_key(&mut s, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
         assert!(matches!(act, Action::OpenMemberContent { user_id, username, content } if user_id == 42 && username == "SysAdmin" && content == "post"));
 
-        // 'c': direct message
-        let act = profile_key(&mut s, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        // 'd': direct message (rebound from `c`, which the global nav
+        // intercepted — issue #613)
+        let act = profile_key(&mut s, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
         assert!(matches!(act, Action::StartNewConversation(Some(name)) if name == "SysAdmin"));
 
         // 'o': open on web
