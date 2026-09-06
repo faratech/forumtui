@@ -412,7 +412,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
     // stack, so emit_text doesn't walk the stack per text run (#622).
     let mut links: Vec<String> = Vec::new();
     // `(buffered label, href)` for the open [URL] frame (#620).
-    let mut link_label: Option<(String, String)> = None;
+    let mut link_label: Option<(String, String, usize)> = None;
     // Text runs buffered for the open [URL] frame, flushed as ONE
     // Chunk::Link when it closes (#620): XF renders one anchor around the
     // whole body, and the old per-run chunks gave every run its own [n]
@@ -464,6 +464,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         if let Some((inner, close_len)) = misses.split(src, rest, &tag_lower) {
                             let mut st = style.clone();
                             st.code = true;
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text(decode_html_entities(inner), st));
                             rest = &rest[close_len..];
                         } else {
@@ -479,11 +480,14 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             if !clean_v.is_empty() {
                                 let mut hst = style.clone();
                                 hst.bold = true;
+                                flush_before_chunk(&mut out, &mut link_label, &style);
                                 out.push(Chunk::Text(format!("[{clean_v} code]\n"), hst));
                             }
                         }
                         let decoded = decode_html_entities(inner.trim_matches('\n'));
+                        flush_link_label(&mut out, &mut link_label, &style);
                         out.push(Chunk::Text(decoded, st.clone()));
+                        flush_link_label(&mut out, &mut link_label, &style);
                         out.push(Chunk::Text("\n".into(), st));
                         rest = &rest[close_len..];
                     }
@@ -498,6 +502,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             let (author, _) = parse_quote_byline(by);
                             let mut st = style.clone();
                             st.italic = true;
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text(format!("{author} wrote:\n"), st));
                         }
                         push_frame(&mut stack, &mut counts, &mut style, Frame::Quote { byline });
@@ -512,6 +517,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             if !clean.is_empty() {
                                 let mut st = style.clone();
                                 st.bold = true;
+                                flush_before_chunk(&mut out, &mut link_label, &style);
                                 out.push(Chunk::Text(format!("[Spoiler: {clean}]\n"), st));
                             }
                         }
@@ -530,42 +536,50 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             .and_then(|v| strip_quotes(v).parse::<u8>().ok())
                             .unwrap_or(1);
                         if !out.is_empty() && !ends_with_newline(&out) {
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text("\n".into(), style.clone()));
                         }
                         push_frame(&mut stack, &mut counts, &mut style, Frame::Heading(level));
                     }
                     "h1" => {
                         if !out.is_empty() && !ends_with_newline(&out) {
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text("\n".into(), style.clone()));
                         }
                         push_frame(&mut stack, &mut counts, &mut style, Frame::Heading(1));
                     }
                     "h2" => {
                         if !out.is_empty() && !ends_with_newline(&out) {
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text("\n".into(), style.clone()));
                         }
                         push_frame(&mut stack, &mut counts, &mut style, Frame::Heading(2));
                     }
                     "h3" => {
                         if !out.is_empty() && !ends_with_newline(&out) {
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text("\n".into(), style.clone()));
                         }
                         push_frame(&mut stack, &mut counts, &mut style, Frame::Heading(3));
                     }
                     "hr" => {
                         if !out.is_empty() && !ends_with_newline(&out) {
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text("\n".into(), style.clone()));
                         }
+                        flush_link_label(&mut out, &mut link_label, &style);
                         out.push(Chunk::Text("───\n".into(), style.clone()));
                     }
                     "table" => {
                         if !out.is_empty() && !ends_with_newline(&out) {
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text("\n".into(), style.clone()));
                         }
                         push_frame(&mut stack, &mut counts, &mut style, Frame::Table);
                     }
                     "tr" => {
                         if !out.is_empty() && !ends_with_newline(&out) {
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text("\n".into(), style.clone()));
                         }
                         push_frame(&mut stack, &mut counts, &mut style, Frame::TableRow);
@@ -578,13 +592,18 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         // everything else (#650) — a literal `&amp;` in the
                         // href was a wrong link.
                         Some(href) => {
+                            flush_link_label(&mut out, &mut link_label, &style);
                             let href = decode_html_entities(strip_quotes(&href));
-                            link_label = Some((String::new(), href.clone()));
+                            flush_link_label(&mut out, &mut link_label, &style);
+                            flush_link_label(&mut out, &mut link_label, &style);
+                        link_label = Some((String::new(), href.clone(), out.len()));
                             links.push(href.clone());
                             push_frame(&mut stack, &mut counts, &mut style, Frame::Link(href));
                         }
                         None => {
-                            link_label = Some((String::new(), String::new()));
+                            flush_link_label(&mut out, &mut link_label, &style);
+                            flush_link_label(&mut out, &mut link_label, &style);
+                        link_label = Some((String::new(), String::new(), out.len()));
                             links.push(String::new());
                             push_frame(&mut stack, &mut counts, &mut style, Frame::Link(String::new()));
                         }
@@ -597,7 +616,9 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             } else {
                                 format!("mailto:{clean}")
                             };
-                            link_label = Some((String::new(), href.clone()));
+                            flush_link_label(&mut out, &mut link_label, &style);
+                            flush_link_label(&mut out, &mut link_label, &style);
+                        link_label = Some((String::new(), href.clone(), out.len()));
                             links.push(href.clone());
                             push_frame(&mut stack, &mut counts, &mut style, Frame::Link(href));
                         }
@@ -612,6 +633,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             if let Some((inner, close_len)) = misses.split(src, rest, "email") {
                                 let st = style.clone();
                                 let addr = decode_html_entities(inner.trim());
+                                flush_before_chunk(&mut out, &mut link_label, &style);
                                 out.push(Chunk::Link(addr.clone(), format!("mailto:{addr}"), st));
                                 rest = &rest[close_len..];
                             } else {
@@ -627,7 +649,8 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         } else {
                             String::new()
                         };
-                        link_label = Some((String::new(), url.clone()));
+                        flush_link_label(&mut out, &mut link_label, &style);
+                        link_label = Some((String::new(), url.clone(), out.len()));
                         links.push(url.clone());
                         push_frame(&mut stack, &mut counts, &mut style, Frame::Link(url));
                     }
@@ -638,7 +661,8 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         } else {
                             String::new()
                         };
-                        link_label = Some((String::new(), url.clone()));
+                        flush_link_label(&mut out, &mut link_label, &style);
+                        link_label = Some((String::new(), url.clone(), out.len()));
                         links.push(url.clone());
                         push_frame(&mut stack, &mut counts, &mut style, Frame::Link(url));
                     }
@@ -649,9 +673,11 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             // literal `&amp;` in the src was a dead image.
                             let trimmed = decode_html_entities(strip_quotes(inner.trim()));
                             if trimmed.is_empty() {
+                                flush_before_chunk(&mut out, &mut link_label, &style);
                                 out.push(Chunk::Text("[image]".into(), st));
                             } else {
                                 let link = links.last().filter(|h| **h != trimmed).cloned();
+                                flush_before_chunk(&mut out, &mut link_label, &style);
                                 out.push(Chunk::Image { url: trimmed, link, style: st });
                             }
                             rest = &rest[close_len..];
@@ -659,6 +685,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             let st = style.clone();
                             let url = decode_html_entities(strip_quotes(v));
                             let link = links.last().filter(|h| **h != url).cloned();
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Image { url, link, style: st });
                         } else {
                             emit_text(&mut out, raw_tag, style.clone(), &mut link_label);
@@ -669,6 +696,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             let st = style.clone();
                             let site = value.as_deref().map(strip_quotes).unwrap_or("media");
                             let (label, url) = resolve_media(site, inner);
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Link(label, url, st));
                             rest = &rest[close_len..];
                         } else {
@@ -683,11 +711,13 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             } else {
                                 inner.trim()
                             };
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Attach(id.to_string(), st));
                             rest = &rest[close_len..];
                         } else if let Some(v) = &value {
                             let st = style.clone();
                             let clean = strip_quotes(v);
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Attach(clean.to_string(), st));
                         } else {
                             emit_text(&mut out, raw_tag, style.clone(), &mut link_label);
@@ -698,12 +728,14 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             let st = style.clone();
                             let name = inner.trim();
                             let name = name.strip_prefix('@').unwrap_or(name);
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text(format!("@{name}"), st));
                             rest = &rest[close_len..];
                         } else if let Some(v) = &value {
                             let st = style.clone();
                             let clean = strip_quotes(v);
                             let clean = clean.strip_prefix('@').unwrap_or(clean);
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text(format!("@{clean}"), st));
                         } else {
                             emit_text(&mut out, raw_tag, style.clone(), &mut link_label);
@@ -728,11 +760,13 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             && !out.is_empty()
                             && !ends_with_newline(&out)
                         {
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text("\n".into(), style.clone()));
                         }
                     }
                     "td" | "th" => {
                         if pop_matching(&mut stack, &mut counts, &mut style, &mut links, &tag_lower) {
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text(" | ".into(), style.clone()));
                         }
                     }
@@ -741,6 +775,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             && !out.is_empty()
                             && !ends_with_newline(&out)
                         {
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text("\n".into(), style.clone()));
                         }
                     }
@@ -749,6 +784,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             && !out.is_empty()
                             && !ends_with_newline(&out)
                         {
+                            flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text("\n".into(), style.clone()));
                         }
                     }
@@ -786,7 +822,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
     }
 
     // An unclosed [URL=x] still owes its buffered label (#620).
-    flush_link_label(&mut out, &mut link_label, &Style::default());
+    flush_link_label(&mut out, &mut link_label, &style);
     if out.is_empty() {
         out.push(Chunk::Text(String::new(), Style::default()));
     }
@@ -1150,20 +1186,45 @@ fn take_until_close<'a>(s: &'a str, name: &str) -> (&'a str, usize) {
 
 /// Emit plain text: inside a [URL] frame the whole run is a link; otherwise
 /// bare http(s) URLs are auto-linked on the way through.
+/// A non-text chunk (image/attach/icode/…) is about to be emitted inside a
+/// `[URL]` frame (#663): flush any buffered label first so source order
+/// holds, and otherwise mark the body non-empty so the close cannot add a
+/// phantom href-as-label link on top of the chunk's own anchor.
+fn flush_before_chunk(
+    out: &mut Vec<Chunk>,
+    pending: &mut Option<(String, String, usize)>,
+    style: &Style,
+) {
+    match pending {
+        Some((label, _, _)) if label.is_empty() => {
+            pending.take();
+        }
+        Some(_) => flush_link_label(out, pending, style),
+        None => {}
+    }
+}
+
 /// Flush the buffered `[URL]` label as one `Chunk::Link` (#620). An empty
 /// body means the href is the label (XF: `<a href="x"></a>` renders the
 /// URL as the anchor text).
-fn flush_link_label(out: &mut Vec<Chunk>, pending: &mut Option<(String, String)>, style: &Style) {
-    if let Some((label, href)) = pending.take() {
-        // Empty href means the label IS the target (the `[URL]body[/URL]`
-        // form); an empty body means the href is the label (XF renders the
-        // URL as the anchor text for `[url=x][/url]`). Both empty: nothing.
-        if label.trim().is_empty() && href.is_empty() {
+fn flush_link_label(
+    out: &mut Vec<Chunk>,
+    pending: &mut Option<(String, String, usize)>,
+    style: &Style,
+) {
+    if let Some((label, href, out_at)) = pending.take() {
+        // The href-as-label fallback applies only when the body produced NO
+        // chunks at all (`[url=x][/url]`) — a body of non-text chunks (an
+        // [IMG] inside the anchor) already carries its own anchor via
+        // `Chunk::Image::link`, and a second self-link here was a phantom
+        // marker plus a printed URL under every wrapped thumbnail (#663).
+        let body_empty = out.len() == out_at && label.is_empty();
+        if body_empty && href.is_empty() {
             return;
         }
         let (label, target) = if href.is_empty() {
             (label.clone(), label)
-        } else if label.trim().is_empty() {
+        } else if body_empty {
             (href.clone(), href)
         } else {
             (label, href)
@@ -1182,10 +1243,10 @@ fn emit_text(
     out: &mut Vec<Chunk>,
     text: &str,
     style: Style,
-    pending: &mut Option<(String, String)>,
+    pending: &mut Option<(String, String, usize)>,
 ) {
     // Inside a [URL] frame everything is the anchor's label.
-    if let Some((label, _)) = pending {
+    if let Some((label, _, _)) = pending {
         label.push_str(&decode_html_entities(text));
         return;
     }
