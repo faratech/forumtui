@@ -2599,11 +2599,17 @@ impl App {
     pub fn input_active(&self) -> bool {
         // Login has no free-text field anymore (short link + polling), so
         // global keys like ? work there too.
+        //
+        // A Search screen only counts while a field owns the keyboard
+        // (#617): on the results list `?`, the palette and `g g`/`G` were
+        // swallowed, which made the screen's own goto_top/goto_bottom arms
+        // unreachable. Compose/NewConversation are editors end to end.
         matches!(
             self.screens.last(),
-            Some(Screen::Search(_))
-                | Some(Screen::Compose(_))
-                | Some(Screen::NewConversation(_))
+            Some(Screen::Search(s)) if s.input_mode
+        ) || matches!(
+            self.screens.last(),
+            Some(Screen::Compose(_)) | Some(Screen::NewConversation(_))
         ) || capture_active(self)
     }
     pub fn push_screen(&mut self, screen: Screen) {
