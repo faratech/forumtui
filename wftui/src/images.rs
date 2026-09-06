@@ -60,6 +60,14 @@ pub const LOGO_ROWS: u16 = 7;
 /// cap is enforced by `WfApiClient::fetch_bytes` (Content-Length *and* the
 /// body actually received).
 pub const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
+/// Pixel-dimension ceiling for decode. `MAX_IMAGE_BYTES` caps the compressed
+/// body, but a hostile header can still declare gigantic dimensions (a 2 MiB
+/// WebP claiming 30000×30000 asks for a ~3.6 GB RGBA buffer, and some
+/// decoders allocate straight from the header). The allocation failure would
+/// abort the process — unwinding past `catch_unwind` and the terminal
+/// restore — so refuse anything over a generous 8K square before a pixel is
+/// read.
+pub const MAX_DECODE_DIM: u32 = 8192;
 /// Decoded protocols kept in memory. Each is an encoded payload sized for one
 /// rect, so this is bounded by roughly (visible images × panel sizes seen).
 pub const LRU_CAP: usize = 32;
@@ -782,7 +790,17 @@ pub fn decode(
 ) -> Result<Loaded, String> {
     use ratatui::layout::Size;
     use ratatui_image::{FilterType, Resize};
-    let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
+    let mut limits = image::Limits::default();
+    // Enforce MAX_DECODE_DIM before any decoder allocates from the header.
+    limits.max_image_width = Some(MAX_DECODE_DIM);
+    limits.max_image_height = Some(MAX_DECODE_DIM);
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
+    reader.limits(limits);
+    let img = reader
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .decode()
+        .map_err(|e| e.to_string())?;
     let px = (img.width(), img.height());
     // ratatui-image 11 takes the target box as a `Size`, not a `Rect` (9 took
     // a Rect and ignored its origin).
@@ -894,6 +912,64 @@ mod tests {
         let without = attachment_box(118, &att("a.png", None, None), (10, 20));
         assert_eq!(with, (39, 12));
         assert_eq!(without, fit(118, (16, 9), (10, 20)));
+    }
+
+    // ---------- decode limits ----------
+
+    /// A minimal uncompressed 24-bpp BMP: `w`/`h` go into the header
+    /// verbatim, followed by `pixels` bytes of (possibly zero) pixel data.
+    /// BMP needs no fixture file because its dimensions are plain header
+    /// fields — the same place a hostile WebP/PNG carries its bomb.
+    #[cfg(feature = "images")]
+    fn bmp(w: i32, h: i32, pixels: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"BM");
+        v.extend_from_slice(&(54 + pixels.len() as u32).to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&54u32.to_le_bytes());
+        v.extend_from_slice(&40u32.to_le_bytes());
+        v.extend_from_slice(&w.to_le_bytes());
+        v.extend_from_slice(&h.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&24u16.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&2835i32.to_le_bytes());
+        v.extend_from_slice(&2835i32.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(pixels);
+        v
+    }
+
+    /// A 68-byte body can declare a 3.6 GB framebuffer. Decode must refuse
+    /// it at the header — an allocation abort would skip `catch_unwind` and
+    /// `TerminalGuard`, leaving the user's terminal in raw mode.
+    #[cfg(feature = "images")]
+    #[test]
+    fn decode_refuses_a_header_declaring_monstrous_dimensions() {
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        let bomb = bmp(60_000, 60_000, &[]);
+        let err = match decode(&picker, &bomb, 39, 12) {
+            Ok(_) => panic!("the bomb must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_lowercase().contains("dimension")
+                || err.to_lowercase().contains("large")
+                || err.to_lowercase().contains("limit"),
+            "expected a limits rejection, got: {err}"
+        );
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn decode_still_accepts_a_small_image_and_reports_its_pixel_size() {
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        // 2×2 24-bpp: 6 bytes per row padded to 8, bottom-up.
+        let ok = bmp(2, 2, &[10, 20, 30, 0, 0, 40, 50, 60, 0, 0, 70, 80, 90, 0, 0, 100]);
+        let loaded = decode(&picker, &ok, 39, 12).expect("a 2x2 bmp decodes");
+        assert_eq!(loaded.px, (2, 2));
     }
 
     // ---------- url choice ----------
