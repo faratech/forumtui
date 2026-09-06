@@ -51,20 +51,43 @@ fn deliver_dual_for_screen(seq: &str) -> String {
     }
 }
 
+/// Control characters (C0, DEL, C1) are stripped at the OSC boundary (#649):
+/// a BEL or ESC inside a thread title or URL could otherwise split or inject
+/// sequences in the terminal itself. Printable text — including multi-byte
+/// scripts — passes untouched.
+fn strip_controls(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// Wrap `label` in an OSC 8 hyperlink pointing at `url`.
 pub fn hyperlink(url: &str, label: &str) -> String {
-    let seq = format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\");
+    let seq = format!(
+        "\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\",
+        strip_controls(url),
+        strip_controls(label)
+    );
     deliver_dual_for_screen(&seq)
 }
 
 /// Set terminal window and tab title via OSC 0.
 pub fn set_title(title: &str) -> String {
-    let seq = format!("\x1b]0;{title}\x07");
+    let seq = format!("\x1b]0;{}\x07", strip_controls(title));
     deliver_dual_for_screen(&seq)
 }
 
-/// OSC 52 clipboard write (base64 payload, BEL terminator).
+/// Largest OSC 52 payload source we will base64 (#648): a megabyte-scale
+/// selection becomes a megabyte-and-a-third escape sequence, and many
+/// terminals cap OSC 52 far below that (or stall on it). Past the cap the
+/// sequence is simply not emitted; the system-clipboard path has no such
+/// limit.
+pub const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
+
+/// OSC 52 clipboard write (base64 payload, BEL terminator). Empty output
+/// means "over the cap — not sent".
 pub fn set_clipboard(value: &str) -> String {
+    if value.len() > MAX_CLIPBOARD_BYTES {
+        return String::new();
+    }
     let b64 = Base64::encode_string(value.as_bytes());
     let raw = format!("\x1b]52;c;{b64}\x07");
     match detect_multiplexer() {
@@ -177,7 +200,11 @@ pub fn copy_to_system_clipboard(value: &str) {
                         use std::io::Write;
                         let _ = stdin.write_all(value.as_bytes());
                     }
-                    if c.wait().is_ok() {
+                    // `Child::wait` returns Ok even for a non-zero exit, so
+                    // `is_ok()` here let a present-but-failing xclip (no X,
+                    // wayland-only session) stop the loop before xsel was
+                    // tried (#648) — only actual success may.
+                    if c.wait().map(|s| s.success()).unwrap_or(false) {
                         break;
                     }
                 }
@@ -245,6 +272,39 @@ pub fn read_from_system_clipboard() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Control characters in user-sourced titles/URLs must be stripped at
+    /// the OSC boundary (#649): a BEL/ESC in a thread title could otherwise
+    /// terminate or inject sequences inside the terminal itself.
+    #[test]
+    fn titles_and_hrefs_carry_no_control_characters() {
+        let t = set_title("Windows \u{1b}]0;pwned\u{7} Forum tabs");
+        // Exactly the framing escapes remain: OSC open, BEL terminator; the
+        // injected sequences' control bytes are gone, leaving plain text.
+        assert!(t.starts_with("\x1b]0;"), "{t:?}");
+        assert!(t.ends_with("\x07"), "{t:?}");
+        let inner = &t["\x1b]0;".len()..t.len() - 1];
+        assert!(!inner.chars().any(char::is_control), "injected: {t:?}");
+        // The injected sequence's bytes are gone; what remains of the title
+        // text ("Windows ]0;pwned Forum tabs") is inert, printable text.
+        assert!(inner.starts_with("Windows ") && inner.ends_with("Forum tabs"), "{t:?}");
+
+        let h = hyperlink("https://x.test/a\u{7}b", "click\u{1b}me");
+        assert!(!h.contains('\u{7}'), "{h:?}");
+        let payload = h.trim_start_matches("\x1b]8;;").trim_end_matches("\x1b]8;;\x1b\\");
+        assert!(payload.starts_with("https://x.test/ab\x1b\\clickme"), "{h:?}");
+    }
+
+    /// #648: an OSC 52 payload far past what terminals accept is not
+    /// emitted at all (empty output = "not sent"); small values still are.
+    #[test]
+    fn clipboard_over_the_cap_is_not_emitted() {
+        assert!(set_clipboard("small").starts_with("\x1b]52;c;"));
+        let huge = "x".repeat(MAX_CLIPBOARD_BYTES + 1);
+        assert!(set_clipboard(&huge).is_empty(), "over-cap payload must not be emitted");
+        let at_cap = "x".repeat(MAX_CLIPBOARD_BYTES);
+        assert!(!set_clipboard(&at_cap).is_empty(), "at-cap is fine");
+    }
 
     #[test]
     fn hyperlink_wraps_label_with_reset() {
