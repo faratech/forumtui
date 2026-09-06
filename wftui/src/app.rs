@@ -284,7 +284,11 @@ pub enum Msg {
     /// A go-to palette member lookup came back. `query` is the palette query
     /// that asked, so a stale answer to an edited query is dropped.
     PaletteMember { query: String, user: Option<User> },
-    ProfileLoaded(TaskResult<User>),
+    /// A profile fetch came back. `generation` is the `open_profile` request
+    /// the screen is waiting on; an older reply (profile A opened again, or
+    /// B pushed over a slow A) is dropped instead of filling the topmost
+    /// profile screen.
+    ProfileLoaded { generation: u64, result: TaskResult<User> },
     LoggedOut(Result<(), String>),
     /// A thumbnail / avatar / the sign-in logo finished loading off-thread.
     /// Only sent by the `images` feature's loader.
@@ -447,6 +451,11 @@ pub struct App {
     /// stamped on the flow's messages so a superseded flow's `LoginReady` /
     /// `LoginFailed` / `LoginComplete` is ignored (issue #547).
     login_generation: u64,
+    /// Which `open_profile` request is the live one, stamped on the pushed
+    /// `ProfileState` and its `Msg::ProfileLoaded` so a slow reply to an
+    /// older profile cannot fill a newer screen (same pattern as
+    /// `login_generation`).
+    profile_generation: u64,
     /// Abort handle for the in-flight login task, so pressing Enter while the
     /// client is still polling stops that poll loop instead of leaving two
     /// flows racing for the same screen.
@@ -673,6 +682,7 @@ pub async fn run(images: crate::images::Images) -> u8 {
         session_recovery_pending: false,
         session_recovery_started_at: None,
         login_generation: 0,
+        profile_generation: 0,
         login_task: None,
         body_rect: ratatui::layout::Rect::default(),
         hits: HitMap::new(common::config::mouse_enabled()),
@@ -2796,9 +2806,12 @@ impl App {
     }
 
     pub fn open_profile(&mut self, user_id: u32, fallback_name: &str) {
+        self.profile_generation += 1;
+        let generation = self.profile_generation;
         self.push_screen(Screen::Profile(screens::ProfileState {
             title: fallback_name.to_string(),
             loading: true,
+            generation,
             ..Default::default()
         }));
         let api = self.api.clone();
@@ -2815,7 +2828,7 @@ impl App {
             };
             let id = resolve_profile_id(user_id, found);
             let result = api.user(id).await.map_err(|e| TaskError::of(&e));
-            tx.send(Msg::ProfileLoaded(result)).ok();
+            tx.send(Msg::ProfileLoaded { generation, result }).ok();
         });
     }
 
@@ -3856,9 +3869,12 @@ impl App {
                     palette.push_member(&found);
                 }
             }
-            Msg::ProfileLoaded(result) => {
+            Msg::ProfileLoaded { generation, result } => {
+                // Only the profile screen waiting on *this* request adopts
+                // the reply — the topmost Profile may belong to a newer
+                // `open_profile` (see ForumLoaded, issue #537).
                 let profile = self.screens.iter_mut().rev().find_map(|s| match s {
-                    Screen::Profile(profile) => Some(profile),
+                    Screen::Profile(profile) if profile.generation == generation => Some(profile),
                     _ => None,
                 });
                 if let Some(profile) = profile {
@@ -4187,7 +4203,7 @@ fn session_error_of(msg: &Msg) -> Option<&TaskError> {
         | Msg::AlertsLoaded(Err(e))
         | Msg::AlertMarked(Err(e))
         | Msg::SearchDone { result: Err(e), .. }
-        | Msg::ProfileLoaded(Err(e))
+        | Msg::ProfileLoaded { result: Err(e), .. }
         | Msg::RecipientResolved { id: Err(e), .. }
         | Msg::PostToggled { result: Err(e), .. } => e,
         _ => return None,
@@ -4228,7 +4244,7 @@ fn mark_retryable(msg: &mut Msg) {
         | Msg::AlertsLoaded(Err(e))
         | Msg::AlertMarked(Err(e))
         | Msg::SearchDone { result: Err(e), .. }
-        | Msg::ProfileLoaded(Err(e))
+        | Msg::ProfileLoaded { result: Err(e), .. }
         | Msg::RecipientResolved { id: Err(e), .. }
         | Msg::PostToggled { result: Err(e), .. } => e,
         _ => return,
@@ -4490,6 +4506,58 @@ mod tests {
             .map(|y| (0..80).map(|x| buf2[(x, y)].symbol().to_string()).collect::<String>())
             .collect();
         assert!(!screen2.contains("Error:"), "thread view still shows the stale error:\n{screen2}");
+    }
+
+    /// The stale-reply identity rule for profiles: a `ProfileLoaded` reply
+    /// fills only the screen whose `open_profile` request it answers. Open
+    /// A, push B over it while A is still in flight, let A's reply land —
+    /// B must still be loading and must never adopt A's user (same pattern
+    /// as ForumLoaded, issue #537).
+    #[tokio::test]
+    async fn a_profile_reply_fills_only_the_screen_that_requested_it() {
+        let mut app = test_app();
+        app.open_profile(11, "alice");
+        let alice_generation = app.profile_generation;
+        app.open_profile(22, "bob");
+        let bob_generation = app.profile_generation;
+        assert_ne!(alice_generation, bob_generation);
+
+        app.handle_msg(Msg::ProfileLoaded {
+            generation: alice_generation,
+            result: Ok(User { user_id: 11, username: "alice".into(), ..Default::default() }),
+        });
+        {
+            let Some(Screen::Profile(top)) = app.screens.last() else {
+                panic!("expected bob's profile screen on top");
+            };
+            assert_eq!(top.title, "bob");
+            assert!(top.user.is_none(), "alice's reply must not fill bob's screen");
+            assert!(top.loading, "bob's screen is still waiting on its own reply");
+        }
+
+        app.handle_msg(Msg::ProfileLoaded {
+            generation: bob_generation,
+            result: Ok(User { user_id: 22, username: "bob".into(), ..Default::default() }),
+        });
+        {
+            let Some(Screen::Profile(top)) = app.screens.last() else {
+                panic!("expected bob's profile screen on top");
+            };
+            assert_eq!(top.user.as_ref().map(|u| u.user_id), Some(22));
+            assert!(!top.loading);
+        }
+
+        // Alice's screen is still live underneath; her (now-arrived) reply
+        // fills it, and only it.
+        app.screens.pop();
+        app.handle_msg(Msg::ProfileLoaded {
+            generation: alice_generation,
+            result: Ok(User { user_id: 11, username: "alice".into(), ..Default::default() }),
+        });
+        let Some(Screen::Profile(alice)) = app.screens.last() else {
+            panic!("expected alice's profile screen");
+        };
+        assert_eq!(alice.user.as_ref().map(|u| u.user_id), Some(11));
     }
 
     /// Issue #535: the recipients field prefilled from a profile's `c` key
@@ -7062,6 +7130,7 @@ mod tests {
             session_recovery_pending: false,
             session_recovery_started_at: None,
             login_generation: 0,
+            profile_generation: 0,
             login_task: None,
             body_rect: ratatui::layout::Rect::default(),
             // Tests build the map enabled: every hit-map test drives it

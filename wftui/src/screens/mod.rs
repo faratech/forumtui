@@ -441,6 +441,11 @@ pub struct ProfileState {
     pub user: Option<User>,
     pub loading: bool,
     pub error: Option<String>,
+    /// Which `open_profile` request this screen is waiting on. The resolved
+    /// id is computed off-thread (a name-only lookup), so the request token
+    /// minted at open time is the only identity the reply can be matched
+    /// against — a stale reply for an older profile must not fill this one.
+    pub generation: u64,
 }
 
 // ---------- screen enum + dispatch ----------
