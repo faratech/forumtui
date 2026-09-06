@@ -805,10 +805,10 @@ impl ConversationViewState {
         self.sel_msg = self
             .sel_msg
             .min(self.messages.len().saturating_sub(1));
-        if self.built == Some((width, self.sel_msg)) {
+        if self.built == Some((width, self.sel_msg, self.reveal_spoilers)) {
             return;
         }
-        self.built = Some((width, self.sel_msg));
+        self.built = Some((width, self.sel_msg, self.reveal_spoilers));
         let width = width.max(1) as usize;
         let body_w = width.saturating_sub(3).max(4);
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -858,6 +858,13 @@ pub fn conversation_view_key(s: &mut ConversationViewState, key: KeyEvent) -> Ac
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => {
             Action::PopScreen
+        }
+        // Issue #669: `x` reveals (or re-hides) [SPOILER] bodies. `built`
+        // keys on the flag, so the next render rebuilds the message lines.
+        KeyCode::Char('x') => {
+            s.reveal_spoilers = !s.reveal_spoilers;
+            s.built = None;
+            Action::None
         }
         _ => conversation_view_key_inner(s, key),
     }
@@ -949,12 +956,16 @@ fn conversation_view_key_inner(s: &mut ConversationViewState, key: KeyEvent) -> 
     }
 }
 
-pub fn conversation_view_hints() -> Hints {
+pub fn conversation_view_hints(s: &ConversationViewState) -> Hints {
     Hints::with_short(
         &[
             ("r", "reply"),
             ("j/k", "scroll"),
             ("n/N", "next/prev msg"),
+            (
+                "x",
+                if s.reveal_spoilers { "hide" } else { "reveal" },
+            ),
             ("p", "author profile"),
             ("P", "starter profile"),
             ("[/]", "page"),
@@ -964,8 +975,11 @@ pub fn conversation_view_hints() -> Hints {
             ("r", "reply"),
             ("j/k", ""),
             ("n/N", "msg"),
+            (
+                "x",
+                if s.reveal_spoilers { "hide" } else { "reveal" },
+            ),
             ("p", "profile"),
-            ("[/]", "page"),
             ("Esc", "back"),
         ],
         0,
@@ -1980,6 +1994,57 @@ mod tests {
             matches!(inbox_key(&mut s, key(']')), Action::Notice(_)),
             "] must refuse while the conversation page is loading"
         );
+    }
+
+    /// #669: `x` on a conversation view flips the spoiler reveal and
+    /// invalidates the line cache — the DM sibling of the thread view's
+    /// toggle (issue #621).
+    #[test]
+    fn x_reveals_spoiler_bodies_in_a_conversation() {
+        let theme = Theme::truecolor();
+        let mut s = crate::screens::ConversationViewState {
+            conversation: crate::screens::Conversation {
+                conversation_id: 3,
+                title: "A DM".into(),
+                ..Default::default()
+            },
+            messages: vec![crate::screens::ConversationMessage {
+                message_id: 1,
+                user_id: 7,
+                username: "kemical".into(),
+                message: "before [ISPOILER]dm secret[/ISPOILER] after".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // Hidden by default: the spoiler run paints black-on-black...
+        let mut sink = Vec::new();
+        let mut links = Vec::new();
+        push_bbcode(&mut sink, &mut links, &s.messages[0].message, &theme, s.reveal_spoilers);
+        let hidden = sink.iter().any(|l| {
+            l.spans.iter().any(|sp| {
+                sp.style.fg == Some(ratatui::style::Color::Black)
+                    && sp.style.bg == Some(ratatui::style::Color::Black)
+                    && sp.content.contains("secret")
+            })
+        });
+        assert!(hidden, "the spoiler body must be hidden by default");
+
+        // ...and `x` reveals it (flag flips, line cache invalidated).
+        conversation_view_key(&mut s, key('x'));
+        assert!(s.reveal_spoilers);
+        assert!(s.built.is_none(), "the flip must force a rebuild");
+        sink.clear();
+        links.clear();
+        push_bbcode(&mut sink, &mut links, &s.messages[0].message, &theme, s.reveal_spoilers);
+        let revealed = sink.iter().any(|l| {
+            l.spans.iter().any(|sp| {
+                sp.content.contains("secret")
+                    && sp.style.fg != Some(ratatui::style::Color::Black)
+            })
+        });
+        assert!(revealed, "the spoiler body must be readable after x");
     }
 
     #[test]

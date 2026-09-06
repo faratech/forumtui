@@ -290,9 +290,13 @@ pub struct ConversationViewState {
     /// `None` forces a rebuild — every writer of `messages` clears it. Both
     /// the Inbox pane and the standalone screen used to re-wrap and re-parse
     /// every message on every frame (issue #522).
-    pub built: Option<(u16, usize)>,
+    pub built: Option<(u16, usize, bool)>,
     pub loading: bool,
     pub error: Option<String>,
+    /// `[SPOILER]` bodies in the messages render hidden until `x` flips
+    /// this (#669 — the conversation-view sibling of the thread view's
+    /// toggle). Part of the `built` memo key, so a flip forces a rebuild.
+    pub reveal_spoilers: bool,
 }
 
 #[derive(Default)]
@@ -629,7 +633,7 @@ impl Screen {
             Screen::ThreadView(s) => browse::thread_view_hints(s),
             Screen::Compose(s) => misc::compose_hints(s),
             Screen::Inbox(s) => social::inbox_hints(s),
-            Screen::ConversationView(_) => social::conversation_view_hints(),
+            Screen::ConversationView(s) => social::conversation_view_hints(s),
             Screen::NewConversation(_) => social::new_conversation_hints(),
             Screen::Search(s) => misc::search_hints(s),
             Screen::Profile(_) => misc::profile_hints(),
@@ -1727,7 +1731,12 @@ mod dispatch_tests {
                     }],
                     ..Default::default()
                 }),
-                skip: &["j/k", "n/N", "[/]"],
+                skip: &[
+                    "j/k", "n/N", "[/]",
+                    // `x` only flips `reveal_spoilers` — screen state, no
+                    // `Action` (pinned by the social spoiler-reveal test).
+                    "x",
+                ],
             },
             Case {
                 name: "NewConversation",
