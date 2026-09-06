@@ -527,7 +527,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                     "size" => push_frame(&mut stack, &mut counts, &mut style, Frame::Size(value.unwrap_or_default())),
                     "font" => push_frame(&mut stack, &mut counts, &mut style, Frame::Font(value.unwrap_or_default())),
                     "left" | "center" | "right" | "justify" => {
-                        stack.push(Frame::Align(tag_lower))
+                        push_frame(&mut stack, &mut counts, &mut style, Frame::Align(tag_lower))
                     }
                     "indent" => push_frame(&mut stack, &mut counts, &mut style, Frame::Align("indent".into())),
                     "heading" => {
