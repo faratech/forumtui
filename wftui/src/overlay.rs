@@ -23,6 +23,7 @@ use ratatui::widgets::{Clear, Paragraph};
 use common::models::User;
 
 use crate::chrome::{self, Hints};
+use crate::hit::{Hit, HitMap};
 use crate::glyph::Glyphs;
 use crate::theme::Theme;
 
@@ -35,7 +36,11 @@ const WHICH_KEY_WIDTH: u16 = 52;
 const WHICH_KEY_HEIGHT: u16 = 5;
 /// Keys card size (`Help.dc.html`: 96 × 16).
 const KEYS_CARD_WIDTH: u16 = 96;
-const KEYS_CARD_HEIGHT: u16 = 16;
+/// DESIGN.md specifies 96 x 16; the card grew by the three rows the mouse
+/// and touch layer added to its MOUSE & CLIPBOARD group (click, right-click,
+/// and the `WFTUI_MOUSE=0` escape hatch beside Shift+drag). `render_keys_card`
+/// clamps this to the body's height, so a small terminal is unaffected.
+const KEYS_CARD_HEIGHT: u16 = 19;
 /// Width of the dim kind column (`forum` / `action` / `member`).
 const KIND_COL: usize = 6;
 /// Cells between a hint's cap and the next hint's cap inside a keys-card column.
@@ -259,6 +264,16 @@ impl Palette {
         }
     }
 
+    /// Put the selection on filtered row `i` — what a click on a palette row
+    /// does before running it. Out of range is ignored: the row a click names
+    /// is always one the last frame drew.
+    pub fn select(&mut self, i: usize) {
+        if i < self.filtered.len() {
+            self.sel = i;
+            self.clamp_scroll();
+        }
+    }
+
     pub fn selected(&self) -> Option<&Item> {
         self.filtered
             .get(self.sel)
@@ -370,12 +385,16 @@ impl Palette {
 
     /// Draw the palette over `body`: 60 wide, centered, two rows down — the
     /// geometry of `Overlays.dc.html`.
-    pub fn render(&self, f: &mut Frame, body: Rect, theme: &Theme, g: &Glyphs) {
+    pub fn render(&self, f: &mut Frame, body: Rect, theme: &Theme, g: &Glyphs, hits: &mut HitMap) {
         let width = PALETTE_WIDTH.min(body.width);
         let height = (PALETTE_ROWS as u16 + 4).min(body.height);
         let x = body.x + body.width.saturating_sub(width) / 2;
         let y = body.y + 2.min(body.height.saturating_sub(height));
         let area = Rect::new(x, y, width, height);
+        // The palette owns the keyboard while it is up, so it owns the
+        // pointer too: everything outside it closes it, and nothing under it
+        // can be reached (`push_around` + last-registered-wins).
+        hits.push_around(body, area, Hit::CloseOverlay);
         f.render_widget(Clear, area);
         let block = chrome::panel(
             theme,
@@ -436,6 +455,12 @@ impl Palette {
             };
             let Some(item) = self.items.get(*idx) else { break };
             let selected = self.scroll + slot == self.sel;
+            // The index is into `filtered`, which is what `sel` indexes too,
+            // so a click can just move the selection and run it.
+            hits.push(
+                Rect::new(inner.x, inner.y + 2 + slot as u16, inner.width, 1),
+                Hit::PaletteRow(self.scroll + slot),
+            );
             lines.push(self.row(theme, item, positions, selected, w));
         }
         if lines.is_empty() {
@@ -612,7 +637,7 @@ const WHICH_KEY: [[(&str, &str); 3]; 3] = [
 ];
 
 /// Draw the `g …` panel bottom-right of the body, one row above the key bar.
-pub fn render_which_key(f: &mut Frame, body: Rect, theme: &Theme, g: &Glyphs) {
+pub fn render_which_key(f: &mut Frame, body: Rect, theme: &Theme, g: &Glyphs, hits: &mut HitMap) {
     let width = WHICH_KEY_WIDTH.min(body.width);
     let height = WHICH_KEY_HEIGHT.min(body.height);
     let x = body
@@ -620,6 +645,7 @@ pub fn render_which_key(f: &mut Frame, body: Rect, theme: &Theme, g: &Glyphs) {
         .max(body.x + body.width.saturating_sub(width + 2));
     let y = body.y + body.height.saturating_sub(height + 1);
     let area = Rect::new(x, y, width, height);
+    hits.push_around(body, area, Hit::CloseOverlay);
     f.render_widget(Clear, area);
     let block = chrome::panel(
         theme,
@@ -638,10 +664,18 @@ pub fn render_which_key(f: &mut Frame, body: Rect, theme: &Theme, g: &Glyphs) {
     let stride = 15usize;
     let lines: Vec<Line<'static>> = WHICH_KEY
         .iter()
-        .map(|row| {
+        .enumerate()
+        .map(|(r, row)| {
             let mut spans = vec![Span::raw(" ")];
-            for (key, label) in row {
+            for &(key, label) in row {
                 let start: usize = spans.iter().map(Span::width).sum();
+                // The whole `cap label` cell is the target, not the two-cell
+                // cap: the chord's key is pressed through `handle_key`, so an
+                // armed `g` resolves exactly as it does from the keyboard.
+                hits.push(
+                    Rect::new(inner.x + start as u16, inner.y + r as u16, stride as u16, 1),
+                    Hit::Key(key),
+                );
                 spans.push(chrome::keycap(theme, key, false));
                 spans.push(Span::styled(format!(" {label}"), theme.dim()));
                 let used: usize = spans.iter().map(Span::width).sum();
@@ -682,6 +716,7 @@ pub fn render_keys_card(
     g: &Glyphs,
     group: &str,
     hints: &Hints,
+    hits: &mut HitMap,
 ) {
     let width = KEYS_CARD_WIDTH.min(body.width);
     let height = KEYS_CARD_HEIGHT.min(body.height);
@@ -690,6 +725,9 @@ pub fn render_keys_card(
     // of the body where the reader's eye already is.
     let y = body.y + body.height.saturating_sub(height) / 3;
     let area = Rect::new(x, y, width, height);
+    // Any key closes the card; so does a click anywhere off it. A click
+    // *on* it is inert — the card is a reference, not a menu.
+    hits.push_around(body, area, Hit::CloseOverlay);
     f.render_widget(Clear, area);
     let block = chrome::panel(
         theme,
@@ -763,6 +801,12 @@ pub fn render_keys_card(
         pair(theme, ("^L", "sign out"), Some(("?", "this card"))),
         Vec::new(),
         vec![Span::raw(" "), head("MOUSE & CLIPBOARD")],
+        mouse_row(
+            theme,
+            "click",
+            pick("select \u{b7} again or double opens", "select \u{b7} again opens"),
+        ),
+        mouse_row(theme, "right-click", pick("open in your browser", "open in web")),
         mouse_row(theme, "drag", pick("select + copy on release", "select + copy")),
         mouse_row(theme, "wheel", "scroll"),
         vec![
@@ -779,6 +823,13 @@ pub fn render_keys_card(
             theme,
             "Shift+drag",
             pick("native terminal selection", "native select"),
+        ),
+        // The permanent form of Shift+drag: no capture at all, so every
+        // gesture (and the scrollback) belongs to the terminal.
+        mouse_row(
+            theme,
+            "WFTUI_MOUSE=0",
+            pick("start with no mouse capture", "no mouse capture"),
         ),
     ];
 
@@ -1196,7 +1247,7 @@ mod tests {
                 press(&mut p, c);
             }
 
-            let shot_palette = shot(w, h, |f, body| p.render(f, body, &theme, &UNICODE));
+            let shot_palette = shot(w, h, |f, body| p.render(f, body, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
             assert_boxed_in_body(&shot_palette, w, h, "Go to", "Enter go");
             let text = shot_palette.join("\n");
             assert!(text.contains("\u{203A} win"), "query line missing:\n{text}");
@@ -1208,7 +1259,7 @@ mod tests {
             assert!(text.contains("@WindowsForum AI"), "member row missing");
 
             let shot_which = shot(w, h, |f, body| {
-                render_which_key(f, body, &theme, &UNICODE)
+                render_which_key(f, body, &theme, &UNICODE, &mut crate::hit::HitMap::default())
             });
             assert_boxed_in_body(&shot_which, w, h, "g \u{2026}", "Esc cancel");
             let text = shot_which.join("\n");
@@ -1217,12 +1268,20 @@ mod tests {
             }
 
             let shot_card = shot(w, h, |f, body| {
-                render_keys_card(f, body, &theme, &UNICODE, "THIS THREAD", &hints)
+                render_keys_card(f, body, &theme, &UNICODE, "THIS THREAD", &hints, &mut crate::hit::HitMap::default())
             });
             assert_boxed_in_body(&shot_card, w, h, "Keys", "any key closes");
             let text = shot_card.join("\n");
             for group in ["MOVE", "THIS THREAD", "EVERYWHERE", "MOUSE & CLIPBOARD"] {
                 assert!(text.contains(group), "card is missing {group}:\n{text}");
+            }
+            // The MOUSE group teaches the pointer/touch gestures and the one
+            // way to turn the whole layer off (beside Shift+drag).
+            for gesture in ["click", "right-click", "drag", "wheel", "Shift+drag", "WFTUI_MOUSE=0"] {
+                assert!(
+                    text.contains(gesture),
+                    "the MOUSE group is missing {gesture}:\n{text}"
+                );
             }
             // The screen's own group comes from its hints, minus what the MOVE
             // and EVERYWHERE columns already teach (`j/k` here).
@@ -1252,7 +1311,7 @@ mod tests {
                 Rect::new(0, 30, 120, 1),
             );
             dim_body(f, body, &theme);
-            p.render(f, body, &theme, &UNICODE);
+            p.render(f, body, &theme, &UNICODE, &mut crate::hit::HitMap::default());
         })
         .expect("render");
         let buf = term.backend().buffer();
@@ -1283,8 +1342,7 @@ mod tests {
                 &theme,
                 &UNICODE,
                 "THIS THREAD",
-                &hints,
-            )
+                &hints, &mut crate::hit::HitMap::default(),)
         })
         .expect("render");
         let buf = term.backend().buffer();
@@ -1311,9 +1369,9 @@ mod tests {
                     term.draw(|f| {
                         let body = Rect::new(0, 1, w, h.saturating_sub(3).max(1));
                         dim_body(f, body, &theme);
-                        p.render(f, body, &theme, g);
-                        render_which_key(f, body, &theme, g);
-                        render_keys_card(f, body, &theme, g, "THIS THREAD", &hints);
+                        p.render(f, body, &theme, g, &mut crate::hit::HitMap::default());
+                        render_which_key(f, body, &theme, g, &mut crate::hit::HitMap::default());
+                        render_keys_card(f, body, &theme, g, "THIS THREAD", &hints, &mut crate::hit::HitMap::default());
                     })
                     .expect("render");
                 }

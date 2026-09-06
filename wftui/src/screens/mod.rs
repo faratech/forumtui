@@ -20,6 +20,7 @@ use common::models::*;
 
 use crate::chrome::{self, Hints};
 use crate::glyph::Glyphs;
+use crate::hit::HitMap;
 use crate::theme::Theme;
 
 // ---------- state structs ----------
@@ -117,6 +118,13 @@ pub struct ThreadViewState {
     /// truncated offset makes the tail of it unreachable (issue #558).
     pub scroll: usize,
     pub links: Vec<String>,
+    /// `(line, index into `links`)` for each `[n] url` row `rebuild_lines`
+    /// wrote, and `(line, image ordinal within its post)` for each image
+    /// caption and the rows reserved under it. Both are what makes a click
+    /// on a link or a picture mean that link or that picture — `lines` is a
+    /// flat span run, so nothing else in it remembers what a row was.
+    pub link_lines: Vec<(usize, usize)>,
+    pub image_lines: Vec<(usize, usize)>,
     pub link_popup: bool,
     pub sel_local: usize,
     pub sel_post: usize,
@@ -229,6 +237,12 @@ pub struct ComposeState {
     /// pane), and the draw always precedes the keys it is asked about.
     pub body_width: u16,
     pub body_height: u16,
+    /// Where the last frame drew the Title field and the body, in absolute
+    /// screen coordinates — what a click resolves its caret against
+    /// (`click_field`). Zero-sized when that field is not on screen, so a
+    /// stale rect can never answer for a point.
+    pub title_rect: Rect,
+    pub body_rect: Rect,
     /// First visual row of the body on screen. Follows the caret, so text
     /// typed past the bottom of the pane scrolls into view instead of being
     /// written blind (issue #519). `usize`: a multi-MB paste is a draft this
@@ -304,6 +318,10 @@ pub struct NewConversationState {
     pub body_height: u16,
     pub body_scroll: usize,
     pub body_desired_col: Option<usize>,
+    /// The three fields' last-drawn rects, for click-to-caret.
+    pub to_rect: Rect,
+    pub title_rect: Rect,
+    pub body_rect: Rect,
 }
 
 #[derive(Default)]
@@ -396,6 +414,13 @@ pub struct SearchState {
     pub sel: usize,
     pub loading: bool,
     pub error: Option<String>,
+    /// Where the query text and the author segment were drawn on the `/` row
+    /// (absolute screen coordinates), so a click lands in the right field
+    /// with the caret where the pointer is. `author_rect` is zero-sized on
+    /// the narrow rungs of `render_query_row`'s ladder, where the author
+    /// segment is not drawn at all.
+    pub query_rect: Rect,
+    pub author_rect: Rect,
 }
 
 impl SearchState {
@@ -509,18 +534,33 @@ pub enum Action {
 }
 
 impl Screen {
-    pub fn render(&mut self, f: &mut Frame, area: Rect, theme: &Theme, g: &Glyphs) {
+    /// Draw this screen into `area`, registering what the pointer can hit as
+    /// it goes. `hits` is the frame's map (`App::draw` clears it); a screen
+    /// that registers nothing simply cannot be clicked, which is exactly what
+    /// `WFTUI_MOUSE=0` turns every screen into.
+    pub fn render(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        g: &Glyphs,
+        hits: &mut HitMap,
+    ) {
         match self {
             Screen::Login(s) => misc::render_login(s, f, area, theme, g),
-            Screen::Home(s) => browse::render_home(s, f, area, theme, g),
-            Screen::ForumTree(s) => browse::render_forum_tree(s, f, area, theme, g),
-            Screen::ThreadList(s) => browse::render_thread_list(s, f, area, theme, g),
-            Screen::ThreadView(s) => browse::render_thread_view(s, f, area, theme, g),
-            Screen::Compose(s) => misc::render_compose(s, f, area, theme, g),
-            Screen::Inbox(s) => social::render_inbox(s, f, area, theme, g),
-            Screen::ConversationView(s) => social::render_conversation_view(s, f, area, theme, g),
-            Screen::NewConversation(s) => social::render_new_conversation(s, f, area, theme, g),
-            Screen::Search(s) => misc::render_search(s, f, area, theme, g),
+            Screen::Home(s) => browse::render_home(s, f, area, theme, g, hits),
+            Screen::ForumTree(s) => browse::render_forum_tree(s, f, area, theme, g, hits),
+            Screen::ThreadList(s) => browse::render_thread_list(s, f, area, theme, g, hits),
+            Screen::ThreadView(s) => browse::render_thread_view(s, f, area, theme, g, hits),
+            Screen::Compose(s) => misc::render_compose(s, f, area, theme, g, hits),
+            Screen::Inbox(s) => social::render_inbox(s, f, area, theme, g, hits),
+            Screen::ConversationView(s) => {
+                social::render_conversation_view(s, f, area, theme, g, hits)
+            }
+            Screen::NewConversation(s) => {
+                social::render_new_conversation(s, f, area, theme, g, hits)
+            }
+            Screen::Search(s) => misc::render_search(s, f, area, theme, g, hits),
             Screen::Profile(s) => misc::render_profile(s, f, area, theme, g),
         }
     }
@@ -638,6 +678,133 @@ impl Screen {
                     ib.focus = InboxPane::View;
                 }
             }
+            _ => {}
+        }
+    }
+
+    /// The row the focused pane's list has selected — read before a click
+    /// moves it, so "clicked the row that was already selected" can mean
+    /// "open it" (`App::click_hit`).
+    pub fn selected_index(&self) -> Option<usize> {
+        match self {
+            Screen::Home(h) => Some(match h.focus {
+                Pane::Tree => h.tree.sel,
+                Pane::List => h.list.sel,
+            }),
+            Screen::ForumTree(t) => Some(t.sel),
+            Screen::ThreadList(l) => Some(l.sel),
+            Screen::Inbox(ib) => Some(match ib.tab {
+                InboxTab::Conversations => ib.convos.sel,
+                InboxTab::Alerts => ib.alerts.sel,
+            }),
+            Screen::Search(s) => Some(s.sel),
+            _ => None,
+        }
+    }
+
+    /// Put the selection on row `i` of the focused pane's list. Out-of-range
+    /// indices are ignored rather than clamped: a click can only ever name a
+    /// row the last frame actually drew, so an index past the end means the
+    /// list changed underneath and the old selection is the better answer.
+    pub fn select_index(&mut self, i: usize) {
+        fn set(sel: &mut usize, len: usize, i: usize) {
+            if i < len {
+                *sel = i;
+            }
+        }
+        match self {
+            Screen::Home(h) => match h.focus {
+                Pane::Tree => set(&mut h.tree.sel, h.tree.nodes.len(), i),
+                Pane::List => set(&mut h.list.sel, h.list.threads.len(), i),
+            },
+            Screen::ForumTree(t) => set(&mut t.sel, t.nodes.len(), i),
+            Screen::ThreadList(l) => set(&mut l.sel, l.threads.len(), i),
+            Screen::Inbox(ib) => match ib.tab {
+                InboxTab::Conversations => {
+                    set(&mut ib.convos.sel, ib.convos.conversations.len(), i)
+                }
+                InboxTab::Alerts => set(&mut ib.alerts.sel, ib.alerts.alerts.len(), i),
+            },
+            Screen::Search(s) => set(&mut s.sel, s.results.len(), i),
+            _ => {}
+        }
+    }
+
+    /// Select the post/message card `i` — what a click on a post body means.
+    ///
+    /// The thread view's gutter colour is baked into `lines` by
+    /// `rebuild_lines`, so this invalidates the cached width exactly the way
+    /// `n`/`N` do (issue #542); the DM view's `built` memo keys on
+    /// `sel_msg`, so assigning it is enough there. Neither scrolls: the
+    /// reader is already looking at the card they clicked.
+    pub fn select_post(&mut self, i: usize) {
+        match self {
+            Screen::ThreadView(v) => {
+                if i < v.posts.len() {
+                    v.sel_post = i;
+                    v.width = 0;
+                }
+            }
+            Screen::ConversationView(v) => {
+                if i < v.messages.len() {
+                    v.sel_msg = i;
+                }
+            }
+            Screen::Inbox(ib) => {
+                if let Some(v) = &mut ib.view
+                    && i < v.messages.len()
+                {
+                    v.sel_msg = i;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The site URL for whatever this screen currently has selected — what a
+    /// right click (a long press on a phone terminal) opens, and the same
+    /// thing `u` opens in the thread view. `None` when the payload carried
+    /// no `view_url`, which is also when `u` would do nothing.
+    pub fn web_url(&self) -> Option<String> {
+        match self {
+            Screen::Home(h) => match h.focus {
+                Pane::Tree => h.tree.nodes.get(h.tree.sel).and_then(|n| n.view_url.clone()),
+                Pane::List => h.list.threads.get(h.list.sel).and_then(|t| t.view_url.clone()),
+            },
+            Screen::ForumTree(t) => t.nodes.get(t.sel).and_then(|n| n.view_url.clone()),
+            Screen::ThreadList(l) => l.threads.get(l.sel).and_then(|t| t.view_url.clone()),
+            Screen::ThreadView(v) => v
+                .posts
+                .get(v.sel_post)
+                .and_then(|p| p.view_url.clone())
+                .or_else(|| v.thread.view_url.clone()),
+            Screen::Inbox(ib) => match ib.tab {
+                InboxTab::Conversations => ib
+                    .convos
+                    .conversations
+                    .get(ib.convos.sel)
+                    .and_then(|c| c.view_url.clone()),
+                InboxTab::Alerts => ib
+                    .alerts
+                    .alerts
+                    .get(ib.alerts.sel)
+                    .and_then(|a| a.alert_url.clone()),
+            },
+            Screen::ConversationView(v) => v.conversation.view_url.clone(),
+            Screen::Search(s) => s.results.get(s.sel).and_then(|h| h.view_url.clone()),
+            Screen::Profile(p) => p.user.as_ref().and_then(|u| u.view_url.clone()),
+            _ => None,
+        }
+    }
+
+    /// Give this screen's field `i` the keyboard and put the caret where the
+    /// pointer is (`Hit::Field`). Screen-local field numbering, and the caret
+    /// arithmetic lives beside the renderer that stamped the field's rect.
+    pub fn click_field(&mut self, field: usize, col: u16, row: u16) {
+        match self {
+            Screen::Compose(s) => misc::compose_click_field(s, field, col, row),
+            Screen::NewConversation(s) => social::new_conversation_click_field(s, field, col, row),
+            Screen::Search(s) => misc::search_click_field(s, field, col),
             _ => {}
         }
     }
@@ -1405,7 +1572,7 @@ mod dispatch_tests {
                     for mut s in all_screens() {
                         term.draw(|f| {
                             let area = f.area();
-                            s.render(f, area, &theme, g);
+                            s.render(f, area, &theme, g, &mut crate::hit::HitMap::default());
                         })
                         .expect("render");
                     }

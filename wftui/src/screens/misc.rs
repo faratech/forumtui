@@ -18,6 +18,7 @@ use super::{
 };
 use crate::chrome::{self, Hints};
 use crate::glyph::Glyphs;
+use crate::hit::{Hit, HitMap};
 use crate::images;
 use crate::theme::{fmt_time, Theme};
 
@@ -748,6 +749,17 @@ fn compose_header_lines(s: &super::ComposeState, theme: &Theme, width: u16) -> V
 /// silently killed the title's text instead of wrapping BBCode), so the bar
 /// must say they don't apply here rather than advertise a body affordance
 /// over a field that no longer has one.
+/// The editor's BBCode chords, in the order the caps row draws them. One
+/// table so the row and its hit boxes cannot drift apart, and `&'static str`
+/// so a click can press exactly the cap it names (`Hit::Cap`).
+const BBCODE_CAPS: [(&str, &str); 5] = [
+    ("^B", "bold"),
+    ("^I", "italic"),
+    ("^K", "code"),
+    ("^Q", "quote"),
+    ("^U", "link"),
+];
+
 fn caps_line(theme: &Theme, chars: usize, width: u16, title_focused: bool) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
     if title_focused {
@@ -756,13 +768,7 @@ fn caps_line(theme: &Theme, chars: usize, width: u16, title_focused: bool) -> Li
             theme.dim(),
         ));
     } else {
-        for (key, desc) in [
-            ("^B", "bold"),
-            ("^I", "italic"),
-            ("^K", "code"),
-            ("^Q", "quote"),
-            ("^U", "link"),
-        ] {
+        for (key, desc) in BBCODE_CAPS {
             spans.push(chrome::keycap(theme, key, false));
             spans.push(Span::styled(format!(" {desc}  "), theme.dim()));
         }
@@ -779,6 +785,7 @@ fn caps_line(theme: &Theme, chars: usize, width: u16, title_focused: bool) -> Li
 }
 
 /// The `Reply` editor panel: header, rule, body, rule, BBCode caps.
+#[allow(clippy::too_many_arguments)]
 fn draw_editor_panel(
     s: &mut super::ComposeState,
     f: &mut Frame,
@@ -786,6 +793,7 @@ fn draw_editor_panel(
     theme: &Theme,
     g: &Glyphs,
     focused: bool,
+    hits: &mut HitMap,
 ) {
     let block = chrome::panel(theme, g, "Reply", focused, Some("edit"), None);
     let inner = block.inner(area);
@@ -819,6 +827,17 @@ fn draw_editor_panel(
     let body_area = chunks[2];
     s.body_width = body_area.width;
     s.body_height = body_area.height;
+    s.body_rect = body_area;
+    // Field 1 is the body; field 0 is the new-thread Title, which only
+    // exists on that target (`compose_header_lines`), so it only registers
+    // where it is actually drawn.
+    hits.push(body_area, Hit::Field(1));
+    if is_new_thread {
+        s.title_rect = Rect::new(chunks[0].x, chunks[0].y, chunks[0].width, 1);
+        hits.push(s.title_rect, Hit::Field(0));
+    } else {
+        s.title_rect = Rect::default();
+    }
     let chars: Vec<char> = s.body.chars().collect();
     let rows = crate::editor::visual_rows_of(&chars, body_area.width as usize);
     let (caret_row, caret_col) = crate::editor::caret_in_rows(&chars, &rows, s.body_cursor);
@@ -862,15 +881,24 @@ fn draw_editor_panel(
     );
 
     f.render_widget(rule_line(chunks[3].width), chunks[3]);
+    let title_focused = is_new_thread && s.title_field;
     f.render_widget(
-        caps_line(
-            theme,
-            s.body.chars().count(),
-            chunks[4].width,
-            is_new_thread && s.title_field,
-        ),
+        caps_line(theme, s.body.chars().count(), chunks[4].width, title_focused),
         chunks[4],
     );
+    // The BBCode caps are click targets only when they are live — with the
+    // Title focused the row says they do not apply here (issue #605), and a
+    // cap you cannot press must not be one you can click either.
+    if !title_focused {
+        let mut x = chunks[4].x + 1;
+        for (key, desc) in BBCODE_CAPS {
+            let cap_w = chrome::cell_width(key) as u16 + 2;
+            hits.push(Rect::new(x, chunks[4].y, cap_w, 1), Hit::Cap(key));
+            x = x
+                .saturating_add(cap_w)
+                .saturating_add(chrome::cell_width(desc) as u16 + 3);
+        }
+    }
 
     if is_new_thread && s.title_field {
         let (_, cur_col) = compose_title_window(s, chunks[0].width);
@@ -1217,10 +1245,15 @@ pub fn render_compose(
     area: Rect,
     theme: &Theme,
     g: &Glyphs,
+    hits: &mut HitMap,
 ) {
     // Cleared before every frame: a stale rect would have the app paint an
     // image over the editor (narrow layout) or over a shrunk panel.
     s.image_requests.clear();
+    // Same for the field rects a click resolves against: with the preview
+    // showing, the editor is not on screen and must answer for no point.
+    s.body_rect = Rect::default();
+    s.title_rect = Rect::default();
     if area.width >= 110 {
         let cols = Layout::horizontal([
             Constraint::Length(72),
@@ -1228,13 +1261,44 @@ pub fn render_compose(
             Constraint::Min(0),
         ])
         .split(area);
-        draw_editor_panel(s, f, cols[0], theme, g, true);
+        draw_editor_panel(s, f, cols[0], theme, g, true, hits);
         draw_preview_panel(s, f, cols[1], theme, g);
     } else if s.preview {
         draw_preview_panel(s, f, area, theme, g);
     } else {
-        draw_editor_panel(s, f, area, theme, g, true);
+        draw_editor_panel(s, f, area, theme, g, true, hits);
     }
+}
+
+/// Focus field `field` (0 = the new-thread Title, 1 = the body) and put the
+/// caret under the pointer, through the same visual-row model the renderer
+/// drew it with (`Hit::Field`).
+pub(crate) fn compose_click_field(
+    s: &mut super::ComposeState,
+    field: usize,
+    col: u16,
+    row: u16,
+) {
+    if s.busy {
+        return;
+    }
+    if field == 0 && compose_is_new_thread(&s.target) {
+        s.title_field = true;
+        let label = chrome::cell_width(COMPOSE_TITLE_LABEL);
+        let room = (s.title_rect.width as usize).saturating_sub(label);
+        let x = col
+            .saturating_sub(s.title_rect.x)
+            .saturating_sub(label as u16);
+        s.title_cursor =
+            crate::editor::field_caret_at(&s.title, s.title_cursor, room, x as usize);
+        return;
+    }
+    s.title_field = false;
+    let line = s.body_scroll + row.saturating_sub(s.body_rect.y) as usize;
+    let x = col.saturating_sub(s.body_rect.x) as usize;
+    s.body_cursor = crate::editor::caret_at_cell(&s.body, s.body_width as usize, line, x);
+    // Any non-vertical move clears the sticky Up/Down column (issue #523).
+    s.body_desired_col = None;
 }
 
 // ================= search =================
@@ -1778,16 +1842,17 @@ fn clip_span_run(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
 /// when they still fitted *after* the whole query, so typing a long query made
 /// the author field the user was about to Tab into disappear. The right side
 /// is now reserved first, and the query scrolls inside what is left.
-fn render_query_row(s: &super::SearchState, f: &mut Frame, area: Rect, theme: &Theme) -> u16 {
-    const PROMPT: &str = "/ ";
-    const AUTHOR_LABEL: &str = "author ";
+/// Draws the `/ query … author … in all forums` row and returns the caret's
+/// column. It also stamps the query and author fields' rects on the state:
+/// which of them a click lands in, and where in the text, is decided by the
+/// same overflow ladder that decided what to draw, so the two can never
+/// disagree (the `author` segment simply is not there on the narrow rungs).
+fn render_query_row(s: &mut super::SearchState, f: &mut Frame, area: Rect, theme: &Theme) -> u16 {
     const FORUM_LABEL: &str = "in all forums";
     /// Gap between the author and forum labels.
     const GAP: usize = 4;
     /// Cells the query keeps even when the right-hand labels want the room.
     const MIN_QUERY: usize = 10;
-    /// Widest the author's own text is ever drawn; it scrolls inside this.
-    const AUTHOR_VIEW: usize = 24;
 
     let w = area.width as usize;
     let prompt_w = chrome::cell_width(PROMPT);
@@ -1832,11 +1897,19 @@ fn render_query_row(s: &super::SearchState, f: &mut Frame, area: Rect, theme: &T
         spans.push(Span::styled(visible, theme.base().add_modifier(Modifier::BOLD)));
     }
 
+    s.query_rect = Rect::new(area.x, area.y, (prompt_w + query_room).min(w) as u16, 1);
+    s.author_rect = Rect::default();
     let mut author_x = area.x + area.width;
     if right_w > 0 {
         let pad = w.saturating_sub(used + right_w);
         spans.push(Span::raw(" ".repeat(pad)));
         author_x = area.x + (used + pad + chrome::cell_width(AUTHOR_LABEL)) as u16;
+        s.author_rect = Rect::new(
+            area.x + (used + pad) as u16,
+            area.y,
+            author_w as u16,
+            1,
+        );
         spans.push(Span::styled(author_label, theme.dim()));
         if show_forum {
             spans.push(Span::raw(" ".repeat(GAP)));
@@ -1852,6 +1925,14 @@ fn render_query_row(s: &super::SearchState, f: &mut Frame, area: Rect, theme: &T
     };
     caret.min(area.x + area.width.saturating_sub(1))
 }
+
+/// The `/ ` prompt, the `author ` label, and the widest the author's own
+/// text is ever drawn (it scrolls horizontally inside that). Module-level
+/// because a click has to measure its caret against exactly the window the
+/// row was drawn with (`search_click_field`).
+const PROMPT: &str = "/ ";
+const AUTHOR_LABEL: &str = "author ";
+const AUTHOR_VIEW: usize = 24;
 
 /// The chip row's dim right-hand hint, derived from state (issue #605): the
 /// constant `"t type · o order · Tab author"` used to show regardless of
@@ -1949,12 +2030,34 @@ fn search_hit_lines(
     lines
 }
 
+/// Focus the query (0) or author (1) field and put the caret under the
+/// pointer. Clicking a field is also the way *into* edit mode — the same
+/// thing `i`/`a` do from the browse mode (`Hit::Field`).
+pub(crate) fn search_click_field(s: &mut super::SearchState, field: usize, col: u16) {
+    s.input_mode = true;
+    s.active_field = if field == 1 { 1 } else { 0 };
+    if field == 1 {
+        let label = chrome::cell_width(AUTHOR_LABEL);
+        let x = col
+            .saturating_sub(s.author_rect.x)
+            .saturating_sub(label as u16) as usize;
+        s.author_cursor =
+            crate::editor::field_caret_at(&s.author, s.author_cursor, AUTHOR_VIEW, x);
+    } else {
+        let prompt = chrome::cell_width(PROMPT);
+        let room = (s.query_rect.width as usize).saturating_sub(prompt);
+        let x = col.saturating_sub(s.query_rect.x).saturating_sub(prompt as u16) as usize;
+        s.query_cursor = crate::editor::field_caret_at(&s.query, s.query_cursor, room, x);
+    }
+}
+
 pub fn render_search(
     s: &mut super::SearchState,
     f: &mut Frame,
     area: Rect,
     theme: &Theme,
     g: &Glyphs,
+    hits: &mut HitMap,
 ) {
     let right_title = format!("page {} of {}", s.page.max(1), s.last_page.max(1));
     let bottom = search_range(s);
@@ -1973,6 +2076,8 @@ pub fn render_search(
     .split(inner);
 
     let caret_x = render_query_row(s, f, sections[0], theme);
+    hits.push(s.query_rect, Hit::Field(0));
+    hits.push(s.author_rect, Hit::Field(1));
     render_chip_row(s, f, sections[1], theme);
 
     let rule = if g.ascii { "-" } else { "\u{2500}" };
@@ -2044,11 +2149,20 @@ pub fn render_search(
             .collect();
         let mut state =
             ListState::default().with_selected(Some(s.sel.min(s.results.len() - 1)));
+        // A hit is one line, or two once it has a snippet — the same shape
+        // `search_hit_lines` just built, so a click lands on the row the eye
+        // is on.
+        let heights: Vec<u16> = s
+            .snippets
+            .iter()
+            .map(|sn| if sn.is_empty() { 1 } else { 2 })
+            .collect();
         f.render_stateful_widget(
             List::new(items).highlight_style(theme.selected()),
             sections[5],
             &mut state,
         );
+        hits.list(sections[5], state.offset(), &heights, Hit::Row);
     }
 }
 
@@ -2271,7 +2385,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
         term.draw(|f| {
             let area = f.area();
-            render_compose(s, f, area, &theme, &UNICODE);
+            render_compose(s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default());
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
@@ -2434,7 +2548,7 @@ mod tests {
         s.snippets[0] = "FROM-THE-CACHE".into();
         let theme = Theme::truecolor();
         let rows = render_rows(100, 20, |f, area| {
-            render_search(&mut s, f, area, &theme, &UNICODE)
+            render_search(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default())
         });
         let screen = rows.join("\n");
         assert!(
@@ -2454,7 +2568,7 @@ mod tests {
         };
         let theme = Theme::truecolor();
         let rows = render_rows(100, 20, |f, area| {
-            render_search(&mut s, f, area, &theme, &UNICODE)
+            render_search(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default())
         });
         let screen = rows.join("\n");
         assert!(screen.contains("Error: boom"), "screen:\n{screen}");
@@ -2526,7 +2640,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_compose(&mut s, f, area, &theme, &UNICODE);
+            render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default());
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
@@ -2736,7 +2850,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_search(&mut s, f, area, &theme, &UNICODE);
+            render_search(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default());
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
@@ -2759,7 +2873,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_search(&mut s, f, area, &theme, &UNICODE);
+            render_search(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default());
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
@@ -2819,7 +2933,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_search(&mut s, f, area, &theme, &UNICODE);
+            render_search(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default());
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
@@ -3077,7 +3191,7 @@ mod tests {
     fn compose_shows_two_panels_wide_and_one_narrow() {
         let theme = Theme::truecolor();
         let mut s = sample_reply();
-        let rows = render_rows(120, 36, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE));
+        let rows = render_rows(120, 36, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
         assert!(rows[0].contains(" Reply "), "{}", rows[0]);
         assert!(rows[0].contains(" Preview "), "{}", rows[0]);
         let all = rows.join("\n");
@@ -3088,7 +3202,7 @@ mod tests {
 
         // Narrow: the editor alone (preview defaults to off).
         let mut s = sample_reply();
-        let rows = render_rows(80, 24, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE));
+        let rows = render_rows(80, 24, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
         assert!(rows[0].contains(" Reply "), "{}", rows[0]);
         assert!(!rows[0].contains(" Preview "), "{}", rows[0]);
 
@@ -3097,7 +3211,7 @@ mod tests {
             preview: true,
             ..sample_reply()
         };
-        let rows = render_rows(80, 24, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE));
+        let rows = render_rows(80, 24, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
         assert!(rows[0].contains(" Preview "), "{}", rows[0]);
         assert!(!rows[0].contains(" Reply "), "{}", rows[0]);
         assert!(rows.join("\n").contains("as it will appear"));
@@ -3113,7 +3227,7 @@ mod tests {
     fn compose_preview_keeps_the_same_indentation_the_editor_shows() {
         let theme = Theme::truecolor();
         let mut s = reply_state("[CODE]def f():\n    return 1[/CODE]");
-        let rows = render_rows(120, 24, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE));
+        let rows = render_rows(120, 24, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
         assert!(rows[0].contains(" Reply "), "{}", rows[0]);
         assert!(rows[0].contains(" Preview "), "{}", rows[0]);
         assert!(
@@ -3185,7 +3299,7 @@ mod tests {
             body: img_draft("https://cdn.example/shot.png"),
             ..sample_reply()
         };
-        let rows = render_rows(80, 24, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE));
+        let rows = render_rows(80, 24, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
         let all = rows.join("\n");
         assert!(all.contains("\u{25a3} shot.png"), "no caption line: {all}");
         assert!(!all.contains("[image]"), "the placeholder survived: {all}");
@@ -3207,7 +3321,7 @@ mod tests {
             body: img_draft(url),
             ..sample_reply()
         };
-        let rows = render_rows(80, 30, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE));
+        let rows = render_rows(80, 30, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
         let all = rows.join("\n");
         // Nothing is known about a bare URL until its bytes arrive.
         assert!(all.contains("\u{25a3} loading\u{2026}"), "{all}");
@@ -3256,10 +3370,10 @@ mod tests {
             body: img_draft(url),
             ..sample_reply()
         };
-        let _ = render_rows(80, 30, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE));
+        let _ = render_rows(80, 30, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
         // What `Msg::ImageLoaded` teaches the store, the app stamps here.
         s.image_sizes.insert(url.to_string(), (1200, 800));
-        let rows = render_rows(80, 30, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE));
+        let rows = render_rows(80, 30, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
         let all = rows.join("\n");
         assert!(all.contains("\u{25a3} shot.png \u{b7} 1200\u{d7}800"), "{all}");
         assert!(!all.contains("loading"), "{all}");
@@ -3275,7 +3389,7 @@ mod tests {
             ..sample_reply()
         };
         // Tall enough for the caption, too short for the twelve reserved rows.
-        let rows = render_rows(80, 10, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE));
+        let rows = render_rows(80, 10, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
         assert!(rows.join("\n").contains("\u{25a3} loading\u{2026}"), "{rows:?}");
         assert!(
             s.image_requests.is_empty(),
@@ -3295,7 +3409,7 @@ mod tests {
             ..sample_reply()
         };
         let draw = |s: &mut ComposeState, theme: &Theme| {
-            render_rows(80, 30, |f, area| render_compose(s, f, area, theme, &UNICODE));
+            render_rows(80, 30, |f, area| render_compose(s, f, area, theme, &UNICODE, &mut crate::hit::HitMap::default()));
         };
         // The composer opened with this reference already in the draft —
         // not a live edit in progress — so the very first build is exempt
@@ -3348,7 +3462,7 @@ mod tests {
             ..sample_reply()
         };
         let draw = |s: &mut ComposeState, theme: &Theme| {
-            render_rows(80, 30, |f, area| render_compose(s, f, area, theme, &UNICODE));
+            render_rows(80, 30, |f, area| render_compose(s, f, area, theme, &UNICODE, &mut crate::hit::HitMap::default()));
         };
 
         let target = "https://example.com/a/b/c.png";
@@ -3383,7 +3497,7 @@ mod tests {
             body: "[IMG]data:image/png;base64,AAAA[/IMG]".into(),
             ..sample_reply()
         };
-        let rows = render_rows(80, 30, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE));
+        let rows = render_rows(80, 30, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
         assert!(s.image_requests.is_empty(), "{:?}", s.image_requests);
         // Nothing is dropped: it still renders as the placeholder it was.
         assert!(rows.join("\n").contains("[image]"), "{rows:?}");
@@ -3516,7 +3630,7 @@ mod tests {
         };
 
         let width = 120u16;
-        let rows = render_rows(width, 36, |f, area| render_search(&mut s, f, area, &theme, &UNICODE));
+        let rows = render_rows(width, 36, |f, area| render_search(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
         let all = rows.join("\n");
         assert!(all.contains("HItest"), "{all}");
         assert!(all.contains("kemical"), "{all}");

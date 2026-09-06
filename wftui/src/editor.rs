@@ -340,6 +340,55 @@ pub fn hwindow(text: &str, cursor: usize, width: usize) -> (usize, usize) {
     (start, used)
 }
 
+/// The character index a click at visual row `row`, cell column `col`, lands
+/// on — the inverse of [`caret_in_rows`], and the reason a click in a
+/// composer lands where the eye says it did.
+///
+/// Cells, never chars: clicking the left half of a wide character puts the
+/// caret before it and the right half puts it after, the same arithmetic
+/// `caret_in_rows` uses to draw it. A click past the end of a row lands at
+/// that row's end (for a soft-wrapped row that is the next row's first
+/// character — the same text position), and a click past the last row lands
+/// at the end of the text.
+pub fn caret_at_cell(text: &str, width: usize, row: usize, col: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let rows = visual_rows_of(&chars, width.max(1));
+    let Some(r) = rows.get(row.min(rows.len().saturating_sub(1))) else {
+        return 0;
+    };
+    let mut used = 0usize;
+    let mut i = r.start;
+    while i < r.end {
+        let cw = char_cells(chars[i]);
+        if used + cw > col {
+            break;
+        }
+        used += cw;
+        i += 1;
+    }
+    i
+}
+
+/// The single-line sibling of [`caret_at_cell`]: the character index a click
+/// `col` cells into a field drawn through [`hwindow`] lands on. The field
+/// scrolls horizontally, so the window the click is measured against is the
+/// one the frame drew — derived from the same `(text, cursor, room)`.
+pub fn field_caret_at(text: &str, cursor: usize, room: usize, col: usize) -> usize {
+    let (start, _) = hwindow(text, cursor, room);
+    let chars: Vec<char> = text.chars().collect();
+    let mut used = 0usize;
+    let mut i = start.min(chars.len());
+    while i < chars.len() {
+        let cw = char_cells(chars[i]);
+        if used + cw > col {
+            break;
+        }
+        used += cw;
+        i += 1;
+    }
+    i
+}
+
 /// Move the caret `delta` visual rows, keeping the sticky desired column:
 /// a run of Up/Down keeps aiming at the column the caret started from, so
 /// passing through a short line does not shorten the next move (`desired` is
@@ -737,5 +786,65 @@ mod tests {
         assert_eq!(normalize_control_chars("a\u{7}b\u{8}c"), "abc");
         // The common case (nothing to normalise) is untouched.
         assert_eq!(normalize_control_chars("plain text"), "plain text");
+    }
+
+    /// A click has to land where the eye says it did, which means the same
+    /// wrapped-row, cell-measured model `caret_in_rows` draws the caret with
+    /// — the two are inverses, and this pins the round trip.
+    #[test]
+    fn caret_at_cell_is_the_inverse_of_caret_in_rows() {
+        let text = "one two three four five six seven eight nine ten";
+        let width = 16;
+        for (row, col) in [(0usize, 0usize), (0, 5), (1, 0), (1, 3), (2, 6)] {
+            let cursor = caret_at_cell(text, width, row, col);
+            assert_eq!(
+                caret_position(text, width, cursor),
+                (row, col),
+                "a click at row {row} col {col} must come back as row {row} col {col}"
+            );
+        }
+        // Past the end of a row lands at that row's end, and past the last
+        // row at the end of the text — never out of bounds.
+        assert_eq!(
+            caret_at_cell(text, width, 0, 999),
+            visual_rows(text, width)[0].end
+        );
+        // ...and a click past the last row lands in the last row, at the
+        // column it names.
+        let last = *visual_rows(text, width).last().expect("a row");
+        assert_eq!(caret_at_cell(text, width, 99, 0), last.start);
+        assert_eq!(caret_at_cell(text, width, 99, 999), text.chars().count());
+        assert_eq!(caret_at_cell("", width, 0, 4), 0);
+    }
+
+    /// Cells, not characters: a double-width character is two columns, so a
+    /// click on its right half lands after it and one on its left half
+    /// before it (issue #569's rule, from the other direction).
+    #[test]
+    fn caret_at_cell_counts_wide_characters_as_two_columns() {
+        let text = "\u{6f22}\u{5b57}\u{30c6}"; // 3 ideographs, 6 cells
+        assert_eq!(caret_at_cell(text, 20, 0, 0), 0);
+        assert_eq!(caret_at_cell(text, 20, 0, 1), 0, "the left half is still that character");
+        assert_eq!(caret_at_cell(text, 20, 0, 2), 1);
+        assert_eq!(caret_at_cell(text, 20, 0, 4), 2);
+        assert_eq!(caret_at_cell(text, 20, 0, 6), 3);
+    }
+
+    /// The single-line sibling: a field that has scrolled horizontally must
+    /// measure the click against the window that was drawn, not the whole
+    /// string.
+    #[test]
+    fn field_caret_at_measures_inside_the_window_the_field_was_drawn_with() {
+        let text = "abcdefghijklmnop";
+        // Window at the head: column 3 is the fourth character.
+        assert_eq!(field_caret_at(text, 0, 10, 3), 3);
+        // Caret at the end with room for 10 cells: `hwindow` scrolled the
+        // field, so column 0 is no longer character 0.
+        let (start, _) = hwindow(text, text.chars().count(), 10);
+        assert!(start > 0, "the field must have scrolled for this to mean anything");
+        assert_eq!(field_caret_at(text, text.chars().count(), 10, 0), start);
+        assert_eq!(field_caret_at(text, text.chars().count(), 10, 2), start + 2);
+        // A click past the text lands at its end.
+        assert_eq!(field_caret_at(text, 0, 40, 99), text.chars().count());
     }
 }

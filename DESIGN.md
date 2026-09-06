@@ -197,11 +197,29 @@ panel width and ≤ 12 rows, aspect kept; avatars 2 rows × 5 cells; the logo 7 
 sign-in. Thumbnails only, fetched through `api_gate`, cached under the config dir
 (`cache/img/`, capped), disabled by `WFTUI_NO_IMAGES=1`.
 
+## Mouse and touch
+
+One hit-testing layer serves both, because a terminal reports touch as mouse
+input: a tap arrives as a left click, a two-finger scroll as a wheel, a long
+press as a right click. Every renderer registers `Rect -> Hit` entries into the
+frame's `HitMap` (`wftui/src/hit.rs`) as it draws, and the pointer cell is
+resolved against that — last registered wins, so an overlay covers what it is
+drawn over. A click selects the row it lands on, clicking the already-selected
+row (or a double click) opens it like Enter, a right click / long press opens
+it on the site, and clicking a key cap presses that key through the ordinary
+key routing rather than a second code path. Press and release in one cell is a
+click; anything that moves is the drag-selection it always was, with
+double-click word select and triple-click line select still on text.
+`WFTUI_MOUSE=0` starts the client with no mouse capture at all, handing every
+gesture (and the scrollback) back to the terminal — `Shift+drag` remains the
+one-off form of the same escape hatch.
+
 ## Keys stay stable
 
 Every current binding keeps working: 1/2/3, L, N, m, r, l, v/V, o, u, p/P, c, a, s,
 i, n, ?, q, Esc, Tab, Ctrl+S, Ctrl+Y, Ctrl+C, Ctrl+L, [ ], j/k, arrows, mouse.
 New: `/` (search, alias of s), `g` prefix, Ctrl+K / `:` palette, `1-9` images, `w` watch.
+Mouse and touch add no keys: every click resolves to one of the above.
 
 ## Gates
 

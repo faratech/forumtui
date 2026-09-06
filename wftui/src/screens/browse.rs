@@ -20,6 +20,7 @@ use super::{
 };
 use crate::chrome::{self, Hints};
 use crate::glyph::Glyphs;
+use crate::hit::{Hit, HitMap, HitPane};
 use crate::images::{self, Slot};
 use crate::theme::{Theme, fmt_age};
 
@@ -243,9 +244,13 @@ fn type_mark(t: &Thread, theme: &Theme, g: &Glyphs) -> (&'static str, Style) {
 struct TreeRow {
     line: Line<'static>,
     node: Option<usize>,
+    /// The QUICK rows stand for a key, not for a node.
+    key: Option<&'static str>,
 }
 
-/// The QUICK block: the four keys that skip the tree entirely.
+/// The QUICK block: the four keys that skip the tree entirely. The key is
+/// `&'static str` because a click on the row presses exactly it
+/// (`Hit::Key`), through `handle_key`, rather than duplicating what it does.
 const QUICK: [(&str, &str); 4] = [
     ("L", "Latest posts"),
     ("1", "Windows News"),
@@ -261,21 +266,29 @@ fn forum_rows(
     width: usize,
 ) -> Vec<TreeRow> {
     let mut rows: Vec<TreeRow> = Vec::with_capacity(s.nodes.len() + QUICK.len() + 2);
-    let plain = |line: Line<'static>| TreeRow { line, node: None };
+    let plain = |line: Line<'static>| TreeRow {
+        line,
+        node: None,
+        key: None,
+    };
 
     rows.push(plain(Line::from(Span::styled(
         " QUICK".to_string(),
         theme.dim().add_modifier(Modifier::BOLD),
     ))));
     for (key, label) in QUICK {
-        rows.push(plain(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                key.to_string(),
-                Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("  {label}"), theme.base()),
-        ])));
+        rows.push(TreeRow {
+            line: Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    key.to_string(),
+                    Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  {label}"), theme.base()),
+            ]),
+            node: None,
+            key: Some(key),
+        });
     }
     rows.push(plain(Line::from(Span::raw(""))));
 
@@ -327,6 +340,7 @@ fn forum_rows(
         rows.push(TreeRow {
             line,
             node: Some(i),
+            key: None,
         });
     }
     rows
@@ -354,6 +368,7 @@ fn tree_window(total: usize, height: usize, sel_row: usize, scroll: &mut usize) 
     (*scroll, *scroll + vis)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_forum_panel(
     s: &mut ForumTreeState,
     current: u32,
@@ -362,7 +377,11 @@ pub(crate) fn render_forum_panel(
     theme: &Theme,
     g: &Glyphs,
     focused: bool,
+    hits: &mut HitMap,
 ) {
+    // The pane itself first, under everything it contains: a click anywhere
+    // inside gives it the keyboard even where no row answers.
+    hits.push(area, Hit::Pane(HitPane::Tree));
     let block = chrome::panel(theme, g, "Forums", focused, None, None);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -421,6 +440,23 @@ pub(crate) fn render_forum_panel(
         inner,
         &mut state,
     );
+
+    // One hit per drawn row. The window was sliced before the widget saw it,
+    // so row `start + i` is simply the i-th line of the panel; a QUICK row
+    // presses its key, a node row selects that node, and the header/blank
+    // rows deliberately register nothing but the pane underneath.
+    for (i, row) in rows[start..end].iter().enumerate() {
+        let y = inner.y + i as u16;
+        if y >= inner.bottom() {
+            break;
+        }
+        let rect = Rect::new(inner.x, y, inner.width, 1);
+        match (row.node, row.key) {
+            (Some(node), _) => hits.push(rect, Hit::Row(node)),
+            (None, Some(key)) => hits.push(rect, Hit::Key(key)),
+            _ => {}
+        }
+    }
 }
 
 // ================= thread list panel =================
@@ -443,6 +479,7 @@ fn list_range(s: &ThreadListState) -> Option<String> {
     Some(format!("{start}\u{2013}{end} of {}", s.total))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_thread_panel(
     s: &mut ThreadListState,
     f: &mut ratatui::Frame,
@@ -451,7 +488,9 @@ pub(crate) fn render_thread_panel(
     g: &Glyphs,
     focused: bool,
     gram: Grammar,
+    hits: &mut HitMap,
 ) {
+    hits.push(area, Hit::Pane(HitPane::List));
     let title = if s.title.is_empty() {
         "Threads".to_string()
     } else {
@@ -525,6 +564,10 @@ pub(crate) fn render_thread_panel(
         list
     };
     f.render_stateful_widget(list, list_area, &mut state);
+    // `offset` is read back AFTER the render: that is when the widget has
+    // scrolled it to keep the selection visible, and a hit map built off a
+    // stale offset points at the wrong threads.
+    hits.rows(list_area, state.offset(), s.threads.len(), Hit::Row);
 }
 
 // ================= Home =================
@@ -636,6 +679,7 @@ pub fn render_home(
     area: Rect,
     theme: &Theme,
     g: &Glyphs,
+    hits: &mut HitMap,
 ) {
     let dual = area.width >= DUAL_PANE_MIN_COLS;
     s.dual = dual;
@@ -647,7 +691,7 @@ pub fn render_home(
         match s.focus {
             Pane::Tree => {
                 s.tree_rect = area;
-                render_forum_panel(&mut s.tree, s.list.node_id, f, area, theme, g, true)
+                render_forum_panel(&mut s.tree, s.list.node_id, f, area, theme, g, true, hits)
             }
             Pane::List => {
                 s.list_rect = area;
@@ -659,6 +703,7 @@ pub fn render_home(
                     g,
                     true,
                     Grammar::for_width(area.width),
+                    hits,
                 )
             }
         }
@@ -677,6 +722,7 @@ pub fn render_home(
         theme,
         g,
         s.focus == Pane::Tree,
+        hits,
     );
     render_thread_panel(
         &mut s.list,
@@ -686,6 +732,7 @@ pub fn render_home(
         g,
         s.focus == Pane::List,
         Grammar::for_width(area.width),
+        hits,
     );
 }
 
@@ -844,8 +891,9 @@ pub fn render_forum_tree(
     area: Rect,
     theme: &Theme,
     g: &Glyphs,
+    hits: &mut HitMap,
 ) {
-    render_forum_panel(s, 0, f, area, theme, g, true);
+    render_forum_panel(s, 0, f, area, theme, g, true, hits);
 }
 
 // ================= thread list (standalone) =================
@@ -973,8 +1021,18 @@ pub fn render_thread_list(
     area: Rect,
     theme: &Theme,
     g: &Glyphs,
+    hits: &mut HitMap,
 ) {
-    render_thread_panel(s, f, area, theme, g, true, Grammar::for_width(area.width));
+    render_thread_panel(
+        s,
+        f,
+        area,
+        theme,
+        g,
+        true,
+        Grammar::for_width(area.width),
+        hits,
+    );
 }
 
 // ================= thread view =================
@@ -1301,6 +1359,10 @@ impl ThreadViewState {
         let mut links: Vec<String> = Vec::new();
         let mut offsets: Vec<usize> = Vec::new();
         let mut slots: Vec<Slot> = Vec::new();
+        // Which rows a click can mean something more specific than "this
+        // post" on: the `[n] url` rows, and every row an image occupies.
+        let mut link_lines: Vec<(usize, usize)> = Vec::new();
+        let mut image_lines: Vec<(usize, usize)> = Vec::new();
 
         lines.push(thread_summary_line(self, theme, g, width));
         lines.push(Line::from(Span::raw("")));
@@ -1389,6 +1451,11 @@ impl ThreadViewState {
                 } else {
                     format!("{} {}{dims}", g.image, att.filename)
                 };
+                if att.is_image() {
+                    // The caption row is a click target on every tier: on the
+                    // text tier it is the only thing the picture has.
+                    image_lines.push((lines.len(), image_n));
+                }
                 lines.push(gutter(vec![Span::styled(
                     truncate(&caption, body_w),
                     theme.dim(),
@@ -1414,6 +1481,9 @@ impl ThreadViewState {
                 // jumps and the panel footer all agree about where the image
                 // is.
                 for _ in 0..rows {
+                    if att.is_image() {
+                        image_lines.push((lines.len(), image_n));
+                    }
                     lines.push(gutter(Vec::new()));
                 }
             }
@@ -1446,6 +1516,7 @@ impl ThreadViewState {
             )]));
 
             for (n, url) in links.iter().enumerate().skip(post_link_base) {
+                link_lines.push((lines.len(), n));
                 lines.push(gutter(vec![
                     Span::styled(format!("[{}] ", n + 1), Style::new().fg(theme.accent)),
                     Span::styled(truncate(url, body_w.saturating_sub(6)), link_style(theme)),
@@ -1459,6 +1530,8 @@ impl ThreadViewState {
         self.links = links;
         self.post_line_offsets = offsets;
         self.image_slots = slots;
+        self.link_lines = link_lines;
+        self.image_lines = image_lines;
     }
 }
 
@@ -1836,6 +1909,7 @@ pub fn render_thread_view(
     area: Rect,
     theme: &Theme,
     g: &Glyphs,
+    hits: &mut HitMap,
 ) {
     let total = s.post_total();
     let right = format!(
@@ -1913,6 +1987,67 @@ pub fn render_thread_view(
         inner,
     );
 
+    // Hits, in the order that makes the topmost one the most specific: the
+    // post card under every row it owns, then the link and image rows over
+    // it. `post_line_offsets` is the card boundary list `n`/`N` navigate by,
+    // so this and the keyboard always agree about which post a row is in.
+    for row in 0..inner.height {
+        let line = s.scroll + row as usize;
+        if line >= s.lines.len() {
+            break;
+        }
+        let Some(post) = s
+            .post_line_offsets
+            .iter()
+            .rposition(|&start| start <= line)
+        else {
+            continue;
+        };
+        hits.push(Rect::new(inner.x, inner.y + row, inner.width, 1), Hit::Post(post));
+    }
+    for &(line, n) in &s.link_lines {
+        if line < s.scroll || line >= s.scroll + inner.height as usize {
+            continue;
+        }
+        let Some(url) = s.links.get(n) else { continue };
+        let y = inner.y + (line - s.scroll) as u16;
+        hits.push(
+            Rect::new(inner.x, y, inner.width, 1),
+            Hit::Link(url.clone()),
+        );
+    }
+    // Inline link markers. A link inside a post body renders as `label [n]`
+    // (hard rule 1 forbids OSC 8 in span content), so the bracketed number IS
+    // the clickable part of that link — the `[n] url` rows under the post are
+    // the other half of the same affordance.
+    let link_fg = link_style(theme).fg;
+    for row in 0..inner.height {
+        let Some(line) = s.lines.get(s.scroll + row as usize) else {
+            break;
+        };
+        let mut x = inner.x;
+        for span in &line.spans {
+            let w = cell_width(&span.content) as u16;
+            if span.style.fg == link_fg
+                && let Some(n) = link_marker_index(&span.content)
+                && let Some(url) = s.links.get(n - 1)
+            {
+                hits.push(
+                    Rect::new(x, inner.y + row, w, 1),
+                    Hit::Link(url.clone()),
+                );
+            }
+            x = x.saturating_add(w);
+        }
+    }
+    for &(line, n) in &s.image_lines {
+        if line < s.scroll || line >= s.scroll + inner.height as usize {
+            continue;
+        }
+        let y = inner.y + (line - s.scroll) as u16;
+        hits.push(Rect::new(inner.x, y, inner.width, 1), Hit::Image(n));
+    }
+
     // Translate the reserved slots into absolute screen rects for the app to
     // paint. A slot that is only partly on screen is dropped rather than
     // clipped: kitty and sixel paint pixels, not cells, and half an image
@@ -1968,7 +2103,30 @@ pub fn render_thread_view(
             p_inner,
             &mut state,
         );
+        // The popup is an overlay of this screen's own: clicking a row opens
+        // that link, and clicking anywhere else — including its own border
+        // and empty rows — closes it, rather than reaching a post behind it.
+        hits.push(area, Hit::CloseOverlay);
+        let links = s.links.clone();
+        hits.rows(p_inner, state.offset(), links.len(), |i| {
+            Hit::Link(links[i].clone())
+        });
     }
+}
+
+/// The 1-based link number in an inline `[12]` marker — the shape
+/// `chunk_lines` writes after a link's label (`wrap_spans` may have taken the
+/// space before it into a span of its own). Callers also require the span to
+/// carry the link colour and the number to name a real link, so a `[12]`
+/// sitting in ordinary body text is not mistaken for one. The `[n] url` rows
+/// under a post keep their trailing space, so they never match here — they
+/// are registered whole, from `link_lines`.
+fn link_marker_index(span: &str) -> Option<usize> {
+    let inner = span.strip_prefix('[')?.strip_suffix(']')?;
+    if inner.is_empty() || !inner.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    inner.parse::<usize>().ok().filter(|n| *n > 0)
 }
 
 pub(crate) fn truncate(s: &str, max: usize) -> String {
@@ -2403,7 +2561,7 @@ mod tests {
         let mut s = home_with_data();
 
         let mut wide = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
-        wide.draw(|f| render_home(&mut s, f, f.area(), &theme, &UNICODE))
+        wide.draw(|f| render_home(&mut s, f, f.area(), &theme, &UNICODE, &mut crate::hit::HitMap::default()))
             .expect("draw");
         assert!(s.dual);
         assert_eq!(s.tree_rect, Rect::new(0, 0, TREE_PANE_COLS, 24));
@@ -2412,7 +2570,7 @@ mod tests {
         // Narrow: one panel, the focused one (List here).
         let mut narrow = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
         narrow
-            .draw(|f| render_home(&mut s, f, f.area(), &theme, &UNICODE))
+            .draw(|f| render_home(&mut s, f, f.area(), &theme, &UNICODE, &mut crate::hit::HitMap::default()))
             .expect("draw");
         assert!(!s.dual);
         assert_eq!(s.list_rect, Rect::new(0, 0, 80, 24));
@@ -2425,7 +2583,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(w, h)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            screen.render(f, area, &theme, &UNICODE);
+            screen.render(f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default());
         })
         .expect("draw");
         let buf = term.backend().buffer().clone();
@@ -2475,7 +2633,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            screen.render(f, area, &theme, &UNICODE);
+            screen.render(f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default());
         })
         .expect("draw");
         let buf = term.backend().buffer().clone();

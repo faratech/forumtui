@@ -115,6 +115,24 @@ pub fn tui_done_url() -> String {
     format!("{}/tui-done", base_url())
 }
 
+/// Whether the client captures the mouse at all (`WFTUI_MOUSE`).
+///
+/// `WFTUI_MOUSE=0` (also `off`/`false`/`no`) skips `EnableMouseCapture`
+/// entirely, so the terminal keeps its own selection and scrollback bindings
+/// and every gesture — click, drag-select, wheel, tap, long-press — belongs to
+/// the terminal rather than to us. The client then builds no hit map either:
+/// with nothing capturing pointer events there is nothing to resolve. It is
+/// the same escape hatch `Shift+drag` gives for one drag, made permanent.
+pub fn mouse_enabled() -> bool {
+    match std::env::var("WFTUI_MOUSE") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        Err(_) => true,
+    }
+}
+
 fn config_root() -> PathBuf {
     if let Ok(dir) = std::env::var("WFTUI_CONFIG_DIR")
         && !dir.trim().is_empty() {
@@ -176,6 +194,25 @@ mod tests {
             assert!(matches!(tail, "read" | "write"), "{scope}");
             assert!(!head.is_empty());
         }
+    }
+
+    /// `WFTUI_MOUSE=0` is the documented way to hand every gesture back to
+    /// the terminal (CLAUDE.md, and the keys card's MOUSE group). Unset — the
+    /// overwhelmingly common case — must stay on.
+    #[test]
+    fn mouse_is_on_unless_the_env_turns_it_off() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("WFTUI_MOUSE") };
+        assert!(mouse_enabled(), "the default is a captured mouse");
+        for off in ["0", "off", "OFF", "false", "no", " 0 "] {
+            unsafe { std::env::set_var("WFTUI_MOUSE", off) };
+            assert!(!mouse_enabled(), "WFTUI_MOUSE={off:?} must disable the mouse");
+        }
+        for on in ["1", "on", "yes", ""] {
+            unsafe { std::env::set_var("WFTUI_MOUSE", on) };
+            assert!(mouse_enabled(), "WFTUI_MOUSE={on:?} must leave it on");
+        }
+        unsafe { std::env::remove_var("WFTUI_MOUSE") };
     }
 
     #[test]

@@ -16,6 +16,7 @@ use super::{
 };
 use crate::chrome::{self, Hints};
 use crate::glyph::Glyphs;
+use crate::hit::{Hit, HitMap, HitPane};
 use crate::theme::{fmt_age, fmt_age_parts, Theme};
 
 /// Both panes fit side by side from here up (DESIGN.md) — the same threshold
@@ -220,6 +221,7 @@ pub fn render_inbox(
     area: Rect,
     theme: &Theme,
     g: &Glyphs,
+    hits: &mut HitMap,
 ) {
     let dual = area.width >= INBOX_DUAL_MIN_COLS;
     s.dual = dual;
@@ -230,16 +232,16 @@ pub fn render_inbox(
         match s.focus {
             InboxPane::List => {
                 s.list_rect = area;
-                render_inbox_list(s, f, area, theme, g, true)
+                render_inbox_list(s, f, area, theme, g, true, hits)
             }
             InboxPane::View => match &mut s.view {
                 Some(view) => {
                     s.view_rect = area;
-                    render_inbox_view_panel(view, f, area, theme, g, true)
+                    render_inbox_view_panel(view, f, area, theme, g, true, hits)
                 }
                 None => {
                     s.list_rect = area;
-                    render_inbox_list(s, f, area, theme, g, true)
+                    render_inbox_list(s, f, area, theme, g, true, hits)
                 }
             },
         }
@@ -250,15 +252,24 @@ pub fn render_inbox(
     // What the wheel routes by (issue #549).
     s.list_rect = left;
     s.view_rect = right;
-    render_inbox_list(s, f, left, theme, g, s.focus == InboxPane::List);
+    render_inbox_list(s, f, left, theme, g, s.focus == InboxPane::List, hits);
     match &mut s.view {
-        Some(view) => render_inbox_view_panel(view, f, right, theme, g, s.focus == InboxPane::View),
+        Some(view) => render_inbox_view_panel(
+            view,
+            f,
+            right,
+            theme,
+            g,
+            s.focus == InboxPane::View,
+            hits,
+        ),
         None => {
             f.render_widget(chrome::panel(theme, g, "Inbox", false, None, None), right);
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_inbox_list(
     s: &mut InboxState,
     f: &mut ratatui::Frame,
@@ -266,7 +277,9 @@ fn render_inbox_list(
     theme: &Theme,
     g: &Glyphs,
     focused: bool,
+    hits: &mut HitMap,
 ) {
+    hits.push(area, Hit::Pane(HitPane::List));
     let bottom = match s.tab {
         InboxTab::Conversations => conversations_range(&s.convos),
         InboxTab::Alerts => alerts_range(&s.alerts),
@@ -280,13 +293,33 @@ fn render_inbox_list(
 
     let [tabs_area, body_area] =
         Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
-    f.render_widget(Paragraph::new(tab_row(theme, s)), tabs_area);
+    let tabs = tab_row(theme, s);
+    // The chips' own cell ranges, measured off the spans that were drawn:
+    // ` `, Conversations chip, ` `, Alerts chip (`tab_row`).
+    if let Some(first) = tabs.first() {
+        let mut x = tabs_area.x;
+        for (i, span) in first.spans.iter().enumerate() {
+            let w = span.width() as u16;
+            let tab = match i {
+                1 => Some(InboxTab::Conversations),
+                3 => Some(InboxTab::Alerts),
+                _ => None,
+            };
+            if let Some(tab) = tab {
+                hits.push(Rect::new(x, tabs_area.y, w, 1), Hit::Tab(tab));
+            }
+            x = x.saturating_add(w);
+        }
+    }
+    f.render_widget(Paragraph::new(tabs), tabs_area);
 
     match s.tab {
         InboxTab::Conversations => {
-            render_conversations_rows(&mut s.convos, f, body_area, theme, g, focused)
+            render_conversations_rows(&mut s.convos, f, body_area, theme, g, focused, hits)
         }
-        InboxTab::Alerts => render_alerts_rows(&mut s.alerts, f, body_area, theme, g, focused),
+        InboxTab::Alerts => {
+            render_alerts_rows(&mut s.alerts, f, body_area, theme, g, focused, hits)
+        }
     }
 }
 
@@ -348,6 +381,7 @@ fn alerts_range(s: &AlertsState) -> Option<String> {
 
 /// Two-line conversation rows: unread glyph + bold title, then dim
 /// `participants · N replies · age`.
+#[allow(clippy::too_many_arguments)]
 fn render_conversations_rows(
     s: &mut ConversationsState,
     f: &mut ratatui::Frame,
@@ -355,6 +389,7 @@ fn render_conversations_rows(
     theme: &Theme,
     g: &Glyphs,
     focused: bool,
+    hits: &mut HitMap,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -421,9 +456,17 @@ fn render_conversations_rows(
         list
     };
     f.render_stateful_widget(list, area, &mut state);
+    // Two rows per conversation (title + meta), so both lines are the row.
+    hits.list(
+        area,
+        state.offset(),
+        &vec![2u16; s.conversations.len()],
+        Hit::Row,
+    );
 }
 
 /// Alert rows: the kind glyph, username bold when unread, dim age.
+#[allow(clippy::too_many_arguments)]
 fn render_alerts_rows(
     s: &mut AlertsState,
     f: &mut ratatui::Frame,
@@ -431,6 +474,7 @@ fn render_alerts_rows(
     theme: &Theme,
     g: &Glyphs,
     focused: bool,
+    hits: &mut HitMap,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -504,6 +548,7 @@ fn render_alerts_rows(
         list
     };
     f.render_stateful_widget(list, area, &mut state);
+    hits.rows(area, state.offset(), s.alerts.len(), Hit::Row);
 }
 
 /// The inline view pane: title = the conversation, right segment `r reply`
@@ -511,6 +556,7 @@ fn render_alerts_rows(
 /// there is replaced by the one key this pane actually wants advertised).
 /// Then `with <participants> · started <age> · N messages`, a rule, and
 /// message cards.
+#[allow(clippy::too_many_arguments)]
 fn render_inbox_view_panel(
     view: &mut ConversationViewState,
     f: &mut ratatui::Frame,
@@ -518,7 +564,9 @@ fn render_inbox_view_panel(
     theme: &Theme,
     g: &Glyphs,
     focused: bool,
+    hits: &mut HitMap,
 ) {
+    hits.push(area, Hit::Pane(HitPane::View));
     let title = truncate(&view.conversation.title, 40);
     let block = chrome::panel(theme, g, &title, focused, Some("r reply"), None);
     let inner = block.inner(area);
@@ -601,6 +649,27 @@ fn render_inbox_view_panel(
         Paragraph::new(crate::editor::visible_window(&view.lines, view.scroll, body_area.height)),
         body_area,
     );
+    message_hits(view, body_area, hits);
+}
+
+/// One `Hit::Post` per drawn row of a message card, so a click anywhere in a
+/// DM selects the message it landed in — the same thing `n`/`N` do, and the
+/// same `msg_line_offsets` they navigate by.
+fn message_hits(view: &ConversationViewState, area: Rect, hits: &mut HitMap) {
+    for row in 0..area.height {
+        let line = view.scroll + row as usize;
+        if line >= view.lines.len() {
+            break;
+        }
+        let Some(msg) = view
+            .msg_line_offsets
+            .iter()
+            .rposition(|&start| start <= line)
+        else {
+            continue;
+        };
+        hits.push(Rect::new(area.x, area.y + row, area.width, 1), Hit::Post(msg));
+    }
 }
 
 /// Left content, then padding, then right-aligned content — a small local
@@ -895,6 +964,7 @@ pub fn render_conversation_view(
     area: ratatui::layout::Rect,
     theme: &Theme,
     g: &Glyphs,
+    hits: &mut HitMap,
 ) {
     let right = format!("page {} of {}", s.page.max(1), s.last_page.max(1));
     let bottom = if s.messages.is_empty() {
@@ -964,6 +1034,7 @@ pub fn render_conversation_view(
         Paragraph::new(crate::editor::visible_window(&s.lines, s.scroll, view.height)),
         view,
     );
+    message_hits(s, view, hits);
 }
 
 // ================= new conversation =================
@@ -1173,12 +1244,58 @@ pub fn new_conversation_hints() -> Hints {
     )
 }
 
+/// The two single-line fields' labels. Their cell widths are the caret's
+/// offset both when drawing and when a click asks where it landed, so they
+/// are named once (issue #535's lesson) rather than counted twice.
+const TO_LABEL: &str = "To (usernames, comma-separated): ";
+const TITLE_LABEL: &str = "Title: ";
+
+/// Focus field `field` and put the caret under the pointer (`Hit::Field`).
+pub(crate) fn new_conversation_click_field(
+    s: &mut super::NewConversationState,
+    field: usize,
+    col: u16,
+    row: u16,
+) {
+    if s.busy {
+        return;
+    }
+    s.field = field.min(2);
+    match field {
+        0 => {
+            let label = crate::chrome::cell_width(TO_LABEL);
+            let room = (s.to_rect.width as usize).saturating_sub(label);
+            let x = col.saturating_sub(s.to_rect.x).saturating_sub(label as u16);
+            s.recipients_cursor =
+                crate::editor::field_caret_at(&s.recipients, s.recipients_cursor, room, x as usize);
+        }
+        1 => {
+            let label = crate::chrome::cell_width(TITLE_LABEL);
+            let room = (s.title_rect.width as usize).saturating_sub(label);
+            let x = col
+                .saturating_sub(s.title_rect.x)
+                .saturating_sub(label as u16);
+            s.title_cursor =
+                crate::editor::field_caret_at(&s.title, s.title_cursor, room, x as usize);
+        }
+        _ => {
+            let line = s.body_scroll + row.saturating_sub(s.body_rect.y) as usize;
+            let x = col.saturating_sub(s.body_rect.x) as usize;
+            s.body_cursor =
+                crate::editor::caret_at_cell(&s.body, s.body_width as usize, line, x);
+            // Any non-vertical move clears the sticky column (issue #523).
+            s.body_desired_col = None;
+        }
+    }
+}
+
 pub fn render_new_conversation(
     s: &mut super::NewConversationState,
     f: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
     theme: &Theme,
     g: &Glyphs,
+    hits: &mut HitMap,
 ) {
     let block = super::solo_panel(theme, g, "New conversation", None, None);
     let inner = block.inner(area);
@@ -1192,8 +1309,12 @@ pub fn render_new_conversation(
     ])
     .areas(inner);
 
-    const TO_LABEL: &str = "To (usernames, comma-separated): ";
-    const TITLE_LABEL: &str = "Title: ";
+    s.to_rect = to_area;
+    s.title_rect = title_area;
+    s.body_rect = body_area;
+    hits.push(to_area, Hit::Field(0));
+    hits.push(title_area, Hit::Field(1));
+    hits.push(body_area, Hit::Field(2));
     // Both single-line fields scroll horizontally inside the room their label
     // leaves them, and the caret comes from the same window (issue #606) —
     // they used to be drawn whole and clipped by the pane, so a long
@@ -1383,7 +1504,7 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_inbox(s, f, area, &theme, &crate::glyph::UNICODE);
+            render_inbox(s, f, area, &theme, &crate::glyph::UNICODE, &mut crate::hit::HitMap::default());
         })
         .expect("draw");
         let buf = term.backend().buffer().clone();
@@ -1410,7 +1531,7 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE);
+            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE, &mut crate::hit::HitMap::default());
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
@@ -1448,7 +1569,7 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE);
+            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE, &mut crate::hit::HitMap::default());
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
@@ -1470,7 +1591,7 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE);
+            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE, &mut crate::hit::HitMap::default());
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
@@ -1500,7 +1621,7 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE);
+            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE, &mut crate::hit::HitMap::default());
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
@@ -1547,7 +1668,7 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE);
+            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE, &mut crate::hit::HitMap::default());
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
@@ -1607,7 +1728,7 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_conversation_view(&mut state, f, area, &theme, &crate::glyph::UNICODE);
+            render_conversation_view(&mut state, f, area, &theme, &crate::glyph::UNICODE, &mut crate::hit::HitMap::default());
         })
         .expect("draw");
         let buf = term.backend().buffer().clone();

@@ -17,6 +17,7 @@ use common::models::*;
 use crate::chrome::{self, GateState};
 use crate::event;
 use crate::glyph::{self, Glyphs};
+use crate::hit::{self, Hit, HitMap};
 use crate::overlay::{self, GoTarget, Palette, PaletteEvent, Prefix, PrefixEvent};
 use crate::screens::{self, Action, ComposeTarget, Screen};
 use crate::theme::Theme;
@@ -389,6 +390,10 @@ pub struct App {
     last_click_instant: Option<std::time::Instant>,
     last_click_pos: (u16, u16),
     click_count: u8,
+    /// Where the left button went down, so the release can tell a click from
+    /// a drag: press and release in the same cell, with the band never having
+    /// left it, is a click.
+    press_pos: Option<(u16, u16)>,
     last_title: String,
     should_quit: bool,
     /// Handles for the alerts/conversations poll loops spawned by
@@ -449,6 +454,10 @@ pub struct App {
     /// The body zone of the last frame (between the header band and the key
     /// bar). The wheel scrolls what is inside it and nothing else (#549).
     body_rect: ratatui::layout::Rect,
+    /// What the last frame drew *where* — rebuilt by `draw`, resolved by
+    /// `handle_mouse`. Empty for the whole run when `WFTUI_MOUSE=0`, which
+    /// is also when nothing enabled mouse capture in the first place.
+    hits: HitMap,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -478,12 +487,25 @@ impl TerminalGuard {
         };
         use ratatui::crossterm::terminal::*;
         enable_raw_mode()?;
-        if let Err(e) = ratatui::crossterm::execute!(
-            std::io::stdout(),
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableBracketedPaste,
-        ) {
+        // `WFTUI_MOUSE=0` never captures: the terminal keeps its own
+        // selection, scrollback and touch gestures, and the client builds no
+        // hit map to resolve events it will not receive.
+        let capture = common::config::mouse_enabled();
+        let enter = if capture {
+            ratatui::crossterm::execute!(
+                std::io::stdout(),
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableBracketedPaste,
+            )
+        } else {
+            ratatui::crossterm::execute!(
+                std::io::stdout(),
+                EnterAlternateScreen,
+                EnableBracketedPaste,
+            )
+        };
+        if let Err(e) = enter {
             // Don't leave the terminal in raw mode if we're bailing out here —
             // otherwise the caller's `eprintln!` (and the shell prompt after
             // it) render with no line discipline.
@@ -640,6 +662,7 @@ pub async fn run(images: crate::images::Images) -> u8 {
         last_click_instant: None,
         last_click_pos: (0, 0),
         click_count: 0,
+        press_pos: None,
         last_title: String::new(),
         should_quit: false,
         poller_handles: Vec::new(),
@@ -652,6 +675,7 @@ pub async fn run(images: crate::images::Images) -> u8 {
         login_generation: 0,
         login_task: None,
         body_rect: ratatui::layout::Rect::default(),
+        hits: HitMap::new(common::config::mouse_enabled()),
     };
     #[cfg(unix)]
     {
@@ -1164,6 +1188,10 @@ impl App {
         .areas(f.area());
         // Where the wheel is allowed to act (issue #549).
         self.body_rect = body;
+        // One hit map per frame, in draw order: the body's own targets first,
+        // then (if an overlay takes over) only the overlay's, then the header
+        // and key bar, which are true whatever is on top of the body.
+        self.hits.clear();
 
         // Crumbs are the screen stack's own names. Login is excluded: it is a
         // gate, not a place, and it owns the whole screen while it is up.
@@ -1184,19 +1212,17 @@ impl App {
             }
         }
         let me_name = self.me.as_ref().map(|u| u.username.as_str());
-        f.render_widget(
-            Paragraph::new(chrome::header_line(
-                &self.theme,
-                &self.glyphs,
-                &crumbs,
-                me_name,
-                self.convos_unread,
-                self.alerts_unread,
-                None,
-                top.width,
-            )),
-            top,
+        let (header, badges) = chrome::header_line_hits(
+            &self.theme,
+            &self.glyphs,
+            &crumbs,
+            me_name,
+            self.convos_unread,
+            self.alerts_unread,
+            None,
+            top.width,
         );
+        f.render_widget(Paragraph::new(header), top);
 
         // Render the top screen; popups handled inside renderers.
         // The graphics policy is stamped on first: the thread view reserves
@@ -1208,7 +1234,7 @@ impl App {
         let screen_title = screen.title().to_string();
         let screen_hints = screen.hints();
         let keys_group = screen.keys_group();
-        screen.render(f, body, &self.theme, &self.glyphs);
+        screen.render(f, body, &self.theme, &self.glyphs, &mut self.hits);
 
         // Inline images, painted over the rects the screen just reserved.
         // Suppressed while any overlay is up: `overlay::dim_body` re-styles
@@ -1239,13 +1265,21 @@ impl App {
         if self.palette.is_some() || self.show_help {
             overlay::dim_body(f, body, &self.theme);
         }
+        // An APP overlay owns the body's pointer as completely as it owns
+        // the keyboard: the body's hits go with the frame it is drawn over,
+        // so nothing behind the glass can be clicked through it. (The thread
+        // view's link popup is the screen's own overlay — it registers its
+        // rows during `render`, over the body's, and must keep them.)
+        if self.palette.is_some() || self.show_help || self.prefix.armed() {
+            self.hits.clear();
+        }
         if let Some(p) = &self.palette {
-            p.render(f, body, &self.theme, &self.glyphs);
+            p.render(f, body, &self.theme, &self.glyphs, &mut self.hits);
             bar = Some(Palette::hints(&self.glyphs));
             status_left = Palette::status().to_string();
         }
         if self.prefix.armed() {
-            overlay::render_which_key(f, body, &self.theme, &self.glyphs);
+            overlay::render_which_key(f, body, &self.theme, &self.glyphs, &mut self.hits);
         }
         if self.show_help {
             overlay::render_keys_card(
@@ -1255,19 +1289,33 @@ impl App {
                 &self.glyphs,
                 keys_group,
                 &screen_hints,
+                &mut self.hits,
             );
             bar = Some(overlay::keys_card_hints());
             status_left = overlay::keys_card_status().to_string();
         }
 
-        f.render_widget(
-            Paragraph::new(chrome::key_bar(
-                &self.theme,
-                bar.as_ref().unwrap_or(&screen_hints),
-                keys.width,
-            )),
-            keys,
+        let (key_bar, caps) = chrome::key_bar_hits(
+            &self.theme,
+            bar.as_ref().unwrap_or(&screen_hints),
+            keys.width,
         );
+        f.render_widget(Paragraph::new(key_bar), keys);
+        // Header and key bar last: they are outside the body, so they stay
+        // clickable under every overlay — and clicking a cap while one is up
+        // presses that key through the same routing the keyboard uses.
+        for b in badges {
+            self.hits.push(
+                ratatui::layout::Rect::new(b.x, top.y, b.width, 1),
+                Hit::Badge(b.tab),
+            );
+        }
+        for c in caps {
+            self.hits.push(
+                ratatui::layout::Rect::new(c.x, keys.y, c.width, 1),
+                Hit::Key(c.key),
+            );
+        }
 
         let new_title = if self.alerts_unread > 0 || self.convos_unread > 0 {
             format!(
@@ -1993,12 +2041,29 @@ impl App {
 
     // ---- mouse: selection + multi-click + wheel scrolling ----
 
+    /// Pointer and touch. Terminals deliver a tap as a left click, a
+    /// two-finger scroll as a wheel and a long press as a right click, so
+    /// there is one layer here for all three.
+    ///
+    /// Press+release in the same cell is a **click**: it resolves against the
+    /// frame's `HitMap` and does what that target says. Anything that moves
+    /// is a **drag**, which is the selection it always was — including across
+    /// a list row, so a thread title is still copyable. The one thing a UI
+    /// target changes is what a *repeat* press means: on text it is the
+    /// double-click word / triple-click line select, on a row or a cap it is
+    /// "open".
     fn handle_mouse(&mut self, me: ratatui::crossterm::event::MouseEvent) {
-        use ratatui::crossterm::event::{KeyCode, MouseEventKind as K};
+        use ratatui::crossterm::event::{KeyCode, MouseButton, MouseEventKind as K};
 
+        // `WFTUI_MOUSE=0`: nothing captured the mouse, so anything that
+        // arrives here anyway (a terminal that reports without being asked)
+        // is not ours to act on.
+        if !self.hits.enabled() {
+            return;
+        }
         let pos = (me.column, me.row);
         match me.kind {
-            K::Down(ratatui::crossterm::event::MouseButton::Left, ..) => {
+            K::Down(MouseButton::Left, ..) => {
                 let now = std::time::Instant::now();
                 let is_rapid = self.last_click_instant.is_some_and(|t| {
                     now.duration_since(t) < Duration::from_millis(400)
@@ -2012,6 +2077,30 @@ impl App {
                 }
                 self.last_click_instant = Some(now);
                 self.last_click_pos = pos;
+                self.press_pos = Some(pos);
+
+                // On a UI target (a row, a cap, a tab, a link, a field) the
+                // SECOND press means "open" — never a word select, which is
+                // what a double click means on text. A single press starts
+                // the band either way: dragging across a list row to copy a
+                // thread title is still a selection, and the release decides
+                // which gesture it was.
+                let ui = self
+                    .hits
+                    .at(pos.0, pos.1)
+                    .is_some_and(|h| !h.is_text_like());
+                if ui && self.click_count >= 2 {
+                    self.selection = None;
+                    self.click_hit(pos, true);
+                    return;
+                }
+                if ui {
+                    self.selection = Some(Selection {
+                        anchor: pos,
+                        end: pos,
+                    });
+                    return;
+                }
 
                 if self.click_count == 2 {
                     // Double-click: select word
@@ -2052,20 +2141,31 @@ impl App {
                     });
                 }
             }
-            K::Drag(ratatui::crossterm::event::MouseButton::Left, ..) => {
+            K::Drag(MouseButton::Left, ..) => {
                 if let Some(sel) = &mut self.selection {
                     sel.end = pos;
                 }
             }
-            K::Up(ratatui::crossterm::event::MouseButton::Left, ..) => {
+            K::Up(MouseButton::Left, ..) => {
+                let press = self.press_pos.take();
                 if self.click_count > 1 {
+                    // The word/line select (or the double-click "open") ran
+                    // on the press; the release has nothing left to do.
                     return;
                 }
-                if let Some(sel) = self.selection.take() {
+                let selection = self.selection.take();
+                // Press and release in the same cell, with the band never
+                // having left it, is a click — anything else is a drag.
+                let still = selection.is_none_or(|sel| {
                     let (x0, y0, x1, y1) = sel.rect();
-                    if (x0, y0) == (x1, y1) {
-                        return; // plain click: clear the selection
-                    }
+                    (x0, y0) == (x1, y1)
+                });
+                if press == Some(pos) && still {
+                    self.click_hit(pos, false);
+                    return;
+                }
+                if let Some(sel) = selection {
+                    let (x0, y0, x1, y1) = sel.rect();
                     let text = self.extract_selection_text(x0, y0, x1, y1);
                     if !text.is_empty() {
                         let n = text.chars().count();
@@ -2076,9 +2176,168 @@ impl App {
                     }
                 }
             }
+            // Long press on a phone terminal, right button on a desktop:
+            // "open this on the site".
+            K::Down(MouseButton::Right, ..) => self.right_click_hit(pos),
             K::ScrollUp => self.handle_wheel(pos, KeyCode::Up),
             K::ScrollDown => self.handle_wheel(pos, KeyCode::Down),
             _ => {}
+        }
+    }
+
+    /// Act on the cell the pointer clicked, per the frame's hit map.
+    ///
+    /// Everything that has a key does it *through* `handle_key`, never by
+    /// duplicating the handler: a click on a cap is a keypress, so every
+    /// gate a keypress passes (a busy composer, the sign-in gate, an armed
+    /// `g` chord, the write gate) applies to it unchanged.
+    fn click_hit(&mut self, pos: (u16, u16), double: bool) {
+        let Some(hit) = self.hits.at(pos.0, pos.1).cloned() else {
+            return;
+        };
+        match hit {
+            Hit::CloseOverlay => self.close_overlay(),
+            Hit::Key(k) | Hit::Cap(k) => {
+                if let Some(key) = hit::key_event_for_label(k) {
+                    self.handle_key(key);
+                }
+            }
+            Hit::Badge(tab) => self.open_inbox(tab),
+            Hit::Tab(tab) => {
+                if let Some(Screen::Inbox(inbox)) = self.screens.last_mut() {
+                    inbox.tab = tab;
+                    inbox.focus = screens::InboxPane::List;
+                }
+            }
+            Hit::PaletteRow(i) => {
+                let target = self.palette.as_mut().and_then(|p| {
+                    p.select(i);
+                    p.selected().map(|item| item.target.clone())
+                });
+                if let Some(target) = target {
+                    self.palette = None;
+                    self.status.clear();
+                    self.run_palette_target(target);
+                }
+            }
+            Hit::Link(url) => {
+                // A link row inside the thread view's popup closes it, the
+                // same as Enter there.
+                if let Some(Screen::ThreadView(v)) = self.screens.last_mut() {
+                    v.link_popup = false;
+                }
+                self.open_url(&url);
+            }
+            Hit::Image(n) => {
+                // Select the post the picture belongs to, then press its
+                // digit: `1`-`9` is the one path that opens an attachment,
+                // and it reads the SELECTED post (issue #542's rule).
+                if let Some(post) = self.hits.post_at(pos.0, pos.1)
+                    && let Some(screen) = self.screens.last_mut()
+                {
+                    screen.select_post(post);
+                }
+                if (1..=9).contains(&n)
+                    && let Some(digit) = char::from_digit(n as u32, 10)
+                {
+                    self.handle_key(KeyEvent::new(
+                        KeyCode::Char(digit),
+                        KeyModifiers::NONE,
+                    ));
+                }
+            }
+            Hit::Field(field) => {
+                if let Some(screen) = self.screens.last_mut() {
+                    screen.click_field(field, pos.0, pos.1);
+                }
+            }
+            Hit::Row(i) => {
+                // The pane under the pointer takes the keyboard first, so the
+                // index lands in the list the user is actually looking at.
+                if let Some(screen) = self.screens.last_mut() {
+                    screen.focus_pane_at(pos.0, pos.1);
+                }
+                let was = self.screens.last().and_then(Screen::selected_index);
+                if let Some(screen) = self.screens.last_mut() {
+                    screen.select_index(i);
+                }
+                // Clicking the row that was already selected, or a
+                // double-click, is Enter — a first click on any other row
+                // only moves the selection there.
+                if double || was == Some(i) {
+                    self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
+            }
+            Hit::Post(i) => {
+                if let Some(screen) = self.screens.last_mut() {
+                    screen.focus_pane_at(pos.0, pos.1);
+                    screen.select_post(i);
+                }
+            }
+            Hit::Pane(_) => {
+                if let Some(screen) = self.screens.last_mut() {
+                    screen.focus_pane_at(pos.0, pos.1);
+                }
+            }
+        }
+    }
+
+    /// Right button / long press: open what is under the pointer on the site.
+    /// A thread row opens that thread, a post opens the thread it is in, and
+    /// a link is a link either way.
+    fn right_click_hit(&mut self, pos: (u16, u16)) {
+        match self.right_click_url(pos) {
+            Some(url) => self.open_url(&url),
+            None => self.set_status("Nothing here to open on the site."),
+        }
+    }
+
+    /// The URL a right click at `pos` means, moving the selection onto the
+    /// row it landed on first (opening row 5 in a browser while row 2 stays
+    /// selected would be its own bug). Split from `right_click_hit` so the
+    /// resolution is testable without spawning the user's browser.
+    fn right_click_url(&mut self, pos: (u16, u16)) -> Option<String> {
+        let hit = self.hits.at(pos.0, pos.1).cloned()?;
+        match hit {
+            Hit::Link(url) => Some(url),
+            Hit::Row(i) => {
+                if let Some(screen) = self.screens.last_mut() {
+                    screen.focus_pane_at(pos.0, pos.1);
+                    screen.select_index(i);
+                }
+                self.screens.last().and_then(Screen::web_url)
+            }
+            Hit::Post(i) => {
+                if let Some(screen) = self.screens.last_mut() {
+                    screen.select_post(i);
+                }
+                self.screens.last().and_then(Screen::web_url)
+            }
+            Hit::Pane(_) | Hit::Image(_) => self.screens.last().and_then(Screen::web_url),
+            _ => None,
+        }
+    }
+
+    /// Close whatever overlay is up, innermost first — a click off it means
+    /// the same as the Esc that closes it.
+    fn close_overlay(&mut self) {
+        if self.palette.is_some() {
+            self.palette = None;
+            self.status.clear();
+            return;
+        }
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
+        if self.prefix.armed() {
+            // Same path a stray key takes: armed -> cancelled, silently.
+            self.prefix
+                .resolve(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            return;
+        }
+        if let Some(Screen::ThreadView(v)) = self.screens.last_mut() {
+            v.link_popup = false;
         }
     }
 
@@ -4183,7 +4442,7 @@ mod tests {
         term.draw(|f| {
             let area = f.area();
             let screen = app.screens.last_mut().expect("screen");
-            screen.render(f, area, &app.theme, &app.glyphs);
+            screen.render(f, area, &app.theme, &app.glyphs, &mut crate::hit::HitMap::default());
         })
         .expect("draw");
         let buf = term.backend().buffer().clone();
@@ -4223,7 +4482,7 @@ mod tests {
             .draw(|f| {
                 let area = f.area();
                 let screen = app.screens.last_mut().expect("screen");
-                screen.render(f, area, &app.theme, &app.glyphs);
+                screen.render(f, area, &app.theme, &app.glyphs, &mut crate::hit::HitMap::default());
             })
             .expect("draw");
         let buf2 = term2.backend().buffer().clone();
@@ -5446,7 +5705,7 @@ mod tests {
         term.draw(|f| {
             let area = f.area();
             let screen = app.screens.last_mut().expect("screen");
-            screen.render(f, area, &app.theme, &app.glyphs);
+            screen.render(f, area, &app.theme, &app.glyphs, &mut crate::hit::HitMap::default());
         })
         .expect("draw");
         let buf = term.backend().buffer().clone();
@@ -6792,6 +7051,7 @@ mod tests {
             last_click_instant: None,
             last_click_pos: (0, 0),
             click_count: 0,
+            press_pos: None,
             last_title: String::new(),
             should_quit: false,
             poller_handles: Vec::new(),
@@ -6804,6 +7064,10 @@ mod tests {
             login_generation: 0,
             login_task: None,
             body_rect: ratatui::layout::Rect::default(),
+            // Tests build the map enabled: every hit-map test drives it
+            // directly, and `WFTUI_MOUSE` is process-global (the env lock
+            // lives in `common::config`), so it is never read here.
+            hits: HitMap::new(true),
         }
     }
 
@@ -7271,5 +7535,619 @@ mod tests {
         list_showing(&mut same, 4).unwrap().title = "hit".into();
         assert!(matches!(&same[1], Screen::ThreadList(l) if l.title == "hit"));
         assert!(matches!(&same[0], Screen::Home(h) if h.list.title.is_empty()));
+    }
+
+    // ================= mouse and touch =================
+    //
+    // Terminals deliver a tap as a left click, a two-finger scroll as a
+    // wheel and a long press as a right click, so these tests are the touch
+    // tests too. Every one of them drives the REAL `App::draw`, so the hit
+    // map under test is the one the client registers, at the geometry the
+    // renderers actually laid out — not a hand-built map that can drift.
+
+    use crate::hit::HitPane;
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    /// Draw one frame into a `w x h` test terminal. The frame is thrown away;
+    /// what is kept is `App::hits` (and `App::screen_rows`).
+    fn frame(app: &mut App, w: u16, h: u16) {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
+            .expect("terminal");
+        term.draw(|f| app.draw(f)).expect("draw");
+    }
+
+    fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Press and release in the same cell: a click.
+    fn click(app: &mut App, x: u16, y: u16) {
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x, y));
+    }
+
+    /// A click a moment later — the double-click window is 400 ms, and two
+    /// clicks in a test land in the same microsecond, so a *separate* click
+    /// says so explicitly instead of depending on the wall clock.
+    fn click_later(app: &mut App, x: u16, y: u16) {
+        app.last_click_instant = None;
+        click(app, x, y);
+    }
+
+    /// The first cell whose topmost hit satisfies `pred`, scanning the frame
+    /// left to right, top to bottom.
+    fn find_hit(app: &App, w: u16, h: u16, pred: impl Fn(&Hit) -> bool) -> Option<(u16, u16)> {
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .find(|(x, y)| app.hits.at(*x, *y).is_some_and(&pred))
+    }
+
+    fn thread(id: u32) -> Thread {
+        Thread {
+            thread_id: id,
+            title: format!("Thread {id}"),
+            view_url: Some(format!("https://windowsforum.com/threads/{id}/")),
+            ..Default::default()
+        }
+    }
+
+    /// A signed-in client on the dual-pane Home: three forums, four threads.
+    fn home_app() -> App {
+        let mut app = test_app();
+        app.me = Some(User {
+            user_id: 1,
+            username: "Mike".into(),
+            ..Default::default()
+        });
+        app.screens.push(Screen::Home(screens::HomeState {
+            tree: screens::ForumTreeState {
+                nodes: (1..=3)
+                    .map(|node_id| Node {
+                        node_id,
+                        title: format!("Forum {node_id}"),
+                        node_type: "Forum".into(),
+                        view_url: Some(format!("https://windowsforum.com/forums/{node_id}/")),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            list: screens::ThreadListState {
+                node_id: 1,
+                title: "Forum 1".into(),
+                threads: (1..=4).map(thread).collect(),
+                page: 1,
+                last_page: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        app
+    }
+
+    /// The Home frame's geometry, spelled out once because the rest of these
+    /// tests read it: header row 0, body rows 1..=21, key bar row 22, status
+    /// row 23. The Forums panel is 37 wide (inner x 1..=35, y from 2): the
+    /// QUICK block is rows 2..=6 (` QUICK`, then L/1/2/3), row 7 is blank and
+    /// the nodes start at row 8. The thread list's inner starts at x 38, with
+    /// the column header on row 2 and the first thread on row 3.
+    #[test]
+    fn the_home_frame_maps_quick_keys_forum_rows_and_thread_rows_to_their_own_panes() {
+        let mut app = home_app();
+        frame(&mut app, 120, 24);
+
+        // QUICK rows are keys, not list rows: clicking one presses it.
+        assert_eq!(app.hits.at(3, 3), Some(&Hit::Key("L")));
+        assert_eq!(app.hits.at(3, 4), Some(&Hit::Key("1")));
+        // The ` QUICK` header and the blank row below the block are inert —
+        // the pane underneath is all they answer with.
+        assert_eq!(app.hits.at(3, 2), Some(&Hit::Pane(HitPane::Tree)));
+        assert_eq!(app.hits.at(3, 7), Some(&Hit::Pane(HitPane::Tree)));
+
+        // Forum rows, and the pane under them.
+        assert_eq!(app.hits.at(3, 8), Some(&Hit::Row(0)));
+        assert_eq!(app.hits.at(3, 10), Some(&Hit::Row(2)));
+        assert_eq!(app.hits.pane_at(3, 8), Some(HitPane::Tree));
+
+        // The thread list is the other pane, with its own row indices.
+        assert_eq!(app.hits.at(60, 3), Some(&Hit::Row(0)));
+        assert_eq!(app.hits.at(60, 5), Some(&Hit::Row(2)));
+        assert_eq!(app.hits.pane_at(60, 5), Some(HitPane::List));
+
+        // A click in the right-hand pane takes the keyboard with it (#549's
+        // rects, now for clicks as well as the wheel).
+        assert!(matches!(app.screens.last(), Some(Screen::Home(h)) if h.focus == screens::Pane::Tree));
+        click(&mut app, 60, 5);
+        let Some(Screen::Home(h)) = app.screens.last() else {
+            panic!("expected Home");
+        };
+        assert_eq!(h.focus, screens::Pane::List, "the pointer takes the keyboard");
+        assert_eq!(h.list.sel, 2, "and the row it landed on is selected");
+    }
+
+    /// The list rule: the first click on a row selects it, and clicking the
+    /// row that is *already* selected opens it — the same thing Enter does,
+    /// through the same dispatch.
+    #[tokio::test]
+    async fn a_click_selects_the_row_and_clicking_it_again_opens_the_thread() {
+        let mut app = home_app();
+        frame(&mut app, 120, 24);
+
+        click(&mut app, 60, 5);
+        assert_eq!(app.screens.len(), 1, "the first click only moves the selection");
+        assert!(matches!(app.screens.last(), Some(Screen::Home(h)) if h.list.sel == 2));
+
+        frame(&mut app, 120, 24);
+        click_later(&mut app, 60, 5);
+        assert_eq!(app.screens.len(), 2, "the second click on the same row opens it");
+        let Some(Screen::ThreadView(v)) = app.screens.last() else {
+            panic!("expected the thread view");
+        };
+        assert_eq!(v.thread.thread_id, 3, "and it opens the row that was clicked");
+    }
+
+    /// The other way to open: a double click, which never waits for a second
+    /// frame — the second press is the gesture.
+    #[tokio::test]
+    async fn a_double_click_on_an_unselected_row_opens_it_straight_away() {
+        let mut app = home_app();
+        frame(&mut app, 120, 24);
+        // Row 3 of the list, which nothing has selected yet.
+        click(&mut app, 60, 6);
+        click(&mut app, 60, 6);
+        assert_eq!(app.screens.len(), 2, "a double click opens without a second frame");
+        let Some(Screen::ThreadView(v)) = app.screens.last() else {
+            panic!("expected the thread view");
+        };
+        assert_eq!(v.thread.thread_id, 4);
+    }
+
+    /// Right click (a long press on a phone terminal) is "open this on the
+    /// site". The URL resolution is asserted on its own rather than through
+    /// `open_url`, which spawns the user's real browser.
+    #[test]
+    fn a_right_click_on_a_thread_row_selects_it_and_resolves_its_web_url() {
+        let mut app = home_app();
+        frame(&mut app, 120, 24);
+
+        assert_eq!(
+            app.right_click_url((60, 5)),
+            Some("https://windowsforum.com/threads/3/".to_string())
+        );
+        let Some(Screen::Home(h)) = app.screens.last() else {
+            panic!("expected Home");
+        };
+        assert_eq!(h.list.sel, 2, "the row it opens is the row it selected");
+
+        // A row whose payload carried no `view_url` says so instead of
+        // silently doing nothing (the same rule `u` follows).
+        if let Some(Screen::Home(h)) = app.screens.last_mut() {
+            for t in &mut h.list.threads {
+                t.view_url = None;
+            }
+        }
+        frame(&mut app, 120, 24);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 60, 5));
+        assert_eq!(app.status, "Nothing here to open on the site.");
+    }
+
+    /// The key bar is a row of buttons: clicking a cap presses that key —
+    /// through `handle_key`, so nothing about a click bypasses the gating a
+    /// keypress goes through. The header's unread badges open the Inbox on
+    /// their own tab.
+    #[tokio::test]
+    async fn key_bar_caps_press_their_key_and_header_badges_open_their_inbox_tab() {
+        let mut app = home_app();
+        frame(&mut app, 120, 24);
+
+        let (x, y) = find_hit(&app, 120, 24, |h| h == &Hit::Key("j/k")).expect("a j/k cap");
+        assert_eq!(y, 22, "the key bar is the second row from the bottom");
+        click(&mut app, x, y);
+        let Some(Screen::Home(h)) = app.screens.last() else {
+            panic!("expected Home");
+        };
+        assert_eq!(h.tree.sel, 1, "a compound cap presses its first key: j moves down");
+
+        // `test_app` starts with 5 unread DMs and 3 unread alerts, so both
+        // badges are drawn.
+        let (x, y) = find_hit(&app, 120, 24, |h| h == &Hit::Badge(screens::InboxTab::Alerts))
+            .expect("an Alerts badge");
+        assert_eq!(y, 0, "the badges are on the header band");
+        click(&mut app, x, y);
+        let Some(Screen::Inbox(ib)) = app.screens.last() else {
+            panic!("expected the Inbox");
+        };
+        assert_eq!(ib.tab, screens::InboxTab::Alerts);
+    }
+
+    /// The thread view's three targets: a link row, an image (its caption and
+    /// the rows reserved for it), and the post card everything else in the
+    /// post belongs to.
+    #[test]
+    fn the_thread_view_maps_links_images_and_posts_and_a_click_selects_the_post() {
+        let mut app = test_app();
+        app.me = Some(User {
+            user_id: 1,
+            username: "Mike".into(),
+            ..Default::default()
+        });
+        let post = |post_id: u32, message: &str| Post {
+            post_id,
+            user_id: 7,
+            username: "kemical".into(),
+            message: message.to_string(),
+            ..Default::default()
+        };
+        let mut second = post(2, "second post");
+        second.attachments = vec![Attachment {
+            attachment_id: 5,
+            filename: "shot.png".into(),
+            content_type: "image/png".into(),
+            ..Default::default()
+        }];
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: thread(9),
+            posts: vec![post(1, "see https://example.com/a for details"), second],
+            page: 1,
+            last_page: 1,
+            ..Default::default()
+        }));
+        frame(&mut app, 80, 24);
+
+        let link = find_hit(&app, 80, 24, |h| {
+            h == &Hit::Link("https://example.com/a".to_string())
+        })
+        .expect("a link");
+        assert_eq!(
+            app.hits.post_at(link.0, link.1),
+            Some(0),
+            "the post under a link is still the post it belongs to"
+        );
+        // Both halves of a link are clickable: the ` [1]` marker beside the
+        // label in the body (four cells — the span, not the row), and the
+        // whole `[1] url` row listed under the post.
+        let link_rows: Vec<u16> = (0..24)
+            .filter(|y| (0..80).any(|x| matches!(app.hits.at(x, *y), Some(Hit::Link(_)))))
+            .collect();
+        assert!(
+            link_rows.len() >= 2,
+            "the inline marker and the link row: {link_rows:?}"
+        );
+        let marker: Vec<u16> = (0..80)
+            .filter(|x| matches!(app.hits.at(*x, link_rows[0]), Some(Hit::Link(_))))
+            .collect();
+        assert_eq!(
+            marker.len(),
+            3,
+            "the inline marker is the `[1]` span, not the whole row"
+        );
+        let image = find_hit(&app, 80, 24, |h| h == &Hit::Image(1)).expect("an image caption");
+        assert_eq!(app.hits.post_at(image.0, image.1), Some(1));
+
+        // A click on a post body selects that post and invalidates the
+        // cached width, which is what `n`/`N` do (issue #542).
+        let (x, y) = find_hit(&app, 80, 24, |h| h == &Hit::Post(1)).expect("the second post");
+        click(&mut app, x, y);
+        let Some(Screen::ThreadView(v)) = app.screens.last() else {
+            panic!("expected the thread view");
+        };
+        assert_eq!(v.sel_post, 1);
+        assert_eq!(v.width, 0, "the gutter colour is baked in, so the lines must rebuild");
+    }
+
+    /// The Inbox: its tab chips switch tabs in place, and its rows are two
+    /// lines each on the conversations tab.
+    #[test]
+    fn inbox_tab_chips_switch_tabs_and_two_line_rows_map_both_of_their_lines() {
+        let mut app = test_app();
+        app.me = Some(User {
+            user_id: 1,
+            username: "Mike".into(),
+            ..Default::default()
+        });
+        app.screens.push(Screen::Inbox(screens::InboxState {
+            convos: screens::ConversationsState {
+                conversations: (1..=3)
+                    .map(|conversation_id| Conversation {
+                        conversation_id,
+                        title: format!("DM {conversation_id}"),
+                        ..Default::default()
+                    })
+                    .collect(),
+                page: 1,
+                last_page: 1,
+                ..Default::default()
+            },
+            alerts: screens::AlertsState {
+                alerts: (1..=3)
+                    .map(|alert_id| Alert {
+                        alert_id,
+                        username: "kemical".into(),
+                        content_type: "post".into(),
+                        action: "quote".into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        frame(&mut app, 120, 24);
+
+        // Inner x 1, tabs on row 2, rows from row 4 — two lines each.
+        assert_eq!(app.hits.at(10, 4), Some(&Hit::Row(0)));
+        assert_eq!(app.hits.at(10, 5), Some(&Hit::Row(0)), "the meta line is the row");
+        assert_eq!(app.hits.at(10, 6), Some(&Hit::Row(1)));
+
+        let (x, y) = find_hit(&app, 120, 24, |h| h == &Hit::Tab(screens::InboxTab::Alerts))
+            .expect("an Alerts chip");
+        assert_eq!(y, 2, "the tab row is the panel's first inner row");
+        click(&mut app, x, y);
+        assert!(matches!(app.screens.last(), Some(Screen::Inbox(ib)) if ib.tab == screens::InboxTab::Alerts));
+
+        // Alerts are one line each; clicking the second selects it.
+        frame(&mut app, 120, 24);
+        assert_eq!(app.hits.at(10, 5), Some(&Hit::Row(1)));
+        click(&mut app, 10, 5);
+        let Some(Screen::Inbox(ib)) = app.screens.last() else {
+            panic!("expected the Inbox");
+        };
+        assert_eq!(ib.alerts.sel, 1);
+    }
+
+    /// Search hits are a title line plus a dim snippet line; both belong to
+    /// the hit, and a click selects it.
+    #[test]
+    fn search_hits_map_their_title_and_snippet_lines_to_one_row() {
+        let mut app = test_app();
+        app.me = Some(User {
+            user_id: 1,
+            username: "Mike".into(),
+            ..Default::default()
+        });
+        let mut search = screens::SearchState {
+            query: "edge".into(),
+            page: 1,
+            last_page: 1,
+            ..Default::default()
+        };
+        search.set_results(
+            (1..=3)
+                .map(|content_id| SearchHit {
+                    content_type: "thread".into(),
+                    content_id,
+                    title: format!("Hit {content_id}"),
+                    message: "a body long enough to make a snippet".into(),
+                    ..Default::default()
+                })
+                .collect(),
+        );
+        app.screens.push(Screen::Search(search));
+        frame(&mut app, 80, 24);
+
+        // Panel inner y 2: query, chips, rule, count, blank, then results.
+        assert_eq!(app.hits.at(10, 7), Some(&Hit::Row(0)));
+        assert_eq!(app.hits.at(10, 8), Some(&Hit::Row(0)), "the snippet is the row");
+        assert_eq!(app.hits.at(10, 9), Some(&Hit::Row(1)));
+        // The `/ query` row is a field, not a result.
+        assert_eq!(app.hits.at(10, 2), Some(&Hit::Field(0)));
+
+        click(&mut app, 10, 9);
+        let Some(Screen::Search(s)) = app.screens.last() else {
+            panic!("expected Search");
+        };
+        assert_eq!(s.sel, 1);
+    }
+
+    /// Every overlay: its rows work, a click off it closes it, and nothing
+    /// behind the glass can be reached through it.
+    #[tokio::test]
+    async fn overlay_rows_run_and_a_click_outside_closes_each_overlay() {
+        // 1. The go-to palette: its rows run, and the body under it is gone.
+        let mut app = home_app();
+        app.open_palette();
+        frame(&mut app, 120, 24);
+        assert!(
+            !matches!(app.hits.at(60, 5), Some(Hit::Row(_))),
+            "the body must not be clickable through an overlay"
+        );
+        let (x, y) = find_hit(&app, 120, 24, |h| h == &Hit::PaletteRow(0)).expect("a palette row");
+        click(&mut app, x, y);
+        assert!(app.palette.is_none(), "running a row closes the palette");
+        // Row 0 with a forum in view is "New thread in <forum>" — the click
+        // ran it, exactly as Enter on that row would have.
+        assert!(
+            matches!(
+                app.screens.last(),
+                Some(Screen::Compose(c))
+                    if matches!(c.target, Some(ComposeTarget::NewThread { node_id: 1 }))
+            ),
+            "the palette row must run its own target"
+        );
+
+        // 2. ...and a click off it just closes it.
+        let mut app = home_app();
+        app.open_palette();
+        frame(&mut app, 120, 24);
+        let (x, y) = find_hit(&app, 120, 24, |h| h == &Hit::CloseOverlay).expect("an outside cell");
+        click(&mut app, x, y);
+        assert!(app.palette.is_none(), "a click outside closes the palette");
+
+        // 3. The keys card.
+        app.show_help = true;
+        frame(&mut app, 120, 24);
+        let (x, y) = find_hit(&app, 120, 24, |h| h == &Hit::CloseOverlay).expect("an outside cell");
+        click(&mut app, x, y);
+        assert!(!app.show_help, "a click outside closes the keys card");
+
+        // 4. The `g` which-key.
+        app.prefix.arm();
+        frame(&mut app, 120, 24);
+        let (x, y) = find_hit(&app, 120, 24, |h| h == &Hit::CloseOverlay).expect("an outside cell");
+        click(&mut app, x, y);
+        assert!(!app.prefix.armed(), "a click outside cancels the chord");
+
+        // 5. The thread view's link popup, which is the screen's own overlay.
+        let mut app = test_app();
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: thread(9),
+            posts: vec![Post {
+                post_id: 1,
+                username: "kemical".into(),
+                message: "see https://example.com/a".into(),
+                ..Default::default()
+            }],
+            page: 1,
+            last_page: 1,
+            link_popup: true,
+            ..Default::default()
+        }));
+        frame(&mut app, 80, 24);
+        let (x, y) = find_hit(&app, 80, 24, |h| h == &Hit::CloseOverlay).expect("an outside cell");
+        click(&mut app, x, y);
+        assert!(
+            matches!(app.screens.last(), Some(Screen::ThreadView(v)) if !v.link_popup),
+            "a click off the link popup closes it"
+        );
+    }
+
+    /// The whole click-vs-drag rule: press and release in one cell is a
+    /// click; anything that moves stays the drag-selection it always was.
+    #[test]
+    fn a_press_and_release_in_one_cell_is_a_click_and_any_movement_is_a_drag() {
+        let mut app = home_app();
+        frame(&mut app, 120, 24);
+
+        // A drag across the list must not select a row — it is a selection.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 60, 5));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 63, 5));
+        assert!(app.selection.is_some(), "a drag paints a selection band");
+        // Released over a blank run of the title column, so nothing reaches
+        // the clipboard: this test must never write the developer's own.
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 63, 5));
+        assert!(app.selection.is_none(), "the band is consumed on release");
+        assert!(
+            !app.status.starts_with("Copied"),
+            "the drag covered blank cells, so nothing should have been copied: {}",
+            app.status
+        );
+        let Some(Screen::Home(h)) = app.screens.last() else {
+            panic!("expected Home");
+        };
+        assert_eq!(h.list.sel, 0, "a drag is not a click: the row must not move");
+        assert_eq!(h.focus, screens::Pane::Tree, "and it must not steal the keyboard");
+
+        // The same cell, without the movement between press and release, is
+        // a click. (A moment later: two presses in one cell inside the
+        // 400 ms window would be the double-click "open" instead.)
+        click_later(&mut app, 60, 5);
+        let Some(Screen::Home(h)) = app.screens.last() else {
+            panic!("expected Home");
+        };
+        assert_eq!(h.list.sel, 2);
+    }
+
+    /// A click in a composer puts the caret where the pointer is, measured
+    /// in cells through the same visual-row model that drew it: on a wrapped
+    /// row, and after a double-width character.
+    #[test]
+    fn a_click_in_the_composer_places_the_caret_on_a_wrapped_row_and_after_a_cjk_character() {
+        let mut app = test_app();
+        let body = "one two three four five six seven eight nine ten eleven twelve thirteen"
+            .to_string();
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 9,
+                thread_title: "A thread".into(),
+            }),
+            body: body.clone(),
+            ..Default::default()
+        }));
+        frame(&mut app, 40, 24);
+
+        let (rect, width) = match app.screens.last() {
+            Some(Screen::Compose(c)) => (c.body_rect, c.body_width as usize),
+            _ => panic!("expected the composer"),
+        };
+        assert!(rect.height > 1 && width > 0, "the body pane must be on screen");
+        assert_eq!(app.hits.at(rect.x + 4, rect.y + 1), Some(&Hit::Field(1)));
+
+        // Second visual row, five cells in: the caret must land on exactly
+        // that cell of that row when measured back the way it is drawn.
+        click(&mut app, rect.x + 5, rect.y + 1);
+        let Some(Screen::Compose(c)) = app.screens.last() else {
+            panic!("expected the composer");
+        };
+        assert_eq!(
+            crate::editor::caret_position(&body, width, c.body_cursor),
+            (1, 5),
+            "the caret must land on the clicked cell of the clicked row"
+        );
+
+        // CJK: two cells per character, so column 4 is after the second one.
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "\u{6f22}\u{5b57}\u{30c6}\u{30b9}\u{30c8}".into();
+            c.body_cursor = 0;
+        }
+        frame(&mut app, 40, 24);
+        click(&mut app, rect.x + 4, rect.y);
+        let Some(Screen::Compose(c)) = app.screens.last() else {
+            panic!("expected the composer");
+        };
+        assert_eq!(
+            c.body_cursor, 2,
+            "column 4 is two ideographs in, not four characters in"
+        );
+    }
+
+    /// The composer's BBCode caps are buttons too: clicking one runs the
+    /// same chord the cap names, through `handle_key`.
+    #[test]
+    fn clicking_a_bbcode_cap_wraps_the_draft_the_way_the_chord_does() {
+        let mut app = test_app();
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 9,
+                thread_title: "A thread".into(),
+            }),
+            ..Default::default()
+        }));
+        frame(&mut app, 80, 24);
+
+        let (x, y) = find_hit(&app, 80, 24, |h| h == &Hit::Cap("^B")).expect("a bold cap");
+        click(&mut app, x, y);
+        let Some(Screen::Compose(c)) = app.screens.last() else {
+            panic!("expected the composer");
+        };
+        assert_eq!(c.body, "[B][/B]");
+        assert_eq!(c.body_cursor, 3, "the caret lands between the tags");
+    }
+
+    /// `WFTUI_MOUSE=0`: nothing captures the mouse, so the client registers
+    /// no hits and ignores anything that arrives anyway. (The env var itself
+    /// is pinned by `common::config::tests::mouse_is_on_unless_the_env_turns_it_off`;
+    /// the map is process-local, so this test sets it directly rather than
+    /// racing every other test for the env lock.)
+    #[test]
+    fn with_the_mouse_disabled_nothing_is_registered_and_no_event_acts() {
+        let mut app = home_app();
+        app.hits = HitMap::new(false);
+        frame(&mut app, 120, 24);
+        assert_eq!(app.hits.count(), 0, "a disabled map registers nothing");
+
+        click(&mut app, 60, 5);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 60, 5));
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 60, 5));
+        let Some(Screen::Home(h)) = app.screens.last() else {
+            panic!("expected Home");
+        };
+        assert_eq!((h.list.sel, h.tree.sel), (0, 0), "no event may act");
+        assert_eq!(h.focus, screens::Pane::Tree);
+        assert!(app.selection.is_none(), "and no selection band is started");
     }
 }

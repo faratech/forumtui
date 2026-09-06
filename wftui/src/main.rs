@@ -9,6 +9,7 @@ pub mod chrome;
 pub mod editor;
 mod event;
 pub mod glyph;
+pub mod hit;
 pub mod images;
 mod overlay;
 mod screens;

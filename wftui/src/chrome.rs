@@ -164,6 +164,33 @@ pub fn header_line(
     online: Option<u32>,
     width: u16,
 ) -> Line<'static> {
+    header_line_hits(theme, g, crumbs, user, inbox, alerts, online, width).0
+}
+
+/// Where a header badge was drawn: `Inbox 2` / `Alerts 5` including their
+/// labels, so the whole segment is the click target rather than the two
+/// digits inside it (a badge is a 3-cell chip; a finger is not).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BadgeHit {
+    pub x: u16,
+    pub width: u16,
+    pub tab: crate::screens::InboxTab,
+}
+
+/// [`header_line`] plus the badges' cell ranges, for the frame's hit map.
+/// One function builds both so the row and the hit boxes can never disagree
+/// about where the overflow ladder left them.
+#[allow(clippy::too_many_arguments)]
+pub fn header_line_hits(
+    theme: &Theme,
+    g: &Glyphs,
+    crumbs: &[String],
+    user: Option<&str>,
+    inbox: u32,
+    alerts: u32,
+    online: Option<u32>,
+    width: u16,
+) -> (Line<'static>, Vec<BadgeHit>) {
     let w = width as usize;
     let brand = brand_spans(theme);
     let brand_w = spans_width(&brand);
@@ -174,12 +201,12 @@ pub fn header_line(
         LEAD + brand_w + crumbs_width(g, crumbs) + right_w + GAP
     };
 
-    let mut right = right_spans(theme, user, inbox, alerts, online);
+    let (mut right, mut marks) = right_spans(theme, user, inbox, alerts, online);
     let mut crumbs: Vec<String> = crumbs.to_vec();
 
     // Rung 1: the online count is the least load-bearing thing on the row.
     if needed(&crumbs, spans_width(&right)) > w && online.is_some() {
-        right = right_spans(theme, user, inbox, alerts, None);
+        (right, marks) = right_spans(theme, user, inbox, alerts, None);
     }
     // Rung 2: the path's middle is inferable; its ends are not.
     if needed(&crumbs, spans_width(&right)) > w && crumbs.len() > 2 {
@@ -217,11 +244,31 @@ pub fn header_line(
 
     let used = spans_width(&spans);
     let right_w = spans_width(&right);
+    let mut badges: Vec<BadgeHit> = Vec::new();
     // `<=`, not `<`: rung 3 sizes the last crumb so the row lands exactly on
     // the width, and a strict `<` would then throw the whole right side away.
     if used + right_w <= w {
         spans.push(Span::styled(" ".repeat(w - used - right_w), theme.chrome()));
+        let right_start = spans.len();
+        let right_x = w - right_w;
         spans.extend(right);
+        // Cell ranges, measured off the spans that were actually pushed —
+        // never a second guess at the layout.
+        for (from, to, tab) in marks {
+            let before: usize = spans[right_start..right_start + from]
+                .iter()
+                .map(Span::width)
+                .sum();
+            let seg: usize = spans[right_start + from..right_start + to]
+                .iter()
+                .map(Span::width)
+                .sum();
+            badges.push(BadgeHit {
+                x: (right_x + before) as u16,
+                width: seg as u16,
+                tab,
+            });
+        }
     } else {
         // No room for the right side at all: the path wins.
         spans = clip_spans(spans, w);
@@ -230,7 +277,7 @@ pub fn header_line(
             spans.push(Span::styled(" ".repeat(w - used), theme.chrome()));
         }
     }
-    Line::from(clip_spans(spans, w))
+    (Line::from(clip_spans(spans, w)), badges)
 }
 
 fn brand_spans(theme: &Theme) -> Vec<Span<'static>> {
@@ -254,20 +301,29 @@ fn mark_spans(theme: &Theme) -> Vec<Span<'static>> {
     )]
 }
 
+/// The right side of the header, plus `(first span, last span + 1, tab)` for
+/// each counter — what [`header_line_hits`] turns into cell ranges once the
+/// row's padding is known.
 fn right_spans(
     theme: &Theme,
     user: Option<&str>,
     inbox: u32,
     alerts: u32,
     online: Option<u32>,
-) -> Vec<Span<'static>> {
+) -> (Vec<Span<'static>>, Vec<(usize, usize, crate::screens::InboxTab)>) {
+    use crate::screens::InboxTab;
     let mut spans = Vec::new();
+    let mut marks = Vec::new();
     match user {
         // Signed in: name plus the Inbox/Alerts badges.
         Some(u) => {
             spans.push(Span::styled(u.to_string(), theme.chrome_bold()));
+            let from = spans.len();
             spans.extend(counter(theme, "Inbox", inbox));
+            marks.push((from, spans.len(), InboxTab::Conversations));
+            let from = spans.len();
             spans.extend(counter(theme, "Alerts", alerts));
+            marks.push((from, spans.len(), InboxTab::Alerts));
         }
         // Logged out (no stored session, or one that just ended): say so
         // explicitly rather than leaving a blank where the member's name
@@ -286,7 +342,7 @@ fn right_spans(
         ));
     }
     spans.push(Span::styled(" ", theme.chrome()));
-    spans
+    (spans, marks)
 }
 
 /// `Inbox [2]` with a badge only when the count is > 0; `Inbox 0` in chrome_dim
@@ -309,23 +365,46 @@ fn counter(theme: &Theme, label: &str, n: u32) -> Vec<Span<'static>> {
 /// still clipped with `…` from the right as a last resort; the leftmost hints
 /// are the most used, so losing the tail is the cheap loss.
 pub fn key_bar(theme: &Theme, hints: &Hints, width: u16) -> Line<'static> {
+    key_bar_hits(theme, hints, width).0
+}
+
+/// Where a key cap was drawn, and which key it stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapHit {
+    pub x: u16,
+    pub width: u16,
+    pub key: &'static str,
+}
+
+/// [`key_bar`] plus each cap's cell range, for the frame's hit map. Caps the
+/// `…` clip cut off are left out: half a cap is not a target.
+pub fn key_bar_hits(theme: &Theme, hints: &Hints, width: u16) -> (Line<'static>, Vec<CapHit>) {
     let keys = if width < NARROW_COLS && !hints.short.is_empty() {
         &hints.short
     } else {
         &hints.keys
     };
     let mut spans = vec![Span::raw(" ")];
+    let mut caps: Vec<CapHit> = Vec::with_capacity(keys.len());
     for (i, (key, desc)) in keys.iter().enumerate() {
-        spans.push(keycap(theme, key, i == hints.primary));
+        let x = spans_width(&spans);
+        let cap = keycap(theme, key, i == hints.primary);
+        caps.push(CapHit {
+            x: x as u16,
+            width: cap.width() as u16,
+            key,
+        });
+        spans.push(cap);
         spans.push(Span::styled(format!(" {desc}  "), theme.dim()));
     }
     let w = width as usize;
     if spans_width(&spans) > w {
         let mut clipped = clip_spans(spans, w.saturating_sub(1));
         clipped.push(Span::styled(ELLIPSIS.to_string(), theme.dim()));
-        return Line::from(clipped);
+        caps.retain(|c| (c.x + c.width) as usize <= w.saturating_sub(1));
+        return (Line::from(clipped), caps);
     }
-    Line::from(spans)
+    (Line::from(spans), caps)
 }
 
 // -------------------------------------------------------------- status line

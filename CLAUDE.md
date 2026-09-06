@@ -11,7 +11,7 @@ deployed.
 ```bash
 cd /web/wftui_app
 cargo build --release                 # release binary
-cargo test --workspace                # unit + wiremock (321 tests; 318 with --no-default-features)
+cargo test --workspace                # unit + wiremock (394 tests; 391 with --no-default-features)
 cargo clippy --all-targets --release -- -D warnings   # gate — must stay at 0
 cp target/release/wftui bin/wftui     # stable artifact location
 cp bin/wftui /usr/local/bin/wftui     # deploy on the server (also on PATH)
@@ -55,10 +55,12 @@ Two-crate workspace (house style from `services/mirror`: resolver 2, edition
   - `osc.rs` — OSC 8 hyperlinks + OSC 52 clipboard, with tmux DCS passthrough.
   - `config.rs` — constants + `WFTUI_*` env overrides (`WFTUI_BASE_URL`,
     `WFTUI_OAUTH_CLIENT_ID`, `WFTUI_CONFIG_DIR`, `WFTUI_LOG`).
-- `wftui/` — the binary: `app.rs` (event loop, message pump, mouse selection),
-  `event.rs` (dedicated blocking reader thread), `theme.rs`,
-  `images.rs` (graphics tiers, sizing, LRU + `cache/img/` disk cache),
-  `screens/` (browse/social/misc renderers + key handlers).
+- `wftui/` — the binary: `app.rs` (event loop, message pump, mouse/touch
+  handling and selection), `event.rs` (dedicated blocking reader thread),
+  `theme.rs`, `hit.rs` (the per-frame hit map every renderer registers into —
+  see "Mouse and touch" below), `images.rs` (graphics tiers, sizing, LRU +
+  `cache/img/` disk cache), `screens/` (browse/social/misc renderers + key
+  handlers).
 
 ## Hard rules (each closes a real bug — do not regress)
 
@@ -86,6 +88,43 @@ Two-crate workspace (house style from `services/mirror`: resolver 2, edition
    with all visitors and the gate constants mirror XF's own flood checks
    (30s posts / 180s threads).
 
+## Mouse and touch
+
+Terminals deliver touch as mouse events — a tap is a left click, a two-finger
+scroll is a wheel, a long press is a right click on most mobile terminals — so
+there is exactly ONE hit-testing layer (`wftui/src/hit.rs`) and pointers and
+fingers both go through it.
+
+`App::draw` clears a `HitMap` at the top of every frame; each renderer
+registers `Rect -> Hit` entries as it draws (`Hit::Row`, `Key`, `Badge`, `Tab`,
+`Pane`, `Link`, `Image`, `Field`, `Cap`, `PaletteRow`, `CloseOverlay`, `Post`),
+and `handle_mouse` resolves the pointer cell against it. Rules that are
+load-bearing:
+
+- **Last registered wins.** An app overlay (palette / `?` card / `g` which-key)
+  clears the map before it draws, so nothing behind the glass is clickable;
+  the header and key bar are registered last, so they stay live under one.
+- **Indices are screen-local.** `Hit::Row(2)` means row 2 of whichever pane the
+  pointer is in — `Hit::Pane` is registered under every pane's contents, and a
+  click focuses that pane (issue #549's rects) *before* the index is used.
+- **Click vs drag.** Press and release in the same cell (with the band never
+  leaving it) is a click; anything that moves is the drag-selection it always
+  was, and double/triple click still means word/line select on text (a post
+  body, a pane's background). On a UI target the second press means "open".
+- **Anything with a key is done through `handle_key`.** A key cap, a BBCode
+  cap, a QUICK row, a which-key cell and an image digit all synthesize their
+  keypress, so every gate a keypress passes (busy composer, sign-in gate,
+  write gate, armed chord) applies to the click too. Never duplicate a
+  handler in `click_hit`.
+- Rows: click selects, clicking the already-selected row (or a double click)
+  opens it; **right click / long press opens it on the site** (`Screen::web_url`).
+- List hits are registered from `ListState::offset()` read back **after** the
+  widget rendered — that is when it has scrolled the offset to the selection.
+- `WFTUI_MOUSE=0` (also `off`/`false`/`no`) skips `EnableMouseCapture` entirely
+  and leaves the hit map disabled, so every gesture and the terminal's own
+  scrollback belong to the terminal — the permanent form of `Shift+drag`,
+  which still borrows one drag back for a native selection.
+
 ## Login flow (works over SSH, no copy-paste)
 
 1. No token at start → `begin_login` registers a PKCE challenge+state and
@@ -110,7 +149,7 @@ runs the client**:
 
 ```tmux
 set -g allow-passthrough on    # tmux >= 3.3 — deliver app OSC 52/8 to the outer terminal
-set -g mouse on                # forward mouse events to the TUI (drag-select, wheel)
+set -g mouse on                # forward mouse events to the TUI (click, drag-select, wheel)
 ```
 
 ## Testing without touching production
@@ -209,6 +248,6 @@ restore from the leaked thread can never be the last word on the exit state.
   text placeholder until upload is wired up (`resolve_image` already handles
   it, and is tested). Enter-to-expand is not implemented: it needs a second, larger
   encode inside an overlay, and overlays deliberately suppress image draws.
-- Double-click word-select / triple-click line-select not implemented (drag +
-  release = copy is).
+- Search's chip row (All/Threads/Posts, Latest/Relevance) is keyboard-only:
+  the chips are drawn but register no hit, so `t`/`o` are the way to flip them.
 - Windows packaging is documentation-only (native build; no CI).
