@@ -1395,11 +1395,7 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
                 // A typed query is a real keyword search: this screen stops
                 // being a member's content list (issue #548).
                 s.member = None;
-                let ct = match s.content_type {
-                    1 => Some("thread".into()),
-                    2 => Some("post".into()),
-                    _ => None,
-                };
+                let ct = content_type_param(s.content_type).map(str::to_string);
                 let ord = match s.order {
                     1 => Some("relevance".into()),
                     _ => Some("date".into()),
@@ -1528,16 +1524,12 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
                         page: 1,
                     };
                 }
-                s.content_type = (s.content_type + 1) % 3;
+                s.content_type = (s.content_type + 1) % 5;
                 let q = s.query.trim().to_string();
                 let a = s.author.trim().to_string();
                 if !q.is_empty() || !a.is_empty() {
                     s.loading = true;
-                    let ct = match s.content_type {
-                        1 => Some("thread".into()),
-                        2 => Some("post".into()),
-                        _ => None,
-                    };
+                    let ct = content_type_param(s.content_type).map(str::to_string);
                     let ord = match s.order {
                         1 => Some("relevance".into()),
                         _ => Some("date".into()),
@@ -1567,11 +1559,7 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
                 let a = s.author.trim().to_string();
                 if !q.is_empty() || !a.is_empty() {
                     s.loading = true;
-                    let ct = match s.content_type {
-                        1 => Some("thread".into()),
-                        2 => Some("post".into()),
-                        _ => None,
-                    };
+                    let ct = content_type_param(s.content_type).map(str::to_string);
                     let ord = match s.order {
                         1 => Some("relevance".into()),
                         _ => Some("date".into()),
@@ -1624,11 +1612,7 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
                             page: s.page - 1,
                         };
                     }
-                    let ct = match s.content_type {
-                        1 => Some("thread".into()),
-                        2 => Some("post".into()),
-                        _ => None,
-                    };
+                    let ct = content_type_param(s.content_type).map(str::to_string);
                     let ord = match s.order {
                         1 => Some("relevance".into()),
                         _ => Some("date".into()),
@@ -1659,11 +1643,7 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
                             page: s.page + 1,
                         };
                     }
-                    let ct = match s.content_type {
-                        1 => Some("thread".into()),
-                        2 => Some("post".into()),
-                        _ => None,
-                    };
+                    let ct = content_type_param(s.content_type).map(str::to_string);
                     let ord = match s.order {
                         1 => Some("relevance".into()),
                         _ => Some("date".into()),
@@ -1758,6 +1738,19 @@ pub fn search_hints(s: &super::SearchState) -> Hints {
         }
         keys.push(("Esc", "back"));
         Hints::new(&keys, 0)
+    }
+}
+
+/// The `search_type` the wire API expects for each chip position
+/// (#673): 0 = all types, 1 = threads, 2 = posts, 3 = Media Gallery
+/// items (`xfmg_media`), 4 = Resource Manager entries (`resource`).
+pub(crate) fn content_type_param(ct: u8) -> Option<&'static str> {
+    match ct {
+        1 => Some("thread"),
+        2 => Some("post"),
+        3 => Some("xfmg_media"),
+        4 => Some("resource"),
+        _ => None,
     }
 }
 
@@ -1996,7 +1989,7 @@ fn search_chip_hint(s: &super::SearchState) -> &'static str {
 /// chip in accent_bg (`chrome::chip_active`), the mode hint dim on the right.
 fn render_chip_row(s: &super::SearchState, f: &mut Frame, area: Rect, theme: &Theme) {
     let mut spans = Vec::new();
-    for (i, label) in ["All", "Threads", "Posts"].into_iter().enumerate() {
+    for (i, label) in ["All", "Threads", "Posts", "Media", "Resources"].into_iter().enumerate() {
         spans.push(if s.content_type == i as u8 {
             chrome::chip_active(theme, label)
         } else {
@@ -3059,6 +3052,49 @@ mod tests {
         let initial_order = s.order;
         search_key(&mut s, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
         assert_eq!(s.order, 1 - initial_order);
+    }
+
+    /// #673: the type cycler targets the Media Gallery (`xfmg_media`) and
+    /// the Resource Manager (`resource`) in addition to threads and posts,
+    /// and every firing key maps the chip position to the wire
+    /// `search_type` the server's searchers answer to.
+    #[test]
+    fn the_type_cycler_reaches_media_and_resources() {
+        let mut s = crate::screens::SearchState {
+            query: "edge".into(),
+            ..Default::default()
+        };
+        let t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE);
+
+        let act = search_key(&mut s, t);
+        assert!(
+            matches!(&act, Action::RunSearchQuery(q) if q.content_type.as_deref() == Some("thread")),
+            "chip 1 is threads"
+        );
+        s.loading = false;
+        let act = search_key(&mut s, t);
+        assert!(
+            matches!(&act, Action::RunSearchQuery(q) if q.content_type.as_deref() == Some("post")),
+            "chip 2 is posts"
+        );
+        s.loading = false;
+        let act = search_key(&mut s, t);
+        assert!(
+            matches!(&act, Action::RunSearchQuery(q) if q.content_type.as_deref() == Some("xfmg_media")),
+            "chip 3 is Media Gallery items"
+        );
+        s.loading = false;
+        let act = search_key(&mut s, t);
+        assert!(
+            matches!(&act, Action::RunSearchQuery(q) if q.content_type.as_deref() == Some("resource")),
+            "chip 4 is Resource Manager entries"
+        );
+        s.loading = false;
+        let act = search_key(&mut s, t);
+        assert!(
+            matches!(&act, Action::RunSearchQuery(q) if q.content_type.is_none()),
+            "chip 5 wraps back to all types"
+        );
     }
 
     /// Issue #548: a Search screen opened from a profile (`t`/`p`) is showing

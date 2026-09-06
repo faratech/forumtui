@@ -748,6 +748,39 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             emit_text(&mut out, raw_tag, style.clone(), &mut link_label);
                         }
                     }
+                    // XFMG's gallery embed (#672): `[GALLERY=media, <id>]`
+                    // with an optional caption body — 29 live posts, mostly
+                    // news reference lists. Renders as the caption (or a
+                    // placeholder) linked to the media item's page, the
+                    // same placeholder-plus-link treatment [MEDIA] gets.
+                    "gallery" => {
+                        if let Some((inner, close_len)) = misses.split(src, rest, "gallery") {
+                            let st = style.clone();
+                            let value = value.as_deref().map(strip_quotes).unwrap_or("");
+                            let id = value
+                                .split(',')
+                                .nth(1)
+                                .map(str::trim)
+                                .filter(|id| !id.is_empty());
+                            let url =
+                                id.map(|id| format!("https://windowsforum.com/media/{id}/"));
+                            if let Some(url) = url {
+                                let caption = inner.trim();
+                                let label = if caption.is_empty() {
+                                    "[gallery media]".to_string()
+                                } else {
+                                    decode_html_entities(caption)
+                                };
+                                flush_before_chunk(&mut out, &mut link_label, &style);
+                                out.push(Chunk::Link(label, url, st));
+                                rest = &rest[close_len..];
+                            } else {
+                                emit_text(&mut out, raw_tag, style.clone(), &mut link_label);
+                            }
+                        } else {
+                            emit_text(&mut out, raw_tag, style.clone(), &mut link_label);
+                        }
+                    }
                     "attach" => {
                         if let Some((inner, close_len)) = misses.split(src, rest, "attach") {
                             let st = style.clone();
@@ -1597,6 +1630,44 @@ mod tests {
             }
             other => panic!("expected the image, got {other:?}"),
         }
+    }
+
+    /// #672: XFMG gallery embeds (`[GALLERY=media, <id>]<caption>
+    /// [/GALLERY]`, 29 live posts) render as the caption linked to the
+    /// media item's page, with a placeholder label when there is no
+    /// caption — and degrade to literal text without a close tag, like
+    /// every other framed tag.
+    #[test]
+    fn gallery_embed_links_the_media_item() {
+        let captioned = render(
+            "[GALLERY=media, 33005]Windows Registry Explained: Hives[/GALLERY]",
+        );
+        match &captioned[0] {
+            Chunk::Link(label, url, _) => {
+                assert_eq!(
+                    label,
+                    "Windows Registry Explained: Hives",
+                    "the caption is the label"
+                );
+                assert_eq!(url, "https://windowsforum.com/media/33005/");
+            }
+            other => panic!("expected a link, got {other:?}"),
+        }
+
+        let bare = render("before [GALLERY=media, 759][/GALLERY] after");
+        match &bare[1] {
+            Chunk::Link(label, url, _) => {
+                assert_eq!(label, "[gallery media]", "no caption: placeholder");
+                assert_eq!(url, "https://windowsforum.com/media/759/");
+            }
+            other => panic!("expected a link, got {other:?}"),
+        }
+        let text = texts(&bare).concat();
+        assert!(text.contains("before") && text.contains("after"));
+
+        // No close tag: literal, like every other framed tag.
+        let open = texts(&render("see [GALLERY=media, 1] here")).concat();
+        assert!(open.contains("[GALLERY=media, 1]"), "{open:?}");
     }
 
     /// #610: the news template writes `[HR][/HR]` before every heading; the
