@@ -1,6 +1,10 @@
-//! Shared HTTP client construction. One client per process: reqwest pools
-//! connections, and a single pool keeps us inside Cloudflare's connection
-//! expectations rather than opening a fresh TLS session per call.
+//! Shared HTTP client construction. `build()` bakes in the UA and timeouts
+//! every caller must use; the pool it hands back is what steady-state traffic
+//! rides. In practice the long-lived client is the `WfApiClient`'s — one
+//! pooled client keeps us inside Cloudflare's connection expectations rather
+//! than opening a fresh TLS session per call — but the process is not limited
+//! to exactly one: the login flow and the logout revokes build short-lived
+//! clients of their own, deliberately outside the session's pool (#661).
 
 use crate::config;
 use crate::error::Result;

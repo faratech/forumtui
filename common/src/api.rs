@@ -970,14 +970,36 @@ mod tests {
     struct EnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         dir: std::path::PathBuf,
+        /// The process's prior env, restored on drop — set back or removed,
+        /// never left pointing at the deleted fixture dir (logging.rs's
+        /// documented "restored, never removed" policy; #660).
+        prior: [(String, Option<String>); 3],
     }
 
     impl EnvGuard {
         fn hold(base: &str, dir: &str) -> Self {
             let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // Pid-suffix the fixture dir, like the app crate's tests do:
+            // two test binaries running `cargo test --workspace` must not
+            // share — or delete each other's — fixtures (#660).
+            let dir = format!("{dir}-{}", std::process::id());
+            let prior = [
+                (
+                    "WFTUI_BASE_URL".to_string(),
+                    std::env::var("WFTUI_BASE_URL").ok(),
+                ),
+                (
+                    "WFTUI_OAUTH_CLIENT_ID".to_string(),
+                    std::env::var("WFTUI_OAUTH_CLIENT_ID").ok(),
+                ),
+                (
+                    "WFTUI_CONFIG_DIR".to_string(),
+                    std::env::var("WFTUI_CONFIG_DIR").ok(),
+                ),
+            ];
             unsafe { std::env::set_var("WFTUI_BASE_URL", base) };
             unsafe { std::env::set_var("WFTUI_OAUTH_CLIENT_ID", "test-client") };
-            unsafe { std::env::set_var("WFTUI_CONFIG_DIR", dir) };
+            unsafe { std::env::set_var("WFTUI_CONFIG_DIR", &dir) };
             // The whole point of the guard: from here on, every path this
             // process resolves must be inside the fixture dir. Asserting it
             // *before* any client is built (and so before any `save()`) is
@@ -987,24 +1009,32 @@ mod tests {
             // exactly that happened and destroyed the operator's session.
             let path = config::token_path();
             assert!(
-                path.starts_with(dir),
+                path.starts_with(&dir),
                 "token store escaped the fixture dir: {path:?} is not under {dir}"
             );
             assert!(
                 !path.starts_with(config::default_config_root()),
                 "a test resolved the real config dir: {path:?}"
             );
-            let _ = std::fs::remove_dir_all(dir);
+            let _ = std::fs::remove_dir_all(&dir);
             EnvGuard {
                 _lock: lock,
-                dir: std::path::PathBuf::from(dir),
+                dir: std::path::PathBuf::from(&dir),
+                prior,
             }
         }
     }
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            unsafe { std::env::remove_var("WFTUI_BASE_URL") };
+            // Restore (set back or remove) — the variable is never just
+            // dropped on the floor pointing at a deleted fixture dir (#660).
+            for (name, value) in &self.prior {
+                match value {
+                    Some(v) => unsafe { std::env::set_var(name, v) },
+                    None => unsafe { std::env::remove_var(name) },
+                }
+            }
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
@@ -1047,13 +1077,16 @@ mod tests {
         let real = config::default_config_root();
         let dir = "/tmp/wftui-t-guard";
         {
-            let _env = EnvGuard::hold("http://127.0.0.1:1", dir);
+            let env = EnvGuard::hold("http://127.0.0.1:1", dir);
+            // `hold` pid-suffixes the fixture dir (#660); compare against
+            // the dir it actually created.
+            let dir = env.dir.to_string_lossy().to_string();
             for path in [config::token_path(), config::log_path()] {
-                assert!(path.starts_with(dir), "escaped the scratch dir: {path:?}");
+                assert!(path.starts_with(&dir), "escaped the scratch dir: {path:?}");
                 assert!(!path.starts_with(&real), "resolved the real config dir: {path:?}");
             }
             let c = WfApiClient::new().unwrap();
-            assert!(c.store_path().starts_with(dir), "{:?}", c.store_path());
+            assert!(c.store_path().starts_with(&dir), "{:?}", c.store_path());
             assert_eq!(c.base_url(), "http://127.0.0.1:1");
             assert!(
                 !c.base_url().contains("windowsforum.com"),
@@ -1064,15 +1097,17 @@ mod tests {
 
         // Poisoned: the config dir is a plain FILE, so a store under it can
         // neither be read nor created. Nothing may quietly fall back to a
-        // usable (i.e. real) location.
-        let poison = "/tmp/wftui-t-guard-poison";
-        let _ = std::fs::remove_dir_all(poison);
-        let _ = std::fs::remove_file(poison);
-        std::fs::write(poison, b"poison").unwrap();
+        // usable (i.e. real) location. (`hold` pid-suffixes the fixture
+        // dir, so the poison is planted at the path it actually created.)
+        let poison_base = "/tmp/wftui-t-guard-poison";
+        let _ = std::fs::remove_dir_all(poison_base);
+        let _ = std::fs::remove_file(poison_base);
         {
-            let _env = EnvGuard::hold("http://127.0.0.1:1", poison);
+            let env = EnvGuard::hold("http://127.0.0.1:1", poison_base);
+            let _ = std::fs::remove_dir_all(&env.dir);
+            std::fs::write(&env.dir, b"poison").unwrap();
             let store = token::Store::new();
-            assert!(store.path().starts_with(poison), "{:?}", store.path());
+            assert!(store.path().starts_with(&env.dir), "{:?}", store.path());
             assert!(
                 !matches!(store.load(), Ok(Some(_))),
                 "a poisoned config dir must never yield a session"
@@ -1089,7 +1124,7 @@ mod tests {
                 "a stray save must fail loudly, not land in the real store"
             );
         }
-        let _ = std::fs::remove_file(poison);
+        let _ = std::fs::remove_file(poison_base);
     }
 
     /// Issue #557: two instances sharing one config dir rotate each other's
@@ -1434,7 +1469,8 @@ mod tests {
     async fn expired_access_token_triggers_refresh() {
         let server = MockServer::start().await;
         let dir = "/tmp/wftui-t-refresh";
-        let _env = EnvGuard::hold(&server.uri(), dir);
+        let env = EnvGuard::hold(&server.uri(), dir);
+        let dir = env.dir.to_string_lossy().to_string();
         Mock::given(method("POST"))
             .and(path("/api/oauth2/token"))
             .and(wiremock::matchers::body_string_contains(
@@ -1489,7 +1525,8 @@ mod tests {
         // A prior run's blocker file survives `EnvGuard`'s `remove_dir_all`
         // (that call no-ops on a plain file), so clear it explicitly first.
         let _ = std::fs::remove_file(dir);
-        let _env = EnvGuard::hold(&server.uri(), dir);
+        let env = EnvGuard::hold(&server.uri(), dir);
+        let dir = env.dir.to_string_lossy().to_string();
         // Exactly one refresh call: if the stranded-old-token bug returns,
         // the second `valid_token()` below retries refresh with the
         // already-consumed `refresh-1` and this expectation fails.
@@ -1520,8 +1557,8 @@ mod tests {
         // config dir with a plain file, so the next `save()`'s
         // `create_dir_all` fails deterministically (no reliance on
         // permission bits, which root ignores).
-        std::fs::remove_dir_all(dir).unwrap();
-        std::fs::write(dir, b"blocker").unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"blocker").unwrap();
 
         let token = c.valid_token().await.expect("refresh must still succeed");
         assert_eq!(token, "tok-2", "the live session must see the new token");
@@ -1559,7 +1596,8 @@ mod tests {
      {
         let server = MockServer::start().await;
         let dir = "/tmp/wftui-t-sibling-rotation";
-        let _env = EnvGuard::hold(&server.uri(), dir);
+        let env = EnvGuard::hold(&server.uri(), dir);
+        let dir = env.dir.to_string_lossy().to_string();
         // This process's refresh token is the one that gets rejected.
         Mock::given(method("POST"))
             .and(path("/api/oauth2/token"))
@@ -1625,7 +1663,8 @@ mod tests {
     async fn a_call_after_invalid_grant_with_a_foreign_token_on_disk_never_goes_out() {
         let server = MockServer::start().await;
         let dir = "/tmp/wftui-t-sibling-rotation-call-site";
-        let _env = EnvGuard::hold(&server.uri(), dir);
+        let env = EnvGuard::hold(&server.uri(), dir);
+        let dir = env.dir.to_string_lossy().to_string();
         Mock::given(method("POST"))
             .and(path("/api/oauth2/token"))
             .and(wiremock::matchers::body_string_contains("refresh_token=refresh-1"))
@@ -1674,7 +1713,8 @@ mod tests {
     async fn a_refresh_rejected_with_nothing_newer_on_disk_still_ends_the_session() {
         let server = MockServer::start().await;
         let dir = "/tmp/wftui-t-sibling-none";
-        let _env = EnvGuard::hold(&server.uri(), dir);
+        let env = EnvGuard::hold(&server.uri(), dir);
+        let dir = env.dir.to_string_lossy().to_string();
         Mock::given(method("POST"))
             .and(path("/api/oauth2/token"))
             .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({

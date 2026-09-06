@@ -822,7 +822,7 @@ mod tests {
     fn steps_and_deletes_move_whole_grapheme_clusters() {
         // ☝️ = U+261D U+FE0F: two chars, one cluster.
         let seq = "\u{261d}\u{fe0f}";
-        let mut s = format!("{seq}ok");
+        let s = format!("{seq}ok");
         let mut c = 0usize;
         move_right(&s, &mut c);
         assert_eq!(c, 2, "Right steps the whole presentation sequence");

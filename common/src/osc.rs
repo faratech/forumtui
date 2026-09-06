@@ -407,6 +407,11 @@ mod tests {
 
     #[test]
     fn terminal_title_generation() {
+        // `set_title` consults TMUX/STY/TERM (detect_multiplexer). The env is
+        // process-global and sibling tests mutate it under ENV_LOCK, so this
+        // read takes the same lock — a bare read alongside a set_var is a
+        // race, not just a flake (#660).
+        let _lock = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let title_seq = set_title("wftui - Windows Forums");
         assert!(title_seq.contains("wftui - Windows Forums"));
     }
