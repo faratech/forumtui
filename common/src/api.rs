@@ -197,6 +197,13 @@ impl WfApiClient {
             return Err(Error::NoToken);
         }
         let refresh_token = existing.refresh_token.clone();
+        // The refresh POST is a second round-trip to the same origin and
+        // goes through the api_gate like every other request (#641): the
+        // caller consumed a slot for its own call, but this one is
+        // additional traffic the origin can see. The tokens lock is already
+        // held across the await by design, so this only ever delays
+        // queued token work by the gate's spacing.
+        self.api_gate.wait().await;
         let err = match oauth::refresh(&self.http, &self.base, &refresh_token).await {
             Ok(refreshed) => return Ok(self.keep_refreshed(&mut guard, refreshed)),
             Err(e) => e,
