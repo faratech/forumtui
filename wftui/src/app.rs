@@ -2905,23 +2905,22 @@ impl App {
         let client = self.client.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            // Snapshot the token set, then take it out of memory and erase
-            // the store *immediately* — before either revoke round-trip,
-            // not after both. Each revoke call can take up to CONNECT 10s +
-            // REQUEST 30s (a slow site, a CF challenge, a stalled
-            // connection — exactly the conditions under which people sign
-            // out and back in), and the old order called
-            // `client.forget_tokens()` only once that ~80s window had
-            // elapsed. A sign-in completed inside it lands its fresh tokens
-            // via `set_tokens()` first, and the late, unconditional
-            // `forget_tokens()` then took the NEW session out of memory and
-            // erased the NEW `token.json` (issue #574). Snapshotting and
-            // forgetting back-to-back, with no network call between them,
-            // closes that window: the revoke calls below use the snapshot,
-            // never the live session, so anything `set_tokens()` installs
-            // afterward survives untouched.
-            let tokens = client.token_set().await;
-            let forgotten = client.forget_tokens().await;
+            // Take the token set out of memory and erase the store *all at
+            // once*, before either revoke round-trip — `take_tokens` holds
+            // the token lock across the snapshot and the forget, so a
+            // poller's refresh rotating the grant cannot interleave between
+            // them, and the revoke calls below use the snapshot, never the
+            // live session (issue #574's window, plus the narrower one the
+            // old `token_set()` + `forget_tokens()` pair still had). Each
+            // revoke call can take up to CONNECT 10s + REQUEST 30s (a slow
+            // site, a CF challenge, a stalled connection — exactly the
+            // conditions under which people sign out and back in), and a
+            // sign-in completed inside it lands its fresh tokens via
+            // `set_tokens()` afterward, which this snapshot never touches.
+            let (tokens, forgotten) = match client.take_tokens().await {
+                Ok(tokens) => (tokens, Ok(())),
+                Err(e) => (None, Err(e)),
+            };
             // Revoke the refresh token first and the access token second,
             // each with its `token_type_hint` — the endpoint defaults to
             // `access_token`, so the old single call left the 90-day refresh

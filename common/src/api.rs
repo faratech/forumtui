@@ -143,6 +143,25 @@ impl WfApiClient {
         self.store.erase()
     }
 
+    /// Snapshot the token set and end the local session in one atomic step:
+    /// the in-memory grant is taken and the store erased while the token
+    /// mutex is still held. Logout needs both — the snapshot so it can revoke
+    /// (it needs the refresh token, not just the bearer), and the forget so
+    /// nothing live survives locally — and `token_set()` + `forget_tokens()`
+    /// left an `await` gap between them: a poller-driven `valid_token()`
+    /// rotating the grant inside that gap made logout revoke the already-dead
+    /// old refresh token while erasing the brand-new 90-day grant, leaving a
+    /// live, unrevoked, locally-unstored session behind. Holding the lock
+    /// across both also makes this wait for an in-flight refresh to finish,
+    /// so the snapshot it hands back is whatever grant is newest when logout
+    /// wins the lock — revoke that, and nothing live remains anywhere.
+    pub async fn take_tokens(&self) -> Result<Option<TokenSet>> {
+        let mut guard = self.tokens.lock().await;
+        let tokens = guard.take();
+        self.store.erase()?;
+        Ok(tokens)
+    }
+
     /// Current token, refreshed silently if expired. Refreshes under the lock
     /// so concurrent calls collapse into one network round-trip.
     ///
@@ -1029,9 +1048,39 @@ mod tests {
     /// pick up what the sibling wrote — and must report `false` (nothing to
     /// recover) when the file is missing or already the token set in memory,
     /// so the caller can end the session instead of looping.
+    /// `take_tokens` must hand back the live grant *and* leave nothing
+    /// behind in one step — logout revokes from the snapshot, so if anything
+    /// (memory or disk) survived, a grant the user believes revoked would
+    /// still be live. Holding the token lock across snapshot + erase is what
+    /// makes the two indivisible; the behaviour pin is that after the call
+    /// neither place holds a session and `valid_token` reports `NoToken`.
     #[tokio::test]
-    async fn adopt_stored_tokens_takes_a_siblings_rotated_token_only_once() {
-        let _env = EnvGuard::hold("http://127.0.0.1:1", "/tmp/wftui-test-adopt");
+    async fn take_tokens_snapshots_the_grant_and_ends_the_local_session_at_once() {
+        let _env = EnvGuard::hold("http://127.0.0.1:1", "/tmp/wftui-test-take");
+        let client = logged_in_client("access-1").await;
+
+        let snapshot = client
+            .take_tokens()
+            .await
+            .unwrap()
+            .expect("logout revokes from the snapshot, so it must get one");
+        assert_eq!(snapshot.access_token, "access-1");
+        assert_eq!(snapshot.refresh_token, "refresh-1");
+
+        assert!(!client.has_tokens().await, "memory must be empty");
+        assert!(client.token_set().await.is_none());
+        assert!(
+            token::Store::new().load().unwrap().is_none(),
+            "the store must be erased"
+        );
+        assert!(matches!(client.valid_token().await, Err(Error::NoToken)));
+
+        // Idempotent: a second take is empty and still erases cleanly.
+        assert!(client.take_tokens().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn adopt_stored_tokens_takes_a_siblings_rotated_token_only_once() {        let _env = EnvGuard::hold("http://127.0.0.1:1", "/tmp/wftui-test-adopt");
         let client = logged_in_client("access-1").await;
 
         // Same token set on disk as in memory: nothing to adopt.
