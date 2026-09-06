@@ -1678,9 +1678,13 @@ impl App {
             Action::MarkAlertRead(id) => self.mark_alert_read(id),
             Action::MarkConversationRead(id) => self.mark_conversation_read(id),
             Action::ReactPost(post_id) => {
+                // A like is an attributed server-side mutation like any other
+                // write: it belongs to the session that started it and must
+                // be aborted by `end_session` (issue #567's rule), not sent
+                // under whatever token is live by the time it fires.
                 let api = self.api.clone();
                 let tx = self.tx.clone();
-                tokio::spawn(async move {
+                self.spawn_write(async move {
                     let result = api.react_post(post_id, 1).await.map_err(|e| TaskError::of(&e));
                     tx.send(Msg::PostToggled { verb: PostVerb::Like, result }).ok();
                 });
@@ -1689,7 +1693,7 @@ impl App {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
                 let verb = PostVerb::of_vote(&vote_type);
-                tokio::spawn(async move {
+                self.spawn_write(async move {
                     let result = api
                         .vote_post(post_id, &vote_type)
                         .await
@@ -3166,8 +3170,12 @@ impl App {
                         // The ♡/▲ counts live in the baked post lines, so the
                         // page has to come back from the server; keep the
                         // reader where they were while it does (issue #538).
-                        if let Some((id, page, sel_post, scroll)) =
-                            open_thread_position(&self.screens)
+                        // A toggle landing after its session ended (the abort
+                        // cannot stop one already in the channel) must not
+                        // reload anything as a signed-out client.
+                        if self.me.is_some()
+                            && let Some((id, page, sel_post, scroll)) =
+                                open_thread_position(&self.screens)
                         {
                             self.keep_thread_position = Some((id, page, sel_post, scroll));
                             self.load_thread(id, page);
@@ -4914,6 +4922,11 @@ mod tests {
         /// stub — issue #567 is "the write went out after sign-out", so the
         /// absence of an entry here is the assertion.
         replies: std::sync::Mutex<Vec<(u32, String)>>,
+        /// `post_id` per `react_post` call that reached the stub, under the
+        /// same `write_delay` contract as `replies` — a like is a write
+        /// (issue #567's rule) and "the reaction went out after sign-out" is
+        /// what must never be observable here.
+        reactions: std::sync::Mutex<Vec<u32>>,
         /// Stands in for the politeness gates: `reply` waits this long
         /// *before* recording anything, the way `WfApiClient::post_form`
         /// waits on `api_gate`/`write_gate` before it even looks at the
@@ -4945,6 +4958,9 @@ mod tests {
         }
         fn replies(&self) -> Vec<(u32, String)> {
             self.replies.lock().expect("lock").clone()
+        }
+        fn reactions(&self) -> Vec<u32> {
+            self.reactions.lock().expect("lock").clone()
         }
     }
 
@@ -5041,7 +5057,9 @@ mod tests {
                 .push((user_id, content.to_string(), page));
             Err(common::error::Error::NoToken)
         }
-        async fn react_post(&self, _: u32, _: u32) -> common::error::Result<Toggle> {
+        async fn react_post(&self, post_id: u32, _: u32) -> common::error::Result<Toggle> {
+            tokio::time::sleep(self.write_delay).await;
+            self.reactions.lock().expect("lock").push(post_id);
             Err(common::error::Error::NoToken)
         }
         async fn vote_post(&self, _: u32, _: &str) -> common::error::Result<Toggle> {
@@ -7398,6 +7416,84 @@ mod tests {
         assert!(
             !msgs.iter().any(|m| matches!(m, Msg::ReplySent(_))),
             "no ReplySent may land on the sign-in screen"
+        );
+    }
+
+    /// The same rule for a like: a ♡ press is an attributed server-side
+    /// mutation, but it rode a plain `tokio::spawn`, so Ctrl+L tore the
+    /// session down while the reaction still went out afterwards — under
+    /// whatever token was in memory once the gate opened. Toggles go through
+    /// `spawn_write` now, so `end_session` aborts them like any other write.
+    #[tokio::test]
+    async fn a_like_abandoned_by_ctrl_l_is_never_sent() {
+        let api = Arc::new(RecordingApi {
+            write_delay: Duration::from_millis(200),
+            ..Default::default()
+        });
+        let mut app = test_app();
+        app.api = api.clone();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.screens.push(screens::home_state(false));
+
+        app.execute_action(Action::ReactPost(99));
+        tokio::task::yield_now().await;
+        assert!(
+            api.reactions().is_empty(),
+            "test setup: the toggle must still be in flight"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert!(app.me.is_none(), "test setup: Ctrl+L must have ended the session");
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            api.reactions().is_empty(),
+            "a like abandoned by Ctrl+L must never reach the API: {:?}",
+            api.reactions()
+        );
+        let mut msgs = Vec::new();
+        while let Ok(m) = app.rx.try_recv() {
+            msgs.push(m);
+        }
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Msg::PostToggled { .. })),
+            "no PostToggled may land on the sign-in screen"
+        );
+    }
+
+    /// An abort cannot stop a `PostToggled` that is already sitting in the
+    /// channel when the session ends. It may still flip the notice, but it
+    /// must not reload the thread as a signed-out client.
+    #[tokio::test]
+    async fn a_post_toggled_landing_after_teardown_reloads_nothing() {
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 42, ..Default::default() },
+            page: 2,
+            ..Default::default()
+        }));
+        let toggle = |result: Result<Toggle, TaskError>| Msg::PostToggled {
+            verb: PostVerb::Like,
+            result,
+        };
+
+        // Live session: the ♡ counts live in the baked post lines, so the
+        // page re-fetch keeps the reader's place (issue #538).
+        app.handle_msg(toggle(Ok(Toggle::Inserted)));
+        assert!(
+            matches!(&app.keep_thread_position, Some((42, 2, ..))),
+            "a live session reloads the page: {:?}",
+            app.keep_thread_position
+        );
+        app.keep_thread_position = None;
+
+        // Same message after the session ended: no reload, nothing marked.
+        app.me = None;
+        app.handle_msg(toggle(Ok(Toggle::Inserted)));
+        assert!(
+            app.keep_thread_position.is_none(),
+            "a toggle landing after teardown must not reload the thread"
         );
     }
 
