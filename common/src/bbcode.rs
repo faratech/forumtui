@@ -302,6 +302,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
     let mut out: Vec<Chunk> = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
     let mut misses = CloseMisses::default();
+    let mut brackets = CloseBracket::default();
     let mut rest = src;
 
     'outer: while !rest.is_empty() {
@@ -318,7 +319,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
         }
 
         // Try to parse a tag at position 0.
-        match parse_tag(rest) {
+        match parse_tag(src, rest, &mut brackets) {
             Some(TagEvent::Open { name, value, len }) => {
                 let raw_tag = &rest[..len];
                 rest = &rest[len..];
@@ -702,7 +703,7 @@ enum TagEvent {
 /// `]` exactly as before. The scan for `"]` is capped so a hostile unterminated
 /// quote cannot make the parse quadratic; past the cap it falls back to the
 /// first `]`, which is what this function always used to return.
-fn tag_close(s: &str) -> Option<usize> {
+fn tag_close(src: &str, s: &str, brackets: &mut CloseBracket) -> Option<usize> {
     /// Longest quoted option value we will look through for the closing `"]`.
     const QUOTED_VALUE_SCAN: usize = 4096;
     let bytes = s.as_bytes();
@@ -727,16 +728,65 @@ fn tag_close(s: &str) -> Option<usize> {
             break;
         }
         if !(b.is_ascii_alphanumeric() || b == b'_') {
+            // The tag name ends here. A `[` can never be part of the name
+            // part that follows (only `=value` and ` attr` forms are legal),
+            // and parse_tag's name check rejects any inner holding one — so
+            // the bracket is literal no matter where a later `]` sits.
+            // Refusing without looking for it is what keeps `[x[x[x…`
+            // linear: the scan below otherwise walks from every bracket to
+            // the next `]` (or end of input), quadratic on the UI thread
+            // (the #607 class).
+            if b == b'[' {
+                return None;
+            }
             break;
         }
         i += 1;
     }
-    s.find(']')
+    // The memo speaks in src-absolute offsets (so a hit survives the render
+    // loop's forward motion); tag_close's contract is relative to `s`.
+    brackets
+        .find(src, s)
+        .map(|abs| abs - (src.len() - s.len()))
 }
 
-fn parse_tag(s: &str) -> Option<TagEvent> {
+/// Per-render memo of the last `first-']'-at-or-after` scan.
+///
+/// `tag_close` ends in `find(']')` for every `[` whose tag does not parse
+/// outright (`[url="` with the closing `']` truncated off a paste: the quote
+/// scan caps at 4096 bytes and then still needs the fallback find). Each
+/// such find walks to the next `]` or end of input, and the render loop
+/// probes once per bracket, so a bracket-dense post re-paid that walk per
+/// bracket — quadratic on the UI thread, the class the #607 close-tag miss
+/// memo closed for `[/name]` scans. Offsets only ever move forward within
+/// one render, so a single `(queried, found)` pair answers every later
+/// query whose cached `]` still lies at or after it.
+#[derive(Default)]
+struct CloseBracket {
+    /// Offset the scan was asked from, and the `]` it found (absolute in
+    /// `src`; `None` = none exists at or after `at`).
+    entry: Option<(usize, Option<usize>)>,
+}
+
+impl CloseBracket {
+    /// First `]` in `rest` (a suffix of `src`), absolute in `src`, memoized.
+    fn find(&mut self, src: &str, rest: &str) -> Option<usize> {
+        let offset = src.len() - rest.len();
+        if let Some((at, found)) = self.entry
+            && offset >= at
+            && found.is_none_or(|pos| pos >= offset)
+        {
+            return found;
+        }
+        let found = rest.find(']').map(|rel| offset + rel);
+        self.entry = Some((offset, found));
+        found
+    }
+}
+
+fn parse_tag(src: &str, s: &str, brackets: &mut CloseBracket) -> Option<TagEvent> {
     debug_assert!(s.starts_with('['));
-    let close = tag_close(s)?;
+    let close = tag_close(src, s, brackets)?;
     let inner = &s[1..close];
     if inner.is_empty() || inner.contains('\n') || inner.contains('\r') {
         return None;
@@ -1063,6 +1113,63 @@ mod tests {
             "2x the input cost {:.1}x the time ({half:.1} ms -> {ti:.1} ms): quadratic",
             ti / half.max(0.001)
         );
+    }
+
+    /// A bracket-dense post whose tags never parse. Three shapes, each once
+    /// quadratic on the UI thread (the #607 class, with `]` instead of
+    /// `[/name]`):
+    /// - `[x[x[x…` made the name scan stop at the next `[` and the fallback
+    ///   `find(']')` walk to the document's last `]` for every bracket;
+    /// - `[u p` repeated walks to end-of-input through the same fallback;
+    /// - `[url="paste` repeated (a cut-off paste) walks through the
+    ///   unterminated-quote fallback, capped at 4096 bytes per bracket by
+    ///   the #602 hardening.
+    ///
+    /// The first two must be flat-out linear; the third keeps its flat
+    /// per-bracket cap but must not also grow with the document.
+    #[test]
+    fn render_is_linear_in_bracket_dense_posts() {
+        fn parse_ms(src: &str) -> f64 {
+            let t = std::time::Instant::now();
+            let out = render(src);
+            assert!(!out.is_empty());
+            t.elapsed().as_secs_f64() * 1000.0
+        }
+
+        // 80 KB: every `[x` fails to parse, one `]` at the very end.
+        let dense = format!("{}]", "[x".repeat(40000));
+        let td = parse_ms(&dense);
+        assert!(td < 200.0, "40 000 `[x` and a late `]` took {td:.1} ms");
+
+        // ~80 KB: whitespace after the name, no `]` anywhere.
+        let spaced = "[u p".repeat(20000);
+        let ts = parse_ms(&spaced);
+        assert!(ts < 200.0, "20 000 `[u p` with no `]` took {ts:.1} ms");
+
+        // ~24 KB: unterminated quoted values, no `]` anywhere.
+        let truncated = "[url=\"paste".repeat(2000);
+        let tt = parse_ms(&truncated);
+        assert!(tt < 200.0, "2 000 truncated `[url=\"` took {tt:.1} ms");
+
+        // …and the growth is linear, not quadratic.
+        let dense_half = parse_ms(&format!("{}]", "[x".repeat(20000)));
+        let spaced_half = parse_ms(&"[u p".repeat(10000));
+        assert!(
+            td < 8.0 * dense_half.max(1.0) && ts < 8.0 * spaced_half.max(1.0),
+            "2x the input cost more than 8x the time (dense {dense_half:.1} -> {td:.1} ms, \
+             spaced {spaced_half:.1} -> {ts:.1} ms): quadratic"
+        );
+    }
+
+    /// The bracket fast-fail is a speed-up only: the soup itself stays
+    /// visible verbatim, and a real tag after it still renders.
+    #[test]
+    fn bracket_soup_stays_literal_and_real_tags_still_render() {
+        let src = "[x[x[x]hello [b]bold[/b]";
+        let text = texts(&render(src)).concat();
+        assert!(text.contains("[x[x[x]hello"), "{text:?}");
+        assert!(text.contains("bold"), "{text:?}");
+        assert!(!text.contains("[b]"), "{text:?}");
     }
 
     /// The depth cap must not change what a normally-nested post renders as.
