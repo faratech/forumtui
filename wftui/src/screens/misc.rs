@@ -474,7 +474,7 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
                 Action::None
             }
             KeyCode::Left => {
-                crate::editor::move_left(&mut s.title_cursor);
+                crate::editor::move_left(&s.title, &mut s.title_cursor);
                 Action::None
             }
             KeyCode::Right => {
@@ -542,7 +542,7 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
                 Action::None
             }
             KeyCode::Left => {
-                crate::editor::move_left(&mut s.body_cursor);
+                crate::editor::move_left(&s.body, &mut s.body_cursor);
                 Action::None
             }
             KeyCode::Right => {
@@ -1416,12 +1416,12 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
                 Action::None
             }
             KeyCode::Left => {
-                let (_, cur) = if s.active_field == 0 {
+                let (txt, cur) = if s.active_field == 0 {
                     (&mut s.query, &mut s.query_cursor)
                 } else {
                     (&mut s.author, &mut s.author_cursor)
                 };
-                crate::editor::move_left(cur);
+                crate::editor::move_left(txt, cur);
                 Action::None
             }
             KeyCode::Right => {

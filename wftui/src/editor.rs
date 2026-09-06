@@ -1,7 +1,11 @@
 //! Reusable text editing primitives for single-line and multi-line inputs.
 //!
 //! All operations work with character indices (0..chars_len) to ensure
-//! Unicode safety and never slice across UTF-8 boundaries.
+//! Unicode safety and never slice across UTF-8 boundaries. Cursor *steps*
+//! and deletions move whole grapheme clusters, not lone chars: Backspace on
+//! "☝️" (base + U+FE0F) removes both, never the modifier alone (#651).
+
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Insert a single character at the character cursor position.
 pub fn insert_char(text: &mut String, cursor: &mut usize, c: char) {
@@ -23,24 +27,26 @@ pub fn insert_str(text: &mut String, cursor: &mut usize, s: &str) {
     *text = chars.into_iter().collect();
 }
 
-/// Delete the character immediately preceding the cursor (Backspace).
+/// Delete the grapheme cluster immediately preceding the cursor (Backspace).
 pub fn delete_back(text: &mut String, cursor: &mut usize) {
     let mut chars: Vec<char> = text.chars().collect();
     *cursor = (*cursor).min(chars.len());
     if *cursor == 0 {
         return;
     }
-    chars.remove(*cursor - 1);
-    *cursor -= 1;
+    let start = cluster_start_before(&chars, *cursor);
+    chars.drain(start..*cursor);
+    *cursor = start;
     *text = chars.into_iter().collect();
 }
 
-/// Delete the character immediately at the cursor (Delete).
+/// Delete the grapheme cluster immediately at the cursor (Delete).
 pub fn delete_forward(text: &mut String, cursor: &mut usize) {
     let mut chars: Vec<char> = text.chars().collect();
     *cursor = (*cursor).min(chars.len());
-    if *cursor < chars.len() {
-        chars.remove(*cursor);
+    let end = next_cluster_end(&chars, *cursor);
+    if end > *cursor {
+        chars.drain(*cursor..end);
         *text = chars.into_iter().collect();
     }
 }
@@ -114,16 +120,42 @@ pub fn kill_to_start(text: &mut String, cursor: &mut usize) {
     }
 }
 
-/// Move cursor left by 1 character.
-pub fn move_left(cursor: &mut usize) {
-    *cursor = cursor.saturating_sub(1);
+/// Move cursor left by one grapheme cluster.
+pub fn move_left(text: &str, cursor: &mut usize) {
+    let chars: Vec<char> = text.chars().collect();
+    *cursor = (*cursor).min(chars.len());
+    *cursor = cluster_start_before(&chars, *cursor);
 }
 
-/// Move cursor right by 1 character.
+/// Move cursor right by one grapheme cluster.
 pub fn move_right(text: &str, cursor: &mut usize) {
-    let max = text.chars().count();
-    *cursor = (*cursor).min(max);
-    *cursor = (*cursor + 1).min(max);
+    let chars: Vec<char> = text.chars().collect();
+    *cursor = (*cursor).min(chars.len());
+    *cursor = next_cluster_end(&chars, *cursor);
+}
+
+/// Char index of the first char of the cluster that ends at `at` (#651).
+fn cluster_start_before(chars: &[char], at: usize) -> usize {
+    if at == 0 {
+        return 0;
+    }
+    let prefix: String = chars[..at].iter().collect();
+    match prefix.grapheme_indices(true).next_back() {
+        Some((_, cluster)) => at - cluster.chars().count(),
+        None => at - 1, // unreachable: the prefix is non-empty
+    }
+}
+
+/// Char index just past the cluster that starts at `at` (#651).
+fn next_cluster_end(chars: &[char], at: usize) -> usize {
+    if at >= chars.len() {
+        return chars.len();
+    }
+    let suffix: String = chars[at..].iter().collect();
+    match suffix.graphemes(true).next() {
+        Some(cluster) => at + cluster.chars().count(),
+        None => chars.len(), // unreachable: the suffix is non-empty
+    }
 }
 
 /// Move cursor to the beginning of the current line (Home / Ctrl+A).
@@ -477,17 +509,23 @@ pub fn visible_window<T: Clone>(lines: &[T], scroll: usize, height: u16) -> Vec<
 
 /// Normalise control characters before they ever reach the buffer (issue
 /// #559): expand `\t` to spaces up to the next 4-column stop (column tracked
-/// across embedded newlines) and drop every other C0 control character.
-/// Nothing between the API and the terminal handles a raw tab — ratatui's
-/// own grapheme filter drops the byte outright when it draws a span — so
-/// leaving one in the buffer both fuses adjacent text together on screen
-/// (`"a\tb"` renders `"ab"`) and, because the wrap/caret math still bills it
-/// one cell, desyncs the caret from the drawn text by one column per tab.
-/// Used both for received text (`chunk_lines`) and pasted composer input
+/// in terminal *cells*, so a CJK character covers two of them) and drop every
+/// other control character — C0, DEL (0x7F) and the C1 block U+0080–U+009F
+/// (#652), the latter two being undefined in ratatui's renderer. Nothing
+/// between the API and the terminal handles a raw tab — ratatui's own
+/// grapheme filter drops the byte outright when it draws a span — so leaving
+/// one in the buffer both fuses adjacent text together on screen (`"a\tb"`
+/// renders `"ab"`) and, because the wrap/caret math still bills it one cell,
+/// desyncs the caret from the drawn text by one column per tab. Used both
+/// for received text (`chunk_lines`) and pasted composer input
 /// (`App::handle_paste`) — the two places raw text crosses into a span or a
 /// text buffer.
 pub fn normalize_control_chars(s: &str) -> String {
-    if !s.bytes().any(|b| b < 0x20 && b != b'\n') {
+    fn needs_work(s: &str) -> bool {
+        s.bytes().any(|b| (b < 0x20 && b != b'\n') || b == 0x7f)
+            || s.chars().any(|c| ('\u{80}'..='\u{9f}').contains(&c))
+    }
+    if !needs_work(s) {
         return s.to_string();
     }
     let mut out = String::with_capacity(s.len());
@@ -508,9 +546,15 @@ pub fn normalize_control_chars(s: &str) -> String {
             c if (c as u32) < 0x20 => {
                 // Drop every other C0 control character (issue #559).
             }
+            c if c == '\u{7f}' || ('\u{80}'..='\u{9f}').contains(&c) => {
+                // DEL and C1: ratatui's rendering of them is undefined (#652).
+            }
             c => {
                 out.push(c);
-                col += 1;
+                // The stop column counts terminal cells: a wide character
+                // covers two of them, and billing it one shifted every tab
+                // stop after it left (#652).
+                col += char_cells(c);
             }
         }
     }
@@ -769,6 +813,60 @@ mod tests {
                 assert!(caret < width.max(1), "caret {caret} outside width {width}");
             }
         }
+    }
+
+    /// Issue #651: Left/Right/Backspace/Delete move whole grapheme clusters,
+    /// never a lone base or modifier char — the editing siblings of the
+    /// width contract that already bills clusters in cells.
+    #[test]
+    fn steps_and_deletes_move_whole_grapheme_clusters() {
+        // ☝️ = U+261D U+FE0F: two chars, one cluster.
+        let seq = "\u{261d}\u{fe0f}";
+        let mut s = format!("{seq}ok");
+        let mut c = 0usize;
+        move_right(&s, &mut c);
+        assert_eq!(c, 2, "Right steps the whole presentation sequence");
+        move_right(&s, &mut c);
+        assert_eq!(c, 3);
+        move_left(&s, &mut c);
+        assert_eq!(c, 2);
+        move_left(&s, &mut c);
+        assert_eq!(c, 0, "Left stops before the cluster, not on its modifier");
+
+        // Backspace removes the whole cluster, never the modifier alone.
+        let mut s2 = format!("a{seq}b");
+        let mut c2 = 3usize;
+        delete_back(&mut s2, &mut c2);
+        assert_eq!(s2, "ab");
+        assert_eq!(c2, 1);
+
+        // A ZWJ family (👨‍👩‍👦 = 5 chars, one cluster) goes in one press.
+        let fam = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f466}";
+        let mut s3 = format!("x{fam}");
+        let mut c3 = 1 + fam.chars().count();
+        delete_back(&mut s3, &mut c3);
+        assert_eq!(s3, "x");
+        assert_eq!(c3, 1);
+
+        // Delete forward removes the cluster at the cursor.
+        let mut s4 = format!("a{seq}b");
+        let mut c4 = 1usize;
+        delete_forward(&mut s4, &mut c4);
+        assert_eq!(s4, "ab");
+        assert_eq!(c4, 1);
+    }
+
+    /// Issue #652: DEL and C1 controls are dropped like the other C0s, and
+    /// tab stops count terminal cells — a double-width character covers two
+    /// columns, so the next stop sits two spaces after it, not three.
+    #[test]
+    fn normalize_strips_del_and_c1_and_expands_tabs_in_cells() {
+        assert_eq!(normalize_control_chars("a\u{7f}b"), "ab");
+        // U+0085 (NEL) lives in the C1 block.
+        assert_eq!(normalize_control_chars("a\u{85}b"), "ab");
+        // U+6F22 is two cells wide: col 2 -> the next stop is 4, two spaces.
+        let cjk = "\u{6f22}";
+        assert_eq!(normalize_control_chars(&format!("{cjk}\tx")), format!("{cjk}  x"));
     }
 
     /// Issue #559: a tab expands to spaces up to the next 4-column stop, and

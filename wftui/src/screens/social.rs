@@ -1124,12 +1124,12 @@ pub fn new_conversation_key(s: &mut super::NewConversationState, key: KeyEvent) 
             Action::None
         }
         KeyCode::Left => {
-            let cursor = match s.field {
-                0 => &mut s.recipients_cursor,
-                1 => &mut s.title_cursor,
-                _ => &mut s.body_cursor,
+            let (text, cursor) = match s.field {
+                0 => (&mut s.recipients, &mut s.recipients_cursor),
+                1 => (&mut s.title, &mut s.title_cursor),
+                _ => (&mut s.body, &mut s.body_cursor),
             };
-            crate::editor::move_left(cursor);
+            crate::editor::move_left(text, cursor);
             Action::None
         }
         KeyCode::Right => {
