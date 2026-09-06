@@ -414,6 +414,12 @@ pub struct SearchState {
     pub sel: usize,
     pub loading: bool,
     pub error: Option<String>,
+    /// Which in-flight load this screen is waiting on: the `App`-wide
+    /// `search_generation` its fetch was stamped with. A reply to an older
+    /// query — or to a member list this screen was pushed over — carries a
+    /// number no live screen is waiting on and is dropped instead of
+    /// overwriting the results (same pattern as `ThreadLoaded`).
+    pub generation: u64,
     /// Where the query text and the author segment were drawn on the `/` row
     /// (absolute screen coordinates), so a click lands in the right field
     /// with the caret where the pointer is. `author_rect` is zero-sized on

@@ -1371,6 +1371,9 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
                 if q.is_empty() && a.is_empty() {
                     return Action::None;
                 }
+                if s.loading {
+                    return Action::Notice("Already searching — one moment.".into());
+                }
                 s.input_mode = false;
                 s.loading = true;
                 // A typed query is a real keyword search: this screen stops
@@ -1491,6 +1494,9 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
                 Action::None
             }
             KeyCode::Char('t') => {
+                if s.loading {
+                    return Action::Notice("Already searching — one moment.".into());
+                }
                 // In member mode `t` flips between the member's threads and
                 // their posts, through `search_member` (issue #548).
                 if let Some((user_id, content)) = &s.member {
@@ -1590,6 +1596,9 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
                 Action::None
             }
             KeyCode::Char('[') | KeyCode::PageUp => {
+                if s.loading {
+                    return Action::Notice("Already searching — one moment.".into());
+                }
                 if s.page > 1 {
                     s.loading = true;
                     if let Some((user_id, content)) = &s.member {
@@ -1622,6 +1631,9 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
                 }
             }
             KeyCode::Char(']') | KeyCode::PageDown => {
+                if s.loading {
+                    return Action::Notice("Already searching — one moment.".into());
+                }
                 if s.page < s.last_page {
                     s.loading = true;
                     if let Some((user_id, content)) = &s.member {
@@ -3035,18 +3047,22 @@ mod tests {
         };
 
         // ']' / '[' page the member's content, not a keyword search.
+        // (`s.loading` is reset between presses: the fetch these actions
+        // start sets it until the reply lands — see the double-fire test.)
         let act = search_key(&mut s, KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
         assert!(
             matches!(&act, Action::LoadMemberContent { user_id, content, page }
                 if *user_id == 42 && content == "thread" && *page == 3),
             "] must ask for the member's next page"
         );
+        s.loading = false;
         let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
         assert!(
             matches!(&act, Action::LoadMemberContent { user_id, content, page }
                 if *user_id == 42 && content == "thread" && *page == 1),
             "[ must ask for the member's previous page"
         );
+        s.loading = false;
 
         // 't' flips threads <-> posts through the same endpoint, from page 1,
         // and relabels the screen.
@@ -3059,10 +3075,12 @@ mod tests {
         assert_eq!(s.member.as_ref().map(|m| m.1.as_str()), Some("post"));
         assert_eq!(s.query, "by: kemical (post)");
         assert_eq!(s.content_type, 2, "the chip row must follow the real mode");
+        s.loading = false;
         let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
         assert!(
             matches!(&act, Action::LoadMemberContent { content, .. } if content == "thread")
         );
+        s.loading = false;
 
         // 'o' (order) and 'a' (author) do not exist for member content: they
         // must refuse out loud, never re-run the label as a keyword search.
@@ -3094,6 +3112,49 @@ mod tests {
             matches!(act, Action::RunSearchQuery(_)),
             "and the ordinary search keys work again"
         );
+    }
+
+    /// A fetch sets `loading` until its reply lands, and the page/toggle
+    /// keys must not fire a second request into that window — behind the
+    /// 3 s `search_gate` each duplicate delays the user's next real search.
+    /// The reply clears `loading`; here the actions that set it stand in for
+    /// the fetch.
+    #[test]
+    fn search_keys_do_not_double_fire_while_a_load_is_in_flight() {
+        let mut s = crate::screens::SearchState {
+            query: "by: kemical (thread)".into(),
+            member: Some((42, "thread".into())),
+            content_type: 1,
+            page: 2,
+            last_page: 5,
+            input_mode: false,
+            ..Default::default()
+        };
+
+        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        assert!(matches!(&act, Action::LoadMemberContent { page: 3, .. }));
+        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        assert!(matches!(act, Action::Notice(_)), "] must refuse while loading");
+        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        assert!(matches!(act, Action::Notice(_)), "[ must refuse while loading");
+        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(matches!(act, Action::Notice(_)), "t must refuse while loading");
+
+        // The reply lands (loading clears) and paging works again.
+        s.loading = false;
+        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        assert!(matches!(&act, Action::LoadMemberContent { page: 3, .. }));
+
+        // The submit path refuses too: type into the input row while a load
+        // is in flight, then press Enter.
+        s.loading = true;
+        search_key(&mut s, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        search_key(&mut s, KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        search_key(&mut s, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        search_key(&mut s, KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        let act = search_key(&mut s, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(act, Action::Notice(_)), "submit must refuse while loading");
+        assert!(s.input_mode, "the refused submit must not close the input row");
     }
 
     #[test]

@@ -280,7 +280,7 @@ pub enum Msg {
     RecipientResolved { name: String, id: TaskResult<Option<u32>> },
     AlertsLoaded(TaskResult<AlertsReply>),
     AlertMarked(TaskResult<()>),
-    SearchDone { page: u32, result: TaskResult<SearchResultsReply> },
+    SearchDone { generation: u64, page: u32, result: TaskResult<SearchResultsReply> },
     /// A go-to palette member lookup came back. `query` is the palette query
     /// that asked, so a stale answer to an edited query is dropped.
     PaletteMember { query: String, user: Option<User> },
@@ -456,6 +456,11 @@ pub struct App {
     /// older profile cannot fill a newer screen (same pattern as
     /// `login_generation`).
     profile_generation: u64,
+    /// Minted by every search load and stamped on the waiting `SearchState`
+    /// and its `Msg::SearchDone`. App-wide, so two Search screens (a member
+    /// list pushed over a slow keyword search) can never mint the same
+    /// number and adopt each other's replies.
+    search_generation: u64,
     /// Abort handle for the in-flight login task, so pressing Enter while the
     /// client is still polling stops that poll loop instead of leaving two
     /// flows racing for the same screen.
@@ -683,6 +688,7 @@ pub async fn run(images: crate::images::Images) -> u8 {
         session_recovery_started_at: None,
         login_generation: 0,
         profile_generation: 0,
+        search_generation: 0,
         login_task: None,
         body_rect: ratatui::layout::Rect::default(),
         hits: HitMap::new(common::config::mouse_enabled()),
@@ -3835,9 +3841,12 @@ impl App {
                 }
                 Err(e) => self.set_status(format!("Mark failed: {e}")),
             },
-            Msg::SearchDone { page, result } => {
+            Msg::SearchDone { generation, page, result } => {
+                // Only the screen waiting on *this* load adopts the reply —
+                // the topmost Search may belong to a newer query or member
+                // (see ForumLoaded, issue #537).
                 let search = self.screens.iter_mut().rev().find_map(|s| match s {
-                    Screen::Search(search) => Some(search),
+                    Screen::Search(search) if search.generation == generation => Some(search),
                     _ => None,
                 });
                 if let Some(search) = search {
@@ -3949,6 +3958,7 @@ impl App {
     /// search term, so it must never be sent as one.
     pub fn load_member_content(&mut self, user_id: u32, content: String, page: u32) {
         self.set_hint("Searching…");
+        let generation = self.begin_search_load();
         let api = self.api.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -3956,11 +3966,12 @@ impl App {
                 .search_member(user_id, &content, page)
                 .await
                 .map_err(|e| TaskError::of(&e));
-            tx.send(Msg::SearchDone { page, result }).ok();
+            tx.send(Msg::SearchDone { generation, page, result }).ok();
         });
     }
 
     pub fn run_search_query(&mut self, query: SearchQuery) {
+        let generation = self.begin_search_load();
         let api = self.api.clone();
         let tx = self.tx.clone();
         let page = query.page;
@@ -3970,8 +3981,25 @@ impl App {
                 .search_advanced(&query)
                 .await
                 .map_err(|e| TaskError::of(&e));
-            tx.send(Msg::SearchDone { page, result }).ok();
+            tx.send(Msg::SearchDone { generation, page, result }).ok();
         });
+    }
+
+    /// Mint the next search-load identity and mark the topmost Search
+    /// screen as the one waiting on it. Every search load originates from a
+    /// Search screen (it is pushed before its first fetch), so the screen
+    /// arm always matches in practice; if it somehow does not, the minted
+    /// number is stamped on no screen and the reply can never be adopted.
+    fn begin_search_load(&mut self) -> u64 {
+        self.search_generation += 1;
+        let generation = self.search_generation;
+        if let Some(search) = self.screens.iter_mut().rev().find_map(|s| match s {
+            Screen::Search(search) => Some(search),
+            _ => None,
+        }) {
+            search.generation = generation;
+        }
+        generation
     }
 
     /// Load one image off the UI thread: disk cache first, then the site
@@ -4560,6 +4588,52 @@ mod tests {
         assert_eq!(alice.user.as_ref().map(|u| u.user_id), Some(11));
     }
 
+    /// The same identity rule for searches: a member-content list pushed
+    /// over a slow one must not adopt the earlier screen's reply, and the
+    /// generations must be minted App-wide (two screens each bumping their
+    /// own counter would both say "1" and adopt each other's replies).
+    #[tokio::test]
+    async fn a_search_reply_fills_only_the_screen_that_requested_it() {
+        let mut app = test_app();
+        app.execute_action(Action::OpenMemberContent {
+            user_id: 11,
+            username: "alice".into(),
+            content: "thread".into(),
+        });
+        let alice_generation = app.search_generation;
+        app.execute_action(Action::OpenMemberContent {
+            user_id: 22,
+            username: "bob".into(),
+            content: "post".into(),
+        });
+        let bob_generation = app.search_generation;
+        assert_ne!(alice_generation, bob_generation, "generations are App-wide");
+
+        app.handle_msg(Msg::SearchDone {
+            generation: alice_generation,
+            page: 1,
+            result: Ok(SearchResultsReply::default()),
+        });
+        {
+            let Some(Screen::Search(top)) = app.screens.last() else {
+                panic!("expected bob's search screen on top");
+            };
+            assert_eq!(top.member.as_ref().map(|m| m.0), Some(22));
+            assert!(top.loading, "bob's screen is still waiting on its own reply");
+            assert!(top.results.is_empty(), "alice's reply must not fill bob's screen");
+        }
+
+        app.handle_msg(Msg::SearchDone {
+            generation: bob_generation,
+            page: 1,
+            result: Ok(SearchResultsReply::default()),
+        });
+        let Some(Screen::Search(top)) = app.screens.last() else {
+            panic!("expected bob's search screen on top");
+        };
+        assert!(!top.loading, "bob's own reply clears the wait");
+    }
+
     /// Issue #535: the recipients field prefilled from a profile's `c` key
     /// must seed a CHAR cursor, not a byte length — every editor.rs helper
     /// indexes by chars, and a non-ASCII username has more bytes than chars.
@@ -5105,9 +5179,18 @@ mod tests {
         assert_eq!(search.member, Some((42, "thread".to_string())));
         search.page = 2;
         search.last_page = 5;
+        // The initial fetch's reply stays in the channel in this test, so
+        // clear the wait it would have cleared.
+        search.loading = false;
 
         app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
         tokio::task::yield_now().await;
+        // The page fetch is now in flight (`loading = true`); its reply
+        // clears the flag before `t` may fire the next request.
+        let Some(Screen::Search(search)) = app.screens.last_mut() else {
+            panic!("expected the member's content on top");
+        };
+        search.loading = false;
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
         tokio::task::yield_now().await;
 
@@ -7131,6 +7214,7 @@ mod tests {
             session_recovery_started_at: None,
             login_generation: 0,
             profile_generation: 0,
+            search_generation: 0,
             login_task: None,
             body_rect: ratatui::layout::Rect::default(),
             // Tests build the map enabled: every hit-map test drives it
