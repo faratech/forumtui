@@ -33,7 +33,14 @@ pub enum Chunk {
     /// apart from a link whose label merely reads that way: the compose
     /// preview turns these into a caption plus a real inline image, and
     /// guessing from a label would put a picture under `[URL=x][image][/URL]`.
-    Image(String, Style),
+    Image {
+        url: String,
+        /// The anchor target when the image sits inside `[URL=…]` — XF
+        /// renders `<a href=full><img src=thumb></a>`, so `o`/the marker
+        /// opens the anchor, not the picture (#620).
+        link: Option<String>,
+        style: Style,
+    },
     /// `[ATTACH]id[/ATTACH]` (and the `=full` / `type="full"` spellings) — an
     /// attachment referenced by id. Only whoever holds the post's (or the
     /// draft's) attachment list can turn the id into a URL, so the parser
@@ -61,7 +68,7 @@ impl Chunk {
     /// target, an `[ATTACH]` whose id is not a number).
     pub fn image_ref(&self) -> Option<ImageRef> {
         match self {
-            Chunk::Image(url, _) if is_http_url(url) => Some(ImageRef::Url(url.clone())),
+            Chunk::Image { url, .. } if is_http_url(url) => Some(ImageRef::Url(url.clone())),
             Chunk::Attach(id, _) => id.trim().parse::<u32>().ok().map(ImageRef::Attachment),
             _ => None,
         }
@@ -183,6 +190,7 @@ fn pop_matching(
     }
 }
 
+#[allow(clippy::match_like_matches_macro)] // the old nested fn, moved as-is
 fn is_closer(name: &str, f: &Frame) -> bool {
     match (name, f) {
         ("b", Frame::Bold)
@@ -375,7 +383,7 @@ fn ends_with_newline(chunks: &[Chunk]) -> bool {
         Chunk::Text(t, _) => t.ends_with('\n'),
         Chunk::Link(l, _, _) => l.ends_with('\n'),
         // Both render as a one-line placeholder, never a paragraph break.
-        Chunk::Image(..) | Chunk::Attach(..) => false,
+        Chunk::Image { .. } | Chunk::Attach(..) => false,
     })
 }
 
@@ -403,6 +411,12 @@ pub fn render(src: &str) -> Vec<Chunk> {
     // The open [URL] href, innermost last — the O(1) sibling of the frame
     // stack, so emit_text doesn't walk the stack per text run (#622).
     let mut links: Vec<String> = Vec::new();
+    // `(buffered label, href)` for the open [URL] frame (#620).
+    let mut link_label: Option<(String, String)> = None;
+    // Text runs buffered for the open [URL] frame, flushed as ONE
+    // Chunk::Link when it closes (#620): XF renders one anchor around the
+    // whole body, and the old per-run chunks gave every run its own [n]
+    // marker. `None` = no link frame open.
     let mut misses = CloseMisses::default();
     let mut brackets = CloseBracket::default();
     let mut rest = src;
@@ -411,12 +425,12 @@ pub fn render(src: &str) -> Vec<Chunk> {
         let bracket = match rest.find('[') {
             Some(i) => i,
             None => {
-                emit_text(&mut out, rest, style.clone(), links.last().map(String::as_str));
+                emit_text(&mut out, rest, style.clone(), &mut link_label);
                 break;
             }
         };
         if bracket > 0 {
-            emit_text(&mut out, &rest[..bracket], style.clone(), links.last().map(String::as_str));
+            emit_text(&mut out, &rest[..bracket], style.clone(), &mut link_label);
             rest = &rest[bracket..];
         }
 
@@ -475,7 +489,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                     }
                     "plain" => {
                         let (inner, close_len) = take_until_close(rest, "plain");
-                        emit_text(&mut out, inner, style.clone(), links.last().map(String::as_str));
+                        emit_text(&mut out, inner, style.clone(), &mut link_label);
                         rest = &rest[close_len..];
                     }
                     "quote" => {
@@ -565,10 +579,12 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         // href was a wrong link.
                         Some(href) => {
                             let href = decode_html_entities(strip_quotes(&href));
+                            link_label = Some((String::new(), href.clone()));
                             links.push(href.clone());
                             push_frame(&mut stack, &mut counts, &mut style, Frame::Link(href));
                         }
                         None => {
+                            link_label = Some((String::new(), String::new()));
                             links.push(String::new());
                             push_frame(&mut stack, &mut counts, &mut style, Frame::Link(String::new()));
                         }
@@ -581,6 +597,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             } else {
                                 format!("mailto:{clean}")
                             };
+                            link_label = Some((String::new(), href.clone()));
                             links.push(href.clone());
                             push_frame(&mut stack, &mut counts, &mut style, Frame::Link(href));
                         }
@@ -610,6 +627,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         } else {
                             String::new()
                         };
+                        link_label = Some((String::new(), url.clone()));
                         links.push(url.clone());
                         push_frame(&mut stack, &mut counts, &mut style, Frame::Link(url));
                     }
@@ -620,6 +638,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         } else {
                             String::new()
                         };
+                        link_label = Some((String::new(), url.clone()));
                         links.push(url.clone());
                         push_frame(&mut stack, &mut counts, &mut style, Frame::Link(url));
                     }
@@ -632,14 +651,17 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             if trimmed.is_empty() {
                                 out.push(Chunk::Text("[image]".into(), st));
                             } else {
-                                out.push(Chunk::Image(trimmed, st));
+                                let link = links.last().filter(|h| **h != trimmed).cloned();
+                                out.push(Chunk::Image { url: trimmed, link, style: st });
                             }
                             rest = &rest[close_len..];
                         } else if let Some(v) = &value {
                             let st = style.clone();
-                            out.push(Chunk::Image(decode_html_entities(strip_quotes(v)), st));
+                            let url = decode_html_entities(strip_quotes(v));
+                            let link = links.last().filter(|h| **h != url).cloned();
+                            out.push(Chunk::Image { url, link, style: st });
                         } else {
-                            emit_text(&mut out, raw_tag, style.clone(), links.last().map(String::as_str));
+                            emit_text(&mut out, raw_tag, style.clone(), &mut link_label);
                         }
                     }
                     "media" => {
@@ -650,7 +672,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             out.push(Chunk::Link(label, url, st));
                             rest = &rest[close_len..];
                         } else {
-                            emit_text(&mut out, raw_tag, style.clone(), links.last().map(String::as_str));
+                            emit_text(&mut out, raw_tag, style.clone(), &mut link_label);
                         }
                     }
                     "attach" => {
@@ -668,7 +690,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             let clean = strip_quotes(v);
                             out.push(Chunk::Attach(clean.to_string(), st));
                         } else {
-                            emit_text(&mut out, raw_tag, style.clone(), links.last().map(String::as_str));
+                            emit_text(&mut out, raw_tag, style.clone(), &mut link_label);
                         }
                     }
                     "user" => {
@@ -684,7 +706,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             let clean = clean.strip_prefix('@').unwrap_or(clean);
                             out.push(Chunk::Text(format!("@{clean}"), st));
                         } else {
-                            emit_text(&mut out, raw_tag, style.clone(), links.last().map(String::as_str));
+                            emit_text(&mut out, raw_tag, style.clone(), &mut link_label);
                         }
                     }
                     "*" => {
@@ -692,7 +714,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                     }
                     _ => {
                         // Unknown tag: literal passthrough, no frame pushed.
-                        emit_text(&mut out, raw_tag, style.clone(), links.last().map(String::as_str));
+                        emit_text(&mut out, raw_tag, style.clone(), &mut link_label);
                     }
                 }
             }
@@ -736,9 +758,16 @@ pub fn render(src: &str) -> Vec<Chunk> {
                     // verbatim as a stray `[/HR]` line under the rule (#610).
                     "hr" => {}
                     _ => {
-                        if !pop_matching(&mut stack, &mut counts, &mut style, &mut links, &tag_lower) {
+                        let links_before = links.len();
+                        if pop_matching(&mut stack, &mut counts, &mut style, &mut links, &tag_lower) {
+                            // A [URL] frame just closed: flush its buffered
+                            // label as the one Link chunk (#620).
+                            if links.len() < links_before {
+                                flush_link_label(&mut out, &mut link_label, &style);
+                            }
+                        } else {
                             // Closing tag for an unknown/unopened tag: keep it visible.
-                            emit_text(&mut out, raw_tag, style.clone(), links.last().map(String::as_str));
+                            emit_text(&mut out, raw_tag, style.clone(), &mut link_label);
                         }
                     }
                 }
@@ -749,13 +778,15 @@ pub fn render(src: &str) -> Vec<Chunk> {
             }
             None => {
                 // Stray '[': literal.
-                emit_text(&mut out, &rest[..1], style.clone(), links.last().map(String::as_str));
+                emit_text(&mut out, &rest[..1], style.clone(), &mut link_label);
                 rest = &rest[1..];
                 continue 'outer;
             }
         }
     }
 
+    // An unclosed [URL=x] still owes its buffered label (#620).
+    flush_link_label(&mut out, &mut link_label, &Style::default());
     if out.is_empty() {
         out.push(Chunk::Text(String::new(), Style::default()));
     }
@@ -774,7 +805,7 @@ pub fn to_plain(src: &str) -> String {
                     s.push_str(&format!(" ({url})"));
                 }
             }
-            Chunk::Image(url, _) => {
+            Chunk::Image { url, .. } => {
                 s.push_str("[image]");
                 if !url.is_empty() {
                     s.push_str(&format!(" ({url})"));
@@ -1119,33 +1150,60 @@ fn take_until_close<'a>(s: &'a str, name: &str) -> (&'a str, usize) {
 
 /// Emit plain text: inside a [URL] frame the whole run is a link; otherwise
 /// bare http(s) URLs are auto-linked on the way through.
-fn emit_text(out: &mut Vec<Chunk>, text: &str, style: Style, link: Option<&str>) {
+/// Flush the buffered `[URL]` label as one `Chunk::Link` (#620). An empty
+/// body means the href is the label (XF: `<a href="x"></a>` renders the
+/// URL as the anchor text).
+fn flush_link_label(out: &mut Vec<Chunk>, pending: &mut Option<(String, String)>, style: &Style) {
+    if let Some((label, href)) = pending.take() {
+        // Empty href means the label IS the target (the `[URL]body[/URL]`
+        // form); an empty body means the href is the label (XF renders the
+        // URL as the anchor text for `[url=x][/url]`). Both empty: nothing.
+        if label.trim().is_empty() && href.is_empty() {
+            return;
+        }
+        let (label, target) = if href.is_empty() {
+            (label.clone(), label)
+        } else if label.trim().is_empty() {
+            (href.clone(), href)
+        } else {
+            (label, href)
+        };
+        out.push(Chunk::Link(label, target, style.clone()));
+    }
+}
+
+/// Emit plain text: inside a `[URL]` frame the run is buffered into the
+/// anchor's label — flushed as ONE `Chunk::Link` when the frame closes
+/// (#620), because XF renders one anchor around the whole body and per-run
+/// chunks gave every run its own [n] marker; bare URLs inside the anchor
+/// stop being auto-linked, a nested anchor not being a thing in HTML
+/// either. Outside a frame, bare http(s) URLs are auto-linked.
+fn emit_text(
+    out: &mut Vec<Chunk>,
+    text: &str,
+    style: Style,
+    pending: &mut Option<(String, String)>,
+) {
+    // Inside a [URL] frame everything is the anchor's label.
+    if let Some((label, _)) = pending {
+        label.push_str(&decode_html_entities(text));
+        return;
+    }
     if text.is_empty() {
         return;
     }
     let decoded_text = decode_html_entities(text);
-    let st = style;
-    if let Some(href) = link.map(|h| h.to_string()) {
-        // [URL=href]label[/URL] — empty href means the label IS the url.
-        let target = if href.is_empty() {
-            decoded_text.clone()
-        } else {
-            href
-        };
-        out.push(Chunk::Link(decoded_text, target, st));
-        return;
-    }
     let mut rest = decoded_text.as_str();
     while let Some(pos) = find_url(rest) {
         let (before, url, after) = split_url(rest, pos);
         if !before.is_empty() {
-            out.push(Chunk::Text(before.to_string(), st.clone()));
+            out.push(Chunk::Text(before.to_string(), style.clone()));
         }
-        out.push(Chunk::Link(url.to_string(), url.to_string(), st.clone()));
+        out.push(Chunk::Link(url.to_string(), url.to_string(), style.clone()));
         rest = after;
     }
     if !rest.is_empty() {
-        out.push(Chunk::Text(rest.to_string(), st));
+        out.push(Chunk::Text(rest.to_string(), style));
     }
 }
 
@@ -1326,11 +1384,10 @@ mod tests {
             other => panic!("expected a link, got {other:?}"),
         }
         let img = render("[IMG]https://x.test/a&amp;b.png[/IMG]");
-        assert!(
-            matches!(&img[0], Chunk::Image(u, _) if u == "https://x.test/a&b.png"),
-            "{:?}",
-            img[0]
-        );
+        let Chunk::Image { url, .. } = &img[0] else {
+            panic!("expected an image, got {:?}", img[0])
+        };
+        assert_eq!(url, "https://x.test/a&b.png");
     }
 
     /// #616: XF only opens the attribute form when a `key=` option follows
@@ -1379,6 +1436,38 @@ mod tests {
         // back to the link text itself.
         let chunks = render("[url unfurl=\"true\"]site[/url]");
         assert!(matches!(&chunks[0], Chunk::Link(l, h, _) if l == "site" && h == "site"), "{:?}", chunks[0]);
+    }
+
+    /// #620: a [URL] frame is ONE anchor around its whole body. An empty
+    /// body renders the URL as its own label; runs inside the anchor merge
+    /// into a single link (one [n] marker in the thread view), and an [IMG]
+    /// inside the anchor carries the href for `o`/the marker while still
+    /// painting from its own src.
+    #[test]
+    fn url_frame_wraps_its_whole_body() {
+        let chunks = render("[url=https://example.com/x][/url] tail");
+        assert!(
+            matches!(&chunks[0], Chunk::Link(l, h, _)
+                if l == "https://example.com/x" && h == "https://example.com/x"),
+            "an empty body makes the URL its own label: {:?}",
+            chunks[0]
+        );
+
+        let chunks = render("[URL=https://example.com][I]Jaws[/I] swims[/URL]");
+        let links = chunks.iter().filter(|c| matches!(c, Chunk::Link(..))).count();
+        assert_eq!(links, 1, "one anchor, not one per run: {chunks:?}");
+        if let Chunk::Link(label, _, _) = &chunks[0] {
+            assert_eq!(label, "Jaws swims");
+        }
+
+        let chunks = render("[URL=https://example.com/full][IMG]https://example.com/thumb[/IMG][/URL]");
+        match &chunks[0] {
+            Chunk::Image { url, link, .. } => {
+                assert_eq!(url.as_str(), "https://example.com/thumb");
+                assert_eq!(link.as_deref(), Some("https://example.com/full"));
+            }
+            other => panic!("expected the image, got {other:?}"),
+        }
     }
 
     /// #610: the news template writes `[HR][/HR]` before every heading; the
@@ -1795,7 +1884,7 @@ mod tests {
     fn img_becomes_an_image_chunk() {
         let chunks = render("[IMG]https://example.com/pic.png[/IMG]");
         match &chunks[0] {
-            Chunk::Image(url, _) => assert_eq!(url, "https://example.com/pic.png"),
+            Chunk::Image { url, .. } => assert_eq!(url, "https://example.com/pic.png"),
             other => panic!("expected an image chunk, got {other:?}"),
         }
         assert_eq!(to_plain("[IMG]https://example.com/pic.png[/IMG]"), "[image] (https://example.com/pic.png)");

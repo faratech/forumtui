@@ -1300,8 +1300,11 @@ pub(crate) fn chunk_lines(
             // (built from the API's attachment record), so here an image
             // reference stays what it has always been: the `[image]`
             // placeholder plus a numbered link for `o` / `1`-`9`.
-            Chunk::Image(url, s) => {
-                links.push(url);
+            Chunk::Image { url, link, style: s } => {
+                // #620: an image inside [URL=…] is anchored to that href —
+                // XF renders <a href=full><img src=thumb></a> — so the
+                // registered link opens the anchor, the picture still paints.
+                links.push(link.clone().unwrap_or_else(|| url.clone()));
                 current.push(Span::styled("[image]".to_string(), style_from(theme, &s)));
                 current.push(Span::styled(
                     format!(" [{}]", links.len()),
