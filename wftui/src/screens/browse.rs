@@ -817,6 +817,9 @@ pub fn forum_tree_key(s: &mut ForumTreeState, key: KeyEvent) -> Action {
         KeyCode::Char('3') => open_node_action(&s.nodes, TUTORIALS_NODE, "Windows Tutorials"),
         KeyCode::Char('L') => Action::OpenLatestThreads,
         KeyCode::Char('r') => {
+            if s.loading {
+                return Action::Notice("Already loading — one moment.".into());
+            }
             s.loading = true;
             Action::LoadNodes
         }
@@ -1724,6 +1727,9 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
             Action::None
         }
         KeyCode::Char('[') => {
+            if s.loading {
+                return Action::Notice("Already loading — one moment.".into());
+            }
             if s.page > 1 {
                 s.loading = true;
                 Action::LoadThread(s.thread.thread_id, s.page - 1)
@@ -1732,6 +1738,9 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
             }
         }
         KeyCode::Char(']') => {
+            if s.loading {
+                return Action::Notice("Already loading — one moment.".into());
+            }
             if s.page < s.last_page {
                 s.loading = true;
                 Action::LoadThread(s.thread.thread_id, s.page + 1)
@@ -1747,10 +1756,16 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
         // the very first load's failure, when `last_page` is still 0 and
         // both keys are inert, with no way to retry short of Esc).
         KeyCode::Char('R') | KeyCode::F(5) => {
+            if s.loading {
+                return Action::Notice("Already loading — one moment.".into());
+            }
             s.loading = true;
             Action::LoadThread(s.thread.thread_id, s.page)
         }
         KeyCode::Enter if s.error.is_some() => {
+            if s.loading {
+                return Action::Notice("Already loading — one moment.".into());
+            }
             s.loading = true;
             Action::LoadThread(s.thread.thread_id, s.page)
         }
@@ -2863,6 +2878,40 @@ mod tests {
             width: 118,
             ..Default::default()
         }
+    }
+
+    /// #665: a fetch sets `loading` until its reply lands; the page keys and
+    /// the R/Enter retry must refuse out loud instead of firing duplicates
+    /// behind the shared gates (the ThreadView sibling of the #657 guards).
+    #[test]
+    fn thread_view_page_and_retry_keys_do_not_double_fire_while_loading() {
+        let mut s = thread_view_fixture();
+        s.page = 2;
+        s.last_page = 5;
+
+        let act = thread_view_key(&mut s, key(']'));
+        assert!(matches!(&act, Action::LoadThread(101, 3)));
+        assert!(matches!(thread_view_key(&mut s, key(']')), Action::Notice(_)));
+        assert!(matches!(thread_view_key(&mut s, key('[')), Action::Notice(_)));
+        s.loading = false;
+        let act = thread_view_key(&mut s, key('['));
+        assert!(matches!(&act, Action::LoadThread(101, 1)));
+
+        // The retry arms refuse too, and a successful page change still
+        // works once the reply lands.
+        s.loading = true;
+        let shift_r = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT);
+        assert!(matches!(thread_view_key(&mut s, shift_r), Action::Notice(_)));
+        s.error = Some("timed out".into());
+        assert!(
+            matches!(thread_view_key(&mut s, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Action::Notice(_)),
+            "Enter-retry must refuse while loading"
+        );
+        s.loading = false;
+        assert!(matches!(
+            thread_view_key(&mut s, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::LoadThread(101, 2)
+        ));
     }
 
     #[test]

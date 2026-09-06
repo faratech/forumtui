@@ -2673,17 +2673,32 @@ impl App {
     /// before.
     pub fn open_conversation(&mut self, conv: Conversation) {
         let cid = conv.conversation_id;
+        // Re-opening the conversation already loading in the view pane must
+        // not fire a second fetch over the first — ConversationLoaded
+        // matches by id only, so the last reply to land would win (#667).
         if let Some(Screen::Inbox(inbox)) = self.screens.last_mut()
             && inbox.dual
         {
-            inbox.view = Some(screens::ConversationViewState {
-                conversation: conv,
-                page: 1,
-                loading: true,
-                ..Default::default()
-            });
-            inbox.focus = screens::InboxPane::View;
-            self.load_conversation(cid, 1, true);
+            let already_loading = inbox
+                .view
+                .as_ref()
+                .is_some_and(|v| v.conversation.conversation_id == cid && v.loading);
+            if !already_loading {
+                inbox.view = Some(screens::ConversationViewState {
+                    conversation: conv,
+                    page: 1,
+                    loading: true,
+                    ..Default::default()
+                });
+                inbox.focus = screens::InboxPane::View;
+                self.load_conversation(cid, 1, true);
+            }
+            return;
+        }
+        if let Some(Screen::ConversationView(v)) = self.screens.last()
+            && v.conversation.conversation_id == cid
+            && v.loading
+        {
             return;
         }
         self.push_screen(Screen::ConversationView(screens::ConversationViewState {
@@ -2842,6 +2857,15 @@ impl App {
     }
 
     pub fn open_thread(&mut self, thread: &Thread) {
+        // A bounced Enter used to stack a second identical view on top —
+        // only the top one ever loads, so popping back revealed a twin
+        // stuck on "Loading…" forever (#667).
+        if let Some(Screen::ThreadView(v)) = self.screens.last()
+            && v.thread.thread_id == thread.thread_id
+            && v.loading
+        {
+            return;
+        }
         // `Thread` carries only `node_id`; the card stack wants the forum's
         // name, and the loaded tree is the only place that has it.
         let forum_title = self
@@ -7527,6 +7551,59 @@ mod tests {
             !msgs.iter().any(|m| matches!(m, Msg::PostToggled { .. })),
             "no PostToggled may land on the sign-in screen"
         );
+    }
+
+    /// #667: a bounced Enter used to stack a second identical ThreadView on
+    /// top of the first — only the top one ever loads, so popping back
+    /// revealed a twin stuck on "Loading…" forever.
+    #[tokio::test]
+    async fn a_double_enter_on_one_thread_stacks_no_duplicate_view() {
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.screens.push(screens::home_state(false));
+
+        let thread = Thread { thread_id: 42, ..Default::default() };
+        app.execute_action(Action::OpenThread(thread.clone()));
+        let depth = app.screens.len();
+        assert!(matches!(app.screens.last(), Some(Screen::ThreadView(_))));
+
+        app.execute_action(Action::OpenThread(thread));
+        assert_eq!(app.screens.len(), depth, "no duplicate view while loading");
+    }
+
+    /// #667: re-opening the conversation already loading in the view pane
+    /// must not fire a second fetch over the first — ConversationLoaded
+    /// matches by id only, so the last reply to land would win.
+    #[tokio::test]
+    async fn reopening_a_loading_conversation_does_not_replace_the_view() {
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        // The dual-pane Inbox is where the view pane lives.
+        app.screens.push(Screen::Inbox(screens::InboxState {
+            dual: true,
+            ..Default::default()
+        }));
+        let conv = common::models::Conversation {
+            conversation_id: 5,
+            title: "A DM".into(),
+            ..Default::default()
+        };
+        app.open_conversation(conv.clone());
+        {
+            let Some(Screen::Inbox(inbox)) = app.screens.last_mut() else {
+                panic!("expected the Inbox");
+            };
+            let view = inbox.view.as_mut().expect("the view pane primed");
+            view.page = 7; // a marker: a replacement would reset it to 1
+        }
+
+        app.open_conversation(conv);
+        let Some(Screen::Inbox(inbox)) = app.screens.last() else {
+            panic!("expected the Inbox");
+        };
+        let view = inbox.view.as_ref().expect("the view survives");
+        assert_eq!(view.page, 7, "the in-flight load was not replaced");
+        assert!(view.loading);
     }
 
     /// The signal forwarder keeps opting the process out of the default

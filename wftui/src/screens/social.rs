@@ -190,6 +190,9 @@ fn alerts_list_key(a: &mut AlertsState, key: KeyEvent) -> Action {
         KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => Action::PopScreen,
         // See `conversations_list_key`: `R`/F5, because `r` replies.
         KeyCode::Char('R') | KeyCode::F(5) => {
+            if a.loading {
+                return Action::Notice("Already loading — one moment.".into());
+            }
             a.loading = true;
             Action::LoadAlerts
         }
@@ -1948,6 +1951,16 @@ mod tests {
             Action::LoadConversations(1)
         ));
         assert!(s.convos.loading);
+
+        // The alerts list's own refresh refuses the same way (#666).
+        let mut s = sample_inbox_state();
+        s.tab = InboxTab::Alerts;
+        s.alerts.loading = true;
+        let shift_r = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT);
+        assert!(
+            matches!(inbox_key(&mut s, shift_r), Action::Notice(_)),
+            "alerts R must refuse while loading"
+        );
 
         // The open conversation's pager behaves the same way.
         let mut s = sample_inbox_state();
