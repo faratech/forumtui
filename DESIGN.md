@@ -101,6 +101,9 @@ row n-1      status:   " left text / toast                                   wri
   count, then replace middle crumbs with `…`, then clip the last crumb with `…`.
 * Badges render only when the count is > 0; otherwise `Inbox 0` in chrome_dim.
 * Key caps are ` Enter `, ` j/k `, ` ^S ` — words, not symbols. Key bar clips with `…`
+* **Spoilers** (`[SPOILER]`/`[ISPOILER]`): bodies render hidden (black on
+  black) until `x` in the thread view toggles reveal; a link inside a hidden
+  spoiler dims its `[n]` marker. Hidden is the default for every reader.
   from the right; below 90 columns screens supply a short hint set.
 * Status right side shows the write gate: `● ready` (ok) or `● 24 s` (warn) plus a
   10-cell ▮▯ bar. `Gate::pending_wait()` in common/ratelimit.rs supplies the wait.

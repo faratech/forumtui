@@ -833,7 +833,9 @@ impl ConversationViewState {
             };
             let mut sink: Vec<Line<'static>> = Vec::new();
             let mut links = Vec::new();
-            push_bbcode(&mut sink, &mut links, &msg.message, theme);
+            // Hidden spoilers in DMs stay hidden: the reveal key lives on
+            // the thread view (#621).
+            push_bbcode(&mut sink, &mut links, &msg.message, theme, false);
             for logical in sink {
                 for wrapped in wrap_line(&logical.spans, body_w) {
                     let mut spans = vec![

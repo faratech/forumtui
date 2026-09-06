@@ -285,5 +285,6 @@ under `<config dir>/cache/img/` (32 MiB, 0600, atomic).
   persistently when the revoke fails.
 - TuiLink cannot yet signal a denied browser approval; the client only offers a
   restart. The Premium Supporter gate (#572) is designed but deliberately not built.
-- `[SPOILER]` bodies are hidden with no reveal key; Search's chip row is
-  keyboard-only; Windows packaging is documentation-only.
+- Search's chip row is keyboard-only; Windows packaging is documentation-only.
+  (`[SPOILER]` bodies are hidden black-on-black until `x` reveals them in the
+  thread view — issue #621.)

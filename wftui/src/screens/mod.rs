@@ -131,6 +131,11 @@ pub struct ThreadViewState {
     pub post_line_offsets: Vec<usize>,
     pub loading: bool,
     pub error: Option<String>,
+    /// `[SPOILER]` bodies render hidden until this is flipped with `x`
+    /// (issue #621): hidden is black-on-black by `style_from`, revealed is
+    /// the text's own styling. Flipping forces `rebuild_lines` via
+    /// `width = 0`, the same trick the image-policy change uses.
+    pub reveal_spoilers: bool,
     /// Graphics policy, stamped by the app before every frame. A change to it
     /// invalidates `lines`: inline images reserve rows that the text tier
     /// does not.
@@ -985,6 +990,7 @@ impl Screen {
 pub(crate) fn style_from(
     theme: &Theme,
     s: &common::bbcode::Style,
+    reveal_spoilers: bool,
 ) -> ratatui::style::Style {
     use ratatui::style::{Color, Modifier, Style};
     let mut st = Style::new().fg(theme.text);
@@ -994,8 +1000,8 @@ pub(crate) fn style_from(
     if s.code {
         st = theme.code();
     }
-    if s.spoiler {
-        // Unchanged from before the redesign: black on black hides the text on
+    if s.spoiler && !reveal_spoilers {
+        // Hidden until `x` reveals (#621): black on black hides the text on
         // every terminal, where Modifier::HIDDEN is widely unimplemented.
         st = Style::new().fg(Color::Black).bg(Color::Black);
     }
@@ -1495,6 +1501,9 @@ mod dispatch_tests {
                 }),
                 skip: &[
                     "j/k", "n/N", "1-9",
+                    // `x` only flips `reveal_spoilers` — screen state, no
+                    // `Action` (pinned directly by the spoiler-reveal test).
+                    "x",
                     // `w` (watch) is deliberately always `Action::None`:
                     // XenForo's REST API has no thread-watch endpoint (see
                     // the comment on its arm in `thread_view_key`).

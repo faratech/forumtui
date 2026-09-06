@@ -1143,7 +1143,9 @@ fn push_wrapped(
     theme: &Theme,
     width: u16,
 ) {
-    for logical in chunk_lines(chunks, links, theme) {
+    // The preview shows the post's DEFAULT render: spoilers hidden, as
+    // every reader will first see them (#621).
+    for logical in chunk_lines(chunks, links, theme, false) {
         for wrapped in wrap_spans(&logical, width as usize) {
             out.push(Line::from(wrapped));
         }

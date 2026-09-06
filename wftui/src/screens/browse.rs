@@ -1247,8 +1247,9 @@ fn bbcode_lines(
     src: &str,
     links: &mut Vec<String>,
     theme: &Theme,
+    reveal_spoilers: bool,
 ) -> Vec<Vec<Span<'static>>> {
-    chunk_lines(&bbcode::render(src), links, theme)
+    chunk_lines(&bbcode::render(src), links, theme, reveal_spoilers)
 }
 
 /// `bbcode_lines` over an already-parsed chunk stream. Split out so a screen
@@ -1259,6 +1260,7 @@ pub(crate) fn chunk_lines(
     chunks: &[Chunk],
     links: &mut Vec<String>,
     theme: &Theme,
+    reveal_spoilers: bool,
 ) -> Vec<Vec<Span<'static>>> {
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
@@ -1278,7 +1280,7 @@ pub(crate) fn chunk_lines(
                         out.push(std::mem::take(&mut current));
                     }
                     if !seg.is_empty() {
-                        current.push(Span::styled(seg.to_string(), style_from(theme, &s)));
+                        current.push(Span::styled(seg.to_string(), style_from(theme, &s, reveal_spoilers)));
                     }
                 }
             }
@@ -1291,12 +1293,19 @@ pub(crate) fn chunk_lines(
                         out.push(std::mem::take(&mut current));
                     }
                     if !seg.is_empty() {
-                        current.push(Span::styled(seg.to_string(), style_from(theme, &s)));
+                        current.push(Span::styled(seg.to_string(), style_from(theme, &s, reveal_spoilers)));
                     }
                 }
+                // A link inside a hidden spoiler dims its marker too: the
+                // [n] invites an `o` that would read the invisible label.
+                let marker_style = if s.spoiler && !reveal_spoilers {
+                    theme.dim()
+                } else {
+                    link_style(theme)
+                };
                 current.push(Span::styled(
                     format!(" [{}]", links.len()),
-                    link_style(theme),
+                    marker_style,
                 ));
             }
             // The thread view has the real picture beside its own caption
@@ -1308,7 +1317,7 @@ pub(crate) fn chunk_lines(
                 // XF renders <a href=full><img src=thumb></a> — so the
                 // registered link opens the anchor, the picture still paints.
                 links.push(link.clone().unwrap_or_else(|| url.clone()));
-                current.push(Span::styled("[image]".to_string(), style_from(theme, &s)));
+                current.push(Span::styled("[image]".to_string(), style_from(theme, &s, reveal_spoilers)));
                 current.push(Span::styled(
                     format!(" [{}]", links.len()),
                     link_style(theme),
@@ -1317,7 +1326,7 @@ pub(crate) fn chunk_lines(
             Chunk::Attach(id, s) => {
                 current.push(Span::styled(
                     format!("[attachment {id}]"),
-                    style_from(theme, &s),
+                    style_from(theme, &s, reveal_spoilers),
                 ));
             }
         }
@@ -1335,8 +1344,9 @@ pub(crate) fn push_bbcode(
     links: &mut Vec<String>,
     src: &str,
     theme: &Theme,
+    reveal_spoilers: bool,
 ) {
-    for l in bbcode_lines(src, links, theme) {
+    for l in bbcode_lines(src, links, theme, reveal_spoilers) {
         lines.push(Line::from(l));
     }
 }
@@ -1438,7 +1448,7 @@ impl ThreadViewState {
             }
 
             let post_link_base = links.len();
-            for logical in bbcode_lines(&post.message, &mut links, theme) {
+            for logical in bbcode_lines(&post.message, &mut links, theme, self.reveal_spoilers) {
                 for wrapped in wrap_spans(&logical, body_w) {
                     lines.push(gutter(wrapped));
                 }
@@ -1755,6 +1765,15 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
         // (issue #604: the panel used to advertise "[/] to change page" on
         // the very first load's failure, when `last_page` is still 0 and
         // both keys are inert, with no way to retry short of Esc).
+        // Issue #621: `x` reveals (or re-hides) [SPOILER] bodies. Flipping
+        // the flag alone changes nothing on screen — `lines` is cached — so
+        // `width = 0` forces `rebuild_lines`, the same trick the image
+        // policy change uses.
+        KeyCode::Char('x') => {
+            s.reveal_spoilers = !s.reveal_spoilers;
+            s.width = 0;
+            Action::None
+        }
         KeyCode::Char('R') | KeyCode::F(5) => {
             if s.loading {
                 return Action::Notice("Already loading — one moment.".into());
@@ -1909,8 +1928,11 @@ pub fn thread_view_hints(s: &ThreadViewState) -> Hints {
             ("v", "vote"),
             ("o", "links"),
             ("1-9", "image"),
-            ("w", "watch"),
-            ("u", "open in web"),
+            (
+                "x",
+                if s.reveal_spoilers { "hide" } else { "reveal" },
+            ),
+            ("u", "web"),
             ("Esc", "back"),
         ],
         &[
@@ -1918,8 +1940,13 @@ pub fn thread_view_hints(s: &ThreadViewState) -> Hints {
             ("j/k", ""),
             ("n/N", "post"),
             ("l", "like"),
-            ("v", "vote"),
+            // `v vote` yields its short-bar slot to the spoiler toggle at
+            // this width — it stays in the full set and the keys card.
             ("o", "links"),
+            (
+                "x",
+                if s.reveal_spoilers { "hide" } else { "reveal" },
+            ),
             ("Esc", "back"),
         ],
         0,
@@ -2883,6 +2910,84 @@ mod tests {
     /// #665: a fetch sets `loading` until its reply lands; the page keys and
     /// the R/Enter retry must refuse out loud instead of firing duplicates
     /// behind the shared gates (the ThreadView sibling of the #657 guards).
+    /// #621: [SPOILER] bodies are hidden (black on black) until `x`
+    /// reveals them; the toggle forces a rebuild and flips the hint. Links
+    /// inside a hidden spoiler dim their [n] marker so it stops inviting
+    /// an `o` that would read the invisible label.
+    #[test]
+    fn x_reveals_and_rehides_spoiler_bodies() {
+        let theme = Theme::truecolor();
+        let mut s = thread_view_fixture();
+        let spoiler_post = Post {
+            post_id: 203,
+            user_id: 10,
+            username: "HItest".into(),
+            message: "before [ISPOILER]secret plans[/ISPOILER] after".into(),
+            ..Default::default()
+        };
+        s.posts.push(spoiler_post);
+        s.rebuild_lines(&theme, &crate::glyph::detect());
+
+        // Hidden by default: the spoiler run paints black-on-black...
+        let hidden = s
+            .lines
+            .iter()
+            .any(|l| {
+                l.spans.iter().any(|sp| {
+                    sp.style.bg == Some(ratatui::style::Color::Black)
+                        && sp.style.fg == Some(ratatui::style::Color::Black)
+                        && sp.content.contains("secret")
+                })
+            });
+        assert!(hidden, "the spoiler body must be hidden by default");
+
+        // ...and `x` reveals it with the text's own colours.
+        thread_view_key(&mut s, key('x'));
+        assert!(s.reveal_spoilers, "the flag flipped");
+        assert_eq!(s.width, 0, "the toggle must force rebuild_lines");
+        s.rebuild_lines(&theme, &crate::glyph::detect());
+        let revealed = s
+            .lines
+            .iter()
+            .any(|l| {
+                l.spans.iter().any(|sp| {
+                    sp.content.contains("secret")
+                        && sp.style.bg != Some(ratatui::style::Color::Black)
+                })
+            });
+        assert!(revealed, "the spoiler body must be readable after x: {:#?}", {
+            let mut rows = Vec::new();
+            for l in &s.lines {
+                for sp in &l.spans {
+                    if sp.content.contains("secret") {
+                        rows.push((sp.content.to_string(), sp.style));
+                    }
+                }
+            }
+            rows
+        });
+
+        // And `x` again re-hides.
+        thread_view_key(&mut s, key('x'));
+        assert!(!s.reveal_spoilers);
+        s.rebuild_lines(&theme, &crate::glyph::detect());
+        let hidden_again = s.lines.iter().any(|l| {
+            l.spans.iter().any(|sp| {
+                sp.content.contains("secret")
+                    && sp.style.fg == Some(ratatui::style::Color::Black)
+            })
+        });
+        assert!(hidden_again, "x re-hides");
+    }
+
+    #[test]
+    fn thread_view_hints_name_the_spoiler_toggle() {
+        let mut s = thread_view_fixture();
+        assert!(thread_view_hints(&s).keys.iter().any(|(k, d)| *k == "x" && *d == "reveal"));
+        thread_view_key(&mut s, key('x'));
+        assert!(thread_view_hints(&s).keys.iter().any(|(k, d)| *k == "x" && *d == "hide"));
+    }
+
     #[test]
     fn thread_view_page_and_retry_keys_do_not_double_fire_while_loading() {
         let mut s = thread_view_fixture();
@@ -3267,7 +3372,7 @@ mod tests {
     fn chunk_lines_expands_tabs_instead_of_dropping_them() {
         let theme = Theme::truecolor();
         let mut links = Vec::new();
-        let lines = bbcode_lines("[CODE]Name\tValue[/CODE]", &mut links, &theme);
+        let lines = bbcode_lines("[CODE]Name\tValue[/CODE]", &mut links, &theme, false);
         assert_eq!(lines.len(), 1);
         let rendered: String = lines[0].iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rendered, "Name    Value", "a tab must expand to spaces, not disappear");
@@ -3411,6 +3516,7 @@ mod tests {
             &mut links,
             "Hello [B]world[/B] from [URL=https://example.com]Windows[/URL]!",
             &theme,
+            false,
         );
         assert_eq!(lines.len(), 1, "inline styling should remain on a single line");
         assert_eq!(links.len(), 1);
@@ -3427,6 +3533,7 @@ mod tests {
             &mut links,
             "Line 1 with [B]bold[/B]\nLine 2 with [I]italic[/I]\n\nLine 4",
             &theme,
+            false,
         );
         assert_eq!(lines.len(), 4);
     }
