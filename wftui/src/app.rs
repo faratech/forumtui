@@ -1149,8 +1149,14 @@ impl App {
     async fn event_loop(
         &mut self,
         terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
-        reader: std::sync::mpsc::Receiver<crate::event::Input>,
+        mut reader: std::sync::mpsc::Receiver<crate::event::Input>,
     ) -> u8 {
+        // A dead reader used to be swallowed (`Disconnected` -> `None`), so
+        // one tty error left the frame redrawing forever with no way to
+        // type (#653). Readers are replaced a bounded number of times; past
+        // that the client exits through the normal terminal-restoring
+        // teardown with a nonzero code.
+        let mut reader_deaths = 0u32;
         loop {
             self.expire_status_toast();
             self.expire_session_recovery_timeout();
@@ -1205,9 +1211,26 @@ impl App {
                                 self.handle_key(k);
                             }
                         }
+                        crate::event::Input::ReaderDied => {
+                            reader_deaths += 1;
+                            if crate::event::reader_should_restart(reader_deaths) {
+                                reader = crate::event::spawn_reader();
+                                self.set_status("Terminal input restarted.");
+                            } else {
+                                self.set_hint("Terminal input failed — exiting.");
+                                self.should_quit = true;
+                            }
+                        }
                     }
                     if self.should_quit {
-                        return 0;
+                        // Nonzero only when input itself gave out: the
+                        // terminal was restored either way, but callers and
+                        // logs can tell the exits apart.
+                        return if reader_deaths > crate::event::MAX_READER_RESPAWNS {
+                            3
+                        } else {
+                            0
+                        };
                     }
                 }
             }

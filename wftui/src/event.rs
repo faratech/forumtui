@@ -16,6 +16,22 @@ pub enum Input {
     Mouse(MouseEvent),
     Paste(String),
     Resize,
+    /// The reader thread's `event::read()` failed — the tty went away or
+    /// errored. The loop respawns the reader a bounded number of times and
+    /// exits cleanly past that, instead of ticking forever with no way to
+    /// type (#653).
+    ReaderDied,
+}
+
+/// How many times a dead reader may be replaced before the client concludes
+/// its input is gone for good and quits through the normal (terminal-
+/// restoring) teardown.
+pub const MAX_READER_RESPAWNS: u32 = 3;
+
+/// The input-death policy (#653): `deaths` is how many readers have died so
+/// far. True = spawn another reader; false = exit cleanly.
+pub fn reader_should_restart(deaths: u32) -> bool {
+    deaths <= MAX_READER_RESPAWNS
 }
 
 /// Spawn the reader thread; returns the receiving side for the UI loop.
@@ -50,7 +66,13 @@ pub fn spawn_reader() -> Receiver<Input> {
                     }
                 }
                 Ok(_) => {}
-                Err(_) => break,
+                Err(_) => {
+                    // Tell the UI loop the reader is gone — it respawns or
+                    // quits; a silent break used to disable all input
+                    // forever while the frame kept redrawing (#653).
+                    let _ = tx.send(Input::ReaderDied);
+                    break;
+                }
             }
         }
     })
@@ -83,9 +105,22 @@ mod tests {
     use super::*;
     use ratatui::crossterm::event::{KeyEventKind, KeyEventState};
 
+    /// #653: a dead reader is replaced a bounded number of times — enough
+    /// to survive a transient tty error, not enough to spin forever when
+    /// stdin is gone for good.
     #[test]
-    fn filters_key_release_events() {
-        let press = KeyEvent {
+    fn the_reader_death_policy_restarts_a_bounded_number_of_times() {
+        assert!(reader_should_restart(0));
+        assert!(reader_should_restart(1));
+        assert!(reader_should_restart(MAX_READER_RESPAWNS));
+        assert!(
+            !reader_should_restart(MAX_READER_RESPAWNS + 1),
+            "past the cap the client must quit cleanly, not respawn forever"
+        );
+    }
+
+    #[test]
+    fn filters_key_release_events() {        let press = KeyEvent {
             code: KeyCode::Char('j'),
             modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press,
