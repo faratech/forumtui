@@ -10,7 +10,7 @@ use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TokenSet {
     pub access_token: String,
     pub refresh_token: String,
@@ -19,11 +19,30 @@ pub struct TokenSet {
     pub scope: String,
 }
 
+// Deliberately manual: the derived Debug printed both live secrets, and one
+// future `tracing::debug!("{tokens:?}")` would have logged the bearer and
+// the 90-day refresh grant (#647).
+impl std::fmt::Debug for TokenSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenSet")
+            .field("access_token", &format_args!("[redacted; {} chars]", self.access_token.len()))
+            .field(
+                "refresh_token",
+                &format_args!("[redacted; {} chars]", self.refresh_token.len()),
+            )
+            .field("expires_at", &self.expires_at)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
 impl TokenSet {
     /// Treat the access token as expired 60s early to absorb clock skew and
     /// in-flight request time.
     pub fn access_expired(&self, now: OffsetDateTime) -> bool {
-        now.unix_timestamp() >= self.expires_at - 60
+        // Saturating: `expires_at` comes off disk and a hand-edited i64::MIN
+        // must not underflow the skew margin (#642).
+        now.unix_timestamp() >= self.expires_at.saturating_sub(60)
     }
 }
 
@@ -229,5 +248,27 @@ mod tests {
         assert!(!t.access_expired(now));
         t.expires_at = 1_050;
         assert!(t.access_expired(now)); // within the 60s window
+    }
+
+    /// `expires_at` comes off disk and a hand-edited i64::MIN must not
+    /// underflow the 60s skew margin (#642): it simply counts as expired.
+    #[test]
+    fn a_minimal_expiry_counts_as_expired_not_a_panic() {
+        let now = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let mut t = sample();
+        t.expires_at = i64::MIN;
+        assert!(t.access_expired(now));
+    }
+
+    /// The manual Debug must never print the bearer or the 90-day refresh
+    /// grant (#647) — one future `tracing::debug!("{tokens:?}")` would
+    /// otherwise leak both.
+    #[test]
+    fn debug_redacts_both_secrets() {
+        let t = sample();
+        let dbg = format!("{t:?}");
+        assert!(!dbg.contains("\"at\""), "Debug leaked the access token: {dbg}");
+        assert!(!dbg.contains("\"rt\""), "Debug leaked the refresh token: {dbg}");
+        assert!(dbg.contains("redacted"), "Debug must say it redacted: {dbg}");
     }
 }

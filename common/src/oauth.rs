@@ -331,7 +331,12 @@ pub async fn poll_link(client: &reqwest::Client, base: &str, id: &str) -> Result
     }
     let poll: Poll = serde_json::from_slice(&body)?;
     match poll.status.as_str() {
-        "authorized" => Ok(PollStatus::Authorized(poll.code)),
+        // An "authorized" verdict with an empty code (the field is
+        // `#[serde(default)]`) must not reach `exchange_code` — the other
+        // code paths (`wait_for_redirect`, `code_from_pasted`) filter empty
+        // codes, and here the right move is to keep waiting: the next poll
+        // may carry it.
+        "authorized" if !poll.code.is_empty() => Ok(PollStatus::Authorized(poll.code)),
         "expired" => Ok(PollStatus::Expired),
         _ => Ok(PollStatus::Waiting),
     }
@@ -399,10 +404,16 @@ async fn token_request(
     }
     let parsed: TokenResp = serde_json::from_slice(&body)?;
     let now = OffsetDateTime::now_utc().unix_timestamp();
+    // `expires_in` is untrusted input (#642, the #554 class): a hostile or
+    // corrupt value must neither overflow `now + expires_in` (panic in
+    // debug, wrap in release) nor make a nonsense-negative expiry. 90 days
+    // is already the client's ceiling for any access token.
+    const MAX_EXPIRES_IN_SECS: i64 = 90 * 24 * 3600;
+    let expires_in = parsed.expires_in.clamp(0, MAX_EXPIRES_IN_SECS);
     Ok(TokenSet {
         access_token: parsed.access_token,
         refresh_token: parsed.refresh_token,
-        expires_at: now + parsed.expires_in,
+        expires_at: now.saturating_add(expires_in),
         scope: parsed.scope,
     })
 }
@@ -723,9 +734,58 @@ mod tests {
     /// back to the synthetic `"http_error"` code — that is the signal
     /// `TaskError::ends_session()` uses to keep a merely-transient failure
     /// from being mistaken for a dead grant.
+    /// `expires_in` is untrusted input (#642): a hostile i64::MAX must be
+    /// clamped to the client's 90-day ceiling instead of overflowing
+    /// `now + expires_in`, and the result must be a sane future instant.
     #[tokio::test]
-    async fn token_request_falls_back_to_http_error_for_non_json_bodies() {
+    async fn token_request_clamps_a_hostile_expires_in() {
         let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(config::OAUTH_TOKEN_PATH))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at",
+                "refresh_token": "rt",
+                "expires_in": 9_223_372_036_854_775_807i64,
+                "scope": "node:read"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = crate::http::build().unwrap();
+        let tokens = refresh(&client, &server.uri(), "rt").await.unwrap();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        assert!(
+            tokens.expires_at > now,
+            "a clamped expiry is still in the future"
+        );
+        assert!(
+            tokens.expires_at <= now + 90 * 24 * 3600 + 5,
+            "the clamp caps the expiry at 90 days: {}",
+            tokens.expires_at
+        );
+    }
+
+    /// An "authorized" poll verdict with no code (the field defaults to
+    /// empty) must keep the flow waiting, not hand an empty code to
+    /// `exchange_code` (#645) — the other code paths filter empties too.
+    #[tokio::test]
+    async fn poll_link_keeps_waiting_when_authorized_carries_no_code() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/wf-tuilink/poll"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "status": "authorized" }),
+            ))
+            .mount(&server)
+            .await;
+
+        let client = crate::http::build().unwrap();
+        let status = poll_link(&client, &server.uri(), "abc123").await.unwrap();
+        assert_eq!(status, PollStatus::Waiting);
+    }
+
+    #[tokio::test]
+    async fn token_request_falls_back_to_http_error_for_non_json_bodies() {        let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(config::OAUTH_TOKEN_PATH))
             .respond_with(
