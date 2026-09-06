@@ -467,12 +467,18 @@ pub fn render(src: &str) -> Vec<Chunk> {
                     "th" => stack.push(Frame::TableHeader),
                     "td" => stack.push(Frame::TableCell),
                     "url" => match value.filter(|v| !v.trim().is_empty()) {
-                        Some(href) => stack.push(Frame::Link(strip_quotes(&href).to_string())),
+                        // XF stores entities in tag values exactly as in text
+                        // (`&amp;` inside an href), so the target decodes like
+                        // everything else (#650) — a literal `&amp;` in the
+                        // href was a wrong link.
+                        Some(href) => {
+                            stack.push(Frame::Link(decode_html_entities(strip_quotes(&href))))
+                        }
                         None => stack.push(Frame::Link(String::new())),
                     },
                     "email" => match value.filter(|v| !v.trim().is_empty()) {
                         Some(target) => {
-                            let clean = strip_quotes(&target);
+                            let clean = decode_html_entities(strip_quotes(&target));
                             let href = if clean.starts_with("mailto:") {
                                 clean.to_string()
                             } else {
@@ -519,16 +525,18 @@ pub fn render(src: &str) -> Vec<Chunk> {
                     "img" => {
                         if let Some((inner, close_len)) = misses.split(src, rest, "img") {
                             let st = Style::from_stack(&stack);
-                            let trimmed = strip_quotes(inner.trim());
+                            // Entity-decoded like the [URL=] target (#650): a
+                            // literal `&amp;` in the src was a dead image.
+                            let trimmed = decode_html_entities(strip_quotes(inner.trim()));
                             if trimmed.is_empty() {
                                 out.push(Chunk::Text("[image]".into(), st));
                             } else {
-                                out.push(Chunk::Image(trimmed.to_string(), st));
+                                out.push(Chunk::Image(trimmed, st));
                             }
                             rest = &rest[close_len..];
                         } else if let Some(v) = &value {
                             let st = Style::from_stack(&stack);
-                            out.push(Chunk::Image(strip_quotes(v).to_string(), st));
+                            out.push(Chunk::Image(decode_html_entities(strip_quotes(v)), st));
                         } else {
                             emit_text(&mut out, raw_tag, &stack);
                         }
@@ -1170,6 +1178,27 @@ mod tests {
         assert!(text.contains("[x[x[x]hello"), "{text:?}");
         assert!(text.contains("bold"), "{text:?}");
         assert!(!text.contains("[b]"), "{text:?}");
+    }
+
+    /// XF stores entities in tag values exactly as in text, and the target
+    /// of a link or image must decode like the label does (#650): a literal
+    /// `&amp;` in the href was a wrong link, in an [IMG] src a dead image.
+    #[test]
+    fn url_and_img_targets_are_entity_decoded() {
+        let url = render("[url=\"https://x.test/?a=1&amp;b=2\"]link[/url]");
+        match &url[0] {
+            Chunk::Link(label, href, _) => {
+                assert_eq!(label.as_str(), "link");
+                assert_eq!(href, "https://x.test/?a=1&b=2", "the href must decode");
+            }
+            other => panic!("expected a link, got {other:?}"),
+        }
+        let img = render("[IMG]https://x.test/a&amp;b.png[/IMG]");
+        assert!(
+            matches!(&img[0], Chunk::Image(u, _) if u == "https://x.test/a&b.png"),
+            "{:?}",
+            img[0]
+        );
     }
 
     /// The depth cap must not change what a normally-nested post renders as.
