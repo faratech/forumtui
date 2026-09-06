@@ -85,32 +85,126 @@ pub fn is_http_url(s: &str) -> bool {
 }
 
 impl Style {
-    fn from_stack(stack: &[Frame]) -> Style {
-        let mut s = Style::default();
-        for frame in stack {
-            match frame {
-                Frame::Bold => s.bold = true,
-                Frame::Italic => s.italic = true,
-                Frame::Underline => s.underline = true,
-                Frame::Strike => s.strikethrough = true,
-                Frame::Quote { .. } => s.quote_depth += 1,
-                Frame::List(_) => s.list_depth += 1,
-                Frame::Spoiler => s.spoiler = true,
-                Frame::InlineCode => s.code = true,
-                Frame::Heading(_) | Frame::TableHeader => {
-                    s.bold = true;
-                }
-                Frame::Color(_)
-                | Frame::Size(_)
-                | Frame::Font(_)
-                | Frame::Align(_)
-                | Frame::Link(_)
-                | Frame::Table
-                | Frame::TableRow
-                | Frame::TableCell => {}
-            }
+    /// Rebuild the style from per-frame-kind open counts. O(1) per call —
+    /// the replacement for the O(depth) `from_stack` walk, which is what
+    /// let the frame-depth cap go entirely (#622).
+    fn from_counts(c: &FrameCounts) -> Style {
+        Style {
+            bold: c.bold > 0,
+            italic: c.italic > 0,
+            underline: c.underline > 0,
+            strikethrough: c.strike > 0,
+            code: c.code > 0,
+            spoiler: c.spoiler > 0,
+            quote_depth: c.quote.min(u8::MAX as u32) as u8,
+            list_depth: c.list.min(u8::MAX as u32) as u8,
         }
-        s
+    }
+}
+
+/// Per-frame-kind open counts — the incremental mirror of the frame stack.
+/// Push/pop are O(1), so emission sites read `Style::from_counts` without
+/// walking the stack, and nesting is limited by nothing but input size
+/// (#622): XF declares `$maxDepth` but never enforces it, and real posts
+/// nest 33 deep.
+#[derive(Debug, Default, Clone, Copy)]
+struct FrameCounts {
+    bold: u32,
+    italic: u32,
+    underline: u32,
+    strike: u32,
+    spoiler: u32,
+    code: u32,
+    quote: u32,
+    list: u32,
+}
+
+/// Apply (or, with `on = false`, reverse) `frame`'s style contribution.
+fn apply_frame(frame: &Frame, c: &mut FrameCounts, on: bool) {
+    macro_rules! bump {
+        ($field:ident) => {{
+            if on {
+                c.$field = c.$field.saturating_add(1);
+            } else {
+                c.$field = c.$field.saturating_sub(1);
+            }
+        }};
+    }
+    match frame {
+        Frame::Bold => bump!(bold),
+        Frame::Italic => bump!(italic),
+        Frame::Underline => bump!(underline),
+        Frame::Strike => bump!(strike),
+        Frame::Spoiler => bump!(spoiler),
+        Frame::InlineCode => bump!(code),
+        Frame::Quote { .. } => bump!(quote),
+        Frame::List(_) => bump!(list),
+        // A heading always carries bold; popping it drops the contribution.
+        Frame::Heading(_) | Frame::TableHeader => bump!(bold),
+        Frame::Color(_)
+        | Frame::Size(_)
+        | Frame::Font(_)
+        | Frame::Align(_)
+        | Frame::Link(_)
+        | Frame::Table
+        | Frame::TableRow
+        | Frame::TableCell => {}
+    }
+}
+
+/// Push a frame and keep the counters and the mirrored `Style` in step.
+fn push_frame(stack: &mut Vec<Frame>, c: &mut FrameCounts, style: &mut Style, frame: Frame) {
+    apply_frame(&frame, c, true);
+    *style = Style::from_counts(c);
+    stack.push(frame);
+}
+
+/// Pop the innermost frame matching the closing tag name; false if none.
+/// Frames above the match are unclosed inner tags and stay, exactly as
+/// before — only the matched frame's contribution is reversed (#622).
+fn pop_matching(
+    stack: &mut Vec<Frame>,
+    c: &mut FrameCounts,
+    style: &mut Style,
+    links: &mut Vec<String>,
+    name: &str,
+) -> bool {
+    match stack.iter().rposition(|f| is_closer(name, f)) {
+        Some(pos) => {
+            let frame = stack.remove(pos);
+            if matches!(frame, Frame::Link(_)) {
+                links.pop();
+            }
+            apply_frame(&frame, c, false);
+            *style = Style::from_counts(c);
+            true
+        }
+        None => false,
+    }
+}
+
+fn is_closer(name: &str, f: &Frame) -> bool {
+    match (name, f) {
+        ("b", Frame::Bold)
+        | ("i", Frame::Italic)
+        | ("u", Frame::Underline)
+        | ("s" | "strike", Frame::Strike)
+        | ("sub" | "sup" | "highlight", Frame::Italic | Frame::Bold)
+        | ("list", Frame::List(_))
+        | ("spoiler" | "ispoiler", Frame::Spoiler)
+        | ("icode" | "inlinecode", Frame::InlineCode)
+        | ("heading" | "h1" | "h2" | "h3", Frame::Heading(_))
+        | ("color", Frame::Color(_))
+        | ("size", Frame::Size(_))
+        | ("font", Frame::Font(_))
+        | ("left" | "center" | "right" | "justify" | "indent", Frame::Align(_))
+        | ("url" | "email" | "post" | "thread", Frame::Link(_))
+        | ("table", Frame::Table)
+        | ("tr", Frame::TableRow)
+        | ("th", Frame::TableHeader)
+        | ("td", Frame::TableCell) => true,
+        ("quote", Frame::Quote { .. }) => true,
+        _ => false,
     }
 }
 
@@ -285,7 +379,7 @@ fn ends_with_newline(chunks: &[Chunk]) -> bool {
     })
 }
 
-fn emit_list_marker(out: &mut Vec<Chunk>, stack: &mut [Frame]) {
+fn emit_list_marker(out: &mut Vec<Chunk>, stack: &mut [Frame], style: Style) {
     let marker = if let Some(Frame::List(kind)) =
         stack.iter_mut().rev().find(|f| matches!(f, Frame::List(_)))
     {
@@ -293,7 +387,7 @@ fn emit_list_marker(out: &mut Vec<Chunk>, stack: &mut [Frame]) {
     } else {
         "• ".to_string()
     };
-    let mut st = Style::from_stack(stack);
+    let mut st = style;
     st.bold = true;
     out.push(Chunk::Text(marker, st));
 }
@@ -301,6 +395,14 @@ fn emit_list_marker(out: &mut Vec<Chunk>, stack: &mut [Frame]) {
 pub fn render(src: &str) -> Vec<Chunk> {
     let mut out: Vec<Chunk> = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
+    // Incremental style mirror of `stack` (#622): O(1) push/pop instead of
+    // an O(depth) walk per emitted chunk, which is what let the frame-depth
+    // cap go.
+    let mut counts = FrameCounts::default();
+    let mut style = Style::default();
+    // The open [URL] href, innermost last — the O(1) sibling of the frame
+    // stack, so emit_text doesn't walk the stack per text run (#622).
+    let mut links: Vec<String> = Vec::new();
     let mut misses = CloseMisses::default();
     let mut brackets = CloseBracket::default();
     let mut rest = src;
@@ -309,12 +411,12 @@ pub fn render(src: &str) -> Vec<Chunk> {
         let bracket = match rest.find('[') {
             Some(i) => i,
             None => {
-                emit_text(&mut out, rest, &stack);
+                emit_text(&mut out, rest, style.clone(), links.last().map(String::as_str));
                 break;
             }
         };
         if bracket > 0 {
-            emit_text(&mut out, &rest[..bracket], &stack);
+            emit_text(&mut out, &rest[..bracket], style.clone(), links.last().map(String::as_str));
             rest = &rest[bracket..];
         }
 
@@ -323,24 +425,14 @@ pub fn render(src: &str) -> Vec<Chunk> {
             Some(TagEvent::Open { name, value, len }) => {
                 let raw_tag = &rest[..len];
                 rest = &rest[len..];
-                // XF's parser caps nesting at 20 frames (Parser.php
-                // `$maxDepth`); past that an open tag is just text. Without a
-                // cap an unclosed `[B]` per 3 bytes kept the frame stack (and
-                // so every `Style::from_stack` walk) growing for the whole
-                // post — 312 ms for 80 KB, re-paid on every redraw of the
-                // thread view (issue #607).
-                if stack.len() >= MAX_FRAME_DEPTH {
-                    emit_text(&mut out, raw_tag, &stack);
-                    continue;
-                }
                 let tag_lower = name.to_ascii_lowercase();
                 match tag_lower.as_str() {
-                    "b" => stack.push(Frame::Bold),
-                    "i" => stack.push(Frame::Italic),
-                    "u" => stack.push(Frame::Underline),
-                    "s" | "strike" => stack.push(Frame::Strike),
-                    "sub" | "sup" => stack.push(Frame::Italic),
-                    "highlight" => stack.push(Frame::Bold),
+                    "b" => push_frame(&mut stack, &mut counts, &mut style, Frame::Bold),
+                    "i" => push_frame(&mut stack, &mut counts, &mut style, Frame::Italic),
+                    "u" => push_frame(&mut stack, &mut counts, &mut style, Frame::Underline),
+                    "s" | "strike" => push_frame(&mut stack, &mut counts, &mut style, Frame::Strike),
+                    "sub" | "sup" => push_frame(&mut stack, &mut counts, &mut style, Frame::Italic),
+                    "highlight" => push_frame(&mut stack, &mut counts, &mut style, Frame::Bold),
                     "icode" | "inlinecode" => {
                         // XF's `icode` rule is `['plain' => true]` — children
                         // are literal, like [CODE]/[PHP]/[HTML]. Pushing a
@@ -356,22 +448,22 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         // swallowing the rest of the document like [CODE]'s
                         // unclosed fallback does.
                         if let Some((inner, close_len)) = misses.split(src, rest, &tag_lower) {
-                            let mut st = Style::from_stack(&stack);
+                            let mut st = style.clone();
                             st.code = true;
                             out.push(Chunk::Text(decode_html_entities(inner), st));
                             rest = &rest[close_len..];
                         } else {
-                            stack.push(Frame::InlineCode);
+                            push_frame(&mut stack, &mut counts, &mut style, Frame::InlineCode);
                         }
                     }
                     "code" | "php" | "html" => {
                         let (inner, close_len) = take_until_close(rest, &tag_lower);
-                        let mut st = Style::from_stack(&stack);
+                        let mut st = style.clone();
                         st.code = true;
                         if let Some(v) = &value {
                             let clean_v = strip_quotes(v);
                             if !clean_v.is_empty() {
-                                let mut hst = Style::from_stack(&stack);
+                                let mut hst = style.clone();
                                 hst.bold = true;
                                 out.push(Chunk::Text(format!("[{clean_v} code]\n"), hst));
                             }
@@ -383,98 +475,103 @@ pub fn render(src: &str) -> Vec<Chunk> {
                     }
                     "plain" => {
                         let (inner, close_len) = take_until_close(rest, "plain");
-                        emit_text(&mut out, inner, &stack);
+                        emit_text(&mut out, inner, style.clone(), links.last().map(String::as_str));
                         rest = &rest[close_len..];
                     }
                     "quote" => {
                         let byline = value.filter(|v| !v.trim().is_empty());
                         if let Some(by) = &byline {
                             let (author, _) = parse_quote_byline(by);
-                            let mut st = Style::from_stack(&stack);
+                            let mut st = style.clone();
                             st.italic = true;
                             out.push(Chunk::Text(format!("{author} wrote:\n"), st));
                         }
-                        stack.push(Frame::Quote { byline });
+                        push_frame(&mut stack, &mut counts, &mut style, Frame::Quote { byline });
                     }
                     "list" => {
                         let kind = ListKind::from_attr(value.as_deref());
-                        stack.push(Frame::List(kind));
+                        push_frame(&mut stack, &mut counts, &mut style, Frame::List(kind));
                     }
                     "spoiler" | "ispoiler" => {
                         if let Some(title) = &value {
                             let clean = strip_quotes(title);
                             if !clean.is_empty() {
-                                let mut st = Style::from_stack(&stack);
+                                let mut st = style.clone();
                                 st.bold = true;
                                 out.push(Chunk::Text(format!("[Spoiler: {clean}]\n"), st));
                             }
                         }
-                        stack.push(Frame::Spoiler);
+                        push_frame(&mut stack, &mut counts, &mut style, Frame::Spoiler);
                     }
-                    "color" => stack.push(Frame::Color(value.unwrap_or_default())),
-                    "size" => stack.push(Frame::Size(value.unwrap_or_default())),
-                    "font" => stack.push(Frame::Font(value.unwrap_or_default())),
+                    "color" => push_frame(&mut stack, &mut counts, &mut style, Frame::Color(value.unwrap_or_default())),
+                    "size" => push_frame(&mut stack, &mut counts, &mut style, Frame::Size(value.unwrap_or_default())),
+                    "font" => push_frame(&mut stack, &mut counts, &mut style, Frame::Font(value.unwrap_or_default())),
                     "left" | "center" | "right" | "justify" => {
                         stack.push(Frame::Align(tag_lower))
                     }
-                    "indent" => stack.push(Frame::Align("indent".into())),
+                    "indent" => push_frame(&mut stack, &mut counts, &mut style, Frame::Align("indent".into())),
                     "heading" => {
                         let level = value
                             .as_deref()
                             .and_then(|v| strip_quotes(v).parse::<u8>().ok())
                             .unwrap_or(1);
                         if !out.is_empty() && !ends_with_newline(&out) {
-                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                            out.push(Chunk::Text("\n".into(), style.clone()));
                         }
-                        stack.push(Frame::Heading(level));
+                        push_frame(&mut stack, &mut counts, &mut style, Frame::Heading(level));
                     }
                     "h1" => {
                         if !out.is_empty() && !ends_with_newline(&out) {
-                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                            out.push(Chunk::Text("\n".into(), style.clone()));
                         }
-                        stack.push(Frame::Heading(1));
+                        push_frame(&mut stack, &mut counts, &mut style, Frame::Heading(1));
                     }
                     "h2" => {
                         if !out.is_empty() && !ends_with_newline(&out) {
-                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                            out.push(Chunk::Text("\n".into(), style.clone()));
                         }
-                        stack.push(Frame::Heading(2));
+                        push_frame(&mut stack, &mut counts, &mut style, Frame::Heading(2));
                     }
                     "h3" => {
                         if !out.is_empty() && !ends_with_newline(&out) {
-                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                            out.push(Chunk::Text("\n".into(), style.clone()));
                         }
-                        stack.push(Frame::Heading(3));
+                        push_frame(&mut stack, &mut counts, &mut style, Frame::Heading(3));
                     }
                     "hr" => {
                         if !out.is_empty() && !ends_with_newline(&out) {
-                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                            out.push(Chunk::Text("\n".into(), style.clone()));
                         }
-                        out.push(Chunk::Text("───\n".into(), Style::from_stack(&stack)));
+                        out.push(Chunk::Text("───\n".into(), style.clone()));
                     }
                     "table" => {
                         if !out.is_empty() && !ends_with_newline(&out) {
-                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                            out.push(Chunk::Text("\n".into(), style.clone()));
                         }
-                        stack.push(Frame::Table);
+                        push_frame(&mut stack, &mut counts, &mut style, Frame::Table);
                     }
                     "tr" => {
                         if !out.is_empty() && !ends_with_newline(&out) {
-                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                            out.push(Chunk::Text("\n".into(), style.clone()));
                         }
-                        stack.push(Frame::TableRow);
+                        push_frame(&mut stack, &mut counts, &mut style, Frame::TableRow);
                     }
-                    "th" => stack.push(Frame::TableHeader),
-                    "td" => stack.push(Frame::TableCell),
+                    "th" => push_frame(&mut stack, &mut counts, &mut style, Frame::TableHeader),
+                    "td" => push_frame(&mut stack, &mut counts, &mut style, Frame::TableCell),
                     "url" => match value.filter(|v| !v.trim().is_empty()) {
                         // XF stores entities in tag values exactly as in text
                         // (`&amp;` inside an href), so the target decodes like
                         // everything else (#650) — a literal `&amp;` in the
                         // href was a wrong link.
                         Some(href) => {
-                            stack.push(Frame::Link(decode_html_entities(strip_quotes(&href))))
+                            let href = decode_html_entities(strip_quotes(&href));
+                            links.push(href.clone());
+                            push_frame(&mut stack, &mut counts, &mut style, Frame::Link(href));
                         }
-                        None => stack.push(Frame::Link(String::new())),
+                        None => {
+                            links.push(String::new());
+                            push_frame(&mut stack, &mut counts, &mut style, Frame::Link(String::new()));
+                        }
                     },
                     "email" => match value.filter(|v| !v.trim().is_empty()) {
                         Some(target) => {
@@ -484,7 +581,8 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             } else {
                                 format!("mailto:{clean}")
                             };
-                            stack.push(Frame::Link(href));
+                            links.push(href.clone());
+                            push_frame(&mut stack, &mut counts, &mut style, Frame::Link(href));
                         }
                         None => {
                             // XF's no-value form, `[email]addr[/email]`: the
@@ -495,12 +593,13 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             // with the raw address as both label and target
                             // (issue #603).
                             if let Some((inner, close_len)) = misses.split(src, rest, "email") {
-                                let st = Style::from_stack(&stack);
+                                let st = style.clone();
                                 let addr = decode_html_entities(inner.trim());
                                 out.push(Chunk::Link(addr.clone(), format!("mailto:{addr}"), st));
                                 rest = &rest[close_len..];
                             } else {
-                                stack.push(Frame::Link(String::new()));
+                                links.push(String::new());
+                                push_frame(&mut stack, &mut counts, &mut style, Frame::Link(String::new()));
                             }
                         }
                     },
@@ -511,7 +610,8 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         } else {
                             String::new()
                         };
-                        stack.push(Frame::Link(url));
+                        links.push(url.clone());
+                        push_frame(&mut stack, &mut counts, &mut style, Frame::Link(url));
                     }
                     "thread" => {
                         let id = value.as_deref().map(strip_quotes).unwrap_or("");
@@ -520,11 +620,12 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         } else {
                             String::new()
                         };
-                        stack.push(Frame::Link(url));
+                        links.push(url.clone());
+                        push_frame(&mut stack, &mut counts, &mut style, Frame::Link(url));
                     }
                     "img" => {
                         if let Some((inner, close_len)) = misses.split(src, rest, "img") {
-                            let st = Style::from_stack(&stack);
+                            let st = style.clone();
                             // Entity-decoded like the [URL=] target (#650): a
                             // literal `&amp;` in the src was a dead image.
                             let trimmed = decode_html_entities(strip_quotes(inner.trim()));
@@ -535,26 +636,26 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             }
                             rest = &rest[close_len..];
                         } else if let Some(v) = &value {
-                            let st = Style::from_stack(&stack);
+                            let st = style.clone();
                             out.push(Chunk::Image(decode_html_entities(strip_quotes(v)), st));
                         } else {
-                            emit_text(&mut out, raw_tag, &stack);
+                            emit_text(&mut out, raw_tag, style.clone(), links.last().map(String::as_str));
                         }
                     }
                     "media" => {
                         if let Some((inner, close_len)) = misses.split(src, rest, "media") {
-                            let st = Style::from_stack(&stack);
+                            let st = style.clone();
                             let site = value.as_deref().map(strip_quotes).unwrap_or("media");
                             let (label, url) = resolve_media(site, inner);
                             out.push(Chunk::Link(label, url, st));
                             rest = &rest[close_len..];
                         } else {
-                            emit_text(&mut out, raw_tag, &stack);
+                            emit_text(&mut out, raw_tag, style.clone(), links.last().map(String::as_str));
                         }
                     }
                     "attach" => {
                         if let Some((inner, close_len)) = misses.split(src, rest, "attach") {
-                            let st = Style::from_stack(&stack);
+                            let st = style.clone();
                             let id = if inner.trim().is_empty() {
                                 value.as_deref().map(strip_quotes).unwrap_or("").trim()
                             } else {
@@ -563,35 +664,35 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             out.push(Chunk::Attach(id.to_string(), st));
                             rest = &rest[close_len..];
                         } else if let Some(v) = &value {
-                            let st = Style::from_stack(&stack);
+                            let st = style.clone();
                             let clean = strip_quotes(v);
                             out.push(Chunk::Attach(clean.to_string(), st));
                         } else {
-                            emit_text(&mut out, raw_tag, &stack);
+                            emit_text(&mut out, raw_tag, style.clone(), links.last().map(String::as_str));
                         }
                     }
                     "user" => {
                         if let Some((inner, close_len)) = misses.split(src, rest, "user") {
-                            let st = Style::from_stack(&stack);
+                            let st = style.clone();
                             let name = inner.trim();
                             let name = name.strip_prefix('@').unwrap_or(name);
                             out.push(Chunk::Text(format!("@{name}"), st));
                             rest = &rest[close_len..];
                         } else if let Some(v) = &value {
-                            let st = Style::from_stack(&stack);
+                            let st = style.clone();
                             let clean = strip_quotes(v);
                             let clean = clean.strip_prefix('@').unwrap_or(clean);
                             out.push(Chunk::Text(format!("@{clean}"), st));
                         } else {
-                            emit_text(&mut out, raw_tag, &stack);
+                            emit_text(&mut out, raw_tag, style.clone(), links.last().map(String::as_str));
                         }
                     }
                     "*" => {
-                        emit_list_marker(&mut out, &mut stack);
+                        emit_list_marker(&mut out, &mut stack, style.clone());
                     }
                     _ => {
                         // Unknown tag: literal passthrough, no frame pushed.
-                        emit_text(&mut out, raw_tag, &stack);
+                        emit_text(&mut out, raw_tag, style.clone(), links.last().map(String::as_str));
                     }
                 }
             }
@@ -601,32 +702,32 @@ pub fn render(src: &str) -> Vec<Chunk> {
                 let tag_lower = name.to_ascii_lowercase();
                 match tag_lower.as_str() {
                     "heading" | "h1" | "h2" | "h3" => {
-                        if pop_matching(&mut stack, &tag_lower)
+                        if pop_matching(&mut stack, &mut counts, &mut style, &mut links, &tag_lower)
                             && !out.is_empty()
                             && !ends_with_newline(&out)
                         {
-                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                            out.push(Chunk::Text("\n".into(), style.clone()));
                         }
                     }
                     "td" | "th" => {
-                        if pop_matching(&mut stack, &tag_lower) {
-                            out.push(Chunk::Text(" | ".into(), Style::from_stack(&stack)));
+                        if pop_matching(&mut stack, &mut counts, &mut style, &mut links, &tag_lower) {
+                            out.push(Chunk::Text(" | ".into(), style.clone()));
                         }
                     }
                     "tr" => {
-                        if pop_matching(&mut stack, "tr")
+                        if pop_matching(&mut stack, &mut counts, &mut style, &mut links, "tr")
                             && !out.is_empty()
                             && !ends_with_newline(&out)
                         {
-                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                            out.push(Chunk::Text("\n".into(), style.clone()));
                         }
                     }
                     "table" => {
-                        if pop_matching(&mut stack, "table")
+                        if pop_matching(&mut stack, &mut counts, &mut style, &mut links, "table")
                             && !out.is_empty()
                             && !ends_with_newline(&out)
                         {
-                            out.push(Chunk::Text("\n".into(), Style::from_stack(&stack)));
+                            out.push(Chunk::Text("\n".into(), style.clone()));
                         }
                     }
                     // XF's hr is self-contained: the news template writes
@@ -635,20 +736,20 @@ pub fn render(src: &str) -> Vec<Chunk> {
                     // verbatim as a stray `[/HR]` line under the rule (#610).
                     "hr" => {}
                     _ => {
-                        if !pop_matching(&mut stack, &tag_lower) {
+                        if !pop_matching(&mut stack, &mut counts, &mut style, &mut links, &tag_lower) {
                             // Closing tag for an unknown/unopened tag: keep it visible.
-                            emit_text(&mut out, raw_tag, &stack);
+                            emit_text(&mut out, raw_tag, style.clone(), links.last().map(String::as_str));
                         }
                     }
                 }
             }
             Some(TagEvent::Star(len)) => {
                 rest = &rest[len..];
-                emit_list_marker(&mut out, &mut stack);
+                emit_list_marker(&mut out, &mut stack, style.clone());
             }
             None => {
                 // Stray '[': literal.
-                emit_text(&mut out, &rest[..1], &stack);
+                emit_text(&mut out, &rest[..1], style.clone(), links.last().map(String::as_str));
                 rest = &rest[1..];
                 continue 'outer;
             }
@@ -684,9 +785,6 @@ pub fn to_plain(src: &str) -> String {
     }
     s.replace('\n', " ").split_whitespace().collect::<Vec<_>>().join(" ")
 }
-
-/// XF's `Parser::$maxDepth`. Deeper open tags render as literal text.
-const MAX_FRAME_DEPTH: usize = 20;
 
 enum TagEvent {
     Open {
@@ -834,6 +932,12 @@ fn parse_tag(src: &str, s: &str, brackets: &mut CloseBracket) -> Option<TagEvent
         let before_eq = &inner[..eq_pos];
         if let Some(space_pos) = before_eq.find(char::is_whitespace) {
             let name_part = before_eq[..space_pos].trim();
+            // A space before the `=` makes this the attribute form, which
+            // only opens when a real `key=` option follows (#616):
+            // `[QUOTE = Trouble; 235284]` is literal text.
+            if !has_tag_option(&inner[space_pos..]) {
+                return None;
+            }
             (name_part, None)
         } else {
             let name_part = before_eq.trim();
@@ -845,6 +949,15 @@ fn parse_tag(src: &str, s: &str, brackets: &mut CloseBracket) -> Option<TagEvent
         // aware) rather than a raw byte offset + `+ 1`, so a multi-byte
         // whitespace character (U+00A0 NBSP, U+3000 IDEOGRAPHIC SPACE, ...)
         // can't land the slice mid-codepoint and panic (issue #533).
+        //
+        // XF only accepts this attribute form when at least one `key=`
+        // option follows the space (Parser.php: `if ($_options && $endChar
+        // == ']') openTag … else pushText`) — `[i removed it]` with no
+        // option is literal text, not an italic frame that swallows the
+        // rest of the post (#616).
+        if !has_tag_option(val) {
+            return None;
+        }
         (name_part.trim(), Some(strip_quotes(val.trim()).to_string()))
     } else {
         (inner.trim(), None)
@@ -867,6 +980,22 @@ fn is_tag_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Does this attribute-form remainder carry at least one `key=` option?
+/// XF's parser only opens the tag when it does (#616): the option key is a
+/// run of word characters immediately before the `=`.
+fn has_tag_option(words: &str) -> bool {
+    let b = words.as_bytes();
+    for (i, &c) in b.iter().enumerate() {
+        if c == b'='
+            && i > 0
+            && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Byte offset of the next `[/name]`, matched ASCII-case-insensitively in a
@@ -953,16 +1082,13 @@ fn take_until_close<'a>(s: &'a str, name: &str) -> (&'a str, usize) {
 
 /// Emit plain text: inside a [URL] frame the whole run is a link; otherwise
 /// bare http(s) URLs are auto-linked on the way through.
-fn emit_text(out: &mut Vec<Chunk>, text: &str, stack: &[Frame]) {
+fn emit_text(out: &mut Vec<Chunk>, text: &str, style: Style, link: Option<&str>) {
     if text.is_empty() {
         return;
     }
     let decoded_text = decode_html_entities(text);
-    let st = Style::from_stack(stack);
-    if let Some(href) = stack.iter().rev().find_map(|f| match f {
-        Frame::Link(h) => Some(h.clone()),
-        _ => None,
-    }) {
+    let st = style;
+    if let Some(href) = link.map(|h| h.to_string()) {
         // [URL=href]label[/URL] — empty href means the label IS the url.
         let target = if href.is_empty() {
             decoded_text.clone()
@@ -1021,42 +1147,6 @@ fn split_url(s: &str, pos: usize) -> (&str, &str, &str) {
         .map(|(i, _)| i)
         .unwrap_or(rest.len());
     (&s[..pos], &rest[..end], &rest[end..])
-}
-
-/// Pop the innermost frame matching the closing tag name; false if none.
-fn pop_matching(stack: &mut Vec<Frame>, name: &str) -> bool {
-    #[allow(clippy::match_like_matches_macro)]
-    fn is_closer(name: &str, f: &Frame) -> bool {
-        match (name, f) {
-            ("b", Frame::Bold)
-            | ("i", Frame::Italic)
-            | ("u", Frame::Underline)
-            | ("s" | "strike", Frame::Strike)
-            | ("sub" | "sup" | "highlight", Frame::Italic | Frame::Bold)
-            | ("list", Frame::List(_))
-            | ("spoiler" | "ispoiler", Frame::Spoiler)
-            | ("icode" | "inlinecode", Frame::InlineCode)
-            | ("heading" | "h1" | "h2" | "h3", Frame::Heading(_))
-            | ("color", Frame::Color(_))
-            | ("size", Frame::Size(_))
-            | ("font", Frame::Font(_))
-            | ("left" | "center" | "right" | "justify" | "indent", Frame::Align(_))
-            | ("url" | "email" | "post" | "thread", Frame::Link(_))
-            | ("table", Frame::Table)
-            | ("tr", Frame::TableRow)
-            | ("th", Frame::TableHeader)
-            | ("td", Frame::TableCell) => true,
-            ("quote", Frame::Quote { .. }) => true,
-            _ => false,
-        }
-    }
-    match stack.iter().rposition(|f| is_closer(name, f)) {
-        Some(pos) => {
-            stack.remove(pos);
-            true
-        }
-        None => false,
-    }
 }
 
 #[cfg(test)]
@@ -1206,6 +1296,42 @@ mod tests {
         );
     }
 
+    /// #616: XF only opens the attribute form when a `key=` option follows
+    /// the space — `[i removed it]` and `[QUOTE = Trouble; 235284]` are
+    /// literal text, not frames that swallow the rest of the post.
+    #[test]
+    fn attribute_form_without_an_option_is_literal_text() {
+        let chunks = render("before [i removed it] after");
+        let after = chunks
+            .iter()
+            .find(|c| matches!(c, Chunk::Text(t, _) if t.contains("after")))
+            .unwrap();
+        if let Chunk::Text(_, s) = after {
+            assert!(!s.italic, "no option, no italic frame: {s:?}");
+            assert!(!s.bold, "no option, no stray frame: {s:?}");
+        }
+        let all = texts(&chunks).concat();
+        assert!(all.contains("[i removed it]"), "still visible verbatim: {all:?}");
+
+        // `[QUOTE = Trouble; 235284]` (space before `=`, no `key=`): literal.
+        let chunks = render("[QUOTE = Trouble; 235284] body");
+        let all = texts(&chunks).concat();
+        assert!(all.contains("[QUOTE = Trouble; 235284]"), "{all:?}");
+        assert!(!chunks.iter().any(|c| matches!(c, Chunk::Text(_, s) if s.quote_depth > 0)));
+    }
+
+    /// …and the attribute form with a real option still opens (#539's
+    /// unfurl case, and `[ATTACH type=…]`).
+    #[test]
+    fn attribute_form_with_an_option_still_opens() {
+        let chunks = render("[ATTACH type=\"full\"]1[/ATTACH]");
+        assert!(matches!(&chunks[0], Chunk::Attach(id, _) if id == "1"));
+        // Per #539, the attribute form has no tag *value*: the href falls
+        // back to the link text itself.
+        let chunks = render("[url unfurl=\"true\"]site[/url]");
+        assert!(matches!(&chunks[0], Chunk::Link(l, h, _) if l == "site" && h == "site"), "{:?}", chunks[0]);
+    }
+
     /// #610: the news template writes `[HR][/HR]` before every heading; the
     /// close tag fell through to the unopened-closer arm and rendered as a
     /// literal `[/HR]` line under every rule. XF's hr is self-contained —
@@ -1221,20 +1347,23 @@ mod tests {
         assert_eq!(to_plain("[HR][/HR]rule"), "─── rule");
     }
 
-    /// The depth cap must not change what a normally-nested post renders as.
+    /// Uncapped nesting must not change what a normally-nested post renders
+    /// as, and a real depth-33 post renders like XF's (#622).
     #[test]
-    fn the_frame_depth_cap_leaves_closed_tags_alone() {
+    fn uncapped_nesting_leaves_closed_tags_alone() {
         let src = "[QUOTE=\"a\"][B]bold [I]both[/I][/B] plain[/QUOTE]";
         let all = texts(&render(src)).concat();
         assert!(all.contains("a wrote:"), "{all:?}");
         assert!(all.contains("bold"), "{all:?}");
         assert!(all.contains("both"), "{all:?}");
         assert!(all.contains("plain"), "{all:?}");
-        // Past the cap an open tag is literal text, exactly like XF.
-        let deep = "[B]".repeat(MAX_FRAME_DEPTH + 2) + "x";
+        // #622: deep nesting renders like XF (which declares $maxDepth but
+        // never enforces it) — no depth at which an open tag degrades to
+        // literal text, and the closes still match.
+        let deep = "[B]".repeat(40) + "x";
         let deep_text = texts(&render(&deep)).concat();
-        assert!(deep_text.contains("[B]"), "{deep_text:?}");
-        assert!(deep_text.ends_with('x'), "{deep_text:?}");
+        assert!(!deep_text.contains("[B]"), "{deep_text:?}");
+        assert_eq!(deep_text, "x", "{deep_text:?}");
     }
 
     use super::*;
