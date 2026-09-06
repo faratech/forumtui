@@ -282,9 +282,12 @@ under `<config dir>/cache/img/` (32 MiB, 0600, atomic).
 - Logout revokes only client-side: stock XF's `/api/oauth2/revoke` needs a client
   secret a public client cannot hold, so the 90-day refresh token outlives a
   sign-out until the TuiLink addon gains a revoke relay (#527). The client warns
-  persistently when the revoke fails.
+  persistently when the revoke fails (issue #527: the server-side relay that
+  would make the revoke succeed is accepted-deferred — it needs a production
+  TuiLink addon change).
 - TuiLink cannot yet signal a denied browser approval; the client only offers a
-  restart. The Premium Supporter gate (#572) is designed but deliberately not built.
+  restart. The Premium Supporter gate (#572) is designed but deliberately not
+  built (accepted-deferred product feature).
 - Search's chip row is keyboard-only; Windows packaging is documentation-only.
   (`[SPOILER]` bodies are hidden black-on-black until `x` reveals them in the
   thread view — issue #621.)
