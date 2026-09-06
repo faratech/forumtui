@@ -3129,9 +3129,20 @@ impl App {
                 emit_raw(&common::osc::set_clipboard(&url));
                 // Beside the client's own store, not `config::token_path()`:
                 // a test client is pinned to a scratch dir and must not be
-                // able to write into the real config dir (issue #565).
+                // able to write into the real config dir (issue #565). 0600
+                // like the rest of the store's files (#655) — the URL is
+                // not a credential, but a shared machine has no business
+                // reading it either.
                 let path = self.client.store_path().with_file_name("login-url.txt");
-                let _ = std::fs::write(&path, &url);
+                #[allow(unused_mut)]
+                let mut opts = std::fs::OpenOptions::new();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                let _ = opts.write(true).create(true).truncate(true).open(&path)
+                    .and_then(|mut f| std::io::Write::write_all(&mut f, url.as_bytes()));
                 self.set_hint("Login link → clipboard + login-url.txt");
                 if let Some(Screen::Login(ls)) = self.screens.last_mut() {
                     ls.busy = false;
@@ -7726,6 +7737,25 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Issue #655: `login-url.txt` is written 0600, like every other file
+    /// in the config dir — the link is not a credential, but a shared
+    /// machine has no business reading it either.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn login_url_file_is_written_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut app = test_app();
+        let scratch = scratch_config_dir();
+        std::fs::create_dir_all(&scratch).unwrap();
+        app.handle_msg(Msg::LoginReady {
+            generation: app.login_generation,
+            url: "https://windowsforum.com/tui-start/abc123".into(),
+        });
+        let path = app.client.store_path().with_file_name("login-url.txt");
+        let mode = std::fs::metadata(&path).expect("the login link is persisted").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "login-url.txt must be owner-only: {path:?}");
     }
 
     /// Issue #524: a second `start_pollers` (the re-login path) must not

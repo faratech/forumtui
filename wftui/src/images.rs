@@ -356,7 +356,15 @@ impl DiskCache {
     }
 
     pub fn get(&self, url: &str) -> Option<Vec<u8>> {
-        std::fs::read(self.path_for(url)).ok()
+        let path = self.path_for(url);
+        // A planted or simply oversized file is never slurped whole: one
+        // entry can never legitimately exceed the cache's own byte cap
+        // (#654).
+        let len = std::fs::metadata(&path).ok()?.len();
+        if len > self.max_bytes {
+            return None;
+        }
+        std::fs::read(path).ok()
     }
 
     /// Best effort: a cache that cannot be written is a slower client, not a
@@ -372,7 +380,14 @@ impl DiskCache {
     fn write_atomic(&self, url: &str, bytes: &[u8]) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
         let final_path = self.path_for(url);
-        let tmp = final_path.with_extension("img.tmp");
+        // One tmp per write (#654): the inflight dedupe is keyed by the
+        // size-qualified store key, so two concurrent loads of one URL (a
+        // resize while a load is in flight) shared a single
+        // `<digest>.img.tmp` and could interleave their writes before
+        // either rename landed.
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = final_path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
         {
             #[allow(unused_mut)]
             let mut opts = std::fs::OpenOptions::new();
@@ -916,6 +931,7 @@ mod tests {
 
     // ---------- decode limits ----------
 
+
     /// A minimal uncompressed 24-bpp BMP: `w`/`h` go into the header
     /// verbatim, followed by `pixels` bytes of (possibly zero) pixel data.
     /// BMP needs no fixture file because its dimensions are plain header
@@ -1336,12 +1352,13 @@ mod tests {
         // Two URLs never share a file.
         assert_eq!(cache.get("https://wf/b.png"), None);
 
-        // No temp file survives an atomic write.
+        // No temp file survives an atomic write (tmp names now carry a
+        // per-write sequence: `<digest>.tmp.<pid>.<n>`, #654).
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.ends_with(".tmp"))
+            .filter(|n| n.contains(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
 
@@ -1376,6 +1393,59 @@ mod tests {
             cache.get("https://wf/5.png").is_some(),
             "the newest entry must survive a prune"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #654: concurrent writes to one URL use one tmp file per write, so
+    /// the final entry is always a whole write — never an interleaving of
+    /// two — and no tmp file is left behind.
+    #[test]
+    fn racing_writes_to_one_url_leave_whole_writes_and_no_tmp() {
+        let dir = scratch("race");
+        let cache = std::sync::Arc::new(DiskCache::with_dir(dir.clone(), DISK_CAP_BYTES));
+        let a = vec![b'a'; 4096];
+        let b = vec![b'b'; 8192];
+        let mut handles = Vec::new();
+        for payload in [&a, &b] {
+            let cache = cache.clone();
+            let payload = payload.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..25 {
+                    cache.put("https://wf/same.png", &payload);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("writers must not panic");
+        }
+        let got = cache.get("https://wf/same.png").expect("a final entry exists");
+        assert!(
+            got == a || got == b,
+            "the entry must be one whole write, not an interleaving: {} bytes, first={:?}",
+            got.len(),
+            got.first()
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp files left behind: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #654: a cache read over the store's own byte cap — a planted or
+    /// oversized file — is refused, never slurped into memory.
+    #[test]
+    fn a_cache_read_over_the_cap_is_refused() {
+        let dir = scratch("bigread");
+        let cache = DiskCache::with_dir(dir.clone(), 1024);
+        cache.put("https://wf/ok.png", &[1u8; 512]);
+        assert_eq!(cache.get("https://wf/ok.png"), Some(vec![1u8; 512]));
+        let big = cache.path_for("https://wf/huge.png");
+        std::fs::write(&big, vec![0u8; 8192]).unwrap();
+        assert!(cache.get("https://wf/huge.png").is_none(), "an oversized entry must not be read");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
