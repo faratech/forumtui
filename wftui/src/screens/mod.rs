@@ -789,17 +789,24 @@ impl Screen {
                 .get(v.sel_post)
                 .and_then(|p| p.view_url.clone())
                 .or_else(|| v.thread.view_url.clone()),
-            Screen::Inbox(ib) => match ib.tab {
-                InboxTab::Conversations => ib
-                    .convos
-                    .conversations
-                    .get(ib.convos.sel)
-                    .and_then(|c| c.view_url.clone()),
-                InboxTab::Alerts => ib
-                    .alerts
-                    .alerts
-                    .get(ib.alerts.sel)
-                    .and_then(|a| a.alert_url.clone()),
+            Screen::Inbox(ib) => match ib.focus {
+                // With the view pane focused, "open on the site" means the
+                // conversation on screen — the list may not even be drawn.
+                InboxPane::View => {
+                    ib.view.as_ref().and_then(|v| v.conversation.view_url.clone())
+                }
+                InboxPane::List => match ib.tab {
+                    InboxTab::Conversations => ib
+                        .convos
+                        .conversations
+                        .get(ib.convos.sel)
+                        .and_then(|c| c.view_url.clone()),
+                    InboxTab::Alerts => ib
+                        .alerts
+                        .alerts
+                        .get(ib.alerts.sel)
+                        .and_then(|a| a.alert_url.clone()),
+                },
             },
             Screen::ConversationView(v) => v.conversation.view_url.clone(),
             Screen::Search(s) => s.results.get(s.sel).and_then(|h| h.view_url.clone()),
@@ -876,9 +883,20 @@ impl Screen {
                 // n/N for the same fix and why).
                 v.width = 0;
             }
-            Screen::Inbox(ib) => match ib.tab {
-                InboxTab::Conversations => ib.convos.sel = 0,
-                InboxTab::Alerts => ib.alerts.sel = 0,
+            Screen::Inbox(ib) => match ib.focus {
+                // The view pane is a real pane with its own scroll: `g` must
+                // move what is on screen, not the hidden list (issue class:
+                // Home's arms route by `h.focus` for the same reason).
+                InboxPane::View => {
+                    if let Some(v) = &mut ib.view {
+                        v.scroll = 0;
+                        v.sel_msg = 0;
+                    }
+                }
+                InboxPane::List => match ib.tab {
+                    InboxTab::Conversations => ib.convos.sel = 0,
+                    InboxTab::Alerts => ib.alerts.sel = 0,
+                },
             },
             Screen::ConversationView(v) => {
                 v.scroll = 0;
@@ -905,11 +923,19 @@ impl Screen {
                 v.sel_post = v.posts.len().saturating_sub(1);
                 v.width = 0;
             }
-            Screen::Inbox(ib) => match ib.tab {
-                InboxTab::Conversations => {
-                    ib.convos.sel = ib.convos.conversations.len().saturating_sub(1)
+            Screen::Inbox(ib) => match ib.focus {
+                InboxPane::View => {
+                    if let Some(v) = &mut ib.view {
+                        v.scroll = v.lines.len();
+                        v.sel_msg = v.messages.len().saturating_sub(1);
+                    }
                 }
-                InboxTab::Alerts => ib.alerts.sel = ib.alerts.alerts.len().saturating_sub(1),
+                InboxPane::List => match ib.tab {
+                    InboxTab::Conversations => {
+                        ib.convos.sel = ib.convos.conversations.len().saturating_sub(1)
+                    }
+                    InboxTab::Alerts => ib.alerts.sel = ib.alerts.alerts.len().saturating_sub(1),
+                },
             },
             Screen::ConversationView(v) => {
                 v.scroll = v.lines.len();
@@ -1258,6 +1284,72 @@ mod dispatch_tests {
         assert!(matches!(&list, Screen::ThreadList(l) if l.sel == 0));
     }
 
+    /// The Inbox's `g g`/`G` and web_url must follow the focused pane, the
+    /// way Home's do. With the view pane focused they used to move the
+    /// hidden list selection instead — in the narrow layout the list is not
+    /// even on screen, so `G` mutated invisible state while the visible
+    /// conversation did not move.
+    #[test]
+    fn inbox_goto_and_web_url_follow_the_focused_pane() {
+        let convo = |id: u32, url: &str| Conversation {
+            conversation_id: id,
+            view_url: Some(url.into()),
+            ..Default::default()
+        };
+        let mut inbox = Screen::Inbox(InboxState {
+            convos: ConversationsState {
+                conversations: vec![convo(1, "https://wf/c.1/"), convo(2, "https://wf/c.2/")],
+                ..Default::default()
+            },
+            view: Some(ConversationViewState {
+                conversation: convo(3, "https://wf/c.3/"),
+                messages: vec![ConversationMessage::default(), ConversationMessage::default()],
+                lines: vec![ratatui::text::Line::raw("one"), ratatui::text::Line::raw("two")],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        // List focus keeps the classic behaviour.
+        inbox.goto_bottom();
+        assert!(
+            matches!(&inbox, Screen::Inbox(ib) if ib.focus == InboxPane::List && ib.convos.sel == 1),
+            "list focus: G moves the list selection"
+        );
+        assert_eq!(
+            inbox.web_url().as_deref(),
+            Some("https://wf/c.2/"),
+            "list focus: the URL is the selected conversation's"
+        );
+
+        // View focus: G/g g scroll the open conversation and leave the list
+        // alone; the URL names the conversation on screen.
+        {
+            let Screen::Inbox(ib) = &mut inbox else { panic!("inbox") };
+            ib.focus = InboxPane::View;
+            ib.convos.sel = 0;
+        }
+        inbox.goto_bottom();
+        {
+            let Screen::Inbox(ib) = &inbox else { panic!("inbox") };
+            assert_eq!(ib.convos.sel, 0, "the hidden list must not move");
+            let Some(v) = &ib.view else { panic!("view") };
+            assert_eq!(v.sel_msg, 1, "view focus: G selects the last message");
+            assert_eq!(v.scroll, v.lines.len(), "view focus: G scrolls to the end");
+        }
+        assert_eq!(
+            inbox.web_url().as_deref(),
+            Some("https://wf/c.3/"),
+            "view focus: the URL is the viewed conversation's"
+        );
+        inbox.goto_top();
+        {
+            let Screen::Inbox(ib) = &inbox else { panic!("inbox") };
+            let Some(v) = &ib.view else { panic!("view") };
+            assert_eq!((v.sel_msg, v.scroll), (0, 0), "view focus: g g returns to the top");
+        }
+    }
+
     /// A key-bar label's literal key(s), or `None` for a label with no
     /// single key to press: a compound/movement pair (`j/k`, `n/N`, `[/]`,
     /// `1/2/3`, `1-9`, ...) or `Tab`, which is a within-screen focus/field
@@ -1482,6 +1574,34 @@ mod dispatch_tests {
                     // nothing for this screen-level dispatch check to see.
                     "Esc",
                 ],
+            },
+            Case {
+                // The state `open_inbox` lands in on a narrow terminal or
+                // the Alerts tab: no view pane, so `r reply` must not be
+                // advertised at all (it used to be a silent no-op there).
+                name: "Inbox (no view pane)",
+                factory: || Screen::Inbox(InboxState {
+                    convos: ConversationsState {
+                        conversations: vec![Conversation {
+                            conversation_id: 3,
+                            title: "A DM".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    alerts: AlertsState {
+                        alerts: vec![Alert {
+                            alert_id: 1,
+                            username: "kemical".into(),
+                            content_type: "post_quote".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    view: None,
+                    ..Default::default()
+                }),
+                skip: &["Tab", "Esc"],
             },
             Case {
                 name: "ConversationView",
