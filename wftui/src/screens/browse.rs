@@ -1318,9 +1318,16 @@ pub(crate) fn chunk_lines(
                 // registered link opens the anchor, the picture still paints.
                 links.push(link.clone().unwrap_or_else(|| url.clone()));
                 current.push(Span::styled("[image]".to_string(), style_from(theme, &s, reveal_spoilers)));
+                // The marker dims inside a hidden spoiler like the link
+                // marker does: an invisible picture must not invite o/1-9.
+                let marker_style = if s.spoiler && !reveal_spoilers {
+                    theme.dim()
+                } else {
+                    link_style(theme)
+                };
                 current.push(Span::styled(
                     format!(" [{}]", links.len()),
-                    link_style(theme),
+                    marker_style,
                 ));
             }
             Chunk::Attach(id, s) => {
