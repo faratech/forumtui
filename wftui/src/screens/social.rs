@@ -133,6 +133,9 @@ fn conversations_list_key(c: &mut ConversationsState, key: KeyEvent) -> Action {
         // leave the screen and come back — `open_inbox` short-circuits when
         // the Inbox is already on top.
         KeyCode::Char('R') | KeyCode::F(5) => {
+            if c.loading {
+                return Action::Notice("Already loading — one moment.".into());
+            }
             c.loading = true;
             Action::LoadConversations(c.page)
         }
@@ -149,6 +152,9 @@ fn conversations_list_key(c: &mut ConversationsState, key: KeyEvent) -> Action {
             Action::None
         }
         KeyCode::Char('[') | KeyCode::PageUp => {
+            if c.loading {
+                return Action::Notice("Already loading — one moment.".into());
+            }
             if c.page > 1 {
                 c.loading = true;
                 Action::LoadConversations(c.page - 1)
@@ -157,6 +163,9 @@ fn conversations_list_key(c: &mut ConversationsState, key: KeyEvent) -> Action {
             }
         }
         KeyCode::Char(']') | KeyCode::PageDown => {
+            if c.loading {
+                return Action::Notice("Already loading — one moment.".into());
+            }
             if c.page < c.last_page {
                 c.loading = true;
                 Action::LoadConversations(c.page + 1)
@@ -873,6 +882,9 @@ fn conversation_view_key_inner(s: &mut ConversationViewState, key: KeyEvent) -> 
             Action::None
         }
         KeyCode::Char('[') => {
+            if s.loading {
+                return Action::Notice("Already loading — one moment.".into());
+            }
             if s.page > 1 {
                 s.loading = true;
                 Action::LoadConversation(s.conversation.conversation_id, s.page - 1)
@@ -881,6 +893,9 @@ fn conversation_view_key_inner(s: &mut ConversationViewState, key: KeyEvent) -> 
             }
         }
         KeyCode::Char(']') => {
+            if s.loading {
+                return Action::Notice("Already loading — one moment.".into());
+            }
             if s.page < s.last_page {
                 s.loading = true;
                 Action::LoadConversation(s.conversation.conversation_id, s.page + 1)
@@ -1871,7 +1886,6 @@ mod tests {
     #[test]
     fn shift_r_refreshes_whichever_inbox_list_is_showing() {
         let shift_r = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT);
-
         let mut s = sample_inbox_state();
         s.convos.page = 3;
         assert!(matches!(
@@ -1900,6 +1914,55 @@ mod tests {
 
         // The key bar advertises it.
         assert!(inbox_hints(&s).keys.iter().any(|(k, _)| *k == "R"));
+    }
+
+    /// #657: a fetch sets `loading` until its reply lands, and the page and
+    /// refresh keys must refuse out loud instead of firing a duplicate
+    /// request into that window — with the 3 s spacing on the shared gates,
+    /// duplicates delay the user's next real request. The reply clears
+    /// `loading`; here the refused action stands in for the fetch.
+    #[test]
+    fn inbox_page_and_refresh_keys_do_not_double_fire_while_loading() {
+        let mut s = sample_inbox_state();
+        s.convos.page = 2;
+        s.convos.last_page = 5;
+
+        assert!(matches!(
+            inbox_key(&mut s, key(']')),
+            Action::LoadConversations(3)
+        ));
+        assert!(
+            matches!(inbox_key(&mut s, key(']')), Action::Notice(_)),
+            "] must refuse while loading"
+        );
+        let shift_r = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT);
+        assert!(
+            matches!(inbox_key(&mut s, shift_r), Action::Notice(_)),
+            "R must refuse while loading"
+        );
+        s.convos.loading = false;
+        assert!(matches!(
+            inbox_key(&mut s, key('[')),
+            Action::LoadConversations(1)
+        ));
+        assert!(s.convos.loading);
+
+        // The open conversation's pager behaves the same way.
+        let mut s = sample_inbox_state();
+        s.focus = InboxPane::View;
+        {
+            let Some(view) = s.view.as_mut() else { panic!("test setup: a view is open") };
+            view.page = 1;
+            view.last_page = 3;
+        }
+        assert!(matches!(
+            inbox_key(&mut s, key(']')),
+            Action::LoadConversation(_, 2)
+        ));
+        assert!(
+            matches!(inbox_key(&mut s, key(']')), Action::Notice(_)),
+            "] must refuse while the conversation page is loading"
+        );
     }
 
     #[test]

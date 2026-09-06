@@ -924,6 +924,9 @@ pub fn thread_list_key(s: &mut ThreadListState, key: KeyEvent) -> Action {
             Action::None
         }
         KeyCode::Char('[') | KeyCode::PageUp => {
+            if s.loading {
+                return Action::Notice("Already loading — one moment.".into());
+            }
             if s.page > 1 {
                 s.loading = true;
                 Action::LoadForum(s.node_id, s.page - 1)
@@ -932,6 +935,9 @@ pub fn thread_list_key(s: &mut ThreadListState, key: KeyEvent) -> Action {
             }
         }
         KeyCode::Char(']') | KeyCode::PageDown => {
+            if s.loading {
+                return Action::Notice("Already loading — one moment.".into());
+            }
             if s.page < s.last_page {
                 s.loading = true;
                 Action::LoadForum(s.node_id, s.page + 1)
@@ -954,6 +960,9 @@ pub fn thread_list_key(s: &mut ThreadListState, key: KeyEvent) -> Action {
         }
         KeyCode::Char('N') => Action::StartNewThread(s.node_id),
         KeyCode::Char('r') => {
+            if s.loading {
+                return Action::Notice("Already loading — one moment.".into());
+            }
             s.loading = true;
             Action::LoadForum(s.node_id, s.page)
         }
