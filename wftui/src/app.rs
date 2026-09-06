@@ -1292,9 +1292,15 @@ impl App {
         let screen = self.screens.last_mut().expect("screen stack never empty");
         screen.set_image_policy(policy, self.images.sizes());
         let screen_title = screen.title().to_string();
+        screen.render(f, body, &self.theme, &self.glyphs, &mut self.hits);
+        // Hints are read AFTER render (#656): the renderers stamp layout
+        // facts (`dual`, focus rects) while they draw, and the two-pane
+        // screens' hint sets branch on pane state — the bar must describe
+        // the frame that was just drawn, not the one before it. Snapshotting
+        // first showed a one-frame-stale bar whenever a layout change
+        // crossed a hint-relevant boundary (the 110-column dual crossover).
         let screen_hints = screen.hints();
         let keys_group = screen.keys_group();
-        screen.render(f, body, &self.theme, &self.glyphs, &mut self.hits);
 
         // Inline images, painted over the rects the screen just reserved.
         // Suppressed while any overlay is up: `overlay::dim_body` re-styles
