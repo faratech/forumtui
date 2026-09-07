@@ -1,0 +1,4 @@
+# The monorepo root ignores *.json (build artifacts elsewhere in /web), which
+# would silently drop every captured fixture in this directory and break
+# `include_str!` on a fresh clone. These files are source, not artifacts.
+!*.json
