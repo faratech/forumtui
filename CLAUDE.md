@@ -31,6 +31,11 @@ cargo build --release && cp target/release/wftui bin/wftui   # bin/wftui is comm
 install -m755 bin/wftui /usr/local/bin/wftui.new && mv -f /usr/local/bin/wftui.new /usr/local/bin/wftui
 ```
 
+Release packaging (signed Windows MSIX for x64/x86/arm64, Linux tarball) is
+`packaging/` — see `packaging/README.md`. The MSIX half only runs on a
+Windows box with the Azure Trusted Signing kit (`/root/.sign` on this
+server, copied to `C:\code\sign` there); the Linux tarball runs here.
+
 The "gates" every change must pass before it is committed: both test invocations,
 both clippy invocations, a release build, and `/usr/bin/grep -rn $'\x1b' wftui/src`
 printing nothing (hard rule 1).
@@ -671,7 +676,7 @@ an image past either returns `Err` and falls back to the placeholder.
 - TuiLink cannot yet signal a denied browser approval; the client only offers a
   restart. The Premium Supporter gate (#572) is designed but deliberately not
   built (accepted-deferred product feature).
-- Search's chip row is keyboard-only; Windows packaging is documentation-only.
+- Search's chip row is keyboard-only.
   (`[SPOILER]` bodies are hidden black-on-black until `x` reveals them in the
   thread view — issue #621.)
 - The library screens are read-only: no album browsing or media comments

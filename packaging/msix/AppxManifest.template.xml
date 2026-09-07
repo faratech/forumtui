@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Template for wftui's MSIX manifest. build-msix.ps1 renders one copy per
+  architecture by substituting the placeholders below — do not hand-edit a
+  rendered copy, edit this template.
+
+  Publisher MUST match the Azure Trusted Signing certificate's subject
+  exactly (see /root/.sign/CLAUDE.md "Current certificate" table on the
+  signing box, mirrored at c:\code\sign\CLAUDE.md) or signtool's post-sign
+  publisher check fails. If that cert is ever reissued under a different
+  subject, update PUBLISHER_DN below to match.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap5 rescap">
+
+  <Identity
+    Name="MikeFara.WindowsForumTUI"
+    Publisher="CN=Mike Fara, O=Mike Fara, L=White Plains, S=ny, C=US"
+    Version="{{VERSION}}"
+    ProcessorArchitecture="{{ARCH}}" />
+
+  <Properties>
+    <DisplayName>WindowsForum TUI</DisplayName>
+    <PublisherDisplayName>Mike Fara</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="WFTUI" Executable="wftui.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="WindowsForum TUI"
+        Description="Terminal client for windowsforum.com — forum, threads, DMs, alerts, search, inline images."
+        BackgroundColor="#0F6CBD"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
+      </uap:VisualElements>
+      <Extensions>
+        <!--
+          Registers `wftui.exe` as a runnable command in any shell once the
+          package is installed (no PATH edit needed) — the standard pattern
+          for a CLI tool shipped as MSIX. Requires uap5.
+        -->
+        <uap5:Extension Category="windows.appExecutionAlias" Executable="wftui.exe" EntryPoint="Windows.FullTrustApplication">
+          <uap5:AppExecutionAlias>
+            <uap5:ExecutionAlias Alias="wftui.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>
