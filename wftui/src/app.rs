@@ -443,9 +443,9 @@ pub struct App {
     crumb_targets: Vec<usize>,
     /// Mints `ThreadListState::load_seq` (#705).
     next_list_seq: u64,
-    /// A video the reader asked to watch (#710). Set by `execute_action` and
-    /// performed by `run`, which owns the terminal and the reader thread.
-    pending_video: Option<(String, String)>,
+    /// The frame currently on screen (#711), repainted on ticks that bring
+    /// no new one so the pane does not flicker to empty between frames.
+    last_video_frame: Option<crate::video::Frame>,
     pub convos_unread: u32,
     pub status: String,
     /// When the current `status` was shown as a toast (`Some`) — cleared by
@@ -644,86 +644,6 @@ fn restore_steps() -> [&'static str; 5] {
 /// `LeaveAlternateScreen`/`DisableMouseCapture`/`cursor::Show` on every exit
 /// path on Windows (issue #531). Splitting them means Pop's failure can never
 /// gate the commands that actually restore visible terminal state.
-/// Hand the terminal to a player, then take it back (#710).
-///
-/// The reader thread stays the only thing reading stdin (hard rule 3): mpv
-/// gets a pipe, and keys arrive here and are forwarded down it as the bytes
-/// a terminal would have sent. That also keeps hard rule 2 — the child's
-/// stdin is ours, not the tty — while still giving the reader pause, seek
-/// and volume.
-///
-/// `q` and Esc are handled here rather than forwarded: stopping the player is
-/// this client's job, so a player that ignores its input can still be closed.
-fn play_video<B: ratatui::backend::Backend>(
-    terminal: &mut ratatui::Terminal<B>,
-    reader: &std::sync::mpsc::Receiver<crate::event::Input>,
-    graphics: crate::images::Tier,
-    url: &str,
-) -> Result<(), String> {
-    use ratatui::crossterm::event::DisableMouseCapture;
-    use ratatui::crossterm::execute;
-    use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
-    use std::io::Write;
-
-    // Give the screen back: the player paints on the normal screen, so
-    // whatever it leaves behind is not mixed into our buffer. Mouse capture
-    // goes too — the player is not ours to click on. Raw mode STAYS, because
-    // the reader thread is still the one reading keys.
-    let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
-
-    let result = (|| -> Result<(), String> {
-        let mut child = std::process::Command::new(crate::video::player())
-            .args(crate::video::player_argv(graphics, url))
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("{}: {e}", crate::video::player()))?;
-        let mut stdin = child.stdin.take();
-
-        loop {
-            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-                let _ = status;
-                return Ok(());
-            }
-            let Some(input) = crate::event::next(reader, Duration::from_millis(50)) else {
-                continue;
-            };
-            if let crate::event::Input::Key(k) = input {
-                let stop = matches!(
-                    k.code,
-                    ratatui::crossterm::event::KeyCode::Char('q')
-                        | ratatui::crossterm::event::KeyCode::Esc
-                ) || (k.code == ratatui::crossterm::event::KeyCode::Char('c')
-                    && k.modifiers.contains(KeyModifiers::CONTROL));
-                if stop {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Ok(());
-                }
-                if let Some(bytes) = crate::video::key_bytes(k.code)
-                    && let Some(pipe) = stdin.as_mut()
-                {
-                    // A closed pipe is not an error worth ending playback
-                    // over: the player may simply not be reading input.
-                    let _ = pipe.write_all(&bytes);
-                    let _ = pipe.flush();
-                }
-            }
-        }
-    })();
-
-    // Take the screen back whatever happened, and redraw from scratch: the
-    // player painted over everything ratatui believed was there.
-    let _ = execute!(std::io::stdout(), EnterAlternateScreen);
-    if common::config::mouse_enabled() {
-        let _ = execute!(
-            std::io::stdout(),
-            ratatui::crossterm::event::EnableMouseCapture
-        );
-    }
-    let _ = terminal.clear();
-    result
-}
-
 pub(crate) fn restore_terminal() {
     use ratatui::crossterm::event::{
         DisableBracketedPaste, DisableMouseCapture, PopKeyboardEnhancementFlags,
@@ -832,7 +752,7 @@ pub async fn run(images: crate::images::Images) -> u8 {
 
     let mut app = App {
         next_list_seq: 1,
-        pending_video: None,
+        last_video_frame: None,
         api: client.clone(),
         client,
         tx,
@@ -1147,6 +1067,15 @@ impl App {
     fn needs_continuous_redraw(&self) -> bool {
         !self.client.write_gate.pending_wait().is_zero()
             || self.screens.iter().any(|s| s.is_loading())
+            // #711: a playing video is the one thing on screen that changes
+            // without anything arriving in the message pump, so the
+            // idle-skip has to know about it or playback freezes on the
+            // first frame. Paused counts as idle — nothing is moving.
+            || matches!(
+                self.screens.last(),
+                Some(Screen::VideoView(v))
+                    if v.playback.as_ref().is_some_and(|p| !p.paused() && !p.finished())
+            )
     }
 
     /// The single place a session ends. Every session-ending failure routes
@@ -1385,18 +1314,6 @@ impl App {
             // Infinite scroll (#700): one path for every way of moving down
             // a list — keys, wheel, `G`, a click.
             self.autoload_more();
-            // #710: a video was asked for. This is the only place that can
-            // do it: the terminal and the reader thread are both owned here,
-            // and playing means handing the screen over and taking it back.
-            if let Some((url, title)) = self.pending_video.take() {
-                let graphics = self.images.policy().tier;
-                let outcome = play_video(terminal, &reader, graphics, &url);
-                match outcome {
-                    Ok(()) => self.set_status(format!("Finished {title}.")),
-                    Err(e) => self.set_hint(format!("Could not play {title}: {e}")),
-                }
-                dirty = true;
-            }
             // Wait up to 50ms for input; yields periodically to allow background tasks / pollers to refresh status.
             if let Some(first) = crate::event::next(&reader, Duration::from_millis(50)) {
                 let mut inputs = vec![first];
@@ -1554,6 +1471,33 @@ impl App {
                 .last()
                 .map(|s| s.image_requests().to_vec())
                 .unwrap_or_default();
+            // #711: a playing video's newest frame, painted into the rect
+            // the view just reserved. Before the still-image requests, so a
+            // thumbnail can never land on top of the picture.
+            if let Some(Screen::VideoView(v)) = self.screens.last_mut()
+                && v.rect.width > 0
+                && let Some(playback) = v.playback.as_mut()
+                && let Some(frame) = playback.take_frame()
+            {
+                v.shown += 1;
+                let rect = v.rect;
+                self.images.paint_frame(f, rect, &frame);
+                self.last_video_frame = Some(frame);
+            } else if let Some(Screen::VideoView(v)) = self.screens.last()
+                && v.rect.width > 0
+                && let Some(frame) = self.last_video_frame.as_ref()
+            {
+                // No new frame this tick: repaint the last one, or the pane
+                // would flicker to empty between frames.
+                let rect = v.rect;
+                let frame = crate::video::Frame {
+                    rgb: frame.rgb.clone(),
+                    width: frame.width,
+                    height: frame.height,
+                    index: frame.index,
+                };
+                self.images.paint_frame(f, rect, &frame);
+            }
             for pending in self.images.paint(f, &reqs) {
                 self.spawn_image_load(pending);
             }
@@ -1988,15 +1932,25 @@ impl App {
             }
             Action::LoadResource(id) => self.load_resource(id),
             Action::PlayVideo { url, title } => {
-                // Refuse here, with a reason, rather than suspending the
-                // whole UI to discover the player is missing.
-                if let Some(why) = crate::video::unavailable_reason(self.theme.tier) {
-                    self.set_hint(why);
-                    return;
+                // #711: in the app, in a pane. Decoding starts immediately so
+                // the first frame is on screen by the time the reader has
+                // registered the pane opened.
+                let mut state = screens::VideoViewState {
+                    title,
+                    url: url.clone(),
+                    ..Default::default()
+                };
+                if let Some(why) = crate::video::unavailable_reason(self.theme.tier, self.images.policy().tier) {
+                    state.error = Some(why);
+                } else {
+                    // Sound only when something can play it: ffmpeg pipes the
+                    // picture here and cannot also make noise.
+                    match crate::video::Playback::start(&url, crate::video::audio_available()) {
+                        Ok(p) => state.playback = Some(p),
+                        Err(e) => state.error = Some(e),
+                    }
                 }
-                // The run loop performs it: it owns the terminal and the
-                // reader thread, and both have to be handed over.
-                self.pending_video = Some((url, title));
+                self.push_screen(Screen::VideoView(state));
             }
             Action::OpenImage(open) => {
                 self.push_screen(Screen::ImageView(screens::ImageViewState::of(*open)));
@@ -8338,7 +8292,7 @@ mod tests {
         App {
             crumb_targets: Vec::new(),
             next_list_seq: 1,
-            pending_video: None,
+            last_video_frame: None,
             api: Arc::new(RecordingApi::default()),
             client,
             tx,
@@ -8743,126 +8697,20 @@ mod tests {
         // path — which is itself the thing worth pinning: it says so instead
         // of hanging or suspending the UI.
         app.click_hit((3, found[1].1), false);
-        assert!(
-            app.pending_video.is_some()
-                || app.status.contains("not installed")
-                || app.status.contains("mpv"),
-            "a click must either queue the video or say why it cannot: {:?}",
-            app.status
-        );
-        if let Some((url, _)) = &app.pending_video {
-            assert!(url.contains("bbb"), "the row that was clicked: {url}");
-        }
-    }
-
-    /// #710: playing hands the terminal to a player and takes it back, and
-    /// the reader thread stays the only thing reading stdin — the player
-    /// gets a pipe and the keys are forwarded down it.
-    ///
-    /// Driven against a stand-in player (`WFTUI_PLAYER`) because a real one
-    /// needs a terminal, a network and a sound card; what is being tested is
-    /// this client's half of the handover, which is all of it that can be
-    /// wrong.
-    #[test]
-    fn playing_forwards_keys_to_the_player_and_stops_on_q() {
-        use crate::event::Input;
-        use ratatui::backend::TestBackend;
-        use ratatui::crossterm::event::{KeyCode, KeyEvent};
-
-        // `WFTUI_PLAYER` is process-global, so any test that sets one holds
-        // this first — the same discipline `common`'s wiremock tests keep.
-        static PLAYER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _lock = PLAYER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("wftui-play-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let log = dir.join("keys.log");
-        let script = dir.join("player.sh");
-        // Reads BYTES, not lines: mpv reads terminal input a byte at a time,
-        // and a line-buffered stand-in would only prove that `Enter` sends a
-        // newline — which it does not, it sends `\r`.
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/bash\nprintf 'ARGS %s\\n' \"$*\" >> {log}\n\
-                 while IFS= read -r -n1 ch; do printf 'IN %s\\n' \"$ch\" >> {log}; done\n",
-                log = log.display()
-            ),
-        )
-        .expect("write player");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
-        }
-        let previous = std::env::var("WFTUI_PLAYER").ok();
-        // SAFETY: guarded by ENV_LOCK, and restored below.
-        unsafe { std::env::set_var("WFTUI_PLAYER", &script) };
-
-        let (tx, rx) = std::sync::mpsc::channel::<Input>();
-        // Sent from a thread, each step waiting for the player to prove it
-        // got the last one. Queueing all three up front raced: the loop
-        // drains them in microseconds and killed the child before `sh` had
-        // run its first line, which tested nothing.
-        let feeder_log = log.clone();
-        let feeder = std::thread::spawn(move || {
-            let wait_for = |needle: &str| {
-                for _ in 0..200 {
-                    if std::fs::read_to_string(&feeder_log)
-                        .unwrap_or_default()
-                        .contains(needle)
-                    {
-                        return true;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-                false
-            };
-            if !wait_for("ARGS") {
-                // Let the player loop end anyway, so the test fails on its
-                // assertions rather than hanging.
-                let _ = tx.send(Input::Key(KeyEvent::from(KeyCode::Char('q'))));
-                return;
+        // The click opens the video view for THAT video — decoding may or
+        // may not start here (ffmpeg has to exist and the URL has to
+        // resolve), but the pane and its url are the client's half.
+        match app.screens.last() {
+            Some(Screen::VideoView(v)) => {
+                assert!(v.url.contains("bbb"), "the row that was clicked: {}", v.url);
             }
-            // A key the player binds, terminated so its line-buffered read
-            // sees the forwarded byte.
-            let _ = tx.send(Input::Key(KeyEvent::from(KeyCode::Char('f'))));
-            let _ = tx.send(Input::Key(KeyEvent::from(KeyCode::Enter)));
-            wait_for("IN f");
-            let _ = tx.send(Input::Key(KeyEvent::from(KeyCode::Char('q'))));
-        });
-
-        let mut term = ratatui::Terminal::new(TestBackend::new(80, 24)).expect("terminal");
-        let out = play_video(
-            &mut term,
-            &rx,
-            crate::images::Tier::Text,
-            "https://www.youtube.com/watch?v=abc",
-        );
-
-        let _ = feeder.join();
-        match previous {
-            // SAFETY: still under ENV_LOCK.
-            Some(v) => unsafe { std::env::set_var("WFTUI_PLAYER", v) },
-            None => unsafe { std::env::remove_var("WFTUI_PLAYER") },
+            other => panic!(
+                "a click on a play row must open the video view, got {:?}",
+                other.map(|s| s.title())
+            ),
         }
-
-        assert!(out.is_ok(), "playing must return cleanly: {out:?}");
-        let logged = std::fs::read_to_string(&log).unwrap_or_default();
-        assert!(logged.contains("ARGS"), "the player was spawned: {logged:?}");
-        assert!(
-            logged.contains("--vo=tct") && logged.contains("youtube"),
-            "with the argv for this terminal: {logged:?}"
-        );
-        assert!(
-            logged.contains("IN f"),
-            "and the keys were forwarded down its stdin: {logged:?}"
-        );
-        assert!(
-            !logged.contains("IN q"),
-            "but `q` stops the player rather than being forwarded: {logged:?}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
+
 
     /// #709: an uploaded file lands at the caret as `[ATTACH]id[/ATTACH]`,
     /// its key is remembered, and the write that follows carries that key —

@@ -343,49 +343,66 @@ addon can be run over it directly. That is how the current implementation was
 confirmed (`valid=true, violations: 0`), and how the three failure modes
 above were confirmed to fire.
 
-## Watching a video in the terminal (#710)
+## Video, played inside the app (#710, #711)
 
-A video renders as a **row you can press** — `▶ Play YouTube video`, where
-the message put it — rather than a link with a `[n]` marker. Click it, or
-press `W` for the selected post's first one. 25,839 posts here carry
+A video renders as a **row you can press** — `▶ Play YouTube video`, where the
+message put it — rather than a link with a `[n]` marker. Click it, or press
+`W` for the selected post's first one. 25,839 posts here carry
 `[MEDIA=youtube]`, which the parser already resolves to a watch URL, so
 `browse::post_videos` recognises those URLs rather than re-parsing the tag —
-which also picks up a plain YouTube link somebody pasted without one.
+which also picks up a plain YouTube link somebody pasted without one. The play
+rows join the same block walk as inline images (#693), sorted by chunk
+position, and `video_lines` maps each row to its own index so clicking the
+second video plays the second.
 
-The play rows join the same block walk as inline images (#693), sorted by
-chunk position so a post that alternates pictures and videos renders them in
-the order it wrote them; `video_lines` maps each row to its own index, so
-clicking the second video plays the second.
+It plays **in a pane**, not by handing the terminal to an external player.
+The first attempt (#710) suspended the UI and ran `mpv`; it worked and it was
+not the app. What made in-app playback viable was measuring instead of
+assuming: decode runs ~32x realtime (5 s of 360p in 0.15 s) and encoding one
+frame for the terminal costs ~1.1 ms, an 885 fps ceiling. Neither is the
+constraint.
 
-**This client decodes nothing.** It hands the URL to `mpv`, which already
-knows how to resolve a YouTube page through `yt-dlp` (installed here) and how
-to paint frames. `video.rs` owns only the argv and the refusal reasons —
-both testable without a terminal, unlike playback. The video output follows
-the graphics tier: kitty and sixel are mpv's own, iTerm2 reads sixel, and
-everything else gets `--vo=tct` (true-colour text blocks), which is what
-makes this work over a plain SSH session. Mono is refused with a reason,
-because there is nothing honest to paint with.
+`video.rs` owns it. Three jobs, each given to the tool that already does it:
 
-mpv is **optional and not installed here**: `W` says so and names the install
-rather than failing obscurely. `WFTUI_PLAYER` overrides the binary.
+- **Resolve** — a forum link is a *page*; `yt-dlp` turns it into media.
+  **Two** URLs, not one: YouTube has largely stopped serving progressive
+  (muxed) streams, so asking for a single one fails outright on most videos
+  with "Requested format is not available", which the first draft did.
+- **Decode** — `ffmpeg` writes raw RGB to a pipe. The filter letterboxes
+  every source into one fixed box (`force_original_aspect_ratio=decrease` +
+  `pad`), because raw video has no frame boundaries and the reader can only
+  split the stream if every frame is exactly the same length. Deriving the
+  height from an assumed aspect tears the moment a video is not 16:9.
+- **Audio** — a second process (`ffplay -nodisp`), because ffmpeg cannot both
+  pipe frames here and make noise. Best-effort: no sound device means a
+  silent video, never a refused one.
 
-The handover is the part to be careful with, and it lives in `app::play_video`
-because only `run` owns the terminal and the reader thread:
+Pacing is ours: the playback thread presents frames against a wall clock and
+keeps only the newest, so a slow terminal drops frames rather than falling
+behind. Everything after resolution happens off the UI thread — resolving
+takes a second or two of network and blocking on it is exactly the un-fluid
+thing this design exists to avoid.
 
-- The reader thread stays the **only** thing reading stdin (hard rule 3). mpv
-  gets a **pipe**, and keys arrive here and are forwarded down it as the bytes
-  a terminal would have sent (`video::key_bytes`). Two readers on one tty
-  would race for every keystroke.
-- That also keeps hard rule 2: the child's stdin is ours, not the tty.
-- `q`/Esc/`^C` are handled here rather than forwarded, so a player that
-  ignores its input can still be stopped — we kill the child.
-- Raw mode **stays on** through playback (the reader needs it); what is handed
-  over is the alternate screen and mouse capture, both taken back afterwards
-  with a full redraw, since the player painted over everything ratatui
-  believed was there.
+Two integration points to remember:
 
-`playing_forwards_keys_to_the_player_and_stops_on_q` drives all of that
-against a stand-in player via `WFTUI_PLAYER`.
+- `needs_continuous_redraw` must be true while playing. A video is the only
+  thing on screen that changes without anything arriving in the message pump,
+  so #674's idle-skip would otherwise freeze it on the first frame. Paused
+  counts as idle.
+- Frames are painted by `images::paint_frame`, deliberately **not** through
+  the image cache: every frame is new, and an LRU of stills would evict a
+  screenful of thumbnails within a second. The payload is still written by
+  `ratatui-image`'s own widget, never by us (hard rule 1).
+
+Pause is `SIGSTOP` to both children at once — decode and sound stop at the
+same instant and cannot drift apart while stopped, which no buffering on our
+side would guarantee. Closing the pane drops `Playback`, whose `Drop` kills
+the children, so a pane that goes away never leaves ffmpeg decoding into a
+pipe nobody reads.
+
+`real_youtube_page_resolves_and_decodes` is `#[ignore]`d and proves the whole
+path against the live site; run it deliberately with
+`cargo test -- --ignored real_youtube`.
 
 ## Attachments
 
