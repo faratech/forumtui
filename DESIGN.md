@@ -28,7 +28,7 @@ should reintroduce a red+green+blue+yellow set as a reusable role.
 
 | role | truecolor | 256 | 16-color | used for |
 |---|---|---|---|---|
-| text | Reset | Reset | Reset | all content |
+| text | Reset | Reset | Reset | all content, unless a post colours it (below) |
 | dim | #6F7C8B | 243 | DarkGray | meta, hints, column headers |
 | faint | #313B47 | 238 | DarkGray | unfocused borders, rules, quote gutters |
 | accent | #4DA3F5 | 75 | LightBlue | focused border, unread dot, links, headings, spinner |
@@ -41,6 +41,18 @@ should reintroduce a red+green+blue+yellow set as a reusable role.
 | warn | #FFB902 | 214 | Yellow | open question, gate counting down, watching star |
 | error | #F54E25 | 202 | Red | errors only |
 | code_fg / code_bg | #F0C674 / #1A2028 | 221 / 234 | Yellow / Reset | [ICODE] and [CODE] |
+
+**The one exception to "content is Reset":** a post may colour its own text.
+`[COLOR=…]` is carried on `bbcode::Style` and painted through
+`theme::quantize`, which brings the author's colour down to the terminal's
+fidelity — exact on TrueColor, nearest cube or grey-ramp entry on 256,
+nearest basic on 16, and **dropped entirely on Mono**, so `NO_COLOR` still
+means what it says. Sizes cannot change a glyph's size in a terminal, so
+`[SIZE]` reads as emphasis (5-7 bold, 1-3 dim) and headings as bold + accent
++ underline by level; `[HIGHLIGHT]` is REVERSED, which stays legible over
+whatever colour the text already carries. The semantics of those tags come
+from `XF\BbCode\Renderer\Html`, not from intuition — see CLAUDE.md, two of
+them are counter-intuitive.
 
 There is no separate mark role: the header and sign-in marks are drawn straight from
 `chrome_bg`/`chrome_fg` (see below). The four-color `mark (r, g, b, y)` role this table
@@ -154,6 +166,13 @@ Column header row in dim above the list. Selected row = selection_bg across the 
 width + bold. Age: `14h` under a day, `6d` under a month, then `Jul 26`, then `2025`.
 Narrow (< 90): drop Started by, author 9 wide, age 6.
 
+Two states ride on the same row. A thread a moderator can see but an ordinary
+reader cannot is marked as what it is: **deleted** rows are struck through and
+dimmed, **awaiting approval** rows are italic, and both carry a chip naming
+the state ahead of the prefix. A **banned** author's name is struck through
+wherever it appears, as the website strikes it — and only where the API said
+so, since XF gates `is_banned` to viewers who may bypass user privacy.
+
 ## Screens (what each looks like — see the PNGs)
 
 * **Home** (`c1.png` top): Forums panel (QUICK: `L` Latest, `1` News, `2` Security,
@@ -168,12 +187,17 @@ Narrow (< 90): drop Started by, author 9 wide, age 6.
   username bold, `AI` chip for the site bot (user 125694), `STAFF` chip for staff,
   date and `#n` right-aligned; second line dim meta; body lines behind a gutter
   (accent for the selected post, faint otherwise); `♡ n   ▲ n` footer; links listed
-  as `[n]`. Keys: r reply · j/k scroll · n/N post · l like · v vote · o links ·
-  1-9 image · u open in web · Esc back.
+  as `[n]`. Images render where the message puts them — a caption plus the
+  picture, with only the attachments the message never referenced listed
+  underneath. Keys: r reply · Q quote · e edit · D delete (twice) · S solution ·
+  j/k scroll · n/N post · l like · v vote · o links · 1-9 / Enter open the
+  picture in the viewer · x spoilers · u open in web · Esc back. `e`, `D` and
+  `S` appear only where the API said this reader may.
 * **Reply** (`c2.png` bottom): editor panel `Reply` (72) + `Preview` (48) rendering
   the draft through common::bbcode; editor bottom line = BBCode caps ^B ^I ^K ^Q ^U
-  and char count. Keys: ^S send · ^O preview on/off · ^Y paste · ^A attach · Tab
-  field · Esc discard.
+  and char count. Keys: ^S send · ^O preview on/off · ^F attach · ^Y paste · Tab
+  field · Esc discard. `^F` opens a one-line path prompt — a terminal has no
+  file picker — and the uploaded file lands at the caret as `[ATTACH]id[/ATTACH]`.
 * **Sign in** (`c3.png` top, `c5.png` bottom): centered 72-wide panel with the white
   bubble mark (rounded top-left/top-right/bottom-left, square bottom-right — matching
   `wf-logo.png` — carrying bold blue `WF`), steps 1-2-3, the short link in its own box,
@@ -187,18 +211,38 @@ Narrow (< 90): drop Started by, author 9 wide, age 6.
   `Go to` panel over the dimmed body (forums, actions with their key, members);
   `g` shows a small which-key panel bottom-right (n news · s security · t tutorials ·
   l latest · i inbox · a alerts · m media · r resources · h home · p profile · g top).
+* **Media Gallery** (`g m`): categories panel 28 wide (nested by parent, with
+  counts, "All media" first) beside the media panel — one pane at a time below
+  90 cols, like Home. Rows are a thumbnail plus title, uploader · age, and
+  views · comments · W×H; row height follows the pane, so a short pane packs
+  compact rows and a tall one gives each picture its full height. Enter opens
+  the picture in the viewer, `o` opens the site.
+* **Resources** (`g r`): title with version, dim tag line, and
+  `author · ↓ downloads · ★ rating · age`. Enter opens the resource **in the
+  client**, not the browser.
+* **Resource page**: icon beside title + version, tag line, then
+  `by author · category · updated · ↓ n · ★ n (n) · n reviews · n views`, a
+  rule, and the description rendered from the same BBCode path the thread view
+  uses. Keys: j/k scroll · d download · o web · R refresh · Esc back.
+* **Image viewer**: one picture, centred, as large as the pane allows, caption
+  pinned underneath (title, uploader · date · W×H, description). On the text
+  tier it says so and offers `o`.
 * **Keys card** (`c4.png` bottom): `?` opens a 96-wide two-column card grouped
   MOVE / THIS THREAD / EVERYWHERE / MOUSE & CLIPBOARD, any key closes.
 
 ## Graphics tiers (phase 3, `wftui/src/images.rs`, cargo feature `images`, default on)
 
 1 kitty (unicode placeholders) · 2 sixel · 3 iTerm2 · 4 half-blocks · 5 text
-placeholder `▣ name · W×H` (digits 1–9 open in browser). Use the `ratatui-image`
+placeholder `▣ name · W×H` (digits 1–9 open the picture in the client's own
+viewer; on the text tier the caption is all the picture has). Use the `ratatui-image`
 crate; run its terminal query BEFORE `event::spawn_reader` takes stdin (hard rule 3)
 and never put image bytes in span content (hard rule 1). Attachments ≤ 40 % of the
 panel width and ≤ 12 rows, aspect kept; avatars 2 rows × 5 cells; the logo 7 × 16 on
-sign-in. Thumbnails only, fetched through `api_gate`, cached under the config dir
-(`cache/img/`, capped), disabled by `WFTUI_NO_IMAGES=1`.
+sign-in. Gallery rows and resource icons fit their own boxes (`fit_within`),
+and the viewer fills its pane. Fetched through `image_gate`, capped at 2 MiB
+for a thumbnail and 8 MiB for the viewer, decoded no larger than 4096 px per
+axis within a 64 MiB budget, cached under the config dir (`cache/img/`,
+capped), disabled by `WFTUI_NO_IMAGES=1`.
 
 ## Mouse and touch
 
@@ -210,7 +254,9 @@ resolved against that — last registered wins, so an overlay covers what it is
 drawn over. A click selects the row it lands on, clicking the already-selected
 row (or a double click) opens it like Enter, a right click / long press opens
 it on the site, and clicking a key cap presses that key through the ordinary
-key routing rather than a second code path. Press and release in one cell is a
+key routing rather than a second code path. The breadcrumb is navigation too:
+each crumb pops back to the screen it names and the brand is Home, with the
+current screen's own crumb inert. Press and release in one cell is a
 click; anything that moves is the drag-selection it always was, with
 double-click word select and triple-click line select still on text.
 `WFTUI_MOUSE=0` starts the client with no mouse capture at all, handing every
@@ -221,17 +267,28 @@ one-off form of the same escape hatch.
 
 Every current binding keeps working: 1/2/3, L, N, m, r, l, v/V, o, u, p/P, c, a, s,
 i, n, ?, q, Esc, Tab, Ctrl+S, Ctrl+Y, Ctrl+C, Ctrl+L, [ ], j/k, arrows, mouse.
-New: `/` (search, alias of s), `g` prefix, Ctrl+K / `:` palette, `1-9` images, `w` watch.
-Mouse and touch add no keys: every click resolves to one of the above.
+New: `/` (search, alias of s), `g` prefix (now including `m` media and `r`
+resources), Ctrl+K / `:` palette, `1-9` images, `w` watch, `x` spoilers, and
+the post-writing set in the thread view — `Q` quote, `e` edit, `D` delete
+(twice, and any other key disarms it), `S` solution — plus `^F` attach in the
+composer. Mouse and touch add no keys: every click resolves to one of the above.
 
 ## Gates
 
 ```bash
 cd /web/wftui_app
 cargo check                                            # while iterating
-cargo test --workspace                                 # 188 tests today; keep them green, add yours
+cargo test --workspace                                 # 523 tests today; keep them green, add yours
+cargo test -p wftui --no-default-features              # the no-images build must stay green too
 cargo clippy --all-targets --release -- -D warnings    # must stay at 0
 cargo build --release && cp target/release/wftui bin/wftui
+# Deploying over a RUNNING wftui needs a rename, not a copy ("Text file busy"):
+install -m755 bin/wftui /usr/local/bin/wftui.new && mv -f /usr/local/bin/wftui.new /usr/local/bin/wftui
 ```
+
+`wftui_app/CLAUDE.md` is the engineering companion to this file: this one is
+the approved look and the key map, that one is the contracts behind them (the
+ContentIntegrity quote rules, the XF BBCode semantics, the attachment key,
+the fixture rule). Neither replaces the other.
 Do not commit. Do not touch `services/mirror`, `public_html`, or anything outside
 `/web/wftui_app`. The reference renders and artboards are read-only.
