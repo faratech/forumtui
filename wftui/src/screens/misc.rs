@@ -521,6 +521,18 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
                     }
                 }
             }
+            KeyCode::Char('x') if s.resumed => {
+                // #715: this composer opened onto a recovered draft the user
+                // does not want. Put back what it would have shown without
+                // one — for an edit that is the post's current text, so
+                // discarding a draft must not empty the post.
+                s.title = s.seed_title.clone();
+                s.body = s.seed_body.clone();
+                s.title_cursor = s.title.chars().count();
+                s.body_cursor = s.body.chars().count();
+                s.resumed = false;
+                return Action::DiscardDraft;
+            }
             KeyCode::Char('f') => {
                 // #709: attach a file. One upload at a time — a second `^F`
                 // while one is in flight would race the key that ties them
@@ -770,14 +782,19 @@ pub fn compose_hints(s: &super::ComposeState) -> Hints {
     if can_attach {
         keys.push(("^F", if s.uploading { "uploading\u{2026}" } else { "attach" }));
     }
-    keys.extend_from_slice(&[("^Y", "paste"), ("Tab", tab_desc), ("Esc", "discard")]);
+    if s.resumed {
+        keys.push(("^X", "discard draft"));
+    }
+    // Esc used to be captioned "discard", which is now a lie: it keeps the
+    // draft and gives it back next time (#715).
+    keys.extend_from_slice(&[("^Y", "paste"), ("Tab", tab_desc), ("Esc", "close")]);
     Hints::with_short(
         &keys,
         &[
             ("^S", primary_short),
             ("^O", "preview"),
             ("^Y", ""),
-            ("Esc", "discard"),
+            ("Esc", "close"),
         ],
         0,
     )

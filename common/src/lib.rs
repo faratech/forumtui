@@ -9,6 +9,7 @@
 pub mod api;
 pub mod bbcode;
 pub mod config;
+pub mod drafts;
 pub mod error;
 pub mod http;
 pub mod logging;

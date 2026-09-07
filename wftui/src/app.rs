@@ -553,6 +553,11 @@ pub struct App {
     /// `handle_mouse`. Empty for the whole run when `WFTUI_MOUSE=0`, which
     /// is also when nothing enabled mouse capture in the first place.
     hits: HitMap,
+    /// Unsent composer drafts, keyed by which composer they belong to
+    /// (#715). Held in memory for the session and mirrored to disk, so Esc
+    /// and a crash both survive.
+    drafts: std::collections::HashMap<common::drafts::DraftKey, common::drafts::Draft>,
+    draft_store: common::drafts::Store,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -747,6 +752,7 @@ pub async fn run(images: crate::images::Images) -> u8 {
         tokio::spawn(forward_signals(tx));
     }
 
+    let draft_store = common::drafts::Store::new();
     let mut app = App {
         next_list_seq: 1,
         api: client.clone(),
@@ -791,6 +797,10 @@ pub async fn run(images: crate::images::Images) -> u8 {
         login_task: None,
         body_rect: ratatui::layout::Rect::default(),
         hits: HitMap::new(common::config::mouse_enabled()),
+        // Drafts left by the previous run (#715): an Esc or a crash mid-post
+        // must not cost the words.
+        drafts: draft_store.load(),
+        draft_store,
     };
     app.bootstrap().await;
     let reader = crate::event::spawn_reader();
@@ -1947,6 +1957,14 @@ impl App {
                     tx.send(Msg::PostToggled { verb, result }).ok();
                 });
             }
+            Action::DiscardDraft => {
+                if let Some(Screen::Compose(c)) = self.screens.last()
+                    && let Some(key) = c.target.as_ref().map(|t| t.draft_key())
+                {
+                    self.discard_draft(key);
+                    self.set_status("Draft discarded.");
+                }
+            }
             Action::StartReply(thread) => self.reply_to_thread(&thread),
             Action::StartEditPost(thread, post) => {
                 // Seeded with what is there now, caret at the start: an edit
@@ -2254,7 +2272,94 @@ impl App {
         if let Some(Screen::ThreadView(view)) = &gone {
             self.report_read(view);
         }
+        // Esc used to destroy an unsent post outright (#715). Keep it instead
+        // — Esc still closes instantly, so the ordinary empty-composer case
+        // pays nothing, and the words come back next time this composer
+        // opens. The successful-send paths do not come through here: they
+        // `screens.remove(idx)` and clear the draft explicitly.
+        if let Some(Screen::Compose(c)) = &gone {
+            self.stash_draft(c);
+        }
         true
+    }
+
+    /// Keep (or clear) the draft slot this composer owns.
+    ///
+    /// An empty composer *removes* any stored draft rather than storing a
+    /// blank one, so opening a reply, thinking better of it and pressing Esc
+    /// does not leave an empty draft to be resumed later.
+    fn stash_draft(&mut self, c: &screens::ComposeState) {
+        let Some(key) = c.target.as_ref().map(|t| t.draft_key()) else {
+            return;
+        };
+        let draft = common::drafts::Draft {
+            title: c.title.clone(),
+            body: c.body.clone(),
+            attachment_key: c.attachment_key.clone(),
+            saved_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+        };
+        if draft.is_empty() {
+            self.discard_draft(key);
+            return;
+        }
+        let too_big = draft.too_big_to_persist();
+        self.drafts.insert(key, draft);
+        self.persist_drafts();
+        if too_big {
+            // Honest about the limit rather than promising a recovery that a
+            // restart will not deliver.
+            self.set_status("Draft kept for this session — too large to save to disk.");
+        } else {
+            self.set_status("Draft saved. Open this composer again to resume it.");
+        }
+    }
+
+    /// Close a composer whose write just succeeded and forget its draft: the
+    /// post is on the site now, so there is nothing left to recover (#715).
+    ///
+    /// Deliberately not `pop_screen`, which *saves* the draft — and which
+    /// could not be used here anyway, since a composer may be buried under a
+    /// screen the user opened while the write was in flight.
+    fn close_sent_composer(&mut self, idx: usize) {
+        let key = match self.screens.get(idx) {
+            Some(Screen::Compose(c)) => c.target.as_ref().map(|t| t.draft_key()),
+            _ => None,
+        };
+        if let Some(key) = key {
+            self.discard_draft(key);
+        }
+        self.screens.remove(idx);
+    }
+
+    /// Forget a draft, in memory and on disk. Called when the composer is
+    /// left empty, when the user discards it, and when the write it belongs
+    /// to actually succeeds.
+    fn discard_draft(&mut self, key: common::drafts::DraftKey) {
+        if self.drafts.remove(&key).is_some() {
+            self.persist_drafts();
+        }
+    }
+
+    /// Forget every draft, in memory and on disk. For the two moments where
+    /// the drafts stop belonging to whoever is now at the keyboard: an
+    /// explicit sign-out, and the token store turning out to hold a
+    /// different account.
+    fn clear_all_drafts(&mut self) {
+        if !self.drafts.is_empty() {
+            self.drafts.clear();
+        }
+        if let Err(e) = self.draft_store.erase() {
+            tracing::warn!("could not clear drafts: {e}");
+        }
+    }
+
+    /// Write the store, best effort. A draft is a convenience: failing to
+    /// save one is worth a line in the log, never an error that interrupts
+    /// the user mid-post.
+    fn persist_drafts(&self) {
+        if let Err(e) = self.draft_store.save(&self.drafts) {
+            tracing::warn!("could not save drafts: {e}");
+        }
     }
 
     /// Read a file and upload it as an attachment (#709).
@@ -3138,7 +3243,28 @@ impl App {
             Some(Screen::Compose(_)) | Some(Screen::NewConversation(_))
         ) || capture_active(self)
     }
-    pub fn push_screen(&mut self, screen: Screen) {
+    pub fn push_screen(&mut self, mut screen: Screen) {
+        // Restore here rather than at each opener (#715): all four composers
+        // — reply, quote-reply, edit, new thread, conversation reply — reach
+        // the stack through this one call, so a fifth cannot forget to.
+        if let Screen::Compose(c) = &mut screen
+            && let Some(key) = c.target.as_ref().map(|t| t.draft_key())
+            && let Some(draft) = self.drafts.get(&key)
+        {
+            // What the composer would have shown without a draft, so `^X`
+            // can put it back — for an edit that is the post's current text.
+            c.seed_title = c.title.clone();
+            c.seed_body = c.body.clone();
+            c.title = draft.title.clone();
+            c.body = draft.body.clone();
+            // The files attached before Esc belong to this draft's key, and
+            // without it they are attached to nothing (#709).
+            c.attachment_key = draft.attachment_key.clone();
+            c.title_cursor = c.title.chars().count();
+            c.body_cursor = c.body.chars().count();
+            c.resumed = true;
+            self.set_hint("Resumed your saved draft — ^X discards it.");
+        }
         self.screens.push(screen);
     }
 
@@ -3615,6 +3741,10 @@ impl App {
         // Same teardown as any other session end — including the generation
         // bump that drops a `Msg::Bootstrap` still in flight from a restore
         // the user just signed out of (issue #557).
+        // Unsent drafts are this account's private writing: signing out must
+        // not leave them on disk for whoever signs in next (#715). A session
+        // that merely *expires* keeps them — that user is coming back.
+        self.clear_all_drafts();
         self.end_session("Logged out.");
     }
 
@@ -3894,6 +4024,11 @@ impl App {
                     if let Some(Screen::Home(h)) = self.screens.first_mut() {
                         h.list = screens::ThreadListState::default();
                     }
+                    // #715: and the saved drafts, which are unsent posts
+                    // written as the old identity. Offering one back to a
+                    // different account would be this comment's own
+                    // "Compose draft written as them", one restart later.
+                    self.clear_all_drafts();
                 }
                 let username = user.username.clone();
                 self.me = Some(user);
@@ -4145,7 +4280,7 @@ impl App {
                             _ => 0,
                         };
                         if let Some(idx) = compose_idx {
-                            self.screens.remove(idx);
+                            self.close_sent_composer(idx);
                         }
                         self.set_status("Reply posted.");
                         if thread_id > 0 {
@@ -4187,7 +4322,7 @@ impl App {
                 match result {
                     Ok(thread) => {
                         if let Some(idx) = compose_idx {
-                            self.screens.remove(idx);
+                            self.close_sent_composer(idx);
                         }
                         self.set_status("Thread created.");
                         // The list we are about to refresh may be showing a
@@ -4365,7 +4500,7 @@ impl App {
                             _ => 0,
                         };
                         if let Some(idx) = compose_idx {
-                            self.screens.remove(idx);
+                            self.close_sent_composer(idx);
                         }
                         self.set_status("Message sent.");
                         if cid > 0 {
@@ -4624,7 +4759,7 @@ impl App {
                         {
                             thread_id = t;
                         }
-                        self.screens.remove(idx);
+                        self.close_sent_composer(idx);
                     }
                     self.set_status("Post saved.");
                     let page = self
@@ -8164,6 +8299,220 @@ mod tests {
         Arc::new(client)
     }
 
+    /// #715: Esc used to destroy an unsent post outright. It must keep it,
+    /// and the same composer must offer it back.
+    #[test]
+    fn esc_keeps_the_draft_and_reopening_the_same_composer_restores_it() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "hours of typing".into();
+        }
+        assert!(app.pop_screen(), "Esc pops the composer");
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Home(_))),
+            "the composer is gone from the stack"
+        );
+
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        match app.screens.last() {
+            Some(Screen::Compose(c)) => {
+                assert_eq!(c.body, "hours of typing", "the words must come back verbatim");
+                assert_eq!(c.body_cursor, "hours of typing".chars().count(), "caret at the end");
+                assert!(c.resumed, "and the composer knows it resumed, so ^X is offered");
+            }
+            other => panic!("expected a composer, got {:?}", other.map(|s| s.title())),
+        }
+    }
+
+    /// A draft belongs to one composer. An edit of a post and a fresh reply
+    /// to the thread holding it must not share one, or a resumed edit would
+    /// silently overwrite a post with someone's half-written reply.
+    #[test]
+    fn drafts_do_not_leak_between_composers() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "reply draft".into();
+        }
+        app.pop_screen();
+
+        // A different thread: same kind of composer, different slot.
+        app.reply_to_thread(&Thread { thread_id: 8, title: "Another thread".into(), ..Default::default() });
+        match app.screens.last() {
+            Some(Screen::Compose(c)) => {
+                assert!(c.body.is_empty(), "thread 8 must not see thread 7's draft");
+                assert!(!c.resumed);
+            }
+            _ => panic!("expected a composer"),
+        }
+        app.pop_screen();
+
+        // And thread 7 still has its own.
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        match app.screens.last() {
+            Some(Screen::Compose(c)) => assert_eq!(c.body, "reply draft"),
+            _ => panic!("expected a composer"),
+        }
+    }
+
+    /// Opening a composer, thinking better of it and pressing Esc must not
+    /// leave an empty draft to be "resumed" later.
+    #[test]
+    fn an_empty_composer_stores_nothing() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "   \n ".into();
+        }
+        app.pop_screen();
+        assert!(app.drafts.is_empty(), "whitespace is not a draft");
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        match app.screens.last() {
+            Some(Screen::Compose(c)) => assert!(!c.resumed, "nothing to resume"),
+            _ => panic!("expected a composer"),
+        }
+    }
+
+    /// Once the post is on the site there is nothing left to recover, so the
+    /// draft must go — otherwise the next reply to that thread comes up
+    /// pre-filled with the post that was already made.
+    // A tokio test: the success arm reloads the thread, which spawns.
+    #[tokio::test]
+    async fn a_successful_reply_clears_the_draft() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "posted words".into();
+        }
+        // Esc first, so there is a stored draft for the send to clear.
+        app.pop_screen();
+        assert_eq!(app.drafts.len(), 1);
+
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.handle_msg(Msg::ReplySent(Ok(Post { post_id: 1, thread_id: 7, ..Default::default() })));
+        assert!(app.drafts.is_empty(), "a sent reply leaves no draft behind");
+        assert!(
+            !app.screens.iter().any(|s| matches!(s, Screen::Compose(_))),
+            "and the composer is closed"
+        );
+    }
+
+    /// `^X` on a resumed composer forgets the draft and puts back what the
+    /// composer would have shown without one. For an edit that seed is the
+    /// post's current text, so discarding a draft must not empty the post.
+    #[test]
+    fn discarding_a_resumed_draft_restores_the_seed_not_an_empty_editor() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        let thread = Thread { thread_id: 7, title: "A thread".into(), ..Default::default() };
+        let mut post = Post { post_id: 500, thread_id: 7, ..Default::default() };
+        post.message = "the post as it stands".into();
+
+        app.execute_action(Action::StartEditPost(thread.clone(), Box::new(post.clone())));
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "an edit I abandoned".into();
+        }
+        app.pop_screen();
+
+        app.execute_action(Action::StartEditPost(thread, Box::new(post)));
+        match app.screens.last() {
+            Some(Screen::Compose(c)) => {
+                assert_eq!(c.body, "an edit I abandoned", "the draft wins on reopen");
+                assert_eq!(c.seed_body, "the post as it stands", "the seed is remembered");
+            }
+            _ => panic!("expected a composer"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert!(app.drafts.is_empty(), "^X forgets the draft");
+        match app.screens.last() {
+            Some(Screen::Compose(c)) => {
+                assert_eq!(
+                    c.body, "the post as it stands",
+                    "discarding must restore the post, not empty the editor"
+                );
+                assert!(!c.resumed, "and the cap goes away");
+            }
+            _ => panic!("expected a composer"),
+        }
+    }
+
+    /// #715 + #581: a draft is unsent writing by one account. Signing out
+    /// must not leave it on disk for whoever signs in next — on the same
+    /// machine, one restart later.
+    #[test]
+    fn signing_out_forgets_the_drafts() {
+        let mut app = test_app();
+        let path = app.draft_store.path().to_path_buf();
+        let _ = std::fs::remove_file(&path);
+        app.screens.push(screens::home_state(false));
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "private words".into();
+        }
+        app.pop_screen();
+        assert!(path.exists(), "test setup: the draft reached the disk");
+
+        app.clear_all_drafts();
+        assert!(app.drafts.is_empty(), "nothing left in memory");
+        assert!(!path.exists(), "and nothing left on disk for the next account");
+    }
+
+    /// A session that merely *expires* is the same person coming back, so
+    /// their draft must still be there. Only an explicit sign-out and a
+    /// changed identity clear it.
+    #[test]
+    fn an_expired_session_keeps_the_draft() {
+        let mut app = test_app();
+        let _ = std::fs::remove_file(app.draft_store.path());
+        app.screens.push(screens::home_state(false));
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "still mine".into();
+        }
+        app.pop_screen();
+
+        app.end_session("Session expired; log in again.");
+        assert_eq!(
+            app.drafts.len(),
+            1,
+            "an expired session is the same user — their unsent post must survive"
+        );
+        let _ = std::fs::remove_file(app.draft_store.path());
+    }
+
+    /// The whole point of writing the file: a draft must survive the process,
+    /// not just the screen stack.
+    #[test]
+    fn a_draft_survives_a_restart() {
+        let mut app = test_app();
+        let path = app.draft_store.path().to_path_buf();
+        let _ = std::fs::remove_file(&path);
+        app.screens.push(screens::home_state(false));
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "survives a crash".into();
+        }
+        app.pop_screen();
+
+        // A second app reading the same store is what a restart looks like.
+        let mut next = test_app();
+        next.drafts = next.draft_store.load();
+        next.screens.push(screens::home_state(false));
+        next.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        match next.screens.last() {
+            Some(Screen::Compose(c)) => assert_eq!(c.body, "survives a crash"),
+            _ => panic!("expected a composer"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// GUARD (issue #565). No test may read or write the machine owner's
     /// real config dir, and none may reach the live site. Both happened:
     /// `test_app()` built a real `WfApiClient::new()`, so
@@ -8193,6 +8542,11 @@ mod tests {
         assert!(login_url.starts_with(&scratch), "{login_url:?}");
         assert!(app.images.disk_dir().starts_with(&scratch), "{:?}", app.images.disk_dir());
         assert!(!app.images.disk_dir().starts_with(&real), "{:?}", app.images.disk_dir());
+        // #715: drafts are the third file the app writes, and a test that
+        // pops a composer writes one — it must never land on the operator's.
+        let drafts = app.draft_store.path();
+        assert!(drafts.starts_with(&scratch), "draft store escaped the scratch dir: {drafts:?}");
+        assert!(!drafts.starts_with(&real), "draft store resolved the real config dir: {drafts:?}");
 
         // 3. The origin is unreachable, and the API seam is a stub, not the
         //    network client (`me()` answers without a request).
@@ -8249,6 +8603,12 @@ mod tests {
             glyphs: glyph::detect(),
             images: crate::images::Images::text_only_at(
                 scratch_config_dir().join("cache").join("img"),
+            ),
+            drafts: std::collections::HashMap::new(),
+            // Scratch dir, never the operator's own (#565) — asserted by
+            // `guard_no_test_touches_the_real_config_dir_or_the_live_site`.
+            draft_store: common::drafts::Store::with_path(
+                scratch_config_dir().join("drafts.json"),
             ),
             image_slots: Arc::new(tokio::sync::Semaphore::new(IMAGE_LOAD_CONCURRENCY)),
             screens: Vec::new(),

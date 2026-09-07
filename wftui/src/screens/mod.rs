@@ -258,6 +258,24 @@ pub enum ComposeTarget {
     },
 }
 
+impl ComposeTarget {
+    /// The draft slot this composer owns (#715).
+    ///
+    /// Identity only: an edit of post 5 and a fresh reply to the thread that
+    /// holds it are different composers, so they must never share a draft.
+    pub fn draft_key(&self) -> common::drafts::DraftKey {
+        use common::drafts::DraftKey;
+        match self {
+            ComposeTarget::ThreadReply { thread_id, .. } => DraftKey::ThreadReply(*thread_id),
+            ComposeTarget::EditPost { post_id, .. } => DraftKey::EditPost(*post_id),
+            ComposeTarget::NewThread { node_id } => DraftKey::NewThread(*node_id),
+            ComposeTarget::ConversationReply { conversation_id, .. } => {
+                DraftKey::ConversationReply(*conversation_id)
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ComposeState {
     pub target: Option<ComposeTarget>,
@@ -285,6 +303,16 @@ pub struct ComposeState {
     /// The write carries it, and without it an uploaded file is attached to
     /// nothing.
     pub attachment_key: Option<String>,
+    /// True when this composer opened onto a draft recovered from a previous
+    /// Esc or crash (#715). Only then is the discard cap advertised — there
+    /// is nothing to discard back to otherwise.
+    pub resumed: bool,
+    /// What the composer was seeded with before a draft was restored over it
+    /// (#715), so `^X` puts that back rather than emptying the editor. For a
+    /// reply this is "" or a quote block; for an edit it is the post's
+    /// current text, which discarding must not throw away.
+    pub seed_title: String,
+    pub seed_body: String,
     /// `^F` opens a one-line path prompt; `Some` while it is up. A terminal
     /// has no file picker, so the path is typed (or pasted) here.
     pub file_prompt: Option<String>,
@@ -721,6 +749,8 @@ pub enum EscIntent {
 /// Actions a screen asks the app to perform.
 pub enum Action {
     None,
+    /// Forget the draft this composer resumed (#715).
+    DiscardDraft,
     PopScreen,
     OpenThreadList(u32, String),
     OpenLatestThreads,
@@ -2116,6 +2146,22 @@ mod dispatch_tests {
                 name: "Login (Idle)",
                 factory: || Screen::Login(LoginState::default()),
                 skip: &[],
+            },
+            Case {
+                // #715: a composer that opened onto a recovered draft
+                // advertises `^X` to discard it, and only then — so the cap
+                // needs its own state here or nothing would ever press it.
+                name: "Compose (resumed draft)",
+                factory: || Screen::Compose(ComposeState {
+                    target: Some(ComposeTarget::ThreadReply {
+                        thread_id: 1,
+                        thread_title: "A thread".into(),
+                    }),
+                    body: "recovered words".into(),
+                    resumed: true,
+                    ..Default::default()
+                }),
+                skip: &["^F", "Tab", "^O", "^Y"],
             },
             Case {
                 // The new-thread flow: `Tab` switches fields and `^O`/`^Y`

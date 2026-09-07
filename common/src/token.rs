@@ -137,11 +137,11 @@ impl Store {
     }
 }
 
-fn tmp_sibling(path: &Path) -> PathBuf {
+pub(crate) fn tmp_sibling(path: &Path) -> PathBuf {
     sibling_with_suffix(path, "tmp")
 }
 
-fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let name = path
         .file_name()
         .map(|n| format!("{}.{suffix}", n.to_string_lossy()))
@@ -150,7 +150,7 @@ fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn restrict_permissions(path: &Path) {
+pub(crate) fn restrict_permissions(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     if let Ok(meta) = std::fs::metadata(path) {
         let mut perms = meta.permissions();

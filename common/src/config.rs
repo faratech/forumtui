@@ -166,6 +166,13 @@ pub fn token_path() -> PathBuf {
     config_root().join("token.json")
 }
 
+/// Where composer drafts are kept (#715). Beside the token store, in the
+/// same config dir, so `WFTUI_CONFIG_DIR` moves both together and a test can
+/// never reach the operator's own.
+pub fn drafts_path() -> PathBuf {
+    config_root().join("drafts.json")
+}
+
 pub fn log_path() -> PathBuf {
     config_root().join("wftui.log")
 }
