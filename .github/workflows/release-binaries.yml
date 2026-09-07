@@ -1,0 +1,167 @@
+name: Release Binaries
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build and sign only (no GitHub Release)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-linux-tarball:
+    name: Build Linux Tarball
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4
+        with:
+          persist-credentials: false
+
+      - name: Extract version from tag or use dev version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="dev-$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building wftui $VERSION"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1482605baf5e54c3a4a81144c8575711b97477ef # master
+        with:
+          toolchain: 1.98
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@82a92a6e3519e677e0ddc7726a767aea594a9a53 # v2
+        with:
+          key: release-linux
+
+      - name: Build release tarball (default features)
+        run: packaging/linux/build-tarball.sh
+
+      - name: Build release tarball (no-images)
+        run: packaging/linux/build-tarball.sh --no-images
+
+      - name: Upload tarballs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: linux-tarballs
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  build-windows-msix:
+    name: Build Windows MSIX
+    runs-on: windows-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.msix_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4
+        with:
+          persist-credentials: false
+
+      - name: Extract version from tag or use dev version
+        id: version
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $VERSION = $env:GITHUB_REF.Substring('refs/tags/v'.Length)
+          } else {
+            $VERSION = "dev-$(git rev-parse --short HEAD)"
+          }
+          $MSIX_VERSION = "$VERSION.0"
+          echo "version=$VERSION" >> $env:GITHUB_OUTPUT
+          echo "msix_version=$MSIX_VERSION" >> $env:GITHUB_OUTPUT
+          Write-Host "Building wftui $VERSION (MSIX: $MSIX_VERSION)"
+        shell: pwsh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1482605baf5e54c3a4a81144c8575711b97477ef # master
+        with:
+          toolchain: 1.98
+          targets: x86_64-pc-windows-msvc,i686-pc-windows-msvc,aarch64-pc-windows-msvc
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@82a92a6e3519e677e0ddc7726a767aea594a9a53 # v2
+        with:
+          key: release-windows
+
+      - name: Restore Trusted Signing dlib
+        run: packaging/msix/install-dlib.ps1
+        shell: pwsh
+
+      - name: Build and sign MSIX packages
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          packaging/msix/build-msix.ps1 `
+              -Version '${{ steps.version.outputs.version }}' `
+              -OutDir 'dist'
+        shell: pwsh
+
+      - name: Upload MSIX packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-msix
+          path: |
+            dist/*.msix
+            dist/*.msixbundle
+            dist/*.SHA256SUMS.txt
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: [build-linux-tarball, build-windows-msix]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)
+    timeout-minutes: 10
+    steps:
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v7
+        with:
+          name: linux-tarballs
+          path: artifacts
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v7
+        with:
+          name: windows-msix
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@4634c74ebf45fcf45f81b36c464ba38ab8c4759c # v2
+        with:
+          name: wftui ${{ needs.build-linux-tarball.outputs.version }}
+          body: |
+            WindowsForum.com Terminal UI Client — release ${{ needs.build-linux-tarball.outputs.version }}
+
+            **Linux**
+            - `wftui-*-linux-x86_64.tar.gz` — native binary + README (requires default features)
+            - `wftui-*-linux-x86_64-no-images.tar.gz` — text-only tier (no graphics)
+
+            **Windows**
+            - `wftui-*.msixbundle` — signed, installable on x64/x86/arm64 (recommended)
+            - `wftui-*-x64.msix`, `wftui-*-x86.msix`, `wftui-*-arm64.msix` — per-architecture
+            - `wftui-*.SHA256SUMS.txt` — checksums for verification
+
+            Proprietary software — in development.
+          files: artifacts/*
+          draft: false
+          prerelease: false

@@ -1,0 +1,54 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test / Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1482605baf5e54c3a4a81144c8575711b97477ef # master
+        with:
+          toolchain: 1.98
+          components: clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@82a92a6e3519e677e0ddc7726a767aea594a9a53 # v2
+        with:
+          key: test
+
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets --release -- -D warnings
+
+      - name: Clippy (no-images)
+        run: cargo clippy -p wftui --no-default-features --all-targets --release -- -D warnings
+
+      - name: Test
+        env:
+          WFTUI_CONFIG_DIR: /tmp/wftui-test
+        run: cargo test --workspace
+
+      - name: Test (no-images)
+        env:
+          WFTUI_CONFIG_DIR: /tmp/wftui-test-no-images
+        run: cargo test -p wftui --no-default-features
+
+      - name: No embedded escapes
+        run: /usr/bin/grep -rn $'\x1b' wftui/src && exit 1 || exit 0
