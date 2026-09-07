@@ -733,6 +733,8 @@ pub enum Action {
     ReactPost(u32),
     VotePost(u32, String),
     StartReply(Thread),
+    /// Reply with the selected post quoted (#707).
+    StartReplyQuoting(Thread, Box<Post>),
     StartReplyConversation(Conversation),
     StartNewThread(u32),
     StartNewConversation(Option<String>),

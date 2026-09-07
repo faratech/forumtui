@@ -152,6 +152,39 @@ If `/me` reports a different user, the old identity is torn down and a hint name
 the new one. `logout()` forgets tokens synchronously before the (slow) revoke
 calls. Writes carry the session generation and are aborted by `end_session`.
 
+## Quoting — the ContentIntegrity contract
+
+`Q` in the thread view replies with the selected post quoted, and the block
+it writes has to satisfy **WindowsForum's own `ContentIntegrity` addon**
+(`public_html/src/addons/WindowsForum/ContentIntegrity/Analyzer.php`), which
+re-derives every quote's fingerprint on save and compares it against the
+source post. A quote that does not match is recorded as forged or altered.
+
+The hash is **derived, never supplied** — there is nothing for the client to
+sign. What `bbcode::quote_block` owes is a block the analyzer re-derives the
+same way:
+
+- `[QUOTE="<username>, post: <id>, member: <user_id>"]` — both keys plain
+  digits, each appearing once (anything else is `quote_malformed`), and
+  `member` matching the source's real author (`quote_author_altered`). A
+  comma in the username would read as an attribute separator, so it is
+  replaced.
+- The body is the source message with **every nested `[QUOTE]` stripped**,
+  which is what `XF\Str\Formatter::getBbCodeForQuote` (via
+  `ProcessorAction\StripQuotes`) produces. A nested quote inside an
+  attributed quote is `nested_quote_in_attributed_quote` on its own, whatever
+  the text says.
+- Nothing else may change: the analyzer requires the quote's semantic text
+  (whitespace collapsed, NFC-normalised) to be a **substring** of the
+  source's, and any link in the quote that is not in the source is
+  `quote_link_injected`.
+
+Verify changes here against the analyzer itself, not against this note —
+`common/examples/quote_probe.rs` prints the block for a real post and the
+addon can be run over it directly. That is how the current implementation was
+confirmed (`valid=true, violations: 0`), and how the three failure modes
+above were confirmed to fire.
+
 ## Visibility and content state
 
 **The server is the gate; the client is the label** (#704). XF's API only

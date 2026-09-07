@@ -1199,6 +1199,89 @@ pub fn render(src: &str) -> Vec<Chunk> {
     out
 }
 
+/// Strip every `[QUOTE]…[/QUOTE]` block, nesting and all (#707).
+///
+/// This mirrors `XF\BbCode\ProcessorAction\StripQuotes`, which XF runs over a
+/// post before offering it as a quote (`Str\Formatter::getBbCodeForQuote`):
+/// the tag and everything inside it are removed outright. Everything else is
+/// preserved byte for byte, which matters — WindowsForum's ContentIntegrity
+/// addon re-derives a quote's fingerprint on save and compares it against
+/// the source post, so a quote body that is not what XF would have produced
+/// is recorded as an altered quote.
+pub fn strip_quote_blocks(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'['
+            && let Some((end, closing, name)) = tag_at(src, i)
+            && name == "quote"
+        {
+            if closing {
+                depth = depth.saturating_sub(1);
+            } else {
+                depth += 1;
+            }
+            i = end;
+            continue;
+        }
+        if depth == 0 {
+            // Push the whole character, never a byte: slicing mid-codepoint
+            // would corrupt the text the hash is taken over.
+            let ch = src[i..].chars().next().unwrap_or('\u{fffd}');
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            let ch = src[i..].chars().next().unwrap_or('\u{fffd}');
+            i += ch.len_utf8();
+        }
+    }
+    out.trim().to_string()
+}
+
+/// The tag starting at `at`, as `(end_offset, is_closing, lowercase_name)`.
+/// `None` when the bracket does not open a well-formed tag.
+fn tag_at(src: &str, at: usize) -> Option<(usize, bool, String)> {
+    let rest = &src[at + 1..];
+    let close = rest.find(']')?;
+    let inner = &rest[..close];
+    if inner.is_empty() || inner.contains('[') {
+        return None;
+    }
+    let (closing, body) = match inner.strip_prefix('/') {
+        Some(b) => (true, b),
+        None => (false, inner),
+    };
+    let name: String = body
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '*')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if name.is_empty() {
+        return None;
+    }
+    Some((at + 1 + close + 1, closing, name))
+}
+
+/// Build the `[QUOTE]` block WindowsForum's integrity checker will accept
+/// (#707).
+///
+/// The attribution is not decoration: `ContentIntegrity\Analyzer` parses
+/// `post:` and `member:` out of it, requires both to be plain digits and to
+/// appear once, checks `member` against the source post's real author, and
+/// then requires the quote's semantic text to be a substring of the source
+/// post's. So the body is the source message with nested quotes stripped —
+/// exactly what XF's own "reply with quote" produces — and nothing else.
+pub fn quote_block(username: &str, post_id: u32, user_id: u32, message: &str) -> String {
+    let body = strip_quote_blocks(message);
+    // The source segment is the text before the first attribute; XF writes
+    // the username there. A comma inside it would be read as an attribute
+    // separator, so it cannot carry one.
+    let source = username.replace(',', " ");
+    format!("[QUOTE=\"{source}, post: {post_id}, member: {user_id}\"]\n{body}\n[/QUOTE]\n\n")
+}
+
 /// Single-paragraph plain-text preview (thread list secondary line).
 pub fn to_plain(src: &str) -> String {
     let mut s = String::new();
@@ -2638,6 +2721,65 @@ mod tests {
             styled >= posts,
             "these posts all carry styling tags: {styled} styled runs across {posts} posts"
         );
+    }
+
+    /// #707: the quote block this client writes has to survive
+    /// WindowsForum's ContentIntegrity analyzer, which re-derives a quote's
+    /// fingerprint on save and compares it against the source post.
+    ///
+    /// Verified against the analyzer itself, not against a reading of it: a
+    /// block built by `quote_block` for a real post came back
+    /// `valid=true, violations: 0`, while a wrong `member:` gave
+    /// `quote_author_altered`, an edited body gave `quote_content_altered`,
+    /// and leaving the source's own nested quote in gave
+    /// `nested_quote_in_attributed_quote`. That last one is why the strip is
+    /// not optional.
+    #[test]
+    fn a_quote_block_matches_the_integrity_contract() {
+        let src = "Outer words.\n[QUOTE=\"Someone, post: 1, member: 2\"]\ninner\n[/QUOTE]\nAfter.";
+        let q = quote_block("HItest", 1008443, 143605, src);
+
+        // The attribution the analyzer parses: digits, each key once, and the
+        // source segment before them.
+        assert!(
+            q.starts_with("[QUOTE=\"HItest, post: 1008443, member: 143605\"]"),
+            "{q}"
+        );
+        assert!(q.trim_end().ends_with("[/QUOTE]"), "{q}");
+
+        // The body carries the source's own words and NOT its nested quote —
+        // a nested quote inside an attributed quote is a violation on its
+        // own, whatever the text says.
+        assert!(q.contains("Outer words."), "{q}");
+        assert!(q.contains("After."), "{q}");
+        assert!(!q.contains("inner"), "the nested quote must be stripped: {q}");
+        assert_eq!(q.matches("[QUOTE").count(), 1, "exactly one quote block: {q}");
+
+        // A username containing a comma would read as an attribute
+        // separator and make the attributes malformed.
+        let q = quote_block("Smith, John", 5, 6, "hi");
+        assert!(q.starts_with("[QUOTE=\"Smith  John, post: 5, member: 6\"]"), "{q}");
+    }
+
+    /// Stripping is by tag, nesting and all, and leaves everything else
+    /// exactly as it was — the integrity check compares the quote's text
+    /// against the source's, so a stray transformation here reads as
+    /// tampering there.
+    #[test]
+    fn stripping_quotes_leaves_the_rest_untouched() {
+        assert_eq!(strip_quote_blocks("a [QUOTE]x[/QUOTE] b"), "a  b");
+        assert_eq!(
+            strip_quote_blocks("a [QUOTE=\"n, post: 1\"]x [QUOTE]deep[/QUOTE] y[/QUOTE] b"),
+            "a  b",
+            "nested blocks go with their parent"
+        );
+        assert_eq!(strip_quote_blocks("[quote]x[/quote]keep"), "keep", "case-insensitive");
+        // Everything that is not a quote survives byte for byte, including
+        // the bracket-heavy things this forum's posts are full of.
+        let kept = "[B]bold[/B] [ICODE]C:\\Program Files (x86)[/ICODE] con2fb_map[i] \u{6f22}\u{5b57}";
+        assert_eq!(strip_quote_blocks(kept), kept);
+        // An unclosed quote swallows the rest, as the parser does.
+        assert_eq!(strip_quote_blocks("before [QUOTE]after"), "before");
     }
 
     /// #703: `[HR]` is a rule of its own, not a run of dashes glued into the

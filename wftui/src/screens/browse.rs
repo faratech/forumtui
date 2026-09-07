@@ -2129,6 +2129,14 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
             }
         }
         KeyCode::Char('r') => Action::StartReply(s.thread.clone()),
+        // `Q` quotes the selected post into a reply (#707) — `q` is taken by
+        // "back", and quoting is the reply path, not a separate screen.
+        KeyCode::Char('Q') => match s.posts.get(s.sel_post) {
+            Some(post) => {
+                Action::StartReplyQuoting(s.thread.clone(), Box::new(post.clone()))
+            }
+            None => Action::Notice("No post selected to quote.".into()),
+        },
         // `r` is taken by "reply", so retrying a failed load (or, while
         // there is no error, a manual refresh of the current page) is
         // `R`/F5 — same convention as the conversations list's refresh
@@ -2320,6 +2328,7 @@ pub fn thread_view_hints(s: &ThreadViewState) -> Hints {
     Hints::with_short(
         &[
             ("r", "reply"),
+            ("Q", "quote"),
             ("j/k", "scroll"),
             ("n/N", "post"),
             ("l", "like"),
@@ -3761,6 +3770,49 @@ mod tests {
     /// #693: a picture the message references renders WHERE the message
     /// puts it, and only the attachments the message never mentioned are
     /// listed underneath — the same split XenForo renders.
+    /// #707: `Q` quotes the selected post into a reply, with the attribution
+    /// WindowsForum's ContentIntegrity analyzer requires.
+    #[test]
+    fn q_quotes_the_selected_post_into_a_reply() {
+        let mut s = thread_view_fixture();
+        s.posts[0].post_id = 1008443;
+        s.posts[0].user_id = 143605;
+        s.posts[0].username = "HItest".into();
+        s.posts[0].message = "Outer.\n[QUOTE=\"X, post: 1, member: 2\"]inner[/QUOTE]".into();
+        s.sel_post = 0;
+
+        match thread_view_key(&mut s, key('Q')) {
+            Action::StartReplyQuoting(thread, post) => {
+                assert_eq!(thread.thread_id, s.thread.thread_id);
+                assert_eq!(post.post_id, 1008443);
+                // The app builds the block; what the key owes is the right
+                // post, since the attribution is derived from it.
+                let q = common::bbcode::quote_block(
+                    &post.username,
+                    post.post_id,
+                    post.user_id,
+                    &post.message,
+                );
+                assert!(q.contains("post: 1008443, member: 143605"), "{q}");
+                assert!(!q.contains("inner"), "the source's nested quote is stripped: {q}");
+            }
+            other => panic!("Q must quote the selected post, got {other:?}", other = match other {
+                Action::None => "None",
+                Action::Notice(_) => "Notice",
+                _ => "something else",
+            }),
+        }
+
+        // A thread whose posts have not arrived yet refuses out loud rather
+        // than opening an empty quote.
+        let mut empty = thread_view_fixture();
+        empty.posts.clear();
+        assert!(matches!(
+            thread_view_key(&mut empty, key('Q')),
+            Action::Notice(_)
+        ));
+    }
+
     /// #706: a banned member's name is struck through wherever it appears,
     /// the way the website strikes it — and only when the API actually said
     /// so, because XF gates `is_banned` to viewers who may bypass user

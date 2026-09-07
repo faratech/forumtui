@@ -1885,6 +1885,20 @@ impl App {
                 });
             }
             Action::StartReply(thread) => self.reply_to_thread(&thread),
+            Action::StartReplyQuoting(thread, post) => {
+                // The quote block is built to WindowsForum's ContentIntegrity
+                // contract (#707): `post:`/`member:` naming the real source
+                // and its author, and the body stripped of nested quotes the
+                // way XF's own "reply with quote" strips them. Anything else
+                // is recorded as an altered quote on save.
+                let quote = common::bbcode::quote_block(
+                    &post.username,
+                    post.post_id,
+                    post.user_id,
+                    &post.message,
+                );
+                self.reply_to_thread_with(&thread, quote);
+            }
             Action::StartReplyConversation(conv) => self.reply_to_conversation(&conv),
             Action::StartNewThread(node_id) => self.new_thread(node_id),
             Action::StartNewConversation(recipient) => {
@@ -3259,9 +3273,16 @@ impl App {
     }
 
     pub fn reply_to_thread(&mut self, thread: &Thread) {
+        self.reply_to_thread_with(thread, String::new());
+    }
+
+    /// Reply with the draft already seeded — `Q` seeds it with the selected
+    /// post's quote block (#707).
+    pub fn reply_to_thread_with(&mut self, thread: &Thread, body: String) {
         // `reply_count` counts replies, so the thread holds `reply_count + 1`
         // posts and this draft becomes the next one after that.
         let reply_number = u32::try_from(thread.reply_count.saturating_add(2)).ok();
+        let cursor = body.chars().count();
         self.push_screen(Screen::Compose(screens::ComposeState {
             target: Some(ComposeTarget::ThreadReply {
                 thread_id: thread.thread_id,
@@ -3269,6 +3290,9 @@ impl App {
             }),
             author: self.me_name(),
             reply_number,
+            body,
+            // Below the quote, where the reply goes.
+            body_cursor: cursor,
             ..Default::default()
         }));
     }
