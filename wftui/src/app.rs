@@ -170,12 +170,17 @@ impl TaskError {
                 message: if code == "http_error" {
                     cap_message(message, RAW_MESSAGE_CAP)
                 } else if code.strip_prefix("api_error.").unwrap_or(code) == "missing_scope" {
-                    // A missing OAuth scope is this client's own
-                    // registration being out of date, not something a retry
-                    // or a fresh login fixes on its own — say so plainly
-                    // instead of surfacing it as a generic failure (issue
-                    // #564).
-                    format!("Configuration error: {message}")
+                    // A missing OAuth scope is not a permission the member
+                    // lacks and not something a retry fixes (issue #564).
+                    // It is one of two things, and the remedy is the same
+                    // for both: the grant this token was issued under
+                    // predates the scope (issue #695 — the catalogs shipped
+                    // before `media:read`/`resource:read` were requested),
+                    // or the client registration is out of date. Signing in
+                    // again mints a token with the current scope set, so
+                    // name that instead of leaving the raw phrase to be
+                    // read as a dead end.
+                    format!("{message}. Sign out with Ctrl+L and sign in again to grant it.")
                 } else {
                     message.clone()
                 },
@@ -7267,14 +7272,20 @@ mod tests {
         }
 
         // missing_scope on bootstrap must not end the session, and its
-        // message must read as a configuration problem, not a raw phrase.
+        // message must name the remedy (#695): the grant is re-minted by
+        // signing in again, so a reader is not left staring at XF's phrase
+        // wondering what to do about it.
         let err = TaskError::of(&Error::Api {
             code: "api_error.missing_scope".into(),
-            message: "You are missing the required OAuth scope.".into(),
+            message: "This request requires access to the following scope: media:read".into(),
             status: 403,
             max_page: None,
         });
-        assert!(err.message.starts_with("Configuration error:"), "message: {:?}", err.message);
+        assert!(
+            err.message.contains("media:read") && err.message.contains("sign in again"),
+            "message: {:?}",
+            err.message
+        );
         let mut app = test_app();
         app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
         app.start_pollers();

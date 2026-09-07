@@ -55,7 +55,7 @@ pub fn oauth_client_id() -> Result<String, Error> {
 
 /// Scopes requested during authorization. Keep in sync with the client row's
 /// allowed scope list; requesting a scope the client lacks fails the handshake.
-pub const SCOPES: [&str; 12] = [
+pub const SCOPES: [&str; 14] = [
     "node:read",
     "thread:read",
     "thread:write",
@@ -68,6 +68,12 @@ pub const SCOPES: [&str; 12] = [
     "attachment:read",
     "attachment:write",
     "profile_post:read",
+    // XFMG / XFRM (#680, #695): the catalog screens and the search type
+    // cycler's Media/Resources modes 403 with `missing_scope` without these.
+    // An API *key* bypasses scopes entirely, which is why probing the
+    // endpoints with one did not catch it.
+    "media:read",
+    "resource:read",
 ];
 
 /// Minimum spacing between any two API calls (politeness budget; the zone's
@@ -189,6 +195,26 @@ mod tests {
         // ours must never degrade to one of those signatures.
         for banned in ["reqwest", "hyper", "python", "okhttp", "axios", "go-http"] {
             assert!(!ua.to_ascii_lowercase().contains(banned), "{ua}");
+        }
+    }
+
+    /// #695: the Media Gallery and Resource Manager screens 403 with
+    /// `missing_scope` unless the grant asks for these. An API key ignores
+    /// scopes, so nothing but this test catches a screen shipped without
+    /// its scope.
+    #[test]
+    fn scopes_cover_every_endpoint_family_the_client_calls() {
+        for needed in [
+            "node:read",
+            "thread:read",
+            "conversation:read",
+            "alert:read",
+            "search:read",
+            "attachment:read",
+            "media:read",
+            "resource:read",
+        ] {
+            assert!(SCOPES.contains(&needed), "missing scope: {needed}");
         }
     }
 
