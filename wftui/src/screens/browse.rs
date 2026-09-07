@@ -1264,7 +1264,10 @@ pub(crate) fn chunk_lines(
 ) -> Vec<Vec<Span<'static>>> {
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
-    for chunk in chunks.iter().cloned() {
+    // Borrow, not clone: the old `iter().cloned()` deep-copied every
+    // Chunk (labels, urls, whole text bodies) per render before copying
+    // the pieces it needs into spans anyway (#677).
+    for chunk in chunks {
         match chunk {
             Chunk::Text(t, s) => {
                 if t.is_empty() {
