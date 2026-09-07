@@ -694,6 +694,11 @@ pub struct ProfileState {
 // dozens, in exchange for nothing a reader would ever notice. Measured, not
 // assumed: the per-frame work this crate actually cares about was profiled
 // in #674-#677 and none of it touches the size of this enum.
+// Measured, not waved through (#714): `size_of::<Screen>()` is 984 bytes.
+// A screen is moved only on push/pop and the stack holds a handful, so
+// boxing the largest variant would buy nothing measurable. The number is
+// pinned by `app::tests::screen_enum_size_is_measured_not_assumed`, which
+// fails if a variant makes this materially worse.
 #[allow(clippy::large_enum_variant)]
 pub enum Screen {
     Login(LoginState),
