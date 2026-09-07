@@ -459,6 +459,127 @@ pub(crate) fn render_forum_panel(
     }
 }
 
+/// One picture a post shows, in the order the reader meets it (#693).
+///
+/// XenForo renders `[ATTACH]id[/ATTACH]` where the message puts it and lists
+/// only the *unreferenced* attachments underneath; this client used to put
+/// every attachment underneath and print `[attachment 3]` in the flow.
+pub(crate) struct PostImage {
+    /// The URL the image store fetches and paints. `None` when the API sent
+    /// an image attachment with no usable URL at all: it still earns its
+    /// caption row and its number, there is simply nothing to draw.
+    pub key: Option<String>,
+    /// Caption text: an attachment's filename, or a URL's last path segment.
+    pub label: String,
+    pub px: Option<(u32, u32)>,
+    /// Where `o` and the browser go for this picture.
+    pub open_url: Option<String>,
+}
+
+/// A post's pictures in display order, plus where the inline ones sit in the
+/// chunk stream.
+pub(crate) struct PostImages {
+    pub all: Vec<PostImage>,
+    /// Chunk index of each image the message references, in message order —
+    /// `all[i]` for `i < inline_at.len()`. The rest of `all` is attachments
+    /// the message never mentioned, which still render underneath.
+    pub inline_at: Vec<usize>,
+}
+
+impl PostImages {
+    pub fn inline_count(&self) -> usize {
+        self.inline_at.len()
+    }
+}
+
+/// Resolve a post's pictures: every image reference its message makes that
+/// this client can actually show, then the image attachments it carries that
+/// the message never referenced.
+pub(crate) fn post_images(post: &Post, chunks: &[Chunk]) -> PostImages {
+    let mut all: Vec<PostImage> = Vec::new();
+    let mut inline_at: Vec<usize> = Vec::new();
+    let mut used: Vec<u32> = Vec::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let Some(r) = chunk.image_ref() else { continue };
+        match r {
+            common::bbcode::ImageRef::Url(url) => {
+                all.push(PostImage {
+                    label: super::misc::url_label(&url),
+                    key: Some(url.clone()),
+                    px: None,
+                    open_url: Some(url),
+                });
+                inline_at.push(i);
+            }
+            common::bbcode::ImageRef::Attachment(id) => {
+                // An `[ATTACH]` naming an id the post does not carry (or a
+                // non-image one) is not something this client can show: it
+                // stays whatever the text made of it.
+                let Some(att) = post
+                    .attachments
+                    .iter()
+                    .find(|a| a.attachment_id == id && a.is_image())
+                else {
+                    continue;
+                };
+                used.push(id);
+                all.push(PostImage {
+                    key: images::attachment_url(att).map(str::to_string),
+                    label: att.filename.clone(),
+                    px: attachment_px(att),
+                    open_url: att.open_url().map(str::to_string),
+                });
+                inline_at.push(i);
+            }
+        }
+    }
+    for att in post
+        .attachments
+        .iter()
+        .filter(|a| a.is_image() && !used.contains(&a.attachment_id))
+    {
+        all.push(PostImage {
+            key: images::attachment_url(att).map(str::to_string),
+            label: att.filename.clone(),
+            px: attachment_px(att),
+            open_url: att.open_url().map(str::to_string),
+        });
+    }
+    PostImages { all, inline_at }
+}
+
+fn attachment_px(att: &common::models::Attachment) -> Option<(u32, u32)> {
+    match (att.width, att.height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+        _ => None,
+    }
+}
+
+/// What Enter (or a digit) on a post's picture opens in the viewer (#693).
+/// `None` when the API gave nothing to paint — the caller then falls back to
+/// the browser, which is all that picture ever had.
+pub(crate) fn image_open_for_post(post: &Post, img: &PostImage) -> Option<Box<super::ImageOpen>> {
+    let key = img.key.clone()?;
+    let mut meta = post.username.clone();
+    if post.post_date > 0 {
+        if !meta.is_empty() {
+            meta.push_str(" \u{b7} ");
+        }
+        meta.push_str(&crate::theme::fmt_age(post.post_date));
+    }
+    if let Some((w, h)) = img.px {
+        meta.push_str(&format!(" \u{b7} {w}\u{d7}{h}"));
+    }
+    Some(Box::new(super::ImageOpen {
+        title: img.label.clone(),
+        meta,
+        description: String::new(),
+        key,
+        px: img.px,
+        web_url: img.open_url.clone(),
+    }))
+}
+
 // ================= thread list panel =================
 
 /// `1–20 of 431`. The API's pagination has no `per_page`, so the last page's
@@ -1489,69 +1610,109 @@ impl ThreadViewState {
             }
 
             let post_link_base = links.len();
-            for logical in bbcode_lines(&post.message, &mut links, theme, self.reveal_spoilers) {
-                for wrapped in wrap_spans(&logical, body_w) {
-                    lines.push(gutter(wrapped));
-                }
-            }
-
-            // Attachments. Every image gets its caption (`\u{25A3} name \u{00B7} W\u{00D7}H \u{00B7} n of N`,
-            // and `n` is the digit that opens it in a browser); on a graphics
-            // tier the image itself is reserved directly under its caption, at
-            // most 40 % of the panel wide and 12 rows tall. Non-image
-            // attachments are captioned but carry no index: no digit opens
-            // them and nothing can decode them.
-            let image_count = post.attachments.iter().filter(|a| a.is_image()).count();
-            let mut image_n = 0usize;
-            for att in post.attachments.iter() {
-                let dims = match (att.width, att.height) {
-                    (Some(w), Some(h)) if w > 0 && h > 0 => format!(" \u{00B7} {w}\u{00D7}{h}"),
-                    _ => String::new(),
+            // The body, with every picture drawn where the message puts it
+            // (#693). XenForo renders `[ATTACH]` inline and lists only the
+            // attachments the message never mentioned; this used to print
+            // `[attachment 3]` in the flow and pile every picture at the
+            // bottom, so a post that alternates text and screenshots read as
+            // a wall of text followed by unlabelled images.
+            let chunks = common::bbcode::render(&post.message);
+            let imgs = post_images(post, &chunks);
+            let image_count = imgs.all.len();
+            let mut ord = 0usize;
+            let mut run_start = 0usize;
+            // Reserving the caption and rows here — not at paint time — is
+            // what keeps the text after a picture from ending up underneath
+            // it, and what makes scrolling, `n`/`N` and the click map agree
+            // about where the picture is.
+            let push_image = |lines: &mut Vec<Line<'static>>,
+                                  slots: &mut Vec<Slot>,
+                                  image_lines: &mut Vec<(usize, usize)>,
+                                  img: &PostImage,
+                                  n: usize| {
+                let dims = match img.px {
+                    Some((w, h)) => format!(" \u{00B7} {w}\u{00D7}{h}"),
+                    None => String::new(),
                 };
-                let caption = if att.is_image() {
-                    image_n += 1;
-                    format!(
-                        "{} {}{dims} \u{00B7} {image_n} of {image_count}",
-                        g.image, att.filename
-                    )
-                } else {
-                    format!("{} {}{dims}", g.image, att.filename)
-                };
-                if att.is_image() {
-                    // The caption row is a click target on every tier: on the
-                    // text tier it is the only thing the picture has.
-                    image_lines.push((lines.len(), image_n));
-                }
+                let caption = format!("{} {}{dims} \u{00B7} {n} of {image_count}", g.image, img.label);
+                // The caption row is a click target on every tier: on the
+                // text tier it is the only thing the picture has.
+                image_lines.push((lines.len(), n));
                 lines.push(gutter(vec![Span::styled(
                     truncate(&caption, body_w),
                     theme.dim(),
                 )]));
-
-                if !policy.inline() {
-                    continue;
-                }
-                let Some(url) = images::attachment_url(att) else {
-                    continue;
+                let Some(key) = img.key.clone() else {
+                    return;
                 };
-                let (cols, rows) = images::attachment_box(width as u16, att, policy.font);
+                if !policy.inline() {
+                    return;
+                }
+                let (cols, rows) =
+                    images::fit(width as u16, img.px.unwrap_or((16, 9)), policy.font);
                 let cols = cols.min(body_w as u16).max(1);
                 slots.push(Slot {
                     line: lines.len(),
                     x: 3,
                     cols,
                     rows,
-                    key: url.to_string(),
+                    key,
                 });
-                // Blank gutter rows the app paints the image over. Reserved
-                // here rather than at render time so scrolling, `n`/`N` post
-                // jumps and the panel footer all agree about where the image
-                // is.
                 for _ in 0..rows {
-                    if att.is_image() {
-                        image_lines.push((lines.len(), image_n));
-                    }
+                    image_lines.push((lines.len(), n));
                     lines.push(gutter(Vec::new()));
                 }
+            };
+
+            for &at in &imgs.inline_at {
+                for logical in chunk_lines(
+                    &chunks[run_start..at],
+                    &mut links,
+                    theme,
+                    self.reveal_spoilers,
+                ) {
+                    for wrapped in wrap_spans(&logical, body_w) {
+                        lines.push(gutter(wrapped));
+                    }
+                }
+                run_start = at + 1;
+                ord += 1;
+                push_image(
+                    &mut lines,
+                    &mut slots,
+                    &mut image_lines,
+                    &imgs.all[ord - 1],
+                    ord,
+                );
+            }
+            for logical in chunk_lines(
+                &chunks[run_start..],
+                &mut links,
+                theme,
+                self.reveal_spoilers,
+            ) {
+                for wrapped in wrap_spans(&logical, body_w) {
+                    lines.push(gutter(wrapped));
+                }
+            }
+
+            // Then the attachments the message never referenced: the
+            // pictures underneath, as the site shows them, plus every
+            // non-image attachment (captioned, but carrying no index — no
+            // digit opens one and nothing can decode it).
+            for img in imgs.all.iter().skip(imgs.inline_count()) {
+                ord += 1;
+                push_image(&mut lines, &mut slots, &mut image_lines, img, ord);
+            }
+            for att in post.attachments.iter().filter(|a| !a.is_image()) {
+                let dims = match (att.width, att.height) {
+                    (Some(w), Some(h)) if w > 0 && h > 0 => format!(" \u{00B7} {w}\u{00D7}{h}"),
+                    _ => String::new(),
+                };
+                lines.push(gutter(vec![Span::styled(
+                    truncate(&format!("{} {}{dims}", g.image, att.filename), body_w),
+                    theme.dim(),
+                )]));
             }
             // Tier 5 (`ThreadText.dc.html`): say what the digits do, and why
             // there is no picture.
@@ -1902,20 +2063,48 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
         // `watch` method to call). It is a no-op rather than absent so the
         // key bar the design specifies is the key bar members learn.
         KeyCode::Char('w') => Action::None,
-        // `1`–`9` open the nth IMAGE attachment of the selected post in a
-        // browser — the same numbering the caption lines print, on every
-        // tier. (Enter on an image line would need a second, larger encode
-        // inside an overlay, and overlays deliberately suppress image
-        // drawing; that is not the cheap toggle the phase brief allows for.)
+        // `1`-`9` open the nth picture of the selected post - the same
+        // numbering the caption lines print, on every tier, and now in the
+        // client's own viewer rather than a browser (#693/#697). The
+        // numbering follows DISPLAY order (the message's own images first,
+        // then the attachments it never referenced), so the digit under a
+        // caption is the picture above it.
         KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
             let n = c.to_digit(10).unwrap_or(0) as usize;
-            match s
-                .posts
-                .get(s.sel_post)
-                .and_then(|p| p.attachments.iter().filter(|a| a.is_image()).nth(n - 1))
-                .and_then(|a| a.open_url())
-            {
-                Some(url) => Action::OpenUrl(url.to_string()),
+            let Some(post) = s.posts.get(s.sel_post) else {
+                return Action::None;
+            };
+            let chunks = common::bbcode::render(&post.message);
+            let imgs = post_images(post, &chunks);
+            match imgs.all.get(n - 1) {
+                Some(img) => match image_open_for_post(post, img) {
+                    Some(open) => Action::OpenImage(open),
+                    // Nothing to paint: the browser is all it ever had.
+                    None => match img.open_url.clone() {
+                        Some(url) => Action::OpenUrl(url),
+                        None => Action::None,
+                    },
+                },
+                None => Action::None,
+            }
+        }
+        // Enter on a post with pictures opens the first one - the standing
+        // "Enter-to-expand an image is not implemented" gap (#693). With no
+        // picture it stays what it was: nothing.
+        KeyCode::Enter => {
+            let Some(post) = s.posts.get(s.sel_post) else {
+                return Action::None;
+            };
+            let chunks = common::bbcode::render(&post.message);
+            let imgs = post_images(post, &chunks);
+            match imgs.all.first() {
+                Some(img) => match image_open_for_post(post, img) {
+                    Some(open) => Action::OpenImage(open),
+                    None => match img.open_url.clone() {
+                        Some(url) => Action::OpenUrl(url),
+                        None => Action::None,
+                    },
+                },
                 None => Action::None,
             }
         }
@@ -2141,6 +2330,22 @@ pub fn render_thread_view(
         }
         let y = inner.y + (line - s.scroll) as u16;
         hits.push(Rect::new(inner.x, y, inner.width, 1), Hit::Image(n));
+    }
+
+    // What the reader has actually had on screen (#694): the newest post
+    // whose card has scrolled into view. This is the date the thread is
+    // marked read up to, so a half-read thread stays half unread.
+    {
+        let bottom = s.scroll + inner.height as usize;
+        let mut seen = s.seen_date;
+        for (i, &line) in s.post_line_offsets.iter().enumerate() {
+            if line < bottom
+                && let Some(post) = s.posts.get(i)
+            {
+                seen = seen.max(post.post_date);
+            }
+        }
+        s.seen_date = seen;
     }
 
     // Translate the reserved slots into absolute screen rects for the app to
@@ -3385,18 +3590,119 @@ mod tests {
         }
     }
 
+    /// #693: a picture the message references renders WHERE the message
+    /// puts it, and only the attachments the message never mentioned are
+    /// listed underneath — the same split XenForo renders.
+    #[test]
+    fn a_referenced_attachment_renders_where_the_message_puts_it() {
+        let theme = Theme::truecolor();
+        let mut s = thread_view_with_attachments();
+        s.posts[0].message =
+            "Before the picture.\n[ATTACH]1[/ATTACH]\nAfter the picture.".into();
+        s.width = 0;
+        s.rebuild_lines(&theme, &UNICODE);
+
+        let text: Vec<String> = s
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+            .collect();
+        let row_of = |needle: &str| {
+            text.iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} missing from {text:#?}"))
+        };
+        let before = row_of("Before the picture");
+        let shot = row_of("winver command returns this");
+        let after = row_of("After the picture");
+        assert!(before < shot && shot < after, "{before} {shot} {after}");
+
+        // The referenced one is not repeated at the bottom; the unreferenced
+        // second image still is, after the body.
+        assert_eq!(
+            text.iter().filter(|l| l.contains("winver command returns this")).count(),
+            1,
+            "a referenced attachment must not also be listed underneath"
+        );
+        let second = row_of("second shot.png");
+        assert!(second > after, "unreferenced attachments follow the body");
+        // Non-image attachments keep their caption row too.
+        assert!(text.iter().any(|l| l.contains("dump.txt")));
+
+        // The numbering is display order, so the digit under a caption is
+        // the picture above it.
+        assert!(text[shot].contains("1 of 2"), "{:?}", text[shot]);
+        assert!(text[second].contains("2 of 2"), "{:?}", text[second]);
+
+        // And `[attachment 1]` must not survive in the flow.
+        assert!(
+            !text.iter().any(|l| l.contains("[attachment")),
+            "the placeholder text must be gone: {text:#?}"
+        );
+    }
+
+    /// An `[ATTACH]` naming an id the post does not carry is not something
+    /// this client can show: it stays the text it always was, and nothing is
+    /// lifted out of the flow for it.
+    #[test]
+    fn an_unresolvable_attach_reference_stays_text() {
+        let theme = Theme::truecolor();
+        let mut s = thread_view_with_attachments();
+        s.posts[0].message = "See [ATTACH]999[/ATTACH] please".into();
+        s.width = 0;
+        s.rebuild_lines(&theme, &UNICODE);
+        let text: Vec<String> = s
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+            .collect();
+        assert!(
+            text.iter().any(|l| l.contains("[attachment 999]")),
+            "{text:#?}"
+        );
+    }
+
+    /// Enter on a post with a picture opens the viewer — CLAUDE.md's
+    /// standing "Enter-to-expand an image is not implemented" gap (#693).
+    #[test]
+    fn enter_expands_the_selected_posts_first_picture() {
+        let mut s = thread_view_with_attachments();
+        s.sel_post = 0;
+        match thread_view_key(&mut s, KeyEvent::from(KeyCode::Enter)) {
+            Action::OpenImage(open) => {
+                assert_eq!(open.key, "https://wf/thumb/1.png");
+                assert!(open.meta.contains("HItest") || open.meta.contains("kemical"));
+            }
+            _ => panic!("Enter must expand the first picture"),
+        }
+        // A post with no picture answers nothing at all.
+        s.sel_post = 1;
+        assert!(matches!(
+            thread_view_key(&mut s, KeyEvent::from(KeyCode::Enter)),
+            Action::None
+        ));
+    }
+
     #[test]
     fn digits_open_the_nth_image_of_the_selected_post() {
         let mut s = thread_view_with_attachments();
         s.sel_post = 0;
 
-        // `direct_url` is what a browser should open, not the thumbnail.
+        // #693: the digit opens the picture in the client's own viewer now.
+        // `direct_url` is still what the browser gets from there, not the
+        // thumbnail the terminal paints.
         match thread_view_key(&mut s, key('1')) {
-            Action::OpenUrl(u) => assert_eq!(u, "https://wf/full/1.png"),
+            Action::OpenImage(open) => {
+                assert_eq!(open.web_url.as_deref(), Some("https://wf/full/1.png"));
+                assert_eq!(open.key, "https://wf/thumb/1.png");
+                assert_eq!(open.px, Some((1152, 720)));
+            }
             _ => panic!("1 did not open the first image"),
         }
         match thread_view_key(&mut s, key('2')) {
-            Action::OpenUrl(u) => assert_eq!(u, "https://wf/full/2.png"),
+            Action::OpenImage(open) => {
+                assert_eq!(open.web_url.as_deref(), Some("https://wf/full/2.png"))
+            }
             _ => panic!("2 did not open the second image"),
         }
         // The log file is the third attachment but not the third image.

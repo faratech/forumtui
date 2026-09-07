@@ -152,6 +152,36 @@ If `/me` reports a different user, the old identity is torn down and a hint name
 the new one. `logout()` forgets tokens synchronously before the (slow) revoke
 calls. Writes carry the session generation and are aborted by `end_session`.
 
+## Images, reading state and navigation
+
+- **Images render where the message puts them** (#693). `ThreadViewState::rebuild_lines`
+  walks the post's chunk stream and lifts each resolvable image reference out
+  into a caption plus reserved rows at that point; only attachments the
+  message never referenced are listed underneath, as XenForo does it. The
+  numbering (`n of N`, and the `1`-`9` digits) follows display order, so the
+  digit under a caption is the picture above it. `post_images()` is the one
+  place that order is decided — renderer and key handler both read it.
+- **Enter expands a picture** into `Screen::ImageView` (the standing
+  "Enter-to-expand" gap). An image attachment the API gave no usable URL for
+  still earns its caption row and its number; it simply has nothing to draw.
+- **Reading marks read** (#694). A thread is marked read up to the newest
+  post that was actually on screen (`seen_date`, stamped by the renderer),
+  sent once when the view leaves the stack — never to "now" on open, so a
+  half-read thread stays half unread. XF refuses to move the marker
+  backwards, which makes a re-read idempotent. `App::pop_screen` is the ONE
+  way a screen leaves the stack, so no exit path can forget it. Showing the
+  Alerts tab marks alerts *viewed* (`/alerts/mark-all`), which is what clears
+  the counter; Enter/`m` on a row still marks that one read.
+- **Pagination is the client's own model** (#699/#700): a list holds a window
+  of consecutive server pages (`page ..= page + pages_loaded - 1`), because
+  XF fixes page size server-side and ignores `per_page`/`limit`. The window
+  fills to the pane and then grows as the reader approaches its end
+  (`autoload_more`, once per loop tick so keys, wheel, `G` and clicks share
+  one path). `[`/`]` step by the window, not by one page.
+- **The breadcrumb is navigation** (#700): each crumb pops back to the screen
+  it names, measured off the spans the header actually drew (the row elides
+  its own middle, so a recomputed position points at the wrong place).
+
 ## Media Gallery and Resource Manager (XFMG / XFRM)
 
 Both add-ons ship REST list APIs on this server and the client browses them:

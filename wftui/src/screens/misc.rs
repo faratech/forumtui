@@ -225,6 +225,7 @@ pub fn render_login(
     area: Rect,
     theme: &Theme,
     g: &Glyphs,
+    hits: &mut HitMap,
 ) {
     // Tiers 1-3 replace the block mark with the real logo; tiers 4 (half-
     // blocks) and 5 (text) keep the mark, which is already drawn out of block
@@ -267,6 +268,10 @@ pub fn render_login(
                 Span::styled(format!("{tl}{}{tr}", rule.repeat(link_inner)), theme.faint()),
             ]));
             let pad_after = link_inner.saturating_sub(2 + url_len);
+            // Which line of the panel carries the link, so the frame can put
+            // a click target on it (#701) - measured here rather than
+            // recounted later, so the two can never disagree.
+            s.url_line = Some(lines.len());
             lines.push(Line::from(vec![
                 Span::raw(" ".repeat(STEP_BODY_COL)),
                 Span::styled(vbar, theme.faint()),
@@ -336,6 +341,19 @@ pub fn render_login(
     let inner = block.inner(panel_area);
     f.render_widget(block, panel_area);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+
+    // The sign-in link is a link (#701): clicking it opens the browser, the
+    // same thing Enter's flow does, so a reader on a machine with a browser
+    // does not have to copy it out by hand.
+    if let Some(line) = s.url_line
+        && !s.url.is_empty()
+        && (line as u16) < inner.height
+    {
+        hits.push(
+            Rect::new(inner.x, inner.y + line as u16, inner.width, 1),
+            crate::hit::Hit::Link(s.url.clone()),
+        );
+    }
 
     // Cleared every frame: the app paints only what this frame reserved.
     s.image_requests.clear();
@@ -1025,7 +1043,7 @@ fn preview_caption(g: &Glyphs, img: &PreviewImage, px: Option<(u32, u32)>, inlin
 
 /// File name from a URL, or its host when the path has none ("…/photo.png" →
 /// `photo.png`, "https://imgur.com/a/xyz/" → `imgur.com`).
-fn url_label(url: &str) -> String {
+pub(crate) fn url_label(url: &str) -> String {
     let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let path = after_scheme.split(['?', '#']).next().unwrap_or("");
     let host = path.split('/').next().unwrap_or("");
@@ -2270,10 +2288,14 @@ pub fn render_profile(
     area: ratatui::layout::Rect,
     theme: &Theme,
     g: &Glyphs,
+    hits: &mut HitMap,
 ) {
     let block = solo_panel(theme, g, &format!("Member: {}", s.title), None, None);
     let inner = block.inner(area);
     f.render_widget(block, area);
+    // #701: the profile registered nothing at all, so a click inside it fell
+    // through to whatever the previous frame had left in the map.
+    hits.push(inner, Hit::Pane(crate::hit::HitPane::View));
 
     if s.loading {
         f.render_widget(Paragraph::new("Loading profile…"), inner);
@@ -3662,7 +3684,7 @@ mod tests {
                 url: "https://windowsforum.com/tui-start/k7Qx2p".into(),
                 ..Default::default()
             };
-            let rows = render_rows(w, h, |f, area| render_login(&mut s, f, area, &theme, &UNICODE));
+            let rows = render_rows(w, h, |f, area| render_login(&mut s, f, area, &theme, &UNICODE, &mut HitMap::default()));
             let all = rows.join("\n");
             assert!(all.contains('\u{2588}'), "no mark glyph at {w}x{h}: {all}");
             assert!(
@@ -3691,7 +3713,7 @@ mod tests {
                 ..Default::default()
             };
             let rows =
-                render_rows(120, 36, |f, area| render_login(&mut s, f, area, &theme, &UNICODE));
+                render_rows(120, 36, |f, area| render_login(&mut s, f, area, &theme, &UNICODE, &mut HitMap::default()));
             let all = rows.join("\n");
             assert!(!all.contains('\u{2588}'), "{tier:?} still draws the block mark: {all}");
             // The copy beside it is untouched.
@@ -3715,7 +3737,7 @@ mod tests {
                 ..Default::default()
             };
             let rows =
-                render_rows(120, 36, |f, area| render_login(&mut s, f, area, &theme, &UNICODE));
+                render_rows(120, 36, |f, area| render_login(&mut s, f, area, &theme, &UNICODE, &mut HitMap::default()));
             let all = rows.join("\n");
             assert!(all.contains('\u{2588}'), "{tier:?} lost the block mark: {all}");
             assert!(s.image_requests.is_empty(), "{tier:?} asked for an image");
@@ -3770,4 +3792,30 @@ mod tests {
         assert_ne!(hit_row[last_content_col], ' ', "{}", rows[6]);
         assert_eq!(hit_row[border_col], '\u{2502}', "{}", rows[6]);
     }
+    /// #701: the sign-in link is clickable — on a machine with a browser,
+    /// clicking it is the whole flow, and copying a URL out of a terminal by
+    /// hand is exactly what the short link exists to avoid.
+    #[test]
+    fn the_sign_in_link_is_a_click_target() {
+        let theme = Theme::truecolor();
+        let mut hits = HitMap::default();
+        let mut s = super::super::LoginState {
+            stage: super::super::LoginStage::Waiting,
+            url: "https://windowsforum.com/tui-start/abc123".into(),
+            ..Default::default()
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            render_login(&mut s, f, area, &theme, &UNICODE, &mut hits);
+        })
+        .expect("draw");
+        let found = (0..30u16).any(|y| {
+            (0..100u16).any(|x| {
+                matches!(hits.at(x, y), Some(Hit::Link(u)) if u.contains("/tui-start/abc123"))
+            })
+        });
+        assert!(found, "the sign-in link must be clickable");
+    }
+
 }

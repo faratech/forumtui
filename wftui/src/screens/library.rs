@@ -589,7 +589,11 @@ pub fn rebuild_resource_lines(s: &mut super::ResourceViewState, theme: &Theme, g
     }
     if !s.links.is_empty() {
         s.lines.push(Line::from(Span::raw("")));
+        s.link_lines.clear();
         for (i, url) in s.links.iter().enumerate() {
+            // Remember which row is which link so a click on it opens that
+            // link — the same contract the thread view keeps (#701).
+            s.link_lines.push((s.lines.len(), i));
             s.lines.push(Line::from(Span::styled(
                 truncate(&format!("[{}] {url}", i + 1), width),
                 theme.dim(),
@@ -653,6 +657,19 @@ pub fn render_resource_view(
         inner,
     );
     hits.push(inner, Hit::Pane(HitPane::List));
+    // Link rows, wherever the scroll has put them.
+    for &(line, idx) in &s.link_lines {
+        if line < s.scroll || line >= s.scroll + inner.height as usize {
+            continue;
+        }
+        if let Some(url) = s.links.get(idx) {
+            let y = inner.y + (line - s.scroll) as u16;
+            hits.push(
+                Rect::new(inner.x, y, inner.width, 1),
+                Hit::Link(url.clone()),
+            );
+        }
+    }
 
     if s.images.inline() {
         for slot in &s.image_slots {
@@ -1402,6 +1419,37 @@ mod tests {
         });
         assert!(s.image_requests.is_empty());
         assert!(rows.join("\n").contains("press o"), "{rows:?}");
+    }
+
+    /// #701: the resource page's link rows are click targets, wherever the
+    /// scroll has put them — a URL you can see but not click is a URL you
+    /// have to retype.
+    #[test]
+    fn resource_page_link_rows_are_clickable() {
+        let theme = Theme::truecolor();
+        let mut hits = HitMap::default();
+        let mut s = ResourceViewState {
+            id: 1,
+            resource: Some(Resource {
+                description: "See [URL=https://example.com/docs]the docs[/URL] first.".into(),
+                ..resource(1)
+            }),
+            ..Default::default()
+        };
+        let mut term = Terminal::new(TestBackend::new(90, 24)).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            render_resource_view(&mut s, f, area, &theme, &UNICODE, &mut hits);
+        })
+        .expect("draw");
+
+        assert!(!s.links.is_empty(), "the body carried a link");
+        let found = (0..24u16).any(|y| {
+            (0..90u16).any(|x| {
+                matches!(hits.at(x, y), Some(Hit::Link(u)) if u == "https://example.com/docs")
+            })
+        });
+        assert!(found, "the [1] url row must be clickable");
     }
 
     /// Paging is bounded by `last_page` and refuses out loud while a fetch

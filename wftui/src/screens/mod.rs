@@ -34,6 +34,9 @@ pub enum LoginStage {
 }
 
 pub struct LoginState {
+    /// Which line of the sign-in panel carries the link, stamped while it is
+    /// drawn so a click can open it (#701).
+    pub url_line: Option<usize>,
     pub stage: LoginStage,
     pub url: String,
     pub busy: bool,
@@ -47,6 +50,7 @@ pub struct LoginState {
 impl Default for LoginState {
     fn default() -> Self {
         LoginState {
+            url_line: None,
             stage: LoginStage::Idle,
             url: String::new(),
             busy: false,
@@ -144,6 +148,13 @@ pub struct ThreadViewState {
     pub post_line_offsets: Vec<usize>,
     pub loading: bool,
     pub error: Option<String>,
+    /// The newest post date the reader has actually had on screen (#694),
+    /// and the newest one already reported. A thread is marked read up to
+    /// what was *seen*, not to "now" on open — XF's mark-read takes a date
+    /// and refuses to move backwards, so a half-read thread stays half
+    /// unread, exactly as it would on the site.
+    pub seen_date: i64,
+    pub reported_date: i64,
     /// `[SPOILER]` bodies render hidden until this is flipped with `x`
     /// (issue #621): hidden is black-on-black by `style_from`, revealed is
     /// the text's own styling. Flipping forces `rebuild_lines` via
@@ -534,6 +545,9 @@ pub struct ResourceViewState {
     pub width: u16,
     pub scroll: usize,
     pub links: Vec<String>,
+    /// `(line, index into `links`)` for each `[n] url` row, so a click on one
+    /// opens that link (#701).
+    pub link_lines: Vec<(usize, usize)>,
     pub loading: bool,
     pub error: Option<String>,
     pub images: crate::images::Policy,
@@ -723,7 +737,7 @@ impl Screen {
         hits: &mut HitMap,
     ) {
         match self {
-            Screen::Login(s) => misc::render_login(s, f, area, theme, g),
+            Screen::Login(s) => misc::render_login(s, f, area, theme, g, hits),
             Screen::Home(s) => browse::render_home(s, f, area, theme, g, hits),
             Screen::ForumTree(s) => browse::render_forum_tree(s, f, area, theme, g, hits),
             Screen::ThreadList(s) => browse::render_thread_list(s, f, area, theme, g, hits),
@@ -737,7 +751,7 @@ impl Screen {
                 social::render_new_conversation(s, f, area, theme, g, hits)
             }
             Screen::Search(s) => misc::render_search(s, f, area, theme, g, hits),
-            Screen::Profile(s) => misc::render_profile(s, f, area, theme, g),
+            Screen::Profile(s) => misc::render_profile(s, f, area, theme, g, hits),
             Screen::MediaGallery(s) => library::render_media_gallery(s, f, area, theme, g, hits),
             Screen::Resources(s) => library::render_resources(s, f, area, theme, g, hits),
             Screen::ResourceView(s) => library::render_resource_view(s, f, area, theme, g, hits),

@@ -647,7 +647,14 @@ pub trait WfApi: Send + Sync {
     async fn thread_posts(&self, id: u32, page: u32) -> Result<PostsReply>;
     async fn reply(&self, thread_id: u32, message: &str) -> Result<Post>;
     async fn create_thread(&self, node_id: u32, title: &str, message: &str) -> Result<Thread>;
-    async fn mark_thread_read(&self, id: u32) -> Result<()>;
+    /// Mark a thread read up to `date` (a post's timestamp), or to now when
+    /// `None`. XF refuses to move the marker backwards, so a partial read
+    /// marks partially and re-reading is idempotent (#694).
+    async fn mark_thread_read(&self, id: u32, date: Option<i64>) -> Result<()>;
+    /// Mark every alert *viewed* — what XF's own web UI does when the alerts
+    /// list is shown: it clears the counter and leaves unactioned alerts
+    /// highlighted (#694).
+    async fn mark_alerts_viewed(&self) -> Result<()>;
     async fn mark_forum_read(&self, node_id: u32) -> Result<()>;
     async fn conversations(&self, page: u32) -> Result<ConversationsReply>;
     async fn conversation(&self, id: u32, page: u32) -> Result<ConversationReply>;
@@ -758,8 +765,18 @@ impl WfApi for WfApiClient {
         Ok(created.thread)
     }
 
-    async fn mark_thread_read(&self, id: u32) -> Result<()> {
-        self.post_unit_path(&format!("/threads/{id}/mark-read")).await
+    async fn mark_thread_read(&self, id: u32, date: Option<i64>) -> Result<()> {
+        let form: Vec<(&str, String)> = match date {
+            Some(d) if d > 0 => vec![("date", d.to_string())],
+            _ => Vec::new(),
+        };
+        self.post_unit(&format!("/threads/{id}/mark-read"), &form)
+            .await
+    }
+
+    async fn mark_alerts_viewed(&self) -> Result<()> {
+        self.post_unit("/alerts/mark-all", &[("viewed", "1".to_string())])
+            .await
     }
 
     async fn mark_forum_read(&self, node_id: u32) -> Result<()> {

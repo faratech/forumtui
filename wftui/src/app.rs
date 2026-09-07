@@ -1713,8 +1713,7 @@ impl App {
                 ib.focus = screens::InboxPane::List;
                 return;
             }
-            if self.screens.len() > 1 {
-                self.screens.pop();
+            if self.pop_screen() {
                 self.status.clear();
             } else {
                 self.should_quit = true;
@@ -1734,9 +1733,7 @@ impl App {
             Action::None => {}
             Action::Notice(msg) => self.set_status(msg),
             Action::PopScreen => {
-                if self.screens.len() > 1 {
-                    self.screens.pop();
-                }
+                self.pop_screen();
             }
             Action::Quit => self.should_quit = true,
             Action::OpenThreadList(mut node_id, mut title) => {
@@ -1839,7 +1836,7 @@ impl App {
                 content,
                 page,
             } => self.load_member_content(user_id, content, page),
-            Action::MarkThreadRead(id) => self.mark_thread_read(id),
+            Action::MarkThreadRead(id) => self.mark_thread_read(id, None),
             Action::MarkForumRead(node_id) => {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
@@ -2069,6 +2066,74 @@ impl App {
         });
     }
 
+    /// Showing the alerts list marks them *viewed* — what XF's own web UI
+    /// does when you open the alerts page (#694). Viewed is not read: the
+    /// counter clears, unactioned alerts stay highlighted, and Enter/`m` on
+    /// a row still marks that one read.
+    ///
+    /// Only sent when there is a count to clear, so revisiting the tab does
+    /// not spend a request each time.
+    fn mark_alerts_viewed(&mut self) {
+        if self.alerts_unread == 0 {
+            return;
+        }
+        self.alerts_unread = 0;
+        let api = self.api.clone();
+        tokio::spawn(async move {
+            // Nothing waits on this: the badge is already cleared locally,
+            // and a failure means the next poll puts the count back.
+            let _ = api.mark_alerts_viewed().await;
+        });
+    }
+
+    /// The one way a screen leaves the stack. Whatever it owes on the way
+    /// out is settled here (#694), so no exit path can forget it.
+    fn pop_screen(&mut self) -> bool {
+        if self.screens.len() <= 1 {
+            return false;
+        }
+        let gone = self.screens.pop();
+        if let Some(Screen::ThreadView(view)) = &gone {
+            self.report_read(view);
+        }
+        true
+    }
+
+    /// Mark what was actually read (#694).
+    ///
+    /// Called when a thread view leaves the stack: the thread is marked read
+    /// up to the newest post that was on screen, never to "now" — XF's
+    /// mark-read takes a date and refuses to move the marker backwards, so a
+    /// half-read thread stays half unread exactly as it would on the site.
+    /// Nothing is sent when nothing new was seen, so backing in and out of a
+    /// thread does not spend a request each time.
+    fn report_read(&mut self, view: &screens::ThreadViewState) {
+        let seen = view.seen_date;
+        if seen <= 0 || seen <= view.reported_date {
+            return;
+        }
+        let id = view.thread.thread_id;
+        // The client's own lists must agree without a refetch, the way the
+        // conversation list already flips its row (#694).
+        let fully_read = view.page >= view.last_page.max(1)
+            && view.posts.iter().all(|p| p.post_date <= seen);
+        if fully_read {
+            for screen in self.screens.iter_mut() {
+                let list = match screen {
+                    Screen::Home(h) => &mut h.list,
+                    Screen::ThreadList(l) => l,
+                    _ => continue,
+                };
+                for t in list.threads.iter_mut() {
+                    if t.thread_id == id {
+                        t.is_unread = false;
+                    }
+                }
+            }
+        }
+        self.mark_thread_read(id, Some(seen));
+    }
+
     /// Infinite scroll (#700): keep the list ahead of the reader.
     ///
     /// The viewport fill (#699) tops a list up to what the pane can show;
@@ -2134,7 +2199,11 @@ impl App {
             // pop of the screen the reader is looking at.
             return;
         }
-        self.screens.truncate(target + 1);
+        while self.screens.len() > target + 1 {
+            // Through `pop_screen`, so a thread left behind by a crumb click
+            // still reports what was read in it (#694).
+            self.pop_screen();
+        }
         // Any overlay was raised over the screen we just left.
         self.palette = None;
         self.show_help = false;
@@ -2490,6 +2559,9 @@ impl App {
                     inbox.tab = tab;
                     inbox.focus = screens::InboxPane::List;
                 }
+                if tab == screens::InboxTab::Alerts {
+                    self.mark_alerts_viewed();
+                }
             }
             Hit::PaletteRow(i) => {
                 let target = self.palette.as_mut().and_then(|p| {
@@ -2835,6 +2907,9 @@ impl App {
     /// switch to that tab in place (so `c`/`a` from anywhere never stacks a
     /// second Inbox on top of the first).
     fn open_inbox(&mut self, tab: screens::InboxTab) {
+        if tab == screens::InboxTab::Alerts {
+            self.mark_alerts_viewed();
+        }
         if let Some(Screen::Inbox(inbox)) = self.screens.last_mut() {
             inbox.tab = tab;
             return;
@@ -3185,11 +3260,11 @@ impl App {
         }));
     }
 
-    pub fn mark_thread_read(&mut self, id: u32) {
+    pub fn mark_thread_read(&mut self, id: u32, date: Option<i64>) {
         let api = self.api.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = api.mark_thread_read(id).await.map_err(|e| TaskError::of(&e));
+            let result = api.mark_thread_read(id, date).await.map_err(|e| TaskError::of(&e));
             tx.send(Msg::MarkedRead(result)).ok();
         });
     }
@@ -5391,6 +5466,10 @@ mod tests {
     /// a single request leaving the process.
     #[derive(Default)]
     struct RecordingApi {
+        /// #694: what the client actually reported as read, and how often it
+        /// cleared the alert counter.
+        threads_read: std::sync::Mutex<Vec<(u32, Option<i64>)>>,
+        alerts_viewed: std::sync::atomic::AtomicUsize,
         marked_read: std::sync::Mutex<Vec<u32>>,
         /// `(user_id, content, page)` per `search_member` call, and the
         /// keywords of every `search_advanced` call — issue #548 is exactly
@@ -5475,8 +5554,13 @@ mod tests {
         async fn create_thread(&self, _: u32, _: &str, _: &str) -> common::error::Result<Thread> {
             Err(common::error::Error::NoToken)
         }
-        async fn mark_thread_read(&self, _: u32) -> common::error::Result<()> {
-            Err(common::error::Error::NoToken)
+        async fn mark_alerts_viewed(&self) -> common::error::Result<()> {
+            self.alerts_viewed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn mark_thread_read(&self, id: u32, date: Option<i64>) -> common::error::Result<()> {
+            self.threads_read.lock().expect("lock").push((id, date));
+            Ok(())
         }
         async fn mark_forum_read(&self, _: u32) -> common::error::Result<()> {
             Err(common::error::Error::NoToken)
@@ -8081,6 +8165,111 @@ mod tests {
         );
     }
 
+    /// #694: reading a thread marks it read — up to the newest post that
+    /// was actually on screen, not to "now" on open, and only when leaving.
+    #[tokio::test]
+    async fn leaving_a_thread_marks_it_read_up_to_what_was_seen() {
+        let api = std::sync::Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+        app.screens.push(screens::home_state(false));
+        if let Some(Screen::Home(h)) = app.screens.last_mut() {
+            h.list.threads = vec![Thread { thread_id: 9, is_unread: true, ..Default::default() }];
+        }
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 9, ..Default::default() },
+            posts: vec![
+                Post { post_id: 1, post_date: 100, ..Default::default() },
+                Post { post_id: 2, post_date: 200, ..Default::default() },
+            ],
+            page: 1,
+            last_page: 1,
+            seen_date: 100,
+            ..Default::default()
+        }));
+
+        app.pop_screen();
+        // The write is spawned, like every other one in this app.
+        tokio::task::yield_now().await;
+        let reported = || api.threads_read.lock().expect("lock").clone();
+        assert_eq!(
+            reported(),
+            vec![(9, Some(100))],
+            "marked up to the post that was seen, not the newest one"
+        );
+        // Only page 1's first post was seen, so the row stays unread.
+        match app.screens.last() {
+            Some(Screen::Home(h)) => assert!(h.list.threads[0].is_unread),
+            _ => panic!("home"),
+        }
+
+        // Read to the end this time: the row flips without a refetch.
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 9, ..Default::default() },
+            posts: vec![
+                Post { post_id: 1, post_date: 100, ..Default::default() },
+                Post { post_id: 2, post_date: 200, ..Default::default() },
+            ],
+            page: 1,
+            last_page: 1,
+            seen_date: 200,
+            ..Default::default()
+        }));
+        app.pop_screen();
+        tokio::task::yield_now().await;
+        assert_eq!(reported().len(), 2);
+        assert_eq!(reported()[1], (9, Some(200)));
+        match app.screens.last() {
+            Some(Screen::Home(h)) => assert!(!h.list.threads[0].is_unread, "row flips locally"),
+            _ => panic!("home"),
+        }
+    }
+
+    /// Nothing new seen, nothing sent: backing in and out of a thread must
+    /// not spend a request each time.
+    #[tokio::test]
+    async fn leaving_a_thread_with_nothing_new_reports_nothing() {
+        let api = std::sync::Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 9, ..Default::default() },
+            posts: vec![Post { post_id: 1, post_date: 100, ..Default::default() }],
+            seen_date: 100,
+            reported_date: 100,
+            ..Default::default()
+        }));
+        app.pop_screen();
+        tokio::task::yield_now().await;
+        assert!(
+            api.threads_read.lock().expect("lock").is_empty(),
+            "already reported: no request"
+        );
+    }
+
+    /// #694: opening the Alerts tab marks them viewed — the badge clears and
+    /// XF stops counting them, which is what the web UI does. It is sent
+    /// only when there is a count to clear.
+    #[tokio::test]
+    async fn showing_the_alerts_tab_marks_them_viewed_once() {
+        let api = std::sync::Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+        app.screens.push(screens::home_state(false));
+        app.alerts_unread = 3;
+        app.open_inbox(screens::InboxTab::Alerts);
+        assert_eq!(app.alerts_unread, 0, "the badge clears immediately");
+        tokio::task::yield_now().await;
+        let viewed = || api.alerts_viewed.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(viewed(), 1);
+
+        // Revisiting with nothing to clear sends nothing.
+        app.open_inbox(screens::InboxTab::Alerts);
+        tokio::task::yield_now().await;
+        assert_eq!(viewed(), 1, "no count, no request");
+    }
+
     /// #700: clicking a breadcrumb goes back to the place it names — a pop,
     /// so the screen it returns to keeps its scroll, selection and pages.
     /// The last crumb is where you already are, and clicking it must not pop
@@ -9178,8 +9367,11 @@ mod tests {
 
     /// The Inbox: its tab chips switch tabs in place, and its rows are two
     /// lines each on the conversations tab.
-    #[test]
-    fn inbox_tab_chips_switch_tabs_and_two_line_rows_map_both_of_their_lines() {
+    ///
+    /// `#[tokio::test]`, not `#[test]`: switching to Alerts marks them
+    /// viewed (#694), and that spawns.
+    #[tokio::test]
+    async fn inbox_tab_chips_switch_tabs_and_two_line_rows_map_both_of_their_lines() {
         let mut app = test_app();
         app.me = Some(User {
             user_id: 1,
