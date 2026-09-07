@@ -25,12 +25,29 @@ cargo test -p common bbcode::tests::                 # one module
 cargo clippy --all-targets --release -- -D warnings                              # gate: 0 warnings
 cargo clippy -p wftui --no-default-features --all-targets --release -- -D warnings
 cargo build --release && cp target/release/wftui bin/wftui   # bin/wftui is committed
-cp bin/wftui /usr/local/bin/wftui                    # deploy on this server (on PATH)
+# Deploy on this server. Install-then-rename, NOT `cp`: a plain copy over a
+# running wftui fails with "Text file busy", while a rename swaps the path
+# atomically and leaves the running process on its old inode.
+install -m755 bin/wftui /usr/local/bin/wftui.new && mv -f /usr/local/bin/wftui.new /usr/local/bin/wftui
 ```
 
 The "gates" every change must pass before it is committed: both test invocations,
 both clippy invocations, a release build, and `/usr/bin/grep -rn $'\x1b' wftui/src`
-printing nothing (hard rule 1). The release binary is committed at `bin/wftui` so
+printing nothing (hard rule 1).
+
+Two harnesses exist for checking this client against the real site rather
+than against a belief about it, and both are worth reaching for:
+
+```bash
+# The quote block the client would write for a post, for the site's own
+# ContentIntegrity analyzer to judge (see "Quoting", below).
+cargo run -q -p common --example quote_probe -- <message-file> <username> <post_id> <user_id>
+
+# Any endpoint's real shape, before writing a model for it. An API key
+# bypasses OAuth scopes, so it proves shapes, NOT permissions (#695).
+KEY=$(grep -m1 '^XF_API_KEY=' /web/.env | cut -d= -f2-)
+curl -s -H "XF-Api-Key: $KEY" 'https://windowsforum.com/api/<path>' | jq .
+``` The release binary is committed at `bin/wftui` so
 machines without a toolchain can grab it. Windows is a native `cargo build
 --release`; there is no CI and no cross-build (`scripts/` is reserved for one).
 
@@ -69,9 +86,17 @@ plain-enum errors, no anyhow/thiserror, inline `#[cfg(test)]` tests, `rust-versi
   `rundll32 url.dll,FileProtocolHandler <url>`, never `cmd /C start`** (cmd parses
   `&`/`%` inside forum URLs — command injection).
 - `token.rs` — 0600 atomic token store; `quarantine_corrupt` renames an unreadable
-  file instead of bricking startup. `models.rs` — XF API shapes; field names come
-  from the entity classes under `/web/public_html/src/XF/Entity/*.php`
-  (`setupApiResultData` / `getStructure`), never guessed. `bbcode.rs` — BBCode →
+  file instead of bricking startup. `models.rs` — XF API shapes. Field names come from the
+  entity classes under `/web/public_html/src/XF/Entity/*.php`
+  (`setupApiResultData` / `getStructure`) or from a captured response, never
+  from a guess — and **the fixture must be a whole captured body**. Three
+  bugs shipped behind hand-written fixtures that agreed with the wrong guess:
+  `rating_average` for `rating_avg` (#696), a map for `tags` when the wire
+  sends an array (#698), and both halves of the attachment upload (#709).
+  Every field here is `#[serde(default)]`-tolerant, which is what makes a
+  wrong name silent rather than an error; `null_default` covers the other
+  half, since `default` applies to a *missing* field and not to an explicit
+  `null`. `bbcode.rs` — BBCode →
   styled `Chunk`s, golden-tested against real posts (XF's parser semantics:
   `[tag="v]"]` quoted values may contain `]`, `[i words]` without `key=` options is
   literal text, `[CODE]`/`[ICODE]` bodies are verbatim, `[USER]` already carries
@@ -89,16 +114,23 @@ plain-enum errors, no anyhow/thiserror, inline `#[cfg(test)]` tests, `rust-versi
   `handle_key` / `handle_mouse`, and `draw`. Screens never see `App`: they own
   their state, render into a `Rect`, and return `Action`s from `on_key`; the app
   executes actions (`execute_action`) by spawning tasks that send `Msg`s back.
-  Loads carry their identity (`ForumLoaded{node_id}`, `ThreadLoaded{id}`,
-  `SearchDone{key}`, `Bootstrap{generation}`) and stale replies are dropped —
-  copy that pattern for any new fetch.
+  Loads carry their identity and stale replies are dropped — copy that
+  pattern for any new fetch. `ThreadLoaded{id}` and `SearchDone{key}` name
+  their content; `Bootstrap{generation}` and `ForumLoaded{seq}` carry a
+  generation instead, because a thread list is one screen that shows many
+  forums in turn: matching on `node_id` alone let a page from the forum the
+  reader had just left land in the list that replaced it (#705). A fresh load
+  mints the generation; a fill inherits it.
 - `screens/mod.rs` — `Screen` enum + dispatch (`render`, `on_key`, `hints`,
   `crumb`, `esc_intent`, `goto_top/bottom`, `web_url`, `selected_index`,
-  `select_index`, `focus_pane_at`, `click_field`), state structs, `Action` enum.
-  `Home` (Forums tree + thread list, dual pane ≥ 110 cols) and `Inbox`
-  (Conversations/Alerts tabs + view pane) are two-pane screens with a
-  renderer-set `dual` flag; `ThreadList`/`ConversationView` are the narrow
-  pushables. Renderers live in `screens/{browse,social,misc}.rs`.
+  `select_index`, `select_post`, `focus_pane_at`, `click_field`,
+  `set_image_policy`, `image_requests`, `keys_group`), state structs, `Action`
+  enum. Three screens are two-pane with a renderer-set `dual` flag: `Home`
+  (Forums tree + thread list) and `Inbox` (Conversations/Alerts + view) at
+  ≥ 110 cols, `MediaGallery` (categories + media) at ≥ 90;
+  `ThreadList`/`ConversationView` are the narrow pushables. Renderers live in
+  `screens/{browse,social,misc,library}.rs` — `library.rs` holds the Media
+  Gallery, the Resource Manager, the resource page and the image viewer.
 - `chrome.rs` — the three zones (`header_line` with breadcrumb + badges,
   `key_bar` with exactly one primary cap, `status_line` with gate countdowns),
   `panel`, key caps/chips, and the cell-width helpers (`cell_width`,
@@ -152,76 +184,58 @@ If `/me` reports a different user, the old identity is torn down and a hint name
 the new one. `logout()` forgets tokens synchronously before the (slow) revoke
 calls. Writes carry the session generation and are aborted by `end_session`.
 
-## Attachments (#709)
+## What the client can do, and the contracts behind it
 
-`^F` in the composer opens a path prompt — a terminal has no file picker, so
-the path is typed (`~` expands) — and the file is uploaded, inserted at the
-caret as `[ATTACH]id[/ATTACH]`, and remembered.
+The sections below are the behaviour a change is most likely to break. Each
+one exists because the obvious implementation was wrong in a way the server
+only tells you about later — read the one you are touching before you touch
+it.
 
-The **attachment key** is the whole mechanism: an upload is attached to
-nothing until a write carries the same key, and XF checks the key's context
-against that write (`context[thread_id]` for a reply, `context[node_id]` for
-a new thread, `context[post_id]` for an edit — `AttachContext`). One key per
-draft: the first file mints it, later files reuse it, and
-`ComposeState::attachment_key` is what `reply`/`create_thread`/`edit_post`
-carry. Conversations take attachments under a different content type this
-client does not upload to, so `^F` is not offered there at all.
+## Media Gallery and Resource Manager (XFMG / XFRM)
 
-Two wire shapes worth remembering, both of which the old code had wrong while
-its tests passed on invented fixtures:
-`POST /attachments/new-key` returns **`{"key": …}`**, not `attachment_key`,
-and `POST /attachments/` returns **`{"attachment": {…}}`** — decoding that
-envelope as a bare `Attachment` yields a silently *blank* one, because every
-field on that model is `#[serde(default)]`.
+Both add-ons ship REST list APIs on this server and the client browses them:
+`GET /api/media/?page=N` → `{media, pagination}` and `GET /api/resources/?page=N`
+→ `{resources, pagination}` back `Screen::MediaGallery` / `Screen::Resources`
+(`screens/library.rs`). Reach them with `g m` / `g r` or the go-to palette's
+"Media Gallery" / "Resources" rows; `j/k` moves, `[`/`]` pages, `R` refreshes,
+Enter/`o` opens the item on the site. Both wear the house `solo_panel` with the
+`page N of M` cap, and both are read-only — there is no upload path.
 
-## Writing: reply, quote, edit, delete, solution
+XFRM serves `rating_average` as a decimal *string* (`"4.50"`), so
+`models::deserialize_opt_f64` accepts either shape. Search's type cycler already
+covers the same content (`xfmg_media`, `resource`, issue #673), and
+`[GALLERY=media, <id>]caption` embeds in posts render as the caption linked to
+the media page.
 
-The thread view's write keys are `r` reply, `Q` quote (see below), `e` edit,
-`D` delete, `S` mark solution. Three rules hold across them:
+## Images, reading state and navigation
 
-- **The API's own permission flags decide what is offered.** Posts carry
-  `can_edit` / `can_soft_delete` / `can_hard_delete`; a key absent from the
-  bar is a key the server would refuse. The server enforces regardless — the
-  flags are for the key bar, never for safety.
-- **Delete is soft and takes two presses.** Soft is what XF's own UI does and
-  leaves the post recoverable; the first `D` arms, the second deletes, and
-  any other key disarms (`ThreadViewState::confirm_delete`). No hard delete
-  from a keystroke.
-- **A failed write keeps the draft.** The editor stays open with its text and
-  the error; losing a rewritten post to a 403 is worse than the 403.
-
-## Quoting — the ContentIntegrity contract
-
-`Q` in the thread view replies with the selected post quoted, and the block
-it writes has to satisfy **WindowsForum's own `ContentIntegrity` addon**
-(`public_html/src/addons/WindowsForum/ContentIntegrity/Analyzer.php`), which
-re-derives every quote's fingerprint on save and compares it against the
-source post. A quote that does not match is recorded as forged or altered.
-
-The hash is **derived, never supplied** — there is nothing for the client to
-sign. What `bbcode::quote_block` owes is a block the analyzer re-derives the
-same way:
-
-- `[QUOTE="<username>, post: <id>, member: <user_id>"]` — both keys plain
-  digits, each appearing once (anything else is `quote_malformed`), and
-  `member` matching the source's real author (`quote_author_altered`). A
-  comma in the username would read as an attribute separator, so it is
-  replaced.
-- The body is the source message with **every nested `[QUOTE]` stripped**,
-  which is what `XF\Str\Formatter::getBbCodeForQuote` (via
-  `ProcessorAction\StripQuotes`) produces. A nested quote inside an
-  attributed quote is `nested_quote_in_attributed_quote` on its own, whatever
-  the text says.
-- Nothing else may change: the analyzer requires the quote's semantic text
-  (whitespace collapsed, NFC-normalised) to be a **substring** of the
-  source's, and any link in the quote that is not in the source is
-  `quote_link_injected`.
-
-Verify changes here against the analyzer itself, not against this note —
-`common/examples/quote_probe.rs` prints the block for a real post and the
-addon can be run over it directly. That is how the current implementation was
-confirmed (`valid=true, violations: 0`), and how the three failure modes
-above were confirmed to fire.
+- **Images render where the message puts them** (#693). `ThreadViewState::rebuild_lines`
+  walks the post's chunk stream and lifts each resolvable image reference out
+  into a caption plus reserved rows at that point; only attachments the
+  message never referenced are listed underneath, as XenForo does it. The
+  numbering (`n of N`, and the `1`-`9` digits) follows display order, so the
+  digit under a caption is the picture above it. `post_images()` is the one
+  place that order is decided — renderer and key handler both read it.
+- **Enter expands a picture** into `Screen::ImageView` (the standing
+  "Enter-to-expand" gap). An image attachment the API gave no usable URL for
+  still earns its caption row and its number; it simply has nothing to draw.
+- **Reading marks read** (#694). A thread is marked read up to the newest
+  post that was actually on screen (`seen_date`, stamped by the renderer),
+  sent once when the view leaves the stack — never to "now" on open, so a
+  half-read thread stays half unread. XF refuses to move the marker
+  backwards, which makes a re-read idempotent. `App::pop_screen` is the ONE
+  way a screen leaves the stack, so no exit path can forget it. Showing the
+  Alerts tab marks alerts *viewed* (`/alerts/mark-all`), which is what clears
+  the counter; Enter/`m` on a row still marks that one read.
+- **Pagination is the client's own model** (#699/#700): a list holds a window
+  of consecutive server pages (`page ..= page + pages_loaded - 1`), because
+  XF fixes page size server-side and ignores `per_page`/`limit`. The window
+  fills to the pane and then grows as the reader approaches its end
+  (`autoload_more`, once per loop tick so keys, wheel, `G` and clicks share
+  one path). `[`/`]` step by the window, not by one page.
+- **The breadcrumb is navigation** (#700): each crumb pops back to the screen
+  it names, measured off the spans the header actually drew (the row elides
+  its own middle, so a recomputed position points at the wrong place).
 
 ## Visibility and content state
 
@@ -280,51 +294,76 @@ and headings as bold + accent + underline by level. `[HIGHLIGHT]` is
 captured live post bodies in `common/src/testdata/`; that corpus is what
 caught the `SIZE` reading. Re-capture it when the parser changes.
 
-## Images, reading state and navigation
+## Writing: reply, quote, edit, delete, solution
 
-- **Images render where the message puts them** (#693). `ThreadViewState::rebuild_lines`
-  walks the post's chunk stream and lifts each resolvable image reference out
-  into a caption plus reserved rows at that point; only attachments the
-  message never referenced are listed underneath, as XenForo does it. The
-  numbering (`n of N`, and the `1`-`9` digits) follows display order, so the
-  digit under a caption is the picture above it. `post_images()` is the one
-  place that order is decided — renderer and key handler both read it.
-- **Enter expands a picture** into `Screen::ImageView` (the standing
-  "Enter-to-expand" gap). An image attachment the API gave no usable URL for
-  still earns its caption row and its number; it simply has nothing to draw.
-- **Reading marks read** (#694). A thread is marked read up to the newest
-  post that was actually on screen (`seen_date`, stamped by the renderer),
-  sent once when the view leaves the stack — never to "now" on open, so a
-  half-read thread stays half unread. XF refuses to move the marker
-  backwards, which makes a re-read idempotent. `App::pop_screen` is the ONE
-  way a screen leaves the stack, so no exit path can forget it. Showing the
-  Alerts tab marks alerts *viewed* (`/alerts/mark-all`), which is what clears
-  the counter; Enter/`m` on a row still marks that one read.
-- **Pagination is the client's own model** (#699/#700): a list holds a window
-  of consecutive server pages (`page ..= page + pages_loaded - 1`), because
-  XF fixes page size server-side and ignores `per_page`/`limit`. The window
-  fills to the pane and then grows as the reader approaches its end
-  (`autoload_more`, once per loop tick so keys, wheel, `G` and clicks share
-  one path). `[`/`]` step by the window, not by one page.
-- **The breadcrumb is navigation** (#700): each crumb pops back to the screen
-  it names, measured off the spans the header actually drew (the row elides
-  its own middle, so a recomputed position points at the wrong place).
+The thread view's write keys are `r` reply, `Q` quote (see below), `e` edit,
+`D` delete, `S` mark solution. Three rules hold across them:
 
-## Media Gallery and Resource Manager (XFMG / XFRM)
+- **The API's own permission flags decide what is offered.** Posts carry
+  `can_edit` / `can_soft_delete` / `can_hard_delete`; a key absent from the
+  bar is a key the server would refuse. The server enforces regardless — the
+  flags are for the key bar, never for safety.
+- **Delete is soft and takes two presses.** Soft is what XF's own UI does and
+  leaves the post recoverable; the first `D` arms, the second deletes, and
+  any other key disarms (`ThreadViewState::confirm_delete`). No hard delete
+  from a keystroke.
+- **A failed write keeps the draft.** The editor stays open with its text and
+  the error; losing a rewritten post to a 403 is worse than the 403.
 
-Both add-ons ship REST list APIs on this server and the client browses them:
-`GET /api/media/?page=N` → `{media, pagination}` and `GET /api/resources/?page=N`
-→ `{resources, pagination}` back `Screen::MediaGallery` / `Screen::Resources`
-(`screens/library.rs`). Reach them with `g m` / `g r` or the go-to palette's
-"Media Gallery" / "Resources" rows; `j/k` moves, `[`/`]` pages, `R` refreshes,
-Enter/`o` opens the item on the site. Both wear the house `solo_panel` with the
-`page N of M` cap, and both are read-only — there is no upload path.
+## Quoting — the ContentIntegrity contract
 
-XFRM serves `rating_average` as a decimal *string* (`"4.50"`), so
-`models::deserialize_opt_f64` accepts either shape. Search's type cycler already
-covers the same content (`xfmg_media`, `resource`, issue #673), and
-`[GALLERY=media, <id>]caption` embeds in posts render as the caption linked to
-the media page.
+`Q` in the thread view replies with the selected post quoted, and the block
+it writes has to satisfy **WindowsForum's own `ContentIntegrity` addon**
+(`public_html/src/addons/WindowsForum/ContentIntegrity/Analyzer.php`), which
+re-derives every quote's fingerprint on save and compares it against the
+source post. A quote that does not match is recorded as forged or altered.
+
+The hash is **derived, never supplied** — there is nothing for the client to
+sign. What `bbcode::quote_block` owes is a block the analyzer re-derives the
+same way:
+
+- `[QUOTE="<username>, post: <id>, member: <user_id>"]` — both keys plain
+  digits, each appearing once (anything else is `quote_malformed`), and
+  `member` matching the source's real author (`quote_author_altered`). A
+  comma in the username would read as an attribute separator, so it is
+  replaced.
+- The body is the source message with **every nested `[QUOTE]` stripped**,
+  which is what `XF\Str\Formatter::getBbCodeForQuote` (via
+  `ProcessorAction\StripQuotes`) produces. A nested quote inside an
+  attributed quote is `nested_quote_in_attributed_quote` on its own, whatever
+  the text says.
+- Nothing else may change: the analyzer requires the quote's semantic text
+  (whitespace collapsed, NFC-normalised) to be a **substring** of the
+  source's, and any link in the quote that is not in the source is
+  `quote_link_injected`.
+
+Verify changes here against the analyzer itself, not against this note —
+`common/examples/quote_probe.rs` prints the block for a real post and the
+addon can be run over it directly. That is how the current implementation was
+confirmed (`valid=true, violations: 0`), and how the three failure modes
+above were confirmed to fire.
+
+## Attachments
+
+`^F` in the composer opens a path prompt — a terminal has no file picker, so
+the path is typed (`~` expands) — and the file is uploaded, inserted at the
+caret as `[ATTACH]id[/ATTACH]`, and remembered.
+
+The **attachment key** is the whole mechanism: an upload is attached to
+nothing until a write carries the same key, and XF checks the key's context
+against that write (`context[thread_id]` for a reply, `context[node_id]` for
+a new thread, `context[post_id]` for an edit — `AttachContext`). One key per
+draft: the first file mints it, later files reuse it, and
+`ComposeState::attachment_key` is what `reply`/`create_thread`/`edit_post`
+carry. Conversations take attachments under a different content type this
+client does not upload to, so `^F` is not offered there at all.
+
+Two wire shapes worth remembering, both of which the old code had wrong while
+its tests passed on invented fixtures:
+`POST /attachments/new-key` returns **`{"key": …}`**, not `attachment_key`,
+and `POST /attachments/` returns **`{"attachment": {…}}`** — decoding that
+envelope as a bare `Attachment` yields a silently *blank* one, because every
+field on that model is `#[serde(default)]`.
 
 ## Hard rules (each closes a real bug — do not regress)
 
@@ -375,6 +414,21 @@ the media page.
   enough because frames are diffed.
 - Live-data checks are read-only SQL against `wf_wf` (`mariadb -N wf_wf -e`);
   verify parser changes against real posts, that is where the BBCode bugs were.
+  `common/src/testdata/styled_posts.txt` is a captured corpus of real bodies
+  that `real_posts_parse_completely_and_carry_their_styles` runs over — it is
+  what caught the `[SIZE=+2]` misreading. Re-capture it when the parser
+  changes:
+  ```bash
+  mariadb -N --raw wf_wf -e "SELECT CONCAT(message, '\n===WFTUI-POST-BOUNDARY===')
+    FROM xf_post WHERE message REGEXP '\\[(SIZE|COLOR|HEADING|CENTER|FONT|HIGHLIGHT)='
+    ORDER BY post_id DESC LIMIT 40" > common/src/testdata/styled_posts.txt
+  ```
+- **A wiremock fixture must be a captured body, not a written one, and the
+  WHOLE body.** Three separate bugs shipped because a hand-written fixture
+  agreed with the wrong guess (#696, #698, #709) — and one of those survived a
+  round of "capture it properly" because the capture was filtered through `jq`
+  to the fields the model already believed in, which dropped the one field
+  whose shape broke it.
 
 ## Runtime environment variables
 
@@ -397,6 +451,13 @@ a second click on the selected row opens it, right click opens it on the site;
 anything with a key is dispatched through `handle_key` so every gate applies to
 the click too — never duplicate a handler in `click_hit`; list hits are read from
 `ListState::offset()` after the widget rendered.
+
+The breadcrumb is navigation, not decoration (#700): each crumb pops back to
+the screen it names, and the brand at the far left is Home. Its hit boxes are
+measured off the spans `header_line_hits` actually drew — the row elides its
+own middle and truncates its last crumb to fit, so a recomputed position
+points at the wrong place. The crumb for the screen you are on is inert, and
+no crumb may pop the sign-in gate.
 
 ## Login flow (works over SSH, no copy-paste)
 
@@ -447,12 +508,20 @@ widget through ratatui's diff-option path (anchor cell `ForcedWidth(1)`, covered
 cells `Skip`; ratatui 0.30 deprecated `Cell::skip`, so read `diff_option`).
 `app::is_image_cell` is the shared probe used by `capture_screen`,
 `paint_selection` and the overlays; images are suppressed while an overlay is up.
-Two surfaces draw them: the thread view (attachments sized from the API's
-width/height, avatars 2×5) and the compose Preview pane (`Chunk::Image` /
-`Chunk::Attach` from the draft, cached in `PreviewCache`, fetched only after the
-draft has been still for 500 ms). Thumbnails ≤ 40 % of the panel and ≤ 12 rows;
-fetches stream through `fetch_bytes` with a hard byte cap, then the disk cache
-under `<config dir>/cache/img/` (32 MiB, 0600, atomic).
+Five surfaces draw them: the thread view (post images where the message puts
+them, avatars 2×5), the compose Preview pane (`Chunk::Image` / `Chunk::Attach`
+from the draft, cached in `PreviewCache`, fetched only after the draft has
+been still for 500 ms), the Media Gallery's row thumbnails, a resource's icon,
+and the full-size viewer. `images::fit` is the inline case and hard-codes the
+thumbnail caps; `fit_within` fits an arbitrary box and is what the viewer and
+the gallery rows use. Inline thumbnails ≤ 40 % of the panel and ≤ 12 rows;
+fetches stream through `fetch_bytes` with a hard byte cap — 2 MiB for
+thumbnails, 8 MiB for the viewer (`Request::full`) — then the disk cache under
+`<config dir>/cache/img/` (32 MiB, 0600, atomic). `fetch_bytes` sends the
+bearer token **only** to our own API base, which the gallery's
+`/api/media/{id}/data` needs and no third-party `[IMG]` host may ever see.
+Decoding is capped at 4096 px per axis and a 64 MiB allocation budget (#679);
+an image past either returns `Err` and falls back to the placeholder.
 
 ## Known gaps
 
@@ -472,3 +541,8 @@ under `<config dir>/cache/img/` (32 MiB, 0600, atomic).
 - Search's chip row is keyboard-only; Windows packaging is documentation-only.
   (`[SPOILER]` bodies are hidden black-on-black until `x` reveals them in the
   thread view — issue #621.)
+- The library screens are read-only: no album browsing or media comments
+  (`XFMG:Albums`, `XFMG:Comments`), and a resource shows its description but
+  not its updates, reviews or versions (`XFRM:ResourceUpdates`,
+  `ResourceReviews`, `ResourceVersions`). All of those endpoints exist.
+- Composer drafts do not survive Esc, and there is no @mention completion.
