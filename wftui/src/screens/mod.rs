@@ -457,11 +457,52 @@ impl SearchState {
     }
 }
 
-/// The Media Gallery catalog screen's state (#680): one fetched page of
-/// XFMG media items plus the house paged-list bookkeeping.
+/// Which pane of the Media Gallery has the keyboard (#697) — the same
+/// two-pane shape Home uses for forums and threads.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MediaPane {
+    Categories,
+    #[default]
+    Items,
+}
+
+/// The Media Gallery's state (#680, #697): the category tree beside one
+/// fetched page of that category's media.
 #[derive(Default)]
 pub struct MediaListState {
-    pub items: Vec<MediaListItem>,
+    pub items: Vec<MediaItem>,
+    pub categories: Vec<MediaCategory>,
+    /// 0 is "All media"; 1.. index `categories`.
+    pub cat_sel: usize,
+    pub focus: MediaPane,
+    /// `None` is the whole gallery, `Some(id)` one category.
+    pub category: Option<u32>,
+    /// Panel title for the item pane — the category's name, or "All media".
+    pub category_title: String,
+    pub page: u32,
+    pub last_page: u32,
+    pub total: u64,
+    pub sel: usize,
+    /// First item row on screen, and how many fit — the renderer stamps
+    /// both, and the app reads `visible` to keep a tall pane fed with
+    /// enough items (the API's page size is fixed server-side).
+    pub scroll: usize,
+    pub visible: usize,
+    pub dual: bool,
+    /// Where each pane was drawn, so a click can focus the pane under the
+    /// pointer before its row index is applied (the Home contract).
+    pub cat_rect: ratatui::layout::Rect,
+    pub items_rect: ratatui::layout::Rect,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub images: crate::images::Policy,
+    pub image_requests: Vec<crate::images::Request>,
+}
+
+/// The Resource Manager catalog screen's state (#680).
+#[derive(Default)]
+pub struct ResourceListState {
+    pub items: Vec<Resource>,
     pub page: u32,
     pub last_page: u32,
     pub total: u64,
@@ -470,16 +511,64 @@ pub struct MediaListState {
     pub error: Option<String>,
 }
 
-/// The Resource Manager catalog screen's state (#680).
+/// The resource page (#697): one resource rendered in the client, from the
+/// same BBCode the site renders.
 #[derive(Default)]
-pub struct ResourceListState {
-    pub items: Vec<ResourceListItem>,
-    pub page: u32,
-    pub last_page: u32,
-    pub total: u64,
-    pub sel: usize,
+pub struct ResourceViewState {
+    pub id: u32,
+    pub resource: Option<Resource>,
+    /// The laid-out page; rebuilt when the pane's width changes.
+    pub lines: Vec<ratatui::text::Line<'static>>,
+    pub width: u16,
+    pub scroll: usize,
+    pub links: Vec<String>,
     pub loading: bool,
     pub error: Option<String>,
+    pub images: crate::images::Policy,
+    pub image_slots: Vec<crate::images::Slot>,
+    pub image_requests: Vec<crate::images::Request>,
+}
+
+/// Everything the viewer needs to show one picture, built by whoever opens
+/// it (a gallery row today; a post's attachment next).
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct ImageOpen {
+    pub title: String,
+    pub meta: String,
+    pub description: String,
+    /// The URL the image store fetches and paints.
+    pub key: String,
+    pub px: Option<(u32, u32)>,
+    pub web_url: Option<String>,
+}
+
+/// The full-size image viewer (#697).
+#[derive(Default)]
+pub struct ImageViewState {
+    pub title: String,
+    pub meta: String,
+    pub description: String,
+    pub key: Option<String>,
+    pub px: Option<(u32, u32)>,
+    pub web_url: Option<String>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub images: crate::images::Policy,
+    pub image_requests: Vec<crate::images::Request>,
+}
+
+impl ImageViewState {
+    pub fn of(open: ImageOpen) -> Self {
+        ImageViewState {
+            title: open.title,
+            meta: open.meta,
+            description: open.description,
+            key: Some(open.key),
+            px: open.px,
+            web_url: open.web_url,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Default)]
@@ -520,6 +609,10 @@ pub enum Screen {
     MediaGallery(MediaListState),
     /// The Resource Manager (XFRM) catalog — `g r` / palette (#680).
     Resources(ResourceListState),
+    /// One resource, rendered here rather than handed to a browser (#697).
+    ResourceView(ResourceViewState),
+    /// One picture, as large as the pane allows (#697).
+    ImageView(ImageViewState),
 }
 
 /// What Esc means on the screen that is on top (see `Screen::esc_intent`).
@@ -560,9 +653,17 @@ pub enum Action {
     OpenMediaGallery,
     /// Browse the Resource Manager catalog, fetching page 1 (#680).
     OpenResources,
-    /// Fetch one page of the media / resource catalogs (#680).
-    LoadMedia(u32),
+    /// Fetch one page of the media / resource catalogs (#680), optionally
+    /// scoped to a gallery category (#697).
+    LoadMedia { category: Option<u32>, page: u32 },
     LoadResources(u32),
+    /// The gallery's category tree (#697).
+    LoadMediaCategories,
+    /// Open one resource's page in the client, and (re)fetch it (#697).
+    OpenResource(u32),
+    LoadResource(u32),
+    /// Show one picture full size in the client (#697).
+    OpenImage(Box<ImageOpen>),
     /// One page of a member's threads/posts (issue #548). `content` is
     /// XenForo's `content` parameter for `/search/member`: "thread" or "post".
     LoadMemberContent {
@@ -627,6 +728,8 @@ impl Screen {
             Screen::Profile(s) => misc::render_profile(s, f, area, theme, g),
             Screen::MediaGallery(s) => library::render_media_gallery(s, f, area, theme, g, hits),
             Screen::Resources(s) => library::render_resources(s, f, area, theme, g, hits),
+            Screen::ResourceView(s) => library::render_resource_view(s, f, area, theme, g, hits),
+            Screen::ImageView(s) => library::render_image_view(s, f, area, theme, g, hits),
         }
     }
 
@@ -643,6 +746,17 @@ impl Screen {
                 }
             }
             Screen::Login(s) => s.images = policy,
+            Screen::MediaGallery(s) => s.images = policy,
+            Screen::ImageView(s) => s.images = policy,
+            Screen::ResourceView(s) => {
+                if s.images != policy {
+                    s.images = policy;
+                    // Same trick the thread view uses: a policy change
+                    // invalidates the laid-out lines, because the icon
+                    // reserves rows the text tier does not.
+                    s.width = 0;
+                }
+            }
             Screen::Compose(s) => {
                 s.images = policy;
                 // The store only ever gains entries, so a length change is
@@ -661,6 +775,9 @@ impl Screen {
     pub fn image_requests(&self) -> &[crate::images::Request] {
         match self {
             Screen::ThreadView(s) => &s.image_requests,
+            Screen::MediaGallery(s) => &s.image_requests,
+            Screen::ResourceView(s) => &s.image_requests,
+            Screen::ImageView(s) => &s.image_requests,
             Screen::Login(s) => &s.image_requests,
             Screen::Compose(s) => &s.image_requests,
             _ => &[],
@@ -684,6 +801,8 @@ impl Screen {
             Screen::Profile(_) => misc::profile_hints(),
             Screen::MediaGallery(s) => library::media_hints(s),
             Screen::Resources(s) => library::resources_hints(s),
+            Screen::ResourceView(s) => library::resource_view_hints(s),
+            Screen::ImageView(s) => library::image_view_hints(s),
         }
     }
 
@@ -704,6 +823,12 @@ impl Screen {
             Screen::Profile(s) => s.title.clone(),
             Screen::MediaGallery(_) => "Media Gallery".into(),
             Screen::Resources(_) => "Resources".into(),
+            Screen::ResourceView(s) => s
+                .resource
+                .as_ref()
+                .map(|r| r.title.clone())
+                .unwrap_or_else(|| "Resource".into()),
+            Screen::ImageView(s) => s.title.clone(),
         }
     }
 
@@ -722,6 +847,8 @@ impl Screen {
             Screen::Profile(s) => misc::profile_key(s, key),
             Screen::MediaGallery(s) => library::media_list_key(s, key),
             Screen::Resources(s) => library::resources_list_key(s, key),
+            Screen::ResourceView(s) => library::resource_view_key(s, key),
+            Screen::ImageView(s) => library::image_view_key(s, key),
         }
     }
 
@@ -749,6 +876,13 @@ impl Screen {
                     ib.focus = InboxPane::View;
                 }
             }
+            Screen::MediaGallery(m) => {
+                if m.dual && m.cat_rect.contains(at) {
+                    m.focus = MediaPane::Categories;
+                } else if m.items_rect.contains(at) {
+                    m.focus = MediaPane::Items;
+                }
+            }
             _ => {}
         }
     }
@@ -769,7 +903,10 @@ impl Screen {
                 InboxTab::Alerts => ib.alerts.sel,
             }),
             Screen::Search(s) => Some(s.sel),
-            Screen::MediaGallery(m) => Some(m.sel),
+            Screen::MediaGallery(m) => Some(match m.focus {
+                MediaPane::Categories => m.cat_sel,
+                MediaPane::Items => m.sel,
+            }),
             Screen::Resources(r) => Some(r.sel),
             _ => None,
         }
@@ -799,7 +936,11 @@ impl Screen {
                 InboxTab::Alerts => set(&mut ib.alerts.sel, ib.alerts.alerts.len(), i),
             },
             Screen::Search(s) => set(&mut s.sel, s.results.len(), i),
-            Screen::MediaGallery(m) => set(&mut m.sel, m.items.len(), i),
+            Screen::MediaGallery(m) => match m.focus {
+                // The category list carries an extra leading "All media" row.
+                MediaPane::Categories => set(&mut m.cat_sel, m.categories.len() + 1, i),
+                MediaPane::Items => set(&mut m.sel, m.items.len(), i),
+            },
             Screen::Resources(r) => set(&mut r.sel, r.items.len(), i),
             _ => {}
         }
@@ -856,6 +997,8 @@ impl Screen {
             Screen::Profile(p) => p.loading,
             Screen::MediaGallery(m) => m.loading,
             Screen::Resources(r) => r.loading,
+            Screen::ResourceView(r) => r.loading,
+            Screen::ImageView(v) => v.loading,
             // The Login Waiting stage animates its "waiting for approval"
             // spinner too — but only while a flow is live.
             Screen::Login(l) => l.busy || matches!(l.stage, LoginStage::Waiting),
@@ -903,6 +1046,8 @@ impl Screen {
             Screen::Search(s) => s.results.get(s.sel).and_then(|h| h.view_url.clone()),
             Screen::MediaGallery(m) => m.items.get(m.sel).and_then(|m| m.view_url.clone()),
             Screen::Resources(r) => r.items.get(r.sel).and_then(|r| r.view_url.clone()),
+            Screen::ResourceView(r) => r.resource.as_ref().and_then(|r| r.view_url.clone()),
+            Screen::ImageView(v) => v.web_url.clone(),
             Screen::Profile(p) => p.user.as_ref().and_then(|u| u.view_url.clone()),
             _ => None,
         }
@@ -996,8 +1141,12 @@ impl Screen {
                 v.sel_msg = 0;
             }
             Screen::Search(s) => s.sel = 0,
-            Screen::MediaGallery(m) => m.sel = 0,
+            Screen::MediaGallery(m) => {
+                m.sel = 0;
+                m.scroll = 0;
+            }
             Screen::Resources(r) => r.sel = 0,
+            Screen::ResourceView(r) => r.scroll = 0,
             _ => {}
         }
     }
@@ -1039,6 +1188,7 @@ impl Screen {
             Screen::Search(s) => s.sel = s.results.len().saturating_sub(1),
             Screen::MediaGallery(m) => m.sel = m.items.len().saturating_sub(1),
             Screen::Resources(r) => r.sel = r.items.len().saturating_sub(1),
+            Screen::ResourceView(r) => r.scroll = r.lines.len().saturating_sub(1),
             _ => {}
         }
     }
@@ -1057,6 +1207,8 @@ impl Screen {
             Screen::Profile(_) => "THIS MEMBER",
             Screen::MediaGallery(_) => "THIS GALLERY",
             Screen::Resources(_) => "THESE RESOURCES",
+            Screen::ResourceView(_) => "THIS RESOURCE",
+            Screen::ImageView(_) => "THIS IMAGE",
         }
     }
 
@@ -1075,6 +1227,8 @@ impl Screen {
             Screen::Profile(s) => &s.title,
             Screen::MediaGallery(_) => "Media Gallery",
             Screen::Resources(_) => "Resources",
+            Screen::ResourceView(_) => "Resource",
+            Screen::ImageView(_) => "Image",
         }
     }
 }
@@ -1301,7 +1455,7 @@ mod dispatch_tests {
                 ..Default::default()
             }),
             Screen::MediaGallery(MediaListState {
-                items: vec![MediaListItem {
+                items: vec![MediaItem {
                     media_id: 33005,
                     title: "Registry Explained".into(),
                     username: "op".into(),
@@ -1314,19 +1468,43 @@ mod dispatch_tests {
                 ..Default::default()
             }),
             Screen::Resources(ResourceListState {
-                items: vec![ResourceListItem {
+                items: vec![Resource {
                     resource_id: 150883,
                     title: "Handy tool".into(),
                     tag_line: "does things".into(),
                     username: "author".into(),
                     resource_date: 1_700_000_000,
                     download_count: 42,
-                    rating_average: Some(4.5),
+                    rating_avg: Some(4.5),
                     ..Default::default()
                 }],
                 page: 1,
                 last_page: 1,
                 total: 1,
+                ..Default::default()
+            }),
+            Screen::ResourceView(ResourceViewState {
+                id: 150883,
+                resource: Some(Resource {
+                    resource_id: 150883,
+                    title: "Handy tool".into(),
+                    tag_line: "does things".into(),
+                    username: "author".into(),
+                    version: "2.5.8".into(),
+                    description: "A [B]useful[/B] tool.".into(),
+                    download_count: 42,
+                    rating_avg: Some(4.5),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            Screen::ImageView(ImageViewState {
+                title: "Registry Explained".into(),
+                meta: "op \u{b7} 3d \u{b7} 1536\u{d7}1024".into(),
+                description: "A screenshot of the registry editor.".into(),
+                key: Some("https://data.windowsforum.com/x.jpg".into()),
+                px: Some((1536, 1024)),
+                web_url: Some("https://windowsforum.com/media/x.1/".into()),
                 ..Default::default()
             }),
             Screen::Profile(ProfileState {
@@ -1742,7 +1920,7 @@ mod dispatch_tests {
                 // the selected media page; R refreshes.
                 name: "MediaGallery",
                 factory: || Screen::MediaGallery(MediaListState {
-                    items: vec![MediaListItem {
+                    items: vec![MediaItem {
                         media_id: 33005,
                         title: "Registry Explained".into(),
                         username: "op".into(),
@@ -1760,7 +1938,7 @@ mod dispatch_tests {
                 // tag lines and download counts.
                 name: "Resources",
                 factory: || Screen::Resources(ResourceListState {
-                    items: vec![ResourceListItem {
+                    items: vec![Resource {
                         resource_id: 150883,
                         title: "Handy tool".into(),
                         tag_line: "does things".into(),
@@ -1925,6 +2103,38 @@ mod dispatch_tests {
                     // no `Action` (see its arm in `search_key`).
                     "i",
                 ],
+            },
+            Case {
+                // The resource page: j/k scroll (no Action), d downloads,
+                // o opens the site, R refetches.
+                name: "ResourceView",
+                factory: || Screen::ResourceView(ResourceViewState {
+                    id: 1,
+                    resource: Some(Resource {
+                        resource_id: 1,
+                        title: "Handy tool".into(),
+                        view_url: Some("https://windowsforum.com/resources/x.1/".into()),
+                        current_download_url: Some(
+                            "https://windowsforum.com/resources/x.1/download".into(),
+                        ),
+                        ..Default::default()
+                    }),
+                    lines: vec![ratatui::text::Line::raw("body")],
+                    ..Default::default()
+                }),
+                // `j/k` is a compound label, and scrolling is screen state
+                // with no `Action` of its own.
+                skip: &["j/k", "Esc"],
+            },
+            Case {
+                name: "ImageView",
+                factory: || Screen::ImageView(ImageViewState {
+                    title: "A picture".into(),
+                    key: Some("https://data.windowsforum.com/x.jpg".into()),
+                    web_url: Some("https://windowsforum.com/media/x.1/".into()),
+                    ..Default::default()
+                }),
+                skip: &["Esc"],
             },
             Case {
                 name: "Profile",

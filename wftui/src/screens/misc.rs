@@ -351,6 +351,7 @@ pub fn render_login(
                 images::LOGO_COLS,
                 images::LOGO_ROWS,
             ),
+                full: false,
         });
     }
 }
@@ -1237,6 +1238,7 @@ fn draw_preview_panel(
         s.image_requests.push(images::Request {
             key: slot.key.clone(),
             rect: Rect::new(x as u16, y as u16, slot.cols, slot.rows),
+                full: false,
         });
     }
     if newly_requested > 0 {

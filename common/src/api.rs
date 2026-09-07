@@ -478,7 +478,17 @@ impl WfApiClient {
     /// do with it afterwards (issue #526).
     pub async fn fetch_bytes(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>> {
         self.image_gate.wait().await;
-        let mut resp = self.http.get(url).send().await?.error_for_status()?;
+        // Media served by the API itself (`/api/media/{id}/data`, the
+        // gallery's full-size bytes) needs the bearer token; anything else is
+        // a plain data-host or third-party URL and must NOT see it. The test
+        // `fetch_bytes_sends_the_token_only_to_our_own_api` pins both halves
+        // — an image URL is attacker-influenced (a post can carry any
+        // `[IMG]`), so a looser rule would hand the grant to whoever asked.
+        let mut req = self.http.get(url);
+        if url.starts_with(&format!("{}/", self.api_base())) {
+            req = req.bearer_auth(self.valid_token().await?);
+        }
+        let mut resp = req.send().await?.error_for_status()?;
 
         let content_type = resp
             .headers()
@@ -653,10 +663,18 @@ pub trait WfApi: Send + Sync {
     async fn alerts(&self, page: u32) -> Result<AlertsReply>;
     async fn mark_alert_read(&self, id: u32) -> Result<()>;
     async fn search(&self, keywords: &str, page: u32) -> Result<SearchResultsReply>;
-    /// XFMG's media list (`GET /api/media/`, issue #680).
-    async fn media_list(&self, page: u32) -> Result<MediaListReply>;
+    /// XFMG's media list (`GET /api/media/`, issue #680). `category` scopes
+    /// it to one gallery category, the way the site's category page does
+    /// (`GET /api/media-categories/{id}/content`, issue #697).
+    async fn media_list(&self, category: Option<u32>, page: u32) -> Result<MediaListReply>;
+    /// The gallery's category tree (`GET /api/media-categories/`, #697).
+    async fn media_categories(&self) -> Result<MediaCategoriesReply>;
+    /// One media item with its description and dimensions (#697).
+    async fn media_item(&self, id: u32) -> Result<MediaItemReply>;
     /// XFRM's resource list (`GET /api/resources/`, issue #680).
     async fn resources_list(&self, page: u32) -> Result<ResourceListReply>;
+    /// One resource, with the BBCode body the in-client page renders (#697).
+    async fn resource(&self, id: u32) -> Result<ResourceReply>;
     async fn search_advanced(&self, query: &SearchQuery) -> Result<SearchResultsReply>;
     async fn search_member(
         &self,
@@ -882,9 +900,27 @@ impl WfApi for WfApiClient {
     }
 
     /// XFMG media list (issue #680): `GET /media/?page=N` — the addon's
-    /// REST list controller returns `{media: [...], pagination}`.
-    async fn media_list(&self, page: u32) -> Result<MediaListReply> {
-        self.get("/media", &[("page", page.to_string())]).await
+    /// REST list controller returns `{media: [...], pagination}`. With a
+    /// category the same envelope comes from that category's content route
+    /// (#697), so one screen shape covers both.
+    async fn media_list(&self, category: Option<u32>, page: u32) -> Result<MediaListReply> {
+        let path = match category {
+            Some(id) => format!("/media-categories/{id}/content"),
+            None => "/media".to_string(),
+        };
+        self.get(&path, &[("page", page.to_string())]).await
+    }
+
+    async fn media_categories(&self) -> Result<MediaCategoriesReply> {
+        self.get("/media-categories", &[]).await
+    }
+
+    async fn media_item(&self, id: u32) -> Result<MediaItemReply> {
+        self.get(&format!("/media/{id}"), &[]).await
+    }
+
+    async fn resource(&self, id: u32) -> Result<ResourceReply> {
+        self.get(&format!("/resources/{id}"), &[]).await
     }
 
     /// XFRM resource list (issue #680): `GET /resources/?page=N` —
@@ -1148,66 +1184,139 @@ mod tests {
     /// pick up what the sibling wrote — and must report `false` (nothing to
     /// recover) when the file is missing or already the token set in memory,
     /// so the caller can end the session instead of looping.
-    /// #680: the XFMG media list maps the addon's `{media, pagination}`
-    /// envelope, including the item's view_url for `o`/Enter.
+    /// #697: the gallery's full-size bytes come from the API itself
+    /// (`/api/media/{id}/data`) and need the bearer token — but an image URL
+    /// is attacker-influenced (any post can carry an `[IMG]` pointing
+    /// anywhere), so the token must never leave our own API. Both halves are
+    /// the contract.
+    #[tokio::test]
+    async fn fetch_bytes_sends_the_token_only_to_our_own_api() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-fetchauth");
+        let png: Vec<u8> = vec![
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, b'I', b'H', b'D', b'R',
+        ];
+        // Our own API path: the request must carry the grant.
+        Mock::given(method("GET"))
+            .and(path("/api/media/7/data"))
+            .and(wiremock::matchers::header("authorization", "Bearer tok-1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(png.clone(), "image/png"),
+            )
+            .mount(&server)
+            .await;
+        // Anywhere else on the same host: it must NOT.
+        Mock::given(method("GET"))
+            .and(path("/data/attachments/9.jpg"))
+            .respond_with(move |req: &wiremock::Request| {
+                if req.headers.get("authorization").is_some() {
+                    // A leaked grant is a failure, not a fallback.
+                    ResponseTemplate::new(500)
+                } else {
+                    ResponseTemplate::new(200).set_body_raw(
+                        vec![0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+                        "image/png",
+                    )
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let api_url = format!("{}/api/media/7/data", server.uri());
+        assert!(
+            c.fetch_bytes(&api_url, 1024).await.is_ok(),
+            "the API's own media needs the token"
+        );
+        let other = format!("{}/data/attachments/9.jpg", server.uri());
+        assert!(
+            c.fetch_bytes(&other, 1024).await.is_ok(),
+            "a non-API image URL must be fetched WITHOUT the token"
+        );
+    }
+
+    /// #680/#696/#697: both catalog envelopes, against **captured live
+    /// responses** rather than hand-written JSON.
+    ///
+    /// This is the lesson of #696: the first version of these tests invented
+    /// their own fixture, so `rating_average` — a field that does not exist
+    /// on the wire — passed happily while the real rating never rendered. A
+    /// captured body also carries the shapes nobody would think to invent,
+    /// like `review_count: null`, which fails a plain `u64` outright
+    /// (`#[serde(default)]` covers a missing field, not an explicit null).
+    const MEDIA_PAGE_JSON: &str = r#"{"media":[{"media_id":35691,"title":"windowsforum-windows-11-10-create-local-groups-for-folder-and-smb-access.webp","username":"WindowsForum AI","media_date":1788748191,"view_url":"https://windowsforum.com/media/windowsforum-windows-11-10-create-local-groups-for-folder-and-smb-access-webp.35691/","media_type":"image","thumbnail_url":"https://data.windowsforum.com/xfmg/thumbnail/35/35691-ce8b7d219b1999476972c0ae567a5ca1.jpg?1788748208","media_url":"https://windowsforum.com/api/media/35691/data","width":1536,"height":1024,"description":"","view_count":3,"comment_count":0,"category_id":11,"rating_avg":0}],"pagination":{"current_page":1,"last_page":2092,"per_page":12,"shown":12,"total":25101}}"#;
+    const RESOURCES_PAGE_JSON: &str = r#"{"resources":[{"resource_id":1,"title":"WindowsForum.com Diagnostic Tool","tag_line":"Windows diagnostic collector for support and troubleshooting","username":"Mike","resource_date":1375003071,"last_update":1787444096,"view_url":"https://windowsforum.com/resources/windowsforum-com-diagnostic-tool.1/","download_count":5678,"view_count":19017,"rating_avg":5,"rating_count":2,"review_count":null,"version":"2.5.8","icon_url":"https://data.windowsforum.com/resource_icons/0/1.jpg?1756443640","resource_type":"download"}],"pagination":{"current_page":1,"last_page":3,"per_page":20,"shown":20,"total":44}}"#;
+
     #[tokio::test]
     async fn media_list_maps_the_gallery_envelope() {
         let server = MockServer::start().await;
         let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-medialist");
         Mock::given(method("GET"))
             .and(path("/api/media"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "media": [
-                    {"media_id": 33005, "title": "Registry Explained", "username":
-                     "op", "media_date": 1_700_000_000,
-                     "view_url": "https://windowsforum.com/media/registry.33005/"},
-                    {"media_id": 759}
-                ],
-                "pagination": {"current_page": 1, "last_page": 4, "total": 80}
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(MEDIA_PAGE_JSON, "application/json"),
+            )
             .mount(&server)
             .await;
         let c = logged_in_client("tok-1").await;
-        let reply = c.media_list(1).await.unwrap();
-        assert_eq!(reply.media.len(), 2);
-        assert_eq!(reply.media[0].title, "Registry Explained");
-        assert_eq!(reply.media[0].username, "op");
-        assert_eq!(
-            reply.media[0].view_url.as_deref(),
-            Some("https://windowsforum.com/media/registry.33005/")
-        );
-        assert_eq!(reply.pagination.last_page, 4);
-        assert_eq!(reply.media[1].view_url, None);
+        let reply = c.media_list(None, 1).await.unwrap();
+        assert_eq!(reply.media.len(), 1);
+        let m = &reply.media[0];
+        assert_eq!(m.media_id, 35691);
+        assert!(m.is_image(), "media_type: {:?}", m.media_type);
+        assert_eq!(m.px(), Some((1536, 1024)));
+        assert!(m.thumbnail_url.as_deref().is_some_and(|u| u.contains("/xfmg/thumbnail/")));
+        assert!(m.media_url.as_deref().is_some_and(|u| u.ends_with("/data")));
+        assert_eq!(m.username, "WindowsForum AI");
+        assert_eq!(m.category_id, 11);
+        assert_eq!(reply.pagination.last_page, 2092);
     }
 
-    /// #680: the XFRM resource list maps `{resources, pagination}`, and the
-    /// decimal rating arrives as a string ("4.50") — it must decode.
+    /// A category scopes the same envelope to that category's content route.
+    #[tokio::test]
+    async fn media_list_with_a_category_uses_the_category_content_route() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-mediacat");
+        Mock::given(method("GET"))
+            .and(path("/api/media-categories/11/content"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(MEDIA_PAGE_JSON, "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let c = logged_in_client("tok-1").await;
+        let reply = c.media_list(Some(11), 1).await.unwrap();
+        assert_eq!(reply.media.len(), 1, "the category route must be the one called");
+    }
+
     #[tokio::test]
     async fn resources_list_maps_the_resource_envelope_and_rating() {
         let server = MockServer::start().await;
         let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-reslist");
         Mock::given(method("GET"))
             .and(path("/api/resources"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "resources": [
-                    {"resource_id": 150883, "title": "Handy tool", "tag_line":
-                     "does things", "username": "author", "resource_date":
-                     1_700_000_000, "view_url":
-                     "https://windowsforum.com/resources/handy.150883/",
-                     "download_count": 42, "rating_average": "4.50"}
-                ],
-                "pagination": {"current_page": 1, "last_page": 1, "total": 1}
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(RESOURCES_PAGE_JSON, "application/json"),
+            )
             .mount(&server)
             .await;
         let c = logged_in_client("tok-1").await;
         let reply = c.resources_list(1).await.unwrap();
         assert_eq!(reply.resources.len(), 1);
         let r = &reply.resources[0];
-        assert_eq!(r.resource_id, 150883);
-        assert_eq!(r.tag_line, "does things");
-        assert_eq!(r.download_count, 42);
-        assert_eq!(r.rating_average, Some(4.5));
+        assert_eq!(r.resource_id, 1);
+        assert_eq!(r.tag_line, "Windows diagnostic collector for support and troubleshooting");
+        assert_eq!(r.download_count, 5678);
+        assert_eq!(r.version, "2.5.8");
+        // The whole point of #696: this is `rating_avg` on the wire.
+        assert_eq!(r.rating_avg, Some(5.0));
+        assert_eq!(r.rating_count, 2);
+        // And the whole point of the null hardening: XF sends this as null.
+        assert_eq!(r.review_count, 0);
     }
 
     /// `take_tokens` must hand back the live grant *and* leave nothing

@@ -2134,6 +2134,7 @@ pub fn render_thread_view(
             reqs.push(images::Request {
                 key: slot.key.clone(),
                 rect: Rect::new(x as u16, y as u16, slot.cols, slot.rows),
+                full: false,
             });
         }
         s.image_requests = reqs;

@@ -53,6 +53,11 @@ pub const MAX_ROWS: u16 = 12;
 /// Avatar slot in a post header: 2 rows × 5 cells (DESIGN.md).
 pub const AVATAR_COLS: u16 = 5;
 pub const AVATAR_ROWS: u16 = 2;
+/// A resource's icon on its page (#697): the same two-row shape the post
+/// avatar uses, one size up, so the header block keeps its height whether
+/// the icon loads or not.
+pub const ICON_COLS: u16 = 8;
+pub const ICON_ROWS: u16 = 4;
 /// Sign-in logo: 7 rows × 16 cells (DESIGN.md).
 pub const LOGO_COLS: u16 = 16;
 pub const LOGO_ROWS: u16 = 7;
@@ -60,6 +65,10 @@ pub const LOGO_ROWS: u16 = 7;
 /// cap is enforced by `WfApiClient::fetch_bytes` (Content-Length *and* the
 /// body actually received).
 pub const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
+/// The full-size viewer's budget. A thumbnail is capped tight because a
+/// screenful of them is fetched at once; one picture the reader asked to see
+/// is allowed to be a real photograph.
+pub const MAX_VIEW_BYTES: usize = 8 * 1024 * 1024;
 /// Pixel-dimension ceiling for decode. `MAX_IMAGE_BYTES` caps the compressed
 /// body, but a hostile header can still declare gigantic dimensions (a 2 MiB
 /// WebP claiming 30000×30000 asks for a ~3.6 GB RGBA buffer, and some
@@ -159,6 +168,10 @@ pub struct Request {
     /// Absolute URL, or [`LOGO_KEY`] for the embedded sign-in logo.
     pub key: String,
     pub rect: Rect,
+    /// True for the full-size viewer (#697): its bytes get the larger cap,
+    /// because a thumbnail budget is not what a whole picture costs. The
+    /// decode caps (#679) are what actually bound memory either way.
+    pub full: bool,
 }
 
 /// An image the store does not hold yet, handed to the app to load off-thread.
@@ -167,6 +180,7 @@ pub struct Pending {
     pub key: String,
     pub cols: u16,
     pub rows: u16,
+    pub full: bool,
 }
 
 impl Pending {
@@ -234,6 +248,30 @@ pub fn fit(panel_cols: u16, px: (u32, u32), font: (u16, u16)) -> (u16, u16) {
     } else {
         let cols = ((max_px_h * iw).div_ceil(ih).div_ceil(fw) as u16).clamp(1, col_cap);
         (cols, MAX_ROWS)
+    }
+}
+
+/// Fit `px` into an arbitrary cell box, aspect kept — what the full-size
+/// viewer and the gallery's thumbnails need (#697). `fit` exists for the
+/// *inline* case and hard-codes the thumbnail caps (a share of the panel,
+/// `MAX_ROWS` tall); a viewer wants the whole pane, and a gallery row wants
+/// its own small square, so both caps come from the caller here.
+///
+/// Never returns a box larger than asked for in either axis, so a caller can
+/// reserve exactly what it got back.
+pub fn fit_within(box_cols: u16, box_rows: u16, px: (u32, u32), font: (u16, u16)) -> (u16, u16) {
+    let (cw, ch) = (box_cols.max(1), box_rows.max(1));
+    let (iw, ih) = (px.0.max(1), px.1.max(1));
+    let (fw, fh) = (font.0.max(1) as u32, font.1.max(1) as u32);
+    let max_px_w = cw as u32 * fw;
+    let max_px_h = ch as u32 * fh;
+    // Which cap bites first: compare aspect ratios without dividing.
+    if iw * max_px_h >= ih * max_px_w {
+        let rows = ((max_px_w * ih).div_ceil(iw).div_ceil(fh) as u16).clamp(1, ch);
+        (cw, rows)
+    } else {
+        let cols = ((max_px_h * iw).div_ceil(ih).div_ceil(fw) as u16).clamp(1, cw);
+        (cols, ch)
     }
 }
 
@@ -775,6 +813,7 @@ impl Images {
                 key: req.key.clone(),
                 cols: req.rect.width,
                 rows: req.rect.height,
+                full: req.full,
             });
         }
         pending
@@ -850,7 +889,10 @@ pub async fn load(
         cached
     } else {
         let fetched = client
-            .fetch_bytes(&pending.key, MAX_IMAGE_BYTES)
+            .fetch_bytes(
+                &pending.key,
+                if pending.full { MAX_VIEW_BYTES } else { MAX_IMAGE_BYTES },
+            )
             .await
             .map_err(|e| e.to_string())?;
         disk.put(&pending.key, &fetched);
@@ -1014,6 +1056,29 @@ mod tests {
         assert_eq!(loaded.px, (2, 2));
     }
 
+    /// #697: the viewer's fit never exceeds the box it was given, keeps the
+    /// aspect within a cell of exact, and fills the axis that binds.
+    #[test]
+    fn fit_within_never_exceeds_its_box_and_keeps_aspect() {
+        let font = (10u16, 20u16);
+        for (px, box_wh) in [
+            ((1536u32, 1024u32), (100u16, 30u16)),
+            ((400, 1200), (100, 30)),
+            ((1, 1), (80, 24)),
+            ((4000, 3000), (20, 5)),
+        ] {
+            let (cols, rows) = fit_within(box_wh.0, box_wh.1, px, font);
+            assert!(cols <= box_wh.0 && rows <= box_wh.1, "{px:?} in {box_wh:?} -> {cols}x{rows}");
+            assert!(cols >= 1 && rows >= 1);
+            // One axis must be filled, or the image would float smaller than
+            // it needs to.
+            assert!(
+                cols == box_wh.0 || rows == box_wh.1,
+                "{px:?} in {box_wh:?} -> {cols}x{rows} fills neither axis"
+            );
+        }
+    }
+
     // ---------- url choice ----------
 
     #[test]
@@ -1148,6 +1213,7 @@ mod tests {
         let reqs = vec![Request {
             key: "https://wf/thumb.png".into(),
             rect: Rect::new(0, 0, 8, 4),
+                full: false,
         }];
         let mut pending = Vec::new();
         terminal
@@ -1169,6 +1235,7 @@ mod tests {
         let reqs = vec![Request {
             key: "https://wf/thumb.png".into(),
             rect: Rect::new(0, 0, 8, 4),
+                full: false,
         }];
 
         let mut first = Vec::new();
@@ -1196,7 +1263,7 @@ mod tests {
     fn painted(images: &mut Images, rect: Rect, w: u16, h: u16) -> ratatui::buffer::Buffer {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-        let reqs = vec![Request { key: LOGO_KEY.to_string(), rect }];
+        let reqs = vec![Request { key: LOGO_KEY.to_string(), rect, full: false }];
         let mut pending = Vec::new();
         let mut frame = ratatui::buffer::Buffer::empty(Rect::new(0, 0, w, h));
         terminal

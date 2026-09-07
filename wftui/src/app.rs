@@ -290,6 +290,9 @@ pub enum Msg {
     /// one fetch in flight, so page stamping is enough identity.
     MediaLoaded { page: u32, result: TaskResult<MediaListReply> },
     ResourceLoaded { page: u32, result: TaskResult<ResourceListReply> },
+    /// The gallery's category tree, and one resource's page (#697).
+    MediaCategoriesLoaded(TaskResult<common::models::MediaCategoriesReply>),
+    ResourceViewLoaded { id: u32, result: TaskResult<common::models::ResourceReply> },
     SearchDone { generation: u64, page: u32, result: TaskResult<SearchResultsReply> },
     /// A go-to palette member lookup came back. `query` is the palette query
     /// that asked, so a stale answer to an edited query is dropped.
@@ -1773,9 +1776,11 @@ impl App {
                 self.push_screen(Screen::MediaGallery(screens::MediaListState {
                     page: 1,
                     loading: true,
+                    category_title: "All media".into(),
                     ..Default::default()
                 }));
-                self.load_media(1);
+                self.load_media(None, 1);
+                self.load_media_categories();
             }
             Action::OpenResources => {
                 self.push_screen(Screen::Resources(screens::ResourceListState {
@@ -1785,8 +1790,21 @@ impl App {
                 }));
                 self.load_resources(1);
             }
-            Action::LoadMedia(page) => self.load_media(page),
+            Action::LoadMedia { category, page } => self.load_media(category, page),
             Action::LoadResources(page) => self.load_resources(page),
+            Action::LoadMediaCategories => self.load_media_categories(),
+            Action::OpenResource(id) => {
+                self.push_screen(Screen::ResourceView(screens::ResourceViewState {
+                    id,
+                    loading: true,
+                    ..Default::default()
+                }));
+                self.load_resource(id);
+            }
+            Action::LoadResource(id) => self.load_resource(id),
+            Action::OpenImage(open) => {
+                self.push_screen(Screen::ImageView(screens::ImageViewState::of(*open)));
+            }
             Action::LoadMemberContent {
                 user_id,
                 content,
@@ -4056,6 +4074,40 @@ impl App {
                     }
                 }
             }
+            Msg::MediaCategoriesLoaded(result) => {
+                // Categories are decoration for the item pane: a failure
+                // leaves "All media" working rather than failing the screen.
+                if let Ok(reply) = result
+                    && let Some(Screen::MediaGallery(m)) =
+                        self.screens.iter_mut().rev().find(|s| {
+                            matches!(s, Screen::MediaGallery(_))
+                        })
+                {
+                    m.categories = reply.categories;
+                }
+            }
+            Msg::ResourceViewLoaded { id, result } => {
+                let view = self.screens.iter_mut().rev().find_map(|s| match s {
+                    Screen::ResourceView(r) if r.id == id => Some(r),
+                    _ => None,
+                });
+                if let Some(view) = view {
+                    match result {
+                        Ok(reply) => {
+                            view.error = None;
+                            view.resource = Some(reply.resource);
+                            view.loading = false;
+                            // Force the layout: the page is built from the
+                            // resource that just arrived.
+                            view.width = 0;
+                        }
+                        Err(e) => {
+                            view.loading = false;
+                            view.error = Some(e.message);
+                        }
+                    }
+                }
+            }
             Msg::AlertMarked(result) => match result {
                 Ok(()) => {
                     self.load_alerts();
@@ -4229,13 +4281,37 @@ impl App {
         });
     }
 
-    /// Fetch one page of the XFMG media catalog (issue #680).
-    pub fn load_media(&mut self, page: u32) {
+    /// Fetch one page of the XFMG media catalog, whole or by category
+    /// (issues #680, #697).
+    pub fn load_media(&mut self, category: Option<u32>, page: u32) {
         let api = self.api.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = api.media_list(page).await.map_err(|e| TaskError::of(&e));
+            let result = api
+                .media_list(category, page)
+                .await
+                .map_err(|e| TaskError::of(&e));
             tx.send(Msg::MediaLoaded { page, result }).ok();
+        });
+    }
+
+    /// The gallery's category tree (#697).
+    pub fn load_media_categories(&mut self) {
+        let api = self.api.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = api.media_categories().await.map_err(|e| TaskError::of(&e));
+            tx.send(Msg::MediaCategoriesLoaded(result)).ok();
+        });
+    }
+
+    /// One resource, for the in-client page (#697).
+    pub fn load_resource(&mut self, id: u32) {
+        let api = self.api.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = api.resource(id).await.map_err(|e| TaskError::of(&e));
+            tx.send(Msg::ResourceViewLoaded { id, result }).ok();
         });
     }
 
@@ -4495,6 +4571,8 @@ fn session_error_of(msg: &Msg) -> Option<&TaskError> {
         | Msg::AlertsLoaded(Err(e))
         | Msg::MediaLoaded { result: Err(e), .. }
         | Msg::ResourceLoaded { result: Err(e), .. }
+        | Msg::MediaCategoriesLoaded(Err(e))
+        | Msg::ResourceViewLoaded { result: Err(e), .. }
         | Msg::AlertMarked(Err(e))
         | Msg::SearchDone { result: Err(e), .. }
         | Msg::ProfileLoaded { result: Err(e), .. }
@@ -4538,6 +4616,8 @@ fn mark_retryable(msg: &mut Msg) {
         | Msg::AlertsLoaded(Err(e))
         | Msg::MediaLoaded { result: Err(e), .. }
         | Msg::ResourceLoaded { result: Err(e), .. }
+        | Msg::MediaCategoriesLoaded(Err(e))
+        | Msg::ResourceViewLoaded { result: Err(e), .. }
         | Msg::AlertMarked(Err(e))
         | Msg::SearchDone { result: Err(e), .. }
         | Msg::ProfileLoaded { result: Err(e), .. }
@@ -5298,9 +5378,31 @@ mod tests {
         }
         async fn media_list(
             &self,
+            _: Option<u32>,
             _: u32,
         ) -> common::error::Result<common::models::MediaListReply> {
             Ok(common::models::MediaListReply::default())
+        }
+        async fn media_categories(
+            &self,
+        ) -> common::error::Result<common::models::MediaCategoriesReply> {
+            Ok(common::models::MediaCategoriesReply::default())
+        }
+        async fn media_item(
+            &self,
+            id: u32,
+        ) -> common::error::Result<common::models::MediaItemReply> {
+            Ok(common::models::MediaItemReply {
+                media: common::models::MediaItem { media_id: id, ..Default::default() },
+            })
+        }
+        async fn resource(
+            &self,
+            id: u32,
+        ) -> common::error::Result<common::models::ResourceReply> {
+            Ok(common::models::ResourceReply {
+                resource: common::models::Resource { resource_id: id, ..Default::default() },
+            })
         }
         async fn resources_list(
             &self,
@@ -7851,7 +7953,7 @@ mod tests {
         app.handle_msg(Msg::MediaLoaded {
             page: 1,
             result: Ok(common::models::MediaListReply {
-                media: vec![common::models::MediaListItem {
+                media: vec![common::models::MediaItem {
                     media_id: 33005,
                     title: "Registry Explained".into(),
                     ..Default::default()

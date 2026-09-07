@@ -819,57 +819,199 @@ pub struct SearchResultsReply {
     pub pagination: Pagination,
 }
 
-/// One XFMG media item from `GET /api/media/` (issue #680). Tolerant like
-/// every other model: the list controller returns `media_id`, `title`,
-/// `username`, `media_date` and `view_url` per item.
+/// One XFMG media item, from `GET /api/media/` or `GET /api/media/{id}`
+/// (issues #680, #697). Field names come from the live wire shape, not from
+/// the entity source: everything here is `#[serde(default)]`-tolerant, so a
+/// name that does not exist deserializes silently to nothing (#696).
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct MediaListItem {
-    #[serde(default)]
+pub struct MediaItem {
+    #[serde(default, deserialize_with = "null_default")]
     pub media_id: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub username: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub media_date: i64,
     #[serde(default)]
     pub view_url: Option<String>,
+    /// "image", "video", "audio" or "embed" — only the first has anything
+    /// this client can draw.
+    #[serde(default, deserialize_with = "null_default")]
+    pub media_type: String,
+    /// The gallery's own thumbnail (a plain data-host URL, no auth).
+    #[serde(default)]
+    pub thumbnail_url: Option<String>,
+    /// Full-size bytes, served from the API (`/api/media/{id}/data`), so it
+    /// is fetched with the bearer token like any other API call.
+    #[serde(default)]
+    pub media_url: Option<String>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub description: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub view_count: u64,
+    #[serde(default, deserialize_with = "null_default")]
+    pub comment_count: u64,
+    #[serde(default, deserialize_with = "null_default")]
+    pub category_id: u32,
+    #[serde(default, deserialize_with = "null_default")]
+    pub album_id: u32,
+    #[serde(default, deserialize_with = "deserialize_opt_f64")]
+    pub rating_avg: Option<f64>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub rating_count: u64,
+}
+
+impl MediaItem {
+    /// True when there is a picture this client can actually draw.
+    pub fn is_image(&self) -> bool {
+        self.media_type == "image"
+    }
+
+    /// Declared pixel size, when the API sent a usable one.
+    pub fn px(&self) -> Option<(u32, u32)> {
+        match (self.width, self.height) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+            _ => None,
+        }
+    }
+}
+
+/// One XFMG category from `GET /api/media-categories/` (#697). The gallery's
+/// left pane is these, nested by `parent_category_id` the way the site nests
+/// them.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MediaCategory {
+    #[serde(default, deserialize_with = "null_default")]
+    pub category_id: u32,
+    #[serde(default, deserialize_with = "null_default")]
+    pub title: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub description: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub parent_category_id: u32,
+    #[serde(default, deserialize_with = "null_default")]
+    pub media_count: u64,
+    #[serde(default)]
+    pub view_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MediaCategoriesReply {
+    #[serde(default)]
+    pub categories: Vec<MediaCategory>,
+}
+
+/// `GET /api/media/{id}`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MediaItemReply {
+    #[serde(default)]
+    pub media: MediaItem,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MediaListReply {
     #[serde(default)]
-    pub media: Vec<MediaListItem>,
+    pub media: Vec<MediaItem>,
     #[serde(default)]
     pub pagination: Pagination,
 }
 
-/// One XFRM resource from `GET /api/resources/` (issue #680).
+/// One XFRM resource, from `GET /api/resources/` or
+/// `GET /api/resources/{id}` (issues #680, #697). The list sends most of
+/// this; the single-resource call adds `description` (BBCode) and the
+/// nested category, which is what the in-client resource page renders.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct ResourceListItem {
-    #[serde(default)]
+pub struct Resource {
+    #[serde(default, deserialize_with = "null_default")]
     pub resource_id: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub tag_line: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub username: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
+    pub user_id: u32,
+    #[serde(default, deserialize_with = "null_default")]
     pub resource_date: i64,
+    #[serde(default, deserialize_with = "null_default")]
+    pub last_update: i64,
     #[serde(default)]
     pub view_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub download_count: u64,
-    /// XFRM stores the average rating as a decimal string ("4.50").
+    #[serde(default, deserialize_with = "null_default")]
+    pub view_count: u64,
+    /// XFRM sends `rating_avg` — NOT `rating_average`, which is what this
+    /// model asked for until #696 and why the rating never rendered. A
+    /// number on the wire today; the tolerant decoder also takes the
+    /// decimal string other XF builds emit.
     #[serde(default, deserialize_with = "deserialize_opt_f64")]
-    pub rating_average: Option<f64>,
+    pub rating_avg: Option<f64>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub rating_count: u64,
+    #[serde(default, deserialize_with = "null_default")]
+    pub review_count: u64,
+    /// Current version string ("2.5.8"), empty when the resource has none.
+    #[serde(default, deserialize_with = "null_default")]
+    pub version: String,
+    /// The resource body, in BBCode — rendered through the same parser the
+    /// thread view uses.
+    #[serde(default, deserialize_with = "null_default")]
+    pub description: String,
+    #[serde(default)]
+    pub icon_url: Option<String>,
+    /// "download", "external" or "install" — what the site would offer.
+    #[serde(default, deserialize_with = "null_default")]
+    pub resource_type: String,
+    #[serde(default)]
+    pub external_url: Option<String>,
+    #[serde(default)]
+    pub current_download_url: Option<String>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub price: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub currency: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub resource_category_id: u32,
+    #[serde(default, rename = "Category")]
+    pub category: Option<ResourceCategoryRef>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub tags: std::collections::HashMap<String, TagRef>,
+}
+
+/// The nested `Category` object the single-resource call includes.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ResourceCategoryRef {
+    #[serde(default, deserialize_with = "null_default")]
+    pub resource_category_id: u32,
+    #[serde(default, deserialize_with = "null_default")]
+    pub title: String,
+}
+
+/// One entry of XF's `tags` map (`{"12": {"tag": "networking", …}}`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TagRef {
+    #[serde(default, deserialize_with = "null_default")]
+    pub tag: String,
+}
+
+/// `GET /api/resources/{id}`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ResourceReply {
+    #[serde(default)]
+    pub resource: Resource,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ResourceListReply {
     #[serde(default)]
-    pub resources: Vec<ResourceListItem>,
+    pub resources: Vec<Resource>,
     #[serde(default)]
     pub pagination: Pagination,
 }
@@ -945,6 +1087,20 @@ impl Attachment {
     pub fn open_url(&self) -> Option<&str> {
         self.direct_url.as_deref().or(self.view_url.as_deref())
     }
+}
+
+/// `#[serde(default)]` covers a *missing* field, not a field explicitly sent
+/// as `null` — that still fails the whole reply. XF sends both: `review_count`
+/// arrives as `null` on a resource nobody has reviewed, and a missing-vs-null
+/// distinction is not one this client ever wants to care about. Every scalar
+/// below that XF can null out decodes through this instead (#697).
+fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    use serde::Deserialize;
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// XFRM ratings are `numeric` columns the API serializes as strings
