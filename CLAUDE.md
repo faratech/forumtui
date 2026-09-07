@@ -456,8 +456,10 @@ under `<config dir>/cache/img/` (32 MiB, 0600, atomic).
 
 ## Known gaps
 
-- Attachment upload is implemented in `common` but not wired into compose, so the
-  preview resolves `[IMG]` URLs only. Enter-to-expand an image is not implemented.
+- Profile posts, watched/unread feeds and moderator actions beyond
+  delete/solution (move, change type, approve) are not built. XF's REST API
+  exposes no watched-content or unread-thread endpoint at all, so that one
+  needs a TuiLink addon route like the login relay does.
 - Logout revokes only client-side: stock XF's `/api/oauth2/revoke` needs a client
   secret a public client cannot hold, so the 90-day refresh token outlives a
   sign-out until the TuiLink addon gains a revoke relay (#527). The client warns
