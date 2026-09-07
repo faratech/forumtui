@@ -176,6 +176,11 @@ pub struct ThreadViewState {
     /// unread, exactly as it would on the site.
     pub seen_date: i64,
     pub reported_date: i64,
+    /// A destructive key waiting on its second press (#708). Deleting a
+    /// post from a keystroke is not something to do on the first `D`, and a
+    /// modal dialog for it would be heavier than the action deserves — so
+    /// the key bar asks, and the same key confirms.
+    pub confirm_delete: Option<u32>,
     /// `[SPOILER]` bodies render hidden until this is flipped with `x`
     /// (issue #621): hidden is black-on-black by `style_from`, revealed is
     /// the text's own styling. Flipping forces `rebuild_lines` via
@@ -235,6 +240,13 @@ pub fn home_state(loading: bool) -> Screen {
 #[derive(Debug, Clone)]
 pub enum ComposeTarget {
     ThreadReply { thread_id: u32, thread_title: String },
+    /// Editing a post already posted (#708). The thread is carried so the
+    /// view can be refreshed on the page the post is actually on.
+    EditPost {
+        post_id: u32,
+        thread_id: u32,
+        thread_title: String,
+    },
     NewThread { node_id: u32 },
     ConversationReply {
         conversation_id: u32,
@@ -735,6 +747,12 @@ pub enum Action {
     StartReply(Thread),
     /// Reply with the selected post quoted (#707).
     StartReplyQuoting(Thread, Box<Post>),
+    /// Edit, delete or mark-as-solution the selected post (#708). Each is
+    /// offered only where the API said this reader may.
+    StartEditPost(Thread, Box<Post>),
+    SubmitEdit { post_id: u32, message: String },
+    DeletePost { post_id: u32, thread_id: u32 },
+    MarkSolution { post_id: u32, thread_id: u32 },
     StartReplyConversation(Conversation),
     StartNewThread(u32),
     StartNewConversation(Option<String>),

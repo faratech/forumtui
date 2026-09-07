@@ -655,6 +655,14 @@ pub trait WfApi: Send + Sync {
     /// list is shown: it clears the counter and leaves unactioned alerts
     /// highlighted (#694).
     async fn mark_alerts_viewed(&self) -> Result<()>;
+    /// Edit a post's message (#708). `POST /posts/{id}`.
+    async fn edit_post(&self, id: u32, message: &str) -> Result<()>;
+    /// Delete a post — soft by default, which is what XF's own UI does and
+    /// what leaves the content recoverable (#708).
+    async fn delete_post(&self, id: u32, hard: bool) -> Result<()>;
+    /// Toggle a post as its thread's solution (#708). XF unmarks whatever
+    /// was marked before, so this is a toggle, not a set.
+    async fn mark_solution(&self, id: u32) -> Result<()>;
     async fn mark_forum_read(&self, node_id: u32) -> Result<()>;
     async fn conversations(&self, page: u32) -> Result<ConversationsReply>;
     async fn conversation(&self, id: u32, page: u32) -> Result<ConversationReply>;
@@ -777,6 +785,37 @@ impl WfApi for WfApiClient {
     async fn mark_alerts_viewed(&self) -> Result<()> {
         self.post_unit("/alerts/mark-all", &[("viewed", "1".to_string())])
             .await
+    }
+
+    async fn edit_post(&self, id: u32, message: &str) -> Result<()> {
+        // An edit is a write like any other: it goes through the write gate,
+        // which is what keeps this client inside the zone's flood budget.
+        self.write_gate.wait().await;
+        self.post_unit(&format!("/posts/{id}"), &[("message", message.to_string())])
+            .await
+    }
+
+    async fn delete_post(&self, id: u32, hard: bool) -> Result<()> {
+        self.api_gate.wait().await;
+        let token = self.valid_token().await?;
+        let url = format!("{}/posts/{id}", self.api_base());
+        let form: Vec<(&str, String)> = if hard {
+            vec![("hard_delete", "1".to_string())]
+        } else {
+            Vec::new()
+        };
+        let resp = self
+            .http
+            .delete(url)
+            .form(&form)
+            .bearer_auth(&token)
+            .send()
+            .await?;
+        check_status(resp).await
+    }
+
+    async fn mark_solution(&self, id: u32) -> Result<()> {
+        self.post_unit_path(&format!("/posts/{id}/mark-solution")).await
     }
 
     async fn mark_forum_read(&self, node_id: u32) -> Result<()> {

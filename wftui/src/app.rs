@@ -302,6 +302,10 @@ pub enum Msg {
     ResourceLoaded { page: u32, result: TaskResult<ResourceListReply> },
     /// The gallery's category tree, and one resource's page (#697).
     MediaCategoriesLoaded(TaskResult<common::models::MediaCategoriesReply>),
+    /// Post edits, deletions and solution toggles (#708).
+    PostEdited { post_id: u32, result: TaskResult<()> },
+    PostDeleted { post_id: u32, thread_id: u32, result: TaskResult<()> },
+    SolutionMarked { post_id: u32, thread_id: u32, result: TaskResult<()> },
     ResourceViewLoaded { id: u32, result: TaskResult<common::models::ResourceReply> },
     SearchDone { generation: u64, page: u32, result: TaskResult<SearchResultsReply> },
     /// A go-to palette member lookup came back. `query` is the palette query
@@ -1885,6 +1889,56 @@ impl App {
                 });
             }
             Action::StartReply(thread) => self.reply_to_thread(&thread),
+            Action::StartEditPost(thread, post) => {
+                // Seeded with what is there now, caret at the start: an edit
+                // usually fixes the top of a post, not appends to it.
+                self.push_screen(Screen::Compose(screens::ComposeState {
+                    target: Some(ComposeTarget::EditPost {
+                        post_id: post.post_id,
+                        thread_id: thread.thread_id,
+                        thread_title: thread.title.clone(),
+                    }),
+                    author: self.me_name(),
+                    body: post.message.clone(),
+                    ..Default::default()
+                }));
+            }
+            Action::SubmitEdit { post_id, message } => {
+                let api = self.api.clone();
+                let tx = self.tx.clone();
+                self.spawn_write(async move {
+                    let result = api
+                        .edit_post(post_id, &message)
+                        .await
+                        .map_err(|e| TaskError::of(&e));
+                    tx.send(Msg::PostEdited { post_id, result }).ok();
+                });
+            }
+            Action::DeletePost { post_id, thread_id } => {
+                let api = self.api.clone();
+                let tx = self.tx.clone();
+                self.spawn_write(async move {
+                    // Soft delete, always: it is what XF's own UI does and it
+                    // leaves the post recoverable. A hard delete from a
+                    // terminal keystroke is not a thing this client offers.
+                    let result = api
+                        .delete_post(post_id, false)
+                        .await
+                        .map_err(|e| TaskError::of(&e));
+                    tx.send(Msg::PostDeleted { post_id, thread_id, result }).ok();
+                });
+            }
+            Action::MarkSolution { post_id, thread_id } => {
+                let api = self.api.clone();
+                let tx = self.tx.clone();
+                self.spawn_write(async move {
+                    let result = api
+                        .mark_solution(post_id)
+                        .await
+                        .map_err(|e| TaskError::of(&e));
+                    tx.send(Msg::SolutionMarked { post_id, thread_id, result }).ok();
+                });
+            }
             Action::StartReplyQuoting(thread, post) => {
                 // The quote block is built to WindowsForum's ContentIntegrity
                 // contract (#707): `post:`/`member:` naming the real source
@@ -4363,6 +4417,95 @@ impl App {
                     }
                 }
             }
+            Msg::PostEdited { post_id, result } => match result {
+                Ok(()) => {
+                    // Close the editor and reload the page the post is on,
+                    // so the reader sees what was actually saved rather than
+                    // what they typed. The thread comes from the editor's own
+                    // target, not from whatever thread view happens to be on
+                    // the stack.
+                    let mut thread_id = 0u32;
+                    if let Some(idx) = self.screens.iter().rposition(|s| {
+                        matches!(
+                            s,
+                            Screen::Compose(c)
+                                if matches!(
+                                    c.target,
+                                    Some(ComposeTarget::EditPost { post_id: p, .. }) if p == post_id
+                                )
+                        )
+                    }) {
+                        if let Screen::Compose(c) = &self.screens[idx]
+                            && let Some(ComposeTarget::EditPost { thread_id: t, .. }) = c.target
+                        {
+                            thread_id = t;
+                        }
+                        self.screens.remove(idx);
+                    }
+                    self.set_status("Post saved.");
+                    let page = self
+                        .screens
+                        .iter()
+                        .rev()
+                        .find_map(|s| match s {
+                            Screen::ThreadView(v) if v.thread.thread_id == thread_id => {
+                                Some(v.page.max(1))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(1);
+                    if thread_id > 0 {
+                        self.keep_thread_position = Some((thread_id, page, 0, 0));
+                        self.load_thread(thread_id, page);
+                    }
+                }
+                Err(e) => {
+                    if let Some(Screen::Compose(c)) = self.screens.last_mut() {
+                        c.busy = false;
+                        c.error = Some(e.message.clone());
+                    }
+                }
+            },
+            Msg::PostDeleted { post_id, thread_id, result } => match result {
+                Ok(()) => {
+                    self.set_status("Post deleted.");
+                    let page = self
+                        .screens
+                        .iter()
+                        .rev()
+                        .find_map(|s| match s {
+                            Screen::ThreadView(v) if v.thread.thread_id == thread_id => {
+                                Some(v.page.max(1))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(1);
+                    self.keep_thread_position = Some((thread_id, page, 0, 0));
+                    self.load_thread(thread_id, page);
+                    let _ = post_id;
+                }
+                Err(e) => self.set_status(format!("Delete failed: {}", e.message)),
+            },
+            Msg::SolutionMarked { post_id, thread_id, result } => match result {
+                Ok(()) => {
+                    self.set_status("Solution updated.");
+                    let page = self
+                        .screens
+                        .iter()
+                        .rev()
+                        .find_map(|s| match s {
+                            Screen::ThreadView(v) if v.thread.thread_id == thread_id => {
+                                Some(v.page.max(1))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(1);
+                    self.keep_thread_position = Some((thread_id, page, 0, 0));
+                    self.load_thread(thread_id, page);
+                    let _ = post_id;
+                }
+                Err(e) => self.set_status(format!("Could not mark solution: {}", e.message)),
+            },
             Msg::MediaCategoriesLoaded(result) => {
                 // Categories are decoration for the item pane: a failure
                 // leaves "All media" working rather than failing the screen.
@@ -5547,6 +5690,10 @@ mod tests {
         /// #694: what the client actually reported as read, and how often it
         /// cleared the alert counter.
         threads_read: std::sync::Mutex<Vec<(u32, Option<i64>)>>,
+        /// #708: the post writes that actually went out.
+        edits: std::sync::Mutex<Vec<(u32, String)>>,
+        deletes: std::sync::Mutex<Vec<(u32, bool)>>,
+        solutions: std::sync::Mutex<Vec<u32>>,
         alerts_viewed: std::sync::atomic::AtomicUsize,
         marked_read: std::sync::Mutex<Vec<u32>>,
         /// `(user_id, content, page)` per `search_member` call, and the
@@ -5631,6 +5778,18 @@ mod tests {
         }
         async fn create_thread(&self, _: u32, _: &str, _: &str) -> common::error::Result<Thread> {
             Err(common::error::Error::NoToken)
+        }
+        async fn edit_post(&self, id: u32, message: &str) -> common::error::Result<()> {
+            self.edits.lock().expect("lock").push((id, message.to_string()));
+            Ok(())
+        }
+        async fn delete_post(&self, id: u32, hard: bool) -> common::error::Result<()> {
+            self.deletes.lock().expect("lock").push((id, hard));
+            Ok(())
+        }
+        async fn mark_solution(&self, id: u32) -> common::error::Result<()> {
+            self.solutions.lock().expect("lock").push(id);
+            Ok(())
         }
         async fn mark_alerts_viewed(&self) -> common::error::Result<()> {
             self.alerts_viewed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -8243,6 +8402,113 @@ mod tests {
             matches!(app.screens.last(), Some(Screen::Resources(_))),
             "and the resources row opens the resource catalog"
         );
+    }
+
+    /// #708: editing a post sends the edit, closes the editor and reloads
+    /// the thread the EDITOR names — not whatever thread view happens to be
+    /// on the stack — so the reader sees what was saved.
+    #[tokio::test]
+    async fn editing_a_post_sends_it_and_reopens_the_thread() {
+        let api = std::sync::Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 9, title: "A thread".into(), ..Default::default() },
+            posts: vec![Post {
+                post_id: 500,
+                message: "before".into(),
+                can_edit: true,
+                ..Default::default()
+            }],
+            page: 2,
+            last_page: 2,
+            ..Default::default()
+        }));
+
+        app.execute_action(Action::StartEditPost(
+            Thread { thread_id: 9, title: "A thread".into(), ..Default::default() },
+            Box::new(Post { post_id: 500, message: "before".into(), can_edit: true, ..Default::default() }),
+        ));
+        match app.screens.last() {
+            Some(Screen::Compose(c)) => {
+                assert_eq!(c.body, "before", "the editor opens on what is there now");
+                assert!(matches!(
+                    c.target,
+                    Some(ComposeTarget::EditPost { post_id: 500, thread_id: 9, .. })
+                ));
+            }
+            _ => panic!("an editor should be open"),
+        }
+
+        app.execute_action(Action::SubmitEdit {
+            post_id: 500,
+            message: "after".into(),
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            api.edits.lock().expect("lock").clone(),
+            vec![(500, "after".to_string())]
+        );
+
+        app.handle_msg(Msg::PostEdited { post_id: 500, result: Ok(()) });
+        assert!(
+            matches!(app.screens.last(), Some(Screen::ThreadView(_))),
+            "the editor closes on success"
+        );
+        assert_eq!(
+            app.keep_thread_position.map(|(id, page, _, _)| (id, page)),
+            Some((9, 2)),
+            "and the thread reloads on the page the post is on"
+        );
+    }
+
+    /// A failed edit keeps the editor open with the draft intact — losing a
+    /// rewritten post to a 403 would be worse than the 403.
+    #[tokio::test]
+    async fn a_failed_edit_keeps_the_draft() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::EditPost {
+                post_id: 500,
+                thread_id: 9,
+                thread_title: "A thread".into(),
+            }),
+            body: "my rewrite".into(),
+            busy: true,
+            ..Default::default()
+        }));
+        app.handle_msg(Msg::PostEdited {
+            post_id: 500,
+            result: Err(TaskError {
+                message: "no permission".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::Api(403),
+            }),
+        });
+        match app.screens.last() {
+            Some(Screen::Compose(c)) => {
+                assert_eq!(c.body, "my rewrite", "the draft survives");
+                assert!(!c.busy);
+                assert_eq!(c.error.as_deref(), Some("no permission"));
+            }
+            _ => panic!("the editor must stay open"),
+        }
+    }
+
+    /// Deleting is soft, always: a hard delete from a keystroke is not
+    /// something this client offers.
+    #[tokio::test]
+    async fn deleting_a_post_is_a_soft_delete() {
+        let api = std::sync::Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+        app.screens.push(screens::home_state(false));
+        app.execute_action(Action::DeletePost { post_id: 500, thread_id: 9 });
+        tokio::task::yield_now().await;
+        assert_eq!(api.deletes.lock().expect("lock").clone(), vec![(500, false)]);
     }
 
     /// #694: reading a thread marks it read — up to the newest post that

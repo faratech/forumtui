@@ -453,6 +453,20 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
                             message: s.body.clone(),
                         };
                     }
+                    ComposeTarget::EditPost { post_id, .. } => {
+                        // An empty edit is a deletion by another name, and
+                        // XF refuses it — say so here rather than sending a
+                        // write that cannot succeed (#708).
+                        if s.body.trim().is_empty() {
+                            s.error = Some("A post cannot be edited to nothing.".into());
+                            return Action::None;
+                        }
+                        s.busy = true;
+                        return Action::SubmitEdit {
+                            post_id,
+                            message: s.body.clone(),
+                        };
+                    }
                 }
             }
             KeyCode::Char('y') | KeyCode::Char('v') => {
@@ -694,6 +708,13 @@ pub fn compose_hints(s: &super::ComposeState) -> Hints {
 pub fn compose_crumb(s: &super::ComposeState) -> String {
     match &s.target {
         Some(ComposeTarget::NewThread { .. }) => "New thread".into(),
+        Some(ComposeTarget::EditPost { thread_title, .. }) => {
+            if thread_title.is_empty() {
+                "Edit post".into()
+            } else {
+                format!("Edit post in {thread_title}")
+            }
+        }
         Some(ComposeTarget::ConversationReply { .. }) => "Reply".into(),
         _ => "Reply".into(),
     }

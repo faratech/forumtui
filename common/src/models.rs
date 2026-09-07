@@ -197,6 +197,15 @@ pub struct Post {
     /// `Thread::discussion_state` (#704).
     #[serde(default, deserialize_with = "null_default")]
     pub message_state: String,
+    /// What THIS reader may do to the post, decided by the server (#708).
+    /// The client offers a key only where the API says yes; the server
+    /// enforces regardless, so these are for the key bar, never for safety.
+    #[serde(default, deserialize_with = "null_default")]
+    pub can_edit: bool,
+    #[serde(default, deserialize_with = "null_default")]
+    pub can_soft_delete: bool,
+    #[serde(default, deserialize_with = "null_default")]
+    pub can_hard_delete: bool,
     #[serde(default)]
     pub thread_id: u32,
     #[serde(default)]

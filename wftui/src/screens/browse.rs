@@ -2083,6 +2083,11 @@ fn clip_to(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
 }
 
 pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
+    // Any key that is not the second `D` disarms the delete confirmation
+    // (#708): an armed destructive key must not survive the reader moving on.
+    if !matches!(key.code, KeyCode::Char('D')) {
+        s.confirm_delete = None;
+    }
     if s.link_popup {
         return link_popup_key(s, key);
     }
@@ -2129,6 +2134,42 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
             }
         }
         KeyCode::Char('r') => Action::StartReply(s.thread.clone()),
+        // #708: edit, delete and mark-solution, each offered only where the
+        // API said this reader may — the server enforces regardless, so
+        // these gates are about not advertising a key that will 403.
+        KeyCode::Char('e') => match s.posts.get(s.sel_post) {
+            Some(post) if post.can_edit => {
+                Action::StartEditPost(s.thread.clone(), Box::new(post.clone()))
+            }
+            Some(_) => Action::Notice("You cannot edit that post.".into()),
+            None => Action::None,
+        },
+        KeyCode::Char('S') => match s.posts.get(s.sel_post) {
+            Some(post) => Action::MarkSolution {
+                post_id: post.post_id,
+                thread_id: s.thread.thread_id,
+            },
+            None => Action::None,
+        },
+        // Two presses: the first arms, the second deletes. Any other key
+        // disarms it (below), so a stray `D` cannot delete a post.
+        KeyCode::Char('D') => match s.posts.get(s.sel_post) {
+            Some(post) if post.can_soft_delete => {
+                let id = post.post_id;
+                if s.confirm_delete == Some(id) {
+                    s.confirm_delete = None;
+                    Action::DeletePost {
+                        post_id: id,
+                        thread_id: s.thread.thread_id,
+                    }
+                } else {
+                    s.confirm_delete = Some(id);
+                    Action::Notice("Press D again to delete this post.".into())
+                }
+            }
+            Some(_) => Action::Notice("You cannot delete that post.".into()),
+            None => Action::None,
+        },
         // `Q` quotes the selected post into a reply (#707) — `q` is taken by
         // "back", and quoting is the reply path, not a separate screen.
         KeyCode::Char('Q') => match s.posts.get(s.sel_post) {
@@ -2325,35 +2366,44 @@ pub fn thread_view_hints(s: &ThreadViewState) -> Hints {
     if s.error.is_some() {
         return Hints::with_short(&[("R", "retry"), ("Esc", "back")], &[("R", "retry"), ("Esc", "back")], 0);
     }
+    // #708: the post-specific keys are advertised only where the API said
+    // this reader may use them — a cap that 403s is the bug #561 fixed.
+    let sel = s.posts.get(s.sel_post);
+    let can_edit = sel.is_some_and(|p| p.can_edit);
+    let can_delete = sel.is_some_and(|p| p.can_soft_delete);
+    let mut keys: Vec<(&str, &str)> = vec![("r", "reply"), ("Q", "quote")];
+    if can_edit {
+        keys.push(("e", "edit"));
+    }
+    if can_delete {
+        keys.push((
+            "D",
+            if s.confirm_delete.is_some() {
+                "confirm"
+            } else {
+                "delete"
+            },
+        ));
+    }
+    keys.extend_from_slice(&[
+        ("j/k", "scroll"),
+        ("n/N", "post"),
+        ("l", "like"),
+        ("v", "vote"),
+        ("o", "links"),
+        ("x", if s.reveal_spoilers { "hide" } else { "reveal" }),
+        ("u", "web"),
+        ("Esc", "back"),
+    ]);
     Hints::with_short(
-        &[
-            ("r", "reply"),
-            ("Q", "quote"),
-            ("j/k", "scroll"),
-            ("n/N", "post"),
-            ("l", "like"),
-            ("v", "vote"),
-            ("o", "links"),
-            ("1-9", "image"),
-            (
-                "x",
-                if s.reveal_spoilers { "hide" } else { "reveal" },
-            ),
-            ("u", "web"),
-            ("Esc", "back"),
-        ],
+        &keys,
         &[
             ("r", "reply"),
             ("j/k", ""),
             ("n/N", "post"),
             ("l", "like"),
-            // `v vote` yields its short-bar slot to the spoiler toggle at
-            // this width — it stays in the full set and the keys card.
             ("o", "links"),
-            (
-                "x",
-                if s.reveal_spoilers { "hide" } else { "reveal" },
-            ),
+            ("x", if s.reveal_spoilers { "hide" } else { "reveal" }),
             ("Esc", "back"),
         ],
         0,
@@ -3770,6 +3820,65 @@ mod tests {
     /// #693: a picture the message references renders WHERE the message
     /// puts it, and only the attachments the message never mentioned are
     /// listed underneath — the same split XenForo renders.
+    /// #708: edit, delete and mark-solution are offered only where the API
+    /// said this reader may — advertising a key that 403s is the bug #561
+    /// fixed, and the server enforces regardless of what the bar says.
+    #[test]
+    fn post_actions_follow_the_permissions_the_api_sent() {
+        let mut s = thread_view_fixture();
+        s.posts[0].post_id = 500;
+        s.posts[0].can_edit = false;
+        s.posts[0].can_soft_delete = false;
+        s.sel_post = 0;
+
+        // Not permitted: the caps are absent and the keys refuse out loud
+        // rather than sending a write that cannot succeed.
+        let caps: Vec<&str> = thread_view_hints(&s).keys.iter().map(|(k, _)| *k).collect();
+        assert!(!caps.contains(&"e") && !caps.contains(&"D"), "{caps:?}");
+        assert!(matches!(thread_view_key(&mut s, key('e')), Action::Notice(_)));
+        assert!(matches!(thread_view_key(&mut s, key('D')), Action::Notice(_)));
+
+        // Permitted: both caps appear.
+        s.posts[0].can_edit = true;
+        s.posts[0].can_soft_delete = true;
+        let caps: Vec<&str> = thread_view_hints(&s).keys.iter().map(|(k, _)| *k).collect();
+        assert!(caps.contains(&"e") && caps.contains(&"D"), "{caps:?}");
+        assert!(matches!(
+            thread_view_key(&mut s, key('e')),
+            Action::StartEditPost(_, _)
+        ));
+    }
+
+    /// Deleting takes two presses, and anything else disarms it — a stray
+    /// `D` must not remove a post.
+    #[test]
+    fn deleting_a_post_needs_a_second_press() {
+        let mut s = thread_view_fixture();
+        s.posts[0].post_id = 500;
+        s.posts[0].can_soft_delete = true;
+        s.sel_post = 0;
+
+        assert!(matches!(thread_view_key(&mut s, key('D')), Action::Notice(_)));
+        assert_eq!(s.confirm_delete, Some(500), "the first press only arms it");
+        // The bar says so while it is armed.
+        assert!(
+            thread_view_hints(&s).keys.iter().any(|(k, d)| *k == "D" && *d == "confirm"),
+            "the key bar must say it is waiting for confirmation"
+        );
+        assert!(matches!(
+            thread_view_key(&mut s, key('D')),
+            Action::DeletePost { post_id: 500, .. }
+        ));
+        assert_eq!(s.confirm_delete, None, "and it disarms once it fires");
+
+        // Any other key disarms: arming must not survive the reader moving.
+        thread_view_key(&mut s, key('D'));
+        assert_eq!(s.confirm_delete, Some(500));
+        thread_view_key(&mut s, key('j'));
+        assert_eq!(s.confirm_delete, None, "moving on disarms it");
+        assert!(matches!(thread_view_key(&mut s, key('D')), Action::Notice(_)));
+    }
+
     /// #707: `Q` quotes the selected post into a reply, with the attribution
     /// WindowsForum's ContentIntegrity analyzer requires.
     #[test]

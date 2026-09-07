@@ -152,6 +152,22 @@ If `/me` reports a different user, the old identity is torn down and a hint name
 the new one. `logout()` forgets tokens synchronously before the (slow) revoke
 calls. Writes carry the session generation and are aborted by `end_session`.
 
+## Writing: reply, quote, edit, delete, solution
+
+The thread view's write keys are `r` reply, `Q` quote (see below), `e` edit,
+`D` delete, `S` mark solution. Three rules hold across them:
+
+- **The API's own permission flags decide what is offered.** Posts carry
+  `can_edit` / `can_soft_delete` / `can_hard_delete`; a key absent from the
+  bar is a key the server would refuse. The server enforces regardless — the
+  flags are for the key bar, never for safety.
+- **Delete is soft and takes two presses.** Soft is what XF's own UI does and
+  leaves the post recoverable; the first `D` arms, the second deletes, and
+  any other key disarms (`ThreadViewState::confirm_delete`). No hard delete
+  from a keystroke.
+- **A failed write keeps the draft.** The editor stays open with its text and
+  the error; losing a rewritten post to a 403 is worse than the 403.
+
 ## Quoting — the ContentIntegrity contract
 
 `Q` in the thread view replies with the selected post quoted, and the block
