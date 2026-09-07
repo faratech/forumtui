@@ -54,6 +54,45 @@ impl DraftKey {
         }
     }
 
+    /// The key XenForo uses for the same composer, or `None` for a kind XF
+    /// has no draft for (#716).
+    ///
+    /// These are not ours to choose: they come from the entity relation
+    /// conditions XF matches on — `Thread::DraftReplies` is `thread-$thread_id`,
+    /// `Forum::DraftThreads` is `forum-$node_id`, and
+    /// `ConversationMaster::DraftReplies` is
+    /// `conversation-reply-$conversation_id`. Get one wrong and the draft is
+    /// invisible to the website rather than broken, which is worse.
+    ///
+    /// `EditPost` returns `None` on purpose, and that `None` is the whole
+    /// "edits stay local" rule: XF's edit form has no draft at all, so there
+    /// is no key to sync to.
+    pub fn xf_key(&self) -> Option<String> {
+        match self {
+            DraftKey::ThreadReply(id) => Some(format!("thread-{id}")),
+            DraftKey::NewThread(id) => Some(format!("forum-{id}")),
+            DraftKey::ConversationReply(id) => Some(format!("conversation-reply-{id}")),
+            DraftKey::EditPost(_) => None,
+        }
+    }
+
+    /// The inverse. An unknown kind — `report-…`, or one an add-on adds
+    /// later — is `None` and the draft is skipped, never guessed at.
+    pub fn from_xf_key(s: &str) -> Option<Self> {
+        // `conversation-reply-` first: `split_once('-')` on it would otherwise
+        // yield the kind "conversation" and a non-numeric rest.
+        if let Some(id) = s.strip_prefix("conversation-reply-") {
+            return id.parse().ok().map(DraftKey::ConversationReply);
+        }
+        if let Some(id) = s.strip_prefix("thread-") {
+            return id.parse().ok().map(DraftKey::ThreadReply);
+        }
+        if let Some(id) = s.strip_prefix("forum-") {
+            return id.parse().ok().map(DraftKey::NewThread);
+        }
+        None
+    }
+
     /// Parse the on-disk form. An unrecognised key is `None` and its draft is
     /// dropped: a store written by a newer build must not brick an older one.
     pub fn from_key(s: &str) -> Option<Self> {
@@ -83,6 +122,13 @@ pub struct Draft {
     /// the thing they just got back is.
     #[serde(default)]
     pub saved_at: i64,
+    /// This draft came from the website and its copy there carries
+    /// attachments this client cannot re-attach (#716): XF stores a
+    /// `temp_hash`, and the API's attachment keys are rows that *wrap* a
+    /// hash, so a hash cannot be turned back into a usable key. Say so on
+    /// resume rather than let the files vanish silently.
+    #[serde(default)]
+    pub remote_attachments: bool,
 }
 
 impl Draft {
@@ -231,6 +277,7 @@ mod tests {
             body: body.into(),
             attachment_key: None,
             saved_at,
+            remote_attachments: false,
         }
     }
 
@@ -245,6 +292,7 @@ mod tests {
                 body: "line one\n\nline two [B]bold[/B]".into(),
                 attachment_key: Some("key-1".into()),
                 saved_at: 1_700_000_000,
+                remote_attachments: false,
             },
         );
         store.save(&map).unwrap();
@@ -349,6 +397,58 @@ mod tests {
         let back = store.load();
         assert_eq!(back.len(), 1);
         assert_eq!(back[&DraftKey::ThreadReply(1)].body, "now");
+    }
+
+    /// #716: these three strings are XenForo's, not ours — they come from the
+    /// entity relation conditions XF matches drafts on. A wrong one does not
+    /// error, it just makes the draft invisible to the website, so pin them
+    /// literally rather than round-tripping through our own formatter.
+    #[test]
+    fn xf_keys_are_the_ones_xenforo_matches_on() {
+        assert_eq!(DraftKey::ThreadReply(51465).xf_key().as_deref(), Some("thread-51465"));
+        assert_eq!(DraftKey::NewThread(88).xf_key().as_deref(), Some("forum-88"));
+        assert_eq!(
+            DraftKey::ConversationReply(5).xf_key().as_deref(),
+            Some("conversation-reply-5")
+        );
+    }
+
+    /// XF's edit form has no draft, so an edit has nowhere to sync to. This
+    /// `None` is the entire "edits stay local" rule.
+    #[test]
+    fn an_edit_draft_has_no_xf_key() {
+        assert_eq!(DraftKey::EditPost(500).xf_key(), None);
+    }
+
+    #[test]
+    fn xf_keys_round_trip_and_stay_distinct() {
+        for k in [
+            DraftKey::ThreadReply(7),
+            DraftKey::NewThread(7),
+            DraftKey::ConversationReply(7),
+        ] {
+            let key = k.xf_key().expect("has an xf key");
+            assert_eq!(DraftKey::from_xf_key(&key), Some(k), "{key}");
+        }
+    }
+
+    /// `conversation-reply-N` starts with neither `thread-` nor `forum-`, but
+    /// a naive `split_once('-')` reads it as kind "conversation"; and a kind
+    /// this build does not know (a report draft, or an add-on's) must be
+    /// skipped rather than guessed at.
+    #[test]
+    fn unknown_or_malformed_xf_keys_are_rejected() {
+        for bad in [
+            "report-1",
+            "conversation-5",
+            "thread-",
+            "thread-x",
+            "forum-1x",
+            "../etc/passwd",
+            "",
+        ] {
+            assert_eq!(DraftKey::from_xf_key(bad), None, "{bad:?} must not parse");
+        }
     }
 
     #[cfg(unix)]

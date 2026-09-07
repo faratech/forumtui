@@ -252,6 +252,10 @@ impl App {
         // pair running" regardless) stops the previous pair first rather
         // than doubling the poll rate.
         self.stop_pollers();
+        // The website's composer drafts (#716). Not a poller — one fetch each
+        // time a session goes live, which is also what picks up a reply
+        // started in the browser since the last run.
+        self.sync_drafts();
         // Alerts poller: unread count for the status bar.
         let api = self.api.clone();
         let tx = self.tx.clone();

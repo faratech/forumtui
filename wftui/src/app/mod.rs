@@ -327,6 +327,11 @@ pub enum Msg {
         mark_read: bool,
         result: TaskResult<ConversationReply>,
     },
+    /// The website's composer drafts, merged into the local store (#716).
+    /// Carries no error arm on purpose: a draft sync that fails is a no-op
+    /// the user cannot act on, so the failure is logged where it happens and
+    /// never reaches the session boundary.
+    DraftsLoaded(Vec<common::models::RemoteDraft>),
     ConvoReplySent(TaskResult<()>),
     ConvoCreated(TaskResult<Conversation>),
     /// The id travels with the result (issue #608) so a successful mark can
@@ -1440,12 +1445,16 @@ impl App {
             body: c.body.clone(),
             attachment_key: c.attachment_key.clone(),
             saved_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+            // Whatever the website's copy carried, this one is now ours and
+            // its files (if any) are reachable through `attachment_key`.
+            remote_attachments: false,
         };
         if draft.is_empty() {
             self.discard_draft(key);
             return;
         }
         let too_big = draft.too_big_to_persist();
+        self.push_draft(key, &draft);
         self.drafts.insert(key, draft);
         self.persist_drafts();
         if too_big {
@@ -1469,6 +1478,9 @@ impl App {
             _ => None,
         };
         if let Some(key) = key {
+            // `discard_draft` also clears it on the website, which is the
+            // whole reason this path exists: the REST API does not delete
+            // drafts the way XF's web post controller does (#716).
             self.discard_draft(key);
         }
         self.screens.remove(idx);
@@ -1481,12 +1493,23 @@ impl App {
         if self.drafts.remove(&key).is_some() {
             self.persist_drafts();
         }
+        // Unconditionally, not only when a local copy existed: the draft may
+        // have been written in the browser and never resumed here, and the
+        // point of a discard is that it is gone from both.
+        self.drop_remote_draft(key);
     }
 
     /// Forget every draft, in memory and on disk. For the two moments where
     /// the drafts stop belonging to whoever is now at the keyboard: an
     /// explicit sign-out, and the token store turning out to hold a
     /// different account.
+    ///
+    /// Deliberately local-only — it does **not** clear the website's copies
+    /// (#716). Those live behind the signing-out user's own account, where
+    /// they are already private and where they are still wanted; the problem
+    /// this solves is the next person at this keyboard, not the drafts
+    /// themselves. Signing out of a terminal must not destroy the reply
+    /// somebody has half-written in their browser.
     fn clear_all_drafts(&mut self) {
         if !self.drafts.is_empty() {
             self.drafts.clear();
@@ -1494,6 +1517,103 @@ impl App {
         if let Err(e) = self.draft_store.erase() {
             tracing::warn!("could not clear drafts: {e}");
         }
+    }
+
+    /// Mirror a draft to the website, best effort (#716).
+    ///
+    /// Fire-and-forget on purpose: the local save has already succeeded by
+    /// the time this runs, so a relay failure costs nothing the user can act
+    /// on — and blocking Esc on a network round trip to save something we
+    /// already saved would be the wrong trade. `drafts.json` stays the store
+    /// the composer reads; this only keeps the website in step.
+    fn push_draft(&self, key: common::drafts::DraftKey, draft: &common::drafts::Draft) {
+        // `None` means XF has no draft for this kind — an edit. Local only.
+        let Some(xf_key) = key.xf_key() else {
+            return;
+        };
+        let api = self.api.clone();
+        let (message, title) = (draft.body.clone(), draft.title.clone());
+        let attachment_key = draft.attachment_key.clone();
+        tokio::spawn(async move {
+            if let Err(e) = api
+                .save_draft(&xf_key, &message, &title, attachment_key.as_deref())
+                .await
+            {
+                tracing::warn!("could not sync draft {xf_key} to the site: {e}");
+            }
+        });
+    }
+
+    /// Forget a draft on the website too.
+    ///
+    /// Load-bearing on the send path: XF's *web* controller deletes the draft
+    /// when a post succeeds, but the REST API never touches drafts at all, so
+    /// without this every post made from the TUI would leave a stale draft
+    /// waiting in the browser's editor.
+    fn drop_remote_draft(&self, key: common::drafts::DraftKey) {
+        let Some(xf_key) = key.xf_key() else {
+            return;
+        };
+        let api = self.api.clone();
+        tokio::spawn(async move {
+            if let Err(e) = api.delete_draft(&xf_key).await {
+                tracing::warn!("could not clear draft {xf_key} on the site: {e}");
+            }
+        });
+    }
+
+    /// Merge the website's drafts into the local store, newest wins (#716).
+    ///
+    /// Runs once when a session goes live rather than when a composer opens,
+    /// so opening a composer stays instant — it reads a map that is already
+    /// in memory.
+    fn merge_remote_drafts(&mut self, remote: Vec<common::models::RemoteDraft>) {
+        let mut changed = false;
+        for r in remote {
+            // A kind this build does not know is skipped, not guessed at.
+            let Some(key) = common::drafts::DraftKey::from_xf_key(&r.key) else {
+                continue;
+            };
+            if let Some(local) = self.drafts.get(&key)
+                && local.saved_at >= r.last_update
+            {
+                // Ours is the same age or newer: keep it. Equal timestamps
+                // mean this is the copy we pushed.
+                continue;
+            }
+            self.drafts.insert(
+                key,
+                common::drafts::Draft {
+                    title: r.title,
+                    body: r.message,
+                    // The website's copy cannot hand us a usable attachment
+                    // key, but a key minted in *this* session still works, so
+                    // keep one if we have it rather than dropping it.
+                    attachment_key: self.drafts.get(&key).and_then(|d| d.attachment_key.clone()),
+                    saved_at: r.last_update,
+                    remote_attachments: r.has_attachments,
+                },
+            );
+            changed = true;
+        }
+        if changed {
+            self.persist_drafts();
+        }
+    }
+
+    /// Ask the website for this account's drafts. Errors are logged and
+    /// dropped: nothing about the composer depends on this call succeeding.
+    fn sync_drafts(&self) {
+        let api = self.api.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match api.list_drafts().await {
+                Ok(drafts) => {
+                    tx.send(Msg::DraftsLoaded(drafts)).ok();
+                }
+                Err(e) => tracing::warn!("could not read drafts from the site: {e}"),
+            }
+        });
     }
 
     /// Write the store, best effort. A draft is a convenience: failing to
@@ -1625,7 +1745,17 @@ impl App {
             c.title_cursor = c.title.chars().count();
             c.body_cursor = c.body.chars().count();
             c.resumed = true;
-            self.set_hint("Resumed your saved draft — ^X discards it.");
+            if draft.remote_attachments {
+                // Say it rather than let the files quietly not be there: the
+                // website's copy carries attachments, and XF's temp hash
+                // cannot be turned back into a key this client could spend
+                // (#716).
+                self.set_hint(
+                    "Resumed a draft from the website. Its attachments stay there —                      ^X discards the draft.",
+                );
+            } else {
+                self.set_hint("Resumed your saved draft — ^X discards it.");
+            }
         }
         self.screens.push(screen);
     }
@@ -2834,6 +2964,14 @@ mod tests {
         /// needs the recheck to actually answer `Bootstrap { Ok }` so it can
         /// assert that answer is honoured rather than swallowed.
         me_ok: std::sync::Mutex<Option<User>>,
+        /// #716: the draft relay calls that reached the stub, and what
+        /// `list_drafts` should answer. `drafts_fail` makes the relay error,
+        /// which is how "a relay failure must not cost the local draft" is
+        /// tested.
+        drafts_saved: std::sync::Mutex<Vec<(String, String, String)>>,
+        drafts_deleted: std::sync::Mutex<Vec<String>>,
+        drafts_remote: std::sync::Mutex<Vec<common::models::RemoteDraft>>,
+        drafts_fail: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingApi {
@@ -2855,10 +2993,46 @@ mod tests {
         fn reactions(&self) -> Vec<u32> {
             self.reactions.lock().expect("lock").clone()
         }
+        fn drafts_saved(&self) -> Vec<(String, String, String)> {
+            self.drafts_saved.lock().expect("lock").clone()
+        }
+        fn drafts_deleted(&self) -> Vec<String> {
+            self.drafts_deleted.lock().expect("lock").clone()
+        }
     }
 
     #[async_trait::async_trait]
     impl WfApi for RecordingApi {
+        async fn list_drafts(&self) -> common::error::Result<Vec<common::models::RemoteDraft>> {
+            if self.drafts_fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(common::error::Error::NoToken);
+            }
+            Ok(self.drafts_remote.lock().expect("lock").clone())
+        }
+        async fn save_draft(
+            &self,
+            xf_key: &str,
+            message: &str,
+            title: &str,
+            _attachment_key: Option<&str>,
+        ) -> common::error::Result<()> {
+            if self.drafts_fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(common::error::Error::NoToken);
+            }
+            self.drafts_saved.lock().expect("lock").push((
+                xf_key.to_string(),
+                message.to_string(),
+                title.to_string(),
+            ));
+            Ok(())
+        }
+        async fn delete_draft(&self, xf_key: &str) -> common::error::Result<()> {
+            if self.drafts_fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(common::error::Error::NoToken);
+            }
+            self.drafts_deleted.lock().expect("lock").push(xf_key.to_string());
+            Ok(())
+        }
         async fn mark_conversation_read(&self, id: u32) -> common::error::Result<()> {
             self.marked_read.lock().expect("lock").push(id);
             Ok(())
@@ -5091,8 +5265,9 @@ mod tests {
 
     /// #715: Esc used to destroy an unsent post outright. It must keep it,
     /// and the same composer must offer it back.
-    #[test]
-    fn esc_keeps_the_draft_and_reopening_the_same_composer_restores_it() {
+    // Async: the draft lifecycle now spawns relay calls (#716).
+    #[tokio::test]
+    async fn esc_keeps_the_draft_and_reopening_the_same_composer_restores_it() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
         app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
@@ -5119,8 +5294,9 @@ mod tests {
     /// A draft belongs to one composer. An edit of a post and a fresh reply
     /// to the thread holding it must not share one, or a resumed edit would
     /// silently overwrite a post with someone's half-written reply.
-    #[test]
-    fn drafts_do_not_leak_between_composers() {
+    // Async: the draft lifecycle now spawns relay calls (#716).
+    #[tokio::test]
+    async fn drafts_do_not_leak_between_composers() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
 
@@ -5151,8 +5327,9 @@ mod tests {
 
     /// Opening a composer, thinking better of it and pressing Esc must not
     /// leave an empty draft to be "resumed" later.
-    #[test]
-    fn an_empty_composer_stores_nothing() {
+    // Async: the draft lifecycle now spawns relay calls (#716).
+    #[tokio::test]
+    async fn an_empty_composer_stores_nothing() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
         app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
@@ -5196,8 +5373,9 @@ mod tests {
     /// `^X` on a resumed composer forgets the draft and puts back what the
     /// composer would have shown without one. For an edit that seed is the
     /// post's current text, so discarding a draft must not empty the post.
-    #[test]
-    fn discarding_a_resumed_draft_restores_the_seed_not_an_empty_editor() {
+    // Async: the draft lifecycle now spawns relay calls (#716).
+    #[tokio::test]
+    async fn discarding_a_resumed_draft_restores_the_seed_not_an_empty_editor() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
         let thread = Thread { thread_id: 7, title: "A thread".into(), ..Default::default() };
@@ -5236,8 +5414,9 @@ mod tests {
     /// #715 + #581: a draft is unsent writing by one account. Signing out
     /// must not leave it on disk for whoever signs in next — on the same
     /// machine, one restart later.
-    #[test]
-    fn signing_out_forgets_the_drafts() {
+    // Async: the draft lifecycle now spawns relay calls (#716).
+    #[tokio::test]
+    async fn signing_out_forgets_the_drafts() {
         let mut app = test_app();
         let path = app.draft_store.path().to_path_buf();
         let _ = std::fs::remove_file(&path);
@@ -5257,8 +5436,9 @@ mod tests {
     /// A session that merely *expires* is the same person coming back, so
     /// their draft must still be there. Only an explicit sign-out and a
     /// changed identity clear it.
-    #[test]
-    fn an_expired_session_keeps_the_draft() {
+    // Async: the draft lifecycle now spawns relay calls (#716).
+    #[tokio::test]
+    async fn an_expired_session_keeps_the_draft() {
         let mut app = test_app();
         let _ = std::fs::remove_file(app.draft_store.path());
         app.screens.push(screens::home_state(false));
@@ -5279,8 +5459,9 @@ mod tests {
 
     /// The whole point of writing the file: a draft must survive the process,
     /// not just the screen stack.
-    #[test]
-    fn a_draft_survives_a_restart() {
+    // Async: the draft lifecycle now spawns relay calls (#716).
+    #[tokio::test]
+    async fn a_draft_survives_a_restart() {
         let mut app = test_app();
         let path = app.draft_store.path().to_path_buf();
         let _ = std::fs::remove_file(&path);
@@ -5293,6 +5474,7 @@ mod tests {
 
         // A second app reading the same store is what a restart looks like.
         let mut next = test_app();
+        next.draft_store = common::drafts::Store::with_path(path.clone());
         next.drafts = next.draft_store.load();
         next.screens.push(screens::home_state(false));
         next.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
@@ -5301,6 +5483,181 @@ mod tests {
             _ => panic!("expected a composer"),
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// #716: the point of the relay. A reply started in the browser must be
+    /// what the composer offers, and the merge must not need the composer to
+    /// be open — it runs once when the session goes live.
+    #[tokio::test]
+    async fn a_draft_from_the_website_is_offered_in_the_composer() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.merge_remote_drafts(vec![common::models::RemoteDraft {
+            key: "thread-7".into(),
+            message: "typed in the browser".into(),
+            title: String::new(),
+            last_update: 2_000,
+            has_attachments: false,
+        }]);
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        match app.screens.last() {
+            Some(Screen::Compose(c)) => {
+                assert_eq!(c.body, "typed in the browser");
+                assert!(c.resumed);
+            }
+            _ => panic!("expected a composer"),
+        }
+    }
+
+    /// Newest wins, in both directions — otherwise a stale server copy would
+    /// silently overwrite words typed here a moment ago.
+    #[tokio::test]
+    async fn the_newer_side_wins_the_merge() {
+        let mut app = test_app();
+        let key = common::drafts::DraftKey::ThreadReply(7);
+        let local = |t: i64| common::drafts::Draft {
+            body: "local".into(),
+            saved_at: t,
+            ..Default::default()
+        };
+        let remote = |t: i64| common::models::RemoteDraft {
+            key: "thread-7".into(),
+            message: "remote".into(),
+            last_update: t,
+            ..Default::default()
+        };
+
+        app.drafts.insert(key, local(5_000));
+        app.merge_remote_drafts(vec![remote(1_000)]);
+        assert_eq!(app.drafts[&key].body, "local", "an older server copy must not win");
+
+        app.merge_remote_drafts(vec![remote(9_000)]);
+        assert_eq!(app.drafts[&key].body, "remote", "a newer server copy must win");
+
+        // Equal timestamps are the copy we pushed ourselves; keep ours.
+        app.drafts.insert(key, local(9_000));
+        app.merge_remote_drafts(vec![remote(9_000)]);
+        assert_eq!(app.drafts[&key].body, "local", "a tie keeps the local copy");
+    }
+
+    /// A kind this build cannot map — a report draft, or one an add-on adds
+    /// later — is skipped, never guessed at.
+    #[tokio::test]
+    async fn unknown_remote_draft_kinds_are_ignored() {
+        let mut app = test_app();
+        app.merge_remote_drafts(vec![
+            common::models::RemoteDraft { key: "report-1".into(), message: "x".into(), ..Default::default() },
+            common::models::RemoteDraft { key: "thread-7".into(), message: "ok".into(), ..Default::default() },
+        ]);
+        assert_eq!(app.drafts.len(), 1);
+        assert!(app.drafts.contains_key(&common::drafts::DraftKey::ThreadReply(7)));
+    }
+
+    /// Esc mirrors the draft to the website under XenForo's own key, and a
+    /// successful send clears it there too — the REST API does not delete
+    /// drafts the way XF's web post controller does, so without that every
+    /// post from here would leave one behind in the browser.
+    #[tokio::test]
+    async fn drafts_are_pushed_and_cleared_on_the_site() {
+        let api = Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+        app.screens.push(screens::home_state(false));
+
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "shared words".into();
+        }
+        app.pop_screen();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            api.drafts_saved(),
+            vec![("thread-7".to_string(), "shared words".to_string(), String::new())],
+            "Esc must mirror the draft under XF's own key"
+        );
+
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.handle_msg(Msg::ReplySent(Ok(Post { post_id: 1, thread_id: 7, ..Default::default() })));
+        tokio::task::yield_now().await;
+        assert_eq!(api.drafts_deleted(), vec!["thread-7".to_string()]);
+    }
+
+    /// XF has no draft for an edit, so there is nothing to sync to. The
+    /// local draft still works; it just never reaches the wire.
+    #[tokio::test]
+    async fn an_edit_draft_is_never_sent_to_the_site() {
+        let api = Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+        app.screens.push(screens::home_state(false));
+
+        let thread = Thread { thread_id: 7, title: "A thread".into(), ..Default::default() };
+        let post = Post { post_id: 500, thread_id: 7, ..Default::default() };
+        app.execute_action(Action::StartEditPost(thread, Box::new(post)));
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "an edit in progress".into();
+        }
+        app.pop_screen();
+        tokio::task::yield_now().await;
+
+        assert!(api.drafts_saved().is_empty(), "an edit has no XF draft key");
+        assert_eq!(
+            app.drafts.len(),
+            1,
+            "but it is still kept locally — that is the whole point of #715"
+        );
+    }
+
+    /// The #715 regression guard, under #716: the relay is a mirror, not the
+    /// store. If the site is unreachable the words must still be here.
+    #[tokio::test]
+    async fn a_relay_failure_never_costs_the_local_draft() {
+        let api = Arc::new(RecordingApi::default());
+        api.drafts_fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut app = test_app();
+        app.api = api.clone();
+        app.screens.push(screens::home_state(false));
+
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "survives a broken relay".into();
+        }
+        app.pop_screen();
+        tokio::task::yield_now().await;
+
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        match app.screens.last() {
+            Some(Screen::Compose(c)) => assert_eq!(c.body, "survives a broken relay"),
+            _ => panic!("expected a composer"),
+        }
+    }
+
+    /// Signing out clears this machine's drafts, but must NOT reach across
+    /// and delete the website's copies: those live behind the signing-out
+    /// user's own account, where they are still wanted. Signing out of a
+    /// terminal must not destroy a reply half-written in a browser.
+    #[tokio::test]
+    async fn signing_out_does_not_delete_the_websites_drafts() {
+        let api = Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+        let _ = std::fs::remove_file(app.draft_store.path());
+        app.screens.push(screens::home_state(false));
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "still mine on the website".into();
+        }
+        app.pop_screen();
+        tokio::task::yield_now().await;
+
+        app.clear_all_drafts();
+        tokio::task::yield_now().await;
+        assert!(app.drafts.is_empty(), "gone from this machine");
+        assert!(
+            api.drafts_deleted().is_empty(),
+            "but never deleted from the account they belong to"
+        );
+        let _ = std::fs::remove_file(app.draft_store.path());
     }
 
     /// GUARD (issue #565). No test may read or write the machine owner's
@@ -5379,6 +5736,9 @@ mod tests {
     /// answers `NoToken` for everything (no request can leave the process
     /// even if a handler spawns one) and `App::client` is pinned to a
     /// scratch store and an unreachable origin.
+    /// Gives every `test_app()` its own draft store; see the comment there.
+    static TEST_DRAFT_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
     fn test_app() -> App {
         let client = offline_client();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -5397,8 +5757,17 @@ mod tests {
             drafts: std::collections::HashMap::new(),
             // Scratch dir, never the operator's own (#565) — asserted by
             // `guard_no_test_touches_the_real_config_dir_or_the_live_site`.
+            //
+            // One file PER APP, not one shared by every test: the suite runs
+            // in parallel, and a shared store meant a test that removed its
+            // draft file deleted another test's draft mid-run. A test that
+            // deliberately wants two apps to share one (the restart case)
+            // points the second at the first's `draft_store.path()`.
             draft_store: common::drafts::Store::with_path(
-                scratch_config_dir().join("drafts.json"),
+                scratch_config_dir().join(format!(
+                    "drafts-{}.json",
+                    TEST_DRAFT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                )),
             ),
             image_slots: Arc::new(tokio::sync::Semaphore::new(IMAGE_LOAD_CONCURRENCY)),
             screens: Vec::new(),
@@ -7004,8 +7373,9 @@ mod tests {
     /// refusal), an idle one must run its own discard arm, Search must be
     /// able to leave edit mode without closing, and a failure that arrives
     /// after the composer is gone must still be visible.
-    #[test]
-    fn esc_reaches_the_screen_first_and_never_pops_a_busy_composer() {
+    // Async: the draft lifecycle now spawns relay calls (#716).
+    #[tokio::test]
+    async fn esc_reaches_the_screen_first_and_never_pops_a_busy_composer() {
         let esc = || KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         let composer = |busy: bool| {
             Screen::Compose(screens::ComposeState {

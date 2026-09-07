@@ -1619,3 +1619,34 @@ mod tests {
     }
 
 }
+
+/// One draft as the TuiLink relay reports it (#716).
+///
+/// `key` is XenForo's own draft key, not ours — `DraftKey::from_xf_key` maps
+/// it back, and an unknown kind is skipped rather than guessed at.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct RemoteDraft {
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub title: String,
+    /// Unix seconds, XF's `last_update`. This is what the merge compares
+    /// against the local draft's `saved_at`.
+    #[serde(default)]
+    pub last_update: i64,
+    /// The relay reports whether files are attached but never the hash: it is
+    /// an `xf_attachment.temp_hash`, and the API's attachment keys are rows
+    /// that *wrap* a hash, so a hash cannot be turned back into a key this
+    /// client could spend. Saying so is honest; the alternative is a resumed
+    /// draft that quietly loses its files.
+    #[serde(default)]
+    pub has_attachments: bool,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct DraftsReply {
+    #[serde(default, deserialize_with = "null_default")]
+    pub drafts: Vec<RemoteDraft>,
+}

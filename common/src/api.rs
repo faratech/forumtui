@@ -697,6 +697,25 @@ pub trait WfApi: Send + Sync {
     /// list is shown: it clears the counter and leaves unactioned alerts
     /// highlighted (#694).
     async fn mark_alerts_viewed(&self) -> Result<()>;
+    /// Composer drafts shared with the website, through the TuiLink relay
+    /// (#716). Stock XF exposes no draft endpoint at all, so this is the only
+    /// way the two stores meet.
+    ///
+    /// All three take the **api gate, not the write gate**: a draft is not a
+    /// flood-checked write (XF's own editor autosaves every 5 s), and the
+    /// composer saves once on close rather than on a timer, so the 30 s
+    /// cool-down would be both wrong and painful.
+    async fn list_drafts(&self) -> Result<Vec<RemoteDraft>>;
+    /// `xf_key` is XenForo's key, from `DraftKey::xf_key`. An empty message
+    /// deletes, which is what the relay and XF's own `DraftPlugin` both do.
+    async fn save_draft(
+        &self,
+        xf_key: &str,
+        message: &str,
+        title: &str,
+        attachment_key: Option<&str>,
+    ) -> Result<()>;
+    async fn delete_draft(&self, xf_key: &str) -> Result<()>;
     /// Edit a post's message (#708). `POST /posts/{id}`.
     async fn edit_post(&self, id: u32, message: &str, attachment_key: Option<&str>)
         -> Result<()>;
@@ -841,6 +860,45 @@ impl WfApi for WfApiClient {
     async fn mark_alerts_viewed(&self) -> Result<()> {
         self.post_unit("/alerts/mark-all", &[("viewed", "1".to_string())])
             .await
+    }
+
+    async fn list_drafts(&self) -> Result<Vec<RemoteDraft>> {
+        let reply: DraftsReply = self.get("/wf-tui-drafts", &[]).await?;
+        Ok(reply.drafts)
+    }
+
+    async fn save_draft(
+        &self,
+        xf_key: &str,
+        message: &str,
+        title: &str,
+        attachment_key: Option<&str>,
+    ) -> Result<()> {
+        let mut form = vec![
+            ("key", xf_key.to_string()),
+            ("message", message.to_string()),
+            ("title", title.to_string()),
+        ];
+        if let Some(key) = attachment_key {
+            form.push(("attachment_key", key.to_string()));
+        }
+        self.post_unit("/wf-tui-drafts", &form).await
+    }
+
+    async fn delete_draft(&self, xf_key: &str) -> Result<()> {
+        self.api_gate.wait().await;
+        let token = self.valid_token().await?;
+        let url = format!("{}/wf-tui-drafts", self.api_base());
+        let resp = self
+            .http
+            .delete(url)
+            .form(&[("key", xf_key)])
+            .bearer_auth(&token)
+            .send()
+            .await?;
+        check_status(resp)
+            .await
+            .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate]))
     }
 
     async fn edit_post(
@@ -1500,6 +1558,63 @@ mod tests {
     const MEDIA_PAGE_JSON: &str = include_str!("testdata/media_page.json");
     const RESOURCES_PAGE_JSON: &str = include_str!("testdata/resources_page.json");
     const RESOURCE_JSON: &str = include_str!("testdata/resource.json");
+    /// Captured verbatim from the live TuiLink relay (#716), not written by
+    /// hand — the same rule as every other fixture here.
+    const DRAFTS_JSON: &str = include_str!("testdata/drafts.json");
+
+
+    /// #716: the relay's envelope, against a body captured from production.
+    #[tokio::test]
+    async fn list_drafts_maps_the_relay_envelope() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-drafts");
+        Mock::given(method("GET"))
+            .and(path("/api/wf-tui-drafts"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(DRAFTS_JSON, "application/json"))
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let drafts = c.list_drafts().await.expect("drafts");
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].key, "thread-51465");
+        assert_eq!(drafts[0].message, "written in the browser");
+        assert_eq!(drafts[0].last_update, 1_788_767_239);
+        assert!(!drafts[0].has_attachments);
+        // The key XF matches on must map back to the composer it belongs to.
+        assert_eq!(
+            crate::drafts::DraftKey::from_xf_key(&drafts[0].key),
+            Some(crate::drafts::DraftKey::ThreadReply(51465))
+        );
+    }
+
+    /// The write half goes out as a form under XF's own key, and — the part
+    /// that is easy to get wrong — through the **api** gate, not the write
+    /// gate: a draft is not a flood-checked write, and the 30 s cool-down on
+    /// every composer close would be unusable.
+    #[tokio::test]
+    async fn save_draft_posts_the_form_without_burning_the_write_gate() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-draftsave");
+        Mock::given(method("POST"))
+            .and(path("/api/wf-tui-drafts"))
+            .and(wiremock::matchers::body_string_contains("key=thread-7"))
+            .and(wiremock::matchers::body_string_contains("message=hello"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "action": "save"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let before = c.write_gate.pending_wait();
+        c.save_draft("thread-7", "hello", "", None).await.expect("save");
+        assert!(
+            c.write_gate.pending_wait() <= before,
+            "a draft must not consume the 30s write cool-down a real post needs"
+        );
+    }
 
     #[tokio::test]
     async fn media_list_maps_the_gallery_envelope() {

@@ -735,6 +735,7 @@ impl App {
                     });
                 }
             }
+            Msg::DraftsLoaded(drafts) => self.merge_remote_drafts(drafts),
             Msg::ConvoReplySent(result) => {
                 let (compose_idx, target) = self
                     .screens
