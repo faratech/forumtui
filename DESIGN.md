@@ -195,9 +195,11 @@ so, since XF gates `is_banned` to viewers who may bypass user privacy.
   `S` appear only where the API said this reader may, and `W` only where the
   post has a video. A video renders as its own row — `▶ Play YouTube video`,
   in link styling, where the message put it — which is a click target as well
-  as what `W` plays. It opens a **video pane inside the app** — picture above,
-  one transport row below (`▶ playing · Space pause · o browser · Esc close`)
-  — rather than handing the terminal to an external player.
+  as what `W` opens. A video renders as its own row — `▶ YouTube video —
+  open`, in link styling, where the message put it — and opens in a browser.
+  Playing it in the terminal was built and removed: a terminal has no video
+  codec, so every frame crosses the wire as colour runs or a base64 image,
+  measured at 7-26 Mbit/s for a 360p video (CLAUDE.md has the arithmetic).
 * **Reply** (`c2.png` bottom): editor panel `Reply` (72) + `Preview` (48) rendering
   the draft through common::bbcode; editor bottom line = BBCode caps ^B ^I ^K ^Q ^U
   and char count. Keys: ^S send · ^O preview on/off · ^F attach · ^Y paste · Tab

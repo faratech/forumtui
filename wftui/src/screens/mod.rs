@@ -615,26 +615,6 @@ pub struct ImageOpen {
     pub web_url: Option<String>,
 }
 
-/// A video playing inside the client (#711).
-///
-/// The playback handle lives here rather than on `App` so that closing the
-/// screen stops the decode: dropping the state drops the children.
-#[derive(Default)]
-pub struct VideoViewState {
-    pub title: String,
-    pub url: String,
-    /// `None` until the first frame arrives, or after an error.
-    pub playback: Option<crate::video::Playback>,
-    pub error: Option<String>,
-    /// Where the picture was drawn, so the app can paint the frame into
-    /// exactly the rect the layout gave it.
-    pub rect: ratatui::layout::Rect,
-    pub images: crate::images::Policy,
-    /// Frames shown, for the status line — and the thing that proves
-    /// playback is actually progressing.
-    pub shown: u64,
-}
-
 /// The full-size image viewer (#697).
 #[derive(Default)]
 pub struct ImageViewState {
@@ -714,8 +694,6 @@ pub enum Screen {
     ResourceView(ResourceViewState),
     /// One picture, as large as the pane allows (#697).
     ImageView(ImageViewState),
-    /// A video playing in a pane (#711).
-    VideoView(VideoViewState),
 }
 
 /// Where an upload's attachment key is anchored (#709). XF checks this
@@ -857,7 +835,6 @@ impl Screen {
             Screen::Resources(s) => library::render_resources(s, f, area, theme, g, hits),
             Screen::ResourceView(s) => library::render_resource_view(s, f, area, theme, g, hits),
             Screen::ImageView(s) => library::render_image_view(s, f, area, theme, g, hits),
-            Screen::VideoView(s) => library::render_video_view(s, f, area, theme, g, hits),
         }
     }
 
@@ -876,7 +853,6 @@ impl Screen {
             Screen::Login(s) => s.images = policy,
             Screen::MediaGallery(s) => s.images = policy,
             Screen::ImageView(s) => s.images = policy,
-            Screen::VideoView(s) => s.images = policy,
             Screen::ResourceView(s) => {
                 if s.images != policy {
                     s.images = policy;
@@ -932,7 +908,6 @@ impl Screen {
             Screen::Resources(s) => library::resources_hints(s),
             Screen::ResourceView(s) => library::resource_view_hints(s),
             Screen::ImageView(s) => library::image_view_hints(s),
-            Screen::VideoView(s) => library::video_view_hints(s),
         }
     }
 
@@ -959,7 +934,6 @@ impl Screen {
                 .map(|r| r.title.clone())
                 .unwrap_or_else(|| "Resource".into()),
             Screen::ImageView(s) => s.title.clone(),
-            Screen::VideoView(s) => s.title.clone(),
         }
     }
 
@@ -980,7 +954,6 @@ impl Screen {
             Screen::Resources(s) => library::resources_list_key(s, key),
             Screen::ResourceView(s) => library::resource_view_key(s, key),
             Screen::ImageView(s) => library::image_view_key(s, key),
-            Screen::VideoView(s) => library::video_view_key(s, key),
         }
     }
 
@@ -1131,9 +1104,6 @@ impl Screen {
             Screen::Resources(r) => r.loading,
             Screen::ResourceView(r) => r.loading,
             Screen::ImageView(v) => v.loading,
-            // A video is never "loading" in the spinner sense: it either has
-            // a frame or it has an error.
-            Screen::VideoView(_) => false,
             // The Login Waiting stage animates its "waiting for approval"
             // spinner too — but only while a flow is live.
             Screen::Login(l) => l.busy || matches!(l.stage, LoginStage::Waiting),
@@ -1183,7 +1153,6 @@ impl Screen {
             Screen::Resources(r) => r.items.get(r.sel).and_then(|r| r.view_url.clone()),
             Screen::ResourceView(r) => r.resource.as_ref().and_then(|r| r.view_url.clone()),
             Screen::ImageView(v) => v.web_url.clone(),
-            Screen::VideoView(v) => Some(v.url.clone()),
             Screen::Profile(p) => p.user.as_ref().and_then(|u| u.view_url.clone()),
             _ => None,
         }
@@ -1345,7 +1314,6 @@ impl Screen {
             Screen::Resources(_) => "THESE RESOURCES",
             Screen::ResourceView(_) => "THIS RESOURCE",
             Screen::ImageView(_) => "THIS IMAGE",
-            Screen::VideoView(_) => "THIS VIDEO",
         }
     }
 
@@ -1366,7 +1334,6 @@ impl Screen {
             Screen::Resources(_) => "Resources",
             Screen::ResourceView(_) => "Resource",
             Screen::ImageView(_) => "Image",
-            Screen::VideoView(_) => "Video",
         }
     }
 }

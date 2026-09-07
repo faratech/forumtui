@@ -1910,7 +1910,7 @@ impl ThreadViewState {
                 lines.push(gutter(vec![
                     Span::styled(format!("{} ", g.play), link_style(theme)),
                     Span::styled(
-                        truncate(&format!("Play {site} video"), body_w.saturating_sub(2)),
+                        truncate(&format!("{site} video \u{2014} open"), body_w.saturating_sub(2)),
                         link_style(theme).add_modifier(Modifier::BOLD),
                     ),
                 ]));
@@ -2244,10 +2244,9 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
         },
         // `Q` quotes the selected post into a reply (#707) — `q` is taken by
         // "back", and quoting is the reply path, not a separate screen.
-        // #710: play the selected post's first video in the terminal. `W`,
-        // not `V` — `v`/`V` are the vote pair, and shadowing a vote with a
-        // video player is exactly the kind of key collision the dispatch
-        // test exists to catch.
+        // #710/#711: open the selected post's first video. `W`, not `V` —
+        // `v`/`V` are the vote pair, and shadowing a vote is exactly the key
+        // collision the dispatch test exists to catch.
         KeyCode::Char('W') => match post_videos(s.posts.get(s.sel_post)).first() {
             Some((url, site)) => Action::PlayVideo {
                 url: url.clone(),
@@ -2458,7 +2457,7 @@ pub fn thread_view_hints(s: &ThreadViewState) -> Hints {
     // #710: only where there is something to play — a cap for a post with no
     // video is a cap that does nothing.
     if !post_videos(sel).is_empty() {
-        keys.push(("W", "watch video"));
+        keys.push(("W", "open video"));
     }
     if can_edit {
         keys.push(("e", "edit"));
@@ -3936,7 +3935,7 @@ mod tests {
             .collect();
         let row = text
             .iter()
-            .position(|l| l.contains("Play YouTube video"))
+            .position(|l| l.contains("YouTube video \u{2014} open"))
             .unwrap_or_else(|| panic!("{text:#?}"));
         let before = text.iter().position(|l| l.contains("Before.")).expect("before");
         let after = text.iter().position(|l| l.contains("After.")).expect("after");
@@ -3954,7 +3953,7 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
             .collect();
-        assert!(ascii.iter().any(|l| l.contains("> Play YouTube")), "{ascii:#?}");
+        assert!(ascii.iter().any(|l| l.contains("> YouTube video")), "{ascii:#?}");
     }
 
     /// Two videos get two rows, mapped to their own indices, in message

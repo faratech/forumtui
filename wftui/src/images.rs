@@ -785,43 +785,6 @@ impl Images {
         self.picker.clone()
     }
 
-    /// Paint one decoded video frame straight into `rect` (#711).
-    ///
-    /// Deliberately not through the cache: every frame is new, and an LRU of
-    /// stills would evict a screenful of thumbnails within a second of
-    /// playback. Encoding measured at ~1.1 ms for a 60x20-cell picture on
-    /// this box, so the cost of doing it per frame is not the constraint.
-    ///
-    /// Like every other image, the payload is written by `ratatui-image`'s
-    /// own widget and never by us (hard rule 1).
-    #[cfg(feature = "images")]
-    pub fn paint_frame(&mut self, f: &mut Frame, rect: Rect, frame: &crate::video::Frame) {
-        use ratatui::widgets::Widget;
-        if !self.policy.inline() || rect.width == 0 || rect.height == 0 {
-            return;
-        }
-        let Some(picker) = self.picker.as_ref() else {
-            return;
-        };
-        let Some(rgb) =
-            image::RgbImage::from_raw(frame.width, frame.height, frame.rgb.clone())
-        else {
-            return;
-        };
-        let img = image::DynamicImage::ImageRgb8(rgb);
-        if let Ok(proto) = picker.new_protocol(
-            img,
-            ratatui::layout::Size::new(rect.width, rect.height),
-            ratatui_image::Resize::Fit(None),
-        ) {
-            ratatui_image::Image::new(&proto).render(rect, f.buffer_mut());
-        }
-    }
-
-    /// Without the `images` feature there is nothing to paint a frame with.
-    #[cfg(not(feature = "images"))]
-    pub fn paint_frame(&mut self, _: &mut Frame, _: Rect, _: &crate::video::Frame) {}
-
     /// Paint every request whose payload is already decoded and return the
     /// ones that are not, for the app to load off-thread. Never blocks and
     /// never decodes: this runs inside `draw`.

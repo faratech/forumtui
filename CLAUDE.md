@@ -343,66 +343,38 @@ addon can be run over it directly. That is how the current implementation was
 confirmed (`valid=true, violations: 0`), and how the three failure modes
 above were confirmed to fire.
 
-## Video, played inside the app (#710, #711)
+## Videos, and why they are not played here (#710, #711)
 
-A video renders as a **row you can press** — `▶ Play YouTube video`, where the
-message put it — rather than a link with a `[n]` marker. Click it, or press
-`W` for the selected post's first one. 25,839 posts here carry
+A video renders as a **row you can press** — `▶ YouTube video — open`, where
+the message put it — rather than a link with a `[n]` marker. Click it or
+press `W`, and it opens in a browser (with the URL on the clipboard, which is
+what makes it work from a remote session). 25,839 posts here carry
 `[MEDIA=youtube]`, which the parser already resolves to a watch URL, so
 `browse::post_videos` recognises those URLs rather than re-parsing the tag —
-which also picks up a plain YouTube link somebody pasted without one. The play
-rows join the same block walk as inline images (#693), sorted by chunk
-position, and `video_lines` maps each row to its own index so clicking the
-second video plays the second.
+which also picks up a plain link somebody pasted without one. The rows join
+the same block walk as inline images (#693), and `video_lines` maps each row
+to its own index so clicking the second video opens the second.
 
-It plays **in a pane**, not by handing the terminal to an external player.
-The first attempt (#710) suspended the UI and ran `mpv`; it worked and it was
-not the app. What made in-app playback viable was measuring instead of
-assuming: decode runs ~32x realtime (5 s of 360p in 0.15 s) and encoding one
-frame for the terminal costs ~1.1 ms, an 885 fps ceiling. Neither is the
-constraint.
+**Playing video in the terminal was built twice and removed.** Not because it
+does not work — it does — but because of what it costs, and the numbers are
+here so nobody has to rediscover them:
 
-`video.rs` owns it. Three jobs, each given to the tool that already does it:
+| approach | result |
+|---|---|
+| #710: suspend the UI, hand the terminal to `mpv` | worked; the screen goes away and comes back, which is not the app |
+| #711: decode in-app and paint frames in a pane | worked; **7.2 Mbit/s** of terminal traffic on half-blocks, **26 Mbit/s** on kitty |
 
-- **Resolve** — a forum link is a *page*; `yt-dlp` turns it into media.
-  **Two** URLs, not one: YouTube has largely stopped serving progressive
-  (muxed) streams, so asking for a single one fails outright on most videos
-  with "Requested format is not available", which the first draft did.
-- **Decode** — `ffmpeg` writes raw RGB to a pipe. The filter letterboxes
-  every source into one fixed box (`force_original_aspect_ratio=decrease` +
-  `pad`), because raw video has no frame boundaries and the reader can only
-  split the stream if every frame is exactly the same length. Deriving the
-  height from an assumed aspect tears the moment a video is not 16:9.
-- **Audio** — a second process (`ffplay -nodisp`), because ffmpeg cannot both
-  pipe frames here and make noise. Best-effort: no sound device means a
-  silent video, never a refused one.
+The decode was never the problem: ffmpeg runs ~32x realtime (5 s of 360p in
+0.15 s) and encoding a frame costs ~1.1 ms. The problem is the wire. A
+terminal has no video codec, so every frame crosses the connection as either
+per-cell SGR colour runs or a base64 image — 74 KB and 266 KB per frame
+respectively at a normal pane size. For a 360p video the reader could have
+watched at about 1 Mbit/s, and on this deployment every byte of it flows out
+of the production web server, which also downloads the video a second time.
 
-Pacing is ours: the playback thread presents frames against a wall clock and
-keeps only the newest, so a slow terminal drops frames rather than falling
-behind. Everything after resolution happens off the UI thread — resolving
-takes a second or two of network and blocking on it is exactly the un-fluid
-thing this design exists to avoid.
-
-Two integration points to remember:
-
-- `needs_continuous_redraw` must be true while playing. A video is the only
-  thing on screen that changes without anything arriving in the message pump,
-  so #674's idle-skip would otherwise freeze it on the first frame. Paused
-  counts as idle.
-- Frames are painted by `images::paint_frame`, deliberately **not** through
-  the image cache: every frame is new, and an LRU of stills would evict a
-  screenful of thumbnails within a second. The payload is still written by
-  `ratatui-image`'s own widget, never by us (hard rule 1).
-
-Pause is `SIGSTOP` to both children at once — decode and sound stop at the
-same instant and cannot drift apart while stopped, which no buffering on our
-side would guarantee. Closing the pane drops `Playback`, whose `Drop` kills
-the children, so a pane that goes away never leaves ffmpeg decoding into a
-pipe nobody reads.
-
-`real_youtube_page_resolves_and_decodes` is `#[ignore]`d and proves the whole
-path against the live site; run it deliberately with
-`cargo test -- --ignored real_youtube`.
+So: a video opens where video is cheap. If this is revisited, revisit the
+arithmetic first — it is the whole argument, and it does not improve with a
+better implementation.
 
 ## Attachments
 

@@ -443,9 +443,6 @@ pub struct App {
     crumb_targets: Vec<usize>,
     /// Mints `ThreadListState::load_seq` (#705).
     next_list_seq: u64,
-    /// The frame currently on screen (#711), repainted on ticks that bring
-    /// no new one so the pane does not flicker to empty between frames.
-    last_video_frame: Option<crate::video::Frame>,
     pub convos_unread: u32,
     pub status: String,
     /// When the current `status` was shown as a toast (`Some`) — cleared by
@@ -752,7 +749,6 @@ pub async fn run(images: crate::images::Images) -> u8 {
 
     let mut app = App {
         next_list_seq: 1,
-        last_video_frame: None,
         api: client.clone(),
         client,
         tx,
@@ -1067,15 +1063,6 @@ impl App {
     fn needs_continuous_redraw(&self) -> bool {
         !self.client.write_gate.pending_wait().is_zero()
             || self.screens.iter().any(|s| s.is_loading())
-            // #711: a playing video is the one thing on screen that changes
-            // without anything arriving in the message pump, so the
-            // idle-skip has to know about it or playback freezes on the
-            // first frame. Paused counts as idle — nothing is moving.
-            || matches!(
-                self.screens.last(),
-                Some(Screen::VideoView(v))
-                    if v.playback.as_ref().is_some_and(|p| !p.paused() && !p.finished())
-            )
     }
 
     /// The single place a session ends. Every session-ending failure routes
@@ -1471,33 +1458,6 @@ impl App {
                 .last()
                 .map(|s| s.image_requests().to_vec())
                 .unwrap_or_default();
-            // #711: a playing video's newest frame, painted into the rect
-            // the view just reserved. Before the still-image requests, so a
-            // thumbnail can never land on top of the picture.
-            if let Some(Screen::VideoView(v)) = self.screens.last_mut()
-                && v.rect.width > 0
-                && let Some(playback) = v.playback.as_mut()
-                && let Some(frame) = playback.take_frame()
-            {
-                v.shown += 1;
-                let rect = v.rect;
-                self.images.paint_frame(f, rect, &frame);
-                self.last_video_frame = Some(frame);
-            } else if let Some(Screen::VideoView(v)) = self.screens.last()
-                && v.rect.width > 0
-                && let Some(frame) = self.last_video_frame.as_ref()
-            {
-                // No new frame this tick: repaint the last one, or the pane
-                // would flicker to empty between frames.
-                let rect = v.rect;
-                let frame = crate::video::Frame {
-                    rgb: frame.rgb.clone(),
-                    width: frame.width,
-                    height: frame.height,
-                    index: frame.index,
-                };
-                self.images.paint_frame(f, rect, &frame);
-            }
             for pending in self.images.paint(f, &reqs) {
                 self.spawn_image_load(pending);
             }
@@ -1932,25 +1892,14 @@ impl App {
             }
             Action::LoadResource(id) => self.load_resource(id),
             Action::PlayVideo { url, title } => {
-                // #711: in the app, in a pane. Decoding starts immediately so
-                // the first frame is on screen by the time the reader has
-                // registered the pane opened.
-                let mut state = screens::VideoViewState {
-                    title,
-                    url: url.clone(),
-                    ..Default::default()
-                };
-                if let Some(why) = crate::video::unavailable_reason(self.theme.tier, self.images.policy().tier) {
-                    state.error = Some(why);
-                } else {
-                    // Sound only when something can play it: ffmpeg pipes the
-                    // picture here and cannot also make noise.
-                    match crate::video::Playback::start(&url, crate::video::audio_available()) {
-                        Ok(p) => state.playback = Some(p),
-                        Err(e) => state.error = Some(e),
-                    }
-                }
-                self.push_screen(Screen::VideoView(state));
+                // #711 played this in a pane. Measured, that cost 7.2 Mbit/s
+                // of terminal traffic on half-blocks and 26 Mbit/s on kitty
+                // — for a 360p video the reader could have watched at about
+                // 1 — with every byte of it flowing through the production
+                // web server. The picture was not worth the pipe, so a video
+                // opens where videos are cheap: the browser.
+                let _ = title;
+                self.open_url(&url);
             }
             Action::OpenImage(open) => {
                 self.push_screen(Screen::ImageView(screens::ImageViewState::of(*open)));
@@ -8292,7 +8241,6 @@ mod tests {
         App {
             crumb_targets: Vec::new(),
             next_list_seq: 1,
-            last_video_frame: None,
             api: Arc::new(RecordingApi::default()),
             client,
             tx,
@@ -8692,23 +8640,19 @@ mod tests {
         assert_eq!(found[0].0, 0);
         assert_eq!(found[1].0, 1);
 
-        // Clicking the SECOND row asks for the second video, not the first.
-        // `mpv` is not installed here, so the action lands on the refusal
-        // path — which is itself the thing worth pinning: it says so instead
-        // of hanging or suspending the UI.
+        // Clicking the SECOND row opens THAT video, not the first. It goes
+        // to the browser (#711's in-app player was removed — it cost 7-26
+        // Mbit/s of terminal traffic through the web server for a video the
+        // reader could watch at about 1), so what is pinned here is which
+        // url the click resolves to.
         app.click_hit((3, found[1].1), false);
-        // The click opens the video view for THAT video — decoding may or
-        // may not start here (ffmpeg has to exist and the URL has to
-        // resolve), but the pane and its url are the client's half.
-        match app.screens.last() {
-            Some(Screen::VideoView(v)) => {
-                assert!(v.url.contains("bbb"), "the row that was clicked: {}", v.url);
-            }
-            other => panic!(
-                "a click on a play row must open the video view, got {:?}",
-                other.map(|s| s.title())
-            ),
-        }
+        // `open_url` says what it opened, and puts it on the clipboard for a
+        // remote session where the opener targets the wrong machine.
+        assert!(
+            app.status.contains("bbb"),
+            "the row that was clicked decides the video: {:?}",
+            app.status
+        );
     }
 
 

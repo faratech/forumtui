@@ -15,7 +15,6 @@ mod overlay;
 mod screens;
 mod theme;
 pub mod tty;
-mod video;
 
 fn main() -> std::process::ExitCode {
     common::logging::init();
