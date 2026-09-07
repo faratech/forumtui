@@ -1428,8 +1428,14 @@ impl App {
     /// blank next-frame buffer, not what is on screen).
     fn capture_screen(&mut self, f: &mut Frame) {
         let area = f.area();
-        let mut rows = Vec::with_capacity(area.height as usize);
-        let mut cols = Vec::with_capacity(area.height as usize);
+        // Reuse the previous frame's buffers (#675): at the old
+        // unconditional 20 fps cadence this mirror was ~1 MB/s of
+        // allocation churn even when the frame was identical to the last
+        // one. `mem::take` keeps the Strings'/Vecs' capacities alive.
+        let mut rows = std::mem::take(&mut self.screen_rows);
+        let mut cols = std::mem::take(&mut self.screen_cols);
+        rows.clear();
+        cols.clear();
         for y in 0..area.height {
             let mut row = String::with_capacity(area.width as usize);
             let mut offsets = Vec::with_capacity(area.width as usize + 1);
