@@ -109,7 +109,12 @@ plain-enum errors, no anyhow/thiserror, inline `#[cfg(test)]` tests, `rust-versi
   blank in many terminals). `overlay.rs` — go-to palette (`Ctrl+K` / `:`), `g`
   which-key prefix, `?` keys card. `editor.rs` — the text editor primitives on
   char indices with a cell-width visual-row model (caret, wrapping, `hwindow`
-  for single-line fields). `hit.rs` — the per-frame mouse/touch hit map.
+  for single-line fields). Both composer bodies keep an `editor::WrapCache`
+  (#678): how a logical line wraps depends only on that line and the width, so
+  a keystroke re-wraps just the line it touched, and the renderer builds
+  `Line`s only for the visible window rather than one per row of the draft.
+  `visual_rows_of` stays the reference implementation the cache is tested
+  against. `hit.rs` — the per-frame mouse/touch hit map.
   `images.rs` — graphics tiers, sizing, LRU + disk cache.
 
 ### Width, text and keys — the contracts tests pin

@@ -204,6 +204,10 @@ pub struct ComposeState {
     pub target: Option<ComposeTarget>,
     pub title: String,
     pub body: String,
+    /// The body's wrap, kept incrementally (issue #678): the renderer and
+    /// the caret model both read it, so a keystroke re-wraps the logical
+    /// line it touched instead of the whole draft.
+    pub wrap: crate::editor::WrapCache,
     pub title_cursor: usize,
     pub body_cursor: usize,
     pub title_field: bool,
@@ -305,6 +309,8 @@ pub struct NewConversationState {
     pub recipients: String,
     pub title: String,
     pub body: String,
+    /// Same contract as `ComposeState::wrap` (issue #678).
+    pub wrap: crate::editor::WrapCache,
     pub recipients_cursor: usize,
     pub title_cursor: usize,
     pub body_cursor: usize,

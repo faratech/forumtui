@@ -632,13 +632,11 @@ fn compose_page(s: &super::ComposeState) -> isize {
 
 fn compose_move_vertical(s: &mut super::ComposeState, delta: isize) {
     let width = if s.body_width == 0 { 1 } else { s.body_width as usize };
-    crate::editor::move_vertical(
-        &s.body,
-        width,
-        &mut s.body_cursor,
-        &mut s.body_desired_col,
-        delta,
-    );
+    // Through the cache (issue #678): on a pasted log this used to re-wrap
+    // every row of the draft per arrow key.
+    s.wrap.sync(&s.body, width);
+    s.wrap
+        .move_vertical(&mut s.body_cursor, &mut s.body_desired_col, delta);
 }
 
 pub fn compose_hints(s: &super::ComposeState) -> Hints {
@@ -850,47 +848,40 @@ fn draw_editor_panel(
     } else {
         s.title_rect = Rect::default();
     }
-    let chars: Vec<char> = s.body.chars().collect();
-    let rows = crate::editor::visual_rows_of(&chars, body_area.width as usize);
-    let (caret_row, caret_col) = crate::editor::caret_in_rows(&chars, &rows, s.body_cursor);
-    let mut body_lines: Vec<Line<'static>> = rows
-        .iter()
-        .map(|r| {
-            Line::from(Span::styled(
-                chars[r.start..r.end].iter().collect::<String>(),
-                theme.base(),
-            ))
-        })
-        .collect();
-    let mut total_rows = body_lines.len();
+    // The wrap is incremental (issue #678) and only the rows the pane shows
+    // are turned into `Line`s — building one per row allocated a String for
+    // every row of a 70 000-row paste, on every frame.
+    s.wrap.sync(&s.body, body_area.width as usize);
+    let (caret_row, caret_col) = s.wrap.caret(s.body_cursor);
+    let mut tail: Vec<Line<'static>> = Vec::new();
     if let Some(err) = &s.error {
-        body_lines.push(Line::from(Span::styled(
+        tail.push(Line::from(Span::styled(
             format!("Error: {err}"),
             Style::new().fg(theme.error),
         )));
-        total_rows += 1;
     }
     if s.busy {
-        body_lines.push(Line::from(Span::styled("Sending\u{2026}", theme.dim())));
-        total_rows += 1;
+        tail.push(Line::from(Span::styled("Sending\u{2026}", theme.dim())));
     }
+    let body_rows = s.wrap.row_count();
+    let total_rows = body_rows + tail.len();
+    // Sliced rather than `Paragraph::scroll` (a `u16` offset) — this site
+    // takes unlimited-length posts, so a draft really can pass 65,536
+    // visual rows (issue #558).
     s.body_scroll = crate::editor::follow_caret(
         s.body_scroll,
         caret_row,
         total_rows,
         body_area.height as usize,
     );
-    // Sliced rather than `Paragraph::scroll` (a `u16` offset) — this site
-    // takes unlimited-length posts, so a draft really can pass 65,536
-    // visual rows (issue #558).
-    f.render_widget(
-        Paragraph::new(crate::editor::visible_window(
-            &body_lines,
-            s.body_scroll,
-            body_area.height,
-        )),
-        body_area,
+    let window = crate::editor::window_lines(
+        &s.wrap,
+        &tail,
+        s.body_scroll,
+        body_area.height,
+        theme.base(),
     );
+    f.render_widget(Paragraph::new(window), body_area);
 
     f.render_widget(rule_line(chunks[3].width), chunks[3]);
     let title_focused = is_new_thread && s.title_field;
@@ -1310,7 +1301,8 @@ pub(crate) fn compose_click_field(
     s.title_field = false;
     let line = s.body_scroll + row.saturating_sub(s.body_rect.y) as usize;
     let x = col.saturating_sub(s.body_rect.x) as usize;
-    s.body_cursor = crate::editor::caret_at_cell(&s.body, s.body_width as usize, line, x);
+    s.wrap.sync(&s.body, s.body_width as usize);
+    s.body_cursor = s.wrap.caret_at_cell(line, x);
     // Any non-vertical move clears the sticky Up/Down column (issue #523).
     s.body_desired_col = None;
 }

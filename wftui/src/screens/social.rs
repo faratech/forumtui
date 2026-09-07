@@ -1214,13 +1214,10 @@ pub fn new_conversation_key(s: &mut super::NewConversationState, key: KeyEvent) 
                 _ => page,
             };
             let width = if s.body_width == 0 { 1 } else { s.body_width as usize };
-            crate::editor::move_vertical(
-                &s.body,
-                width,
-                &mut s.body_cursor,
-                &mut s.body_desired_col,
-                delta,
-            );
+            // Through the cache, like the Reply editor (issue #678).
+            s.wrap.sync(&s.body, width);
+            s.wrap
+                .move_vertical(&mut s.body_cursor, &mut s.body_desired_col, delta);
             Action::None
         }
         KeyCode::Char(c)
@@ -1313,8 +1310,8 @@ pub(crate) fn new_conversation_click_field(
         _ => {
             let line = s.body_scroll + row.saturating_sub(s.body_rect.y) as usize;
             let x = col.saturating_sub(s.body_rect.x) as usize;
-            s.body_cursor =
-                crate::editor::caret_at_cell(&s.body, s.body_width as usize, line, x);
+            s.wrap.sync(&s.body, s.body_width as usize);
+            s.body_cursor = s.wrap.caret_at_cell(line, x);
             // Any non-vertical move clears the sticky column (issue #523).
             s.body_desired_col = None;
         }
@@ -1387,29 +1384,21 @@ pub fn render_new_conversation(
     // past the pane's last row unreachable.
     s.body_width = body_area.width;
     s.body_height = body_area.height;
-    let body_chars: Vec<char> = s.body.chars().collect();
-    let rows = crate::editor::visual_rows_of(&body_chars, body_area.width as usize);
-    let (caret_row, caret_col) = crate::editor::caret_in_rows(&body_chars, &rows, s.body_cursor);
+    s.wrap.sync(&s.body, body_area.width as usize);
+    let (caret_row, caret_col) = s.wrap.caret(s.body_cursor);
     s.body_scroll = crate::editor::follow_caret(
         s.body_scroll,
         caret_row,
-        rows.len(),
+        s.wrap.row_count(),
         body_area.height as usize,
     );
-    let body_lines: Vec<Line<'static>> = rows
-        .iter()
-        .map(|r| {
-            Line::from(Span::styled(
-                body_chars[r.start..r.end].iter().collect::<String>(),
-                theme.base(),
-            ))
-        })
-        .collect();
     f.render_widget(
-        Paragraph::new(crate::editor::visible_window(
-            &body_lines,
+        Paragraph::new(crate::editor::window_lines(
+            &s.wrap,
+            &[],
             s.body_scroll,
             body_area.height,
+            theme.base(),
         )),
         body_area,
     );

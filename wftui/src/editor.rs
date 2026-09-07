@@ -306,6 +306,281 @@ fn wrap_logical_line(
     }
 }
 
+/// An incrementally maintained wrap of one editor body (issue #678).
+///
+/// `visual_rows_of` wraps the whole buffer, and the composer called it from
+/// the caret model *and* the renderer on every keystroke — O(draft) per key,
+/// on a screen that explicitly accepts a pasted 70 000-row CBS.log. How a
+/// logical line wraps depends only on that line and the width, so this keeps
+/// the rows per logical line and re-wraps only the lines an edit touched.
+///
+/// The rows it yields are identical to `visual_rows_of`'s — that is the
+/// contract `the_wrap_cache_agrees_with_the_reference_wrap` pins in both
+/// directions, because a caret model that disagrees with the renderer is
+/// worse than a slow one.
+#[derive(Default)]
+pub struct WrapCache {
+    width: usize,
+    chars: Vec<char>,
+    /// Absolute char index each logical line starts at, plus a sentinel at
+    /// the end of the text (`lines + 1` entries).
+    line_starts: Vec<usize>,
+    /// Rows per logical line, offsets *relative* to that line's start — so
+    /// an edit shifts `line_starts`, not every row in the tail.
+    line_rows: Vec<Vec<VisualRow>>,
+    /// Rows before each logical line, plus the total (`lines + 1` entries).
+    row_prefix: Vec<usize>,
+    /// Rows the last `sync` actually re-wrapped. One assignment per sync,
+    /// and it is what pins the cache's whole reason to exist
+    /// (`a_keystroke_rewraps_one_logical_line_not_the_whole_draft`).
+    rewrapped: usize,
+}
+
+impl WrapCache {
+    /// Bring the cache up to date with `text` at `width` cells. A width
+    /// change (or the first call) rebuilds; otherwise the edit is located by
+    /// common prefix + common suffix and only the logical lines it spans are
+    /// re-wrapped. Every accessor below reads the state this leaves.
+    pub fn sync(&mut self, text: &str, width: usize) {
+        let width = width.max(1);
+        if width != self.width || self.line_starts.is_empty() {
+            self.width = width;
+            self.chars.clear();
+            self.chars.extend(text.chars());
+            self.rebuild();
+            self.rewrapped = self.row_count();
+            return;
+        }
+
+        // The edit, found as a common prefix + common suffix against the
+        // chars already held. Deriving it from the text rather than from an
+        // edit hint keeps every mutation site — typing, delete, paste —
+        // unchanged and correct, and this walks `text` in place: collecting
+        // it into a fresh `Vec<char>` first was itself an O(draft) cost per
+        // keystroke.
+        let mut p = 0usize;
+        let mut pb = 0usize;
+        let mut it = text.char_indices();
+        while p < self.chars.len() {
+            let Some((b, c)) = it.next() else { break };
+            if self.chars[p] != c {
+                break;
+            }
+            pb = b + c.len_utf8();
+            p += 1;
+        }
+        if p == self.chars.len() && pb == text.len() {
+            self.rewrapped = 0;
+            return;
+        }
+
+        let mut old_end = self.chars.len();
+        let mut sb = text.len();
+        let mut back = text[pb..].char_indices().rev();
+        while old_end > p {
+            let Some((b, c)) = back.next() else { break };
+            if self.chars[old_end - 1] != c {
+                break;
+            }
+            old_end -= 1;
+            sb = pb + b;
+        }
+        let new_end = p + text[pb..sb].chars().count();
+
+        // The logical lines the edit touches, in old coordinates (a binary
+        // search, so this stays cheap on a 70 000-line draft).
+        let first = self.line_of(p);
+        let last = self.line_of(old_end);
+        let start = self.line_starts[first];
+
+        self.chars.splice(p..old_end, text[pb..sb].chars());
+
+        // Re-wrap from that first line's start through the end of the line
+        // the edit now ends in — every other line keeps the rows it had.
+        let mut end = new_end.max(start);
+        while end < self.chars.len() && self.chars[end] != '\n' {
+            end += 1;
+        }
+        let (starts, rows) = wrap_segment(&self.chars, start, end, width);
+
+        let delta = new_end as isize - old_end as isize;
+        let replaced = starts.len();
+        self.rewrapped = rows.iter().map(Vec::len).sum();
+        self.line_starts.splice(first..=last, starts);
+        self.line_rows.splice(first..=last, rows);
+        // Everything after the replaced span keeps its wrap; only its
+        // absolute position moved (the end sentinel moves with it).
+        for st in self.line_starts.iter_mut().skip(first + replaced) {
+            *st = (*st as isize + delta).max(0) as usize;
+        }
+        self.rebuild_prefix();
+    }
+
+    fn rebuild(&mut self) {
+        let (starts, rows) = wrap_segment(&self.chars, 0, self.chars.len(), self.width);
+        self.line_starts = starts;
+        self.line_rows = rows;
+        self.line_starts.push(self.chars.len());
+        self.rebuild_prefix();
+    }
+
+    /// The row prefix is a pass of integer adds over the logical lines —
+    /// cheap next to re-wrapping them, which is the point of the cache.
+    fn rebuild_prefix(&mut self) {
+        self.row_prefix.clear();
+        self.row_prefix.reserve(self.line_rows.len() + 1);
+        let mut acc = 0usize;
+        for rows in &self.line_rows {
+            self.row_prefix.push(acc);
+            acc += rows.len();
+        }
+        self.row_prefix.push(acc);
+    }
+
+    /// The logical line `cursor` falls in.
+    fn line_of(&self, cursor: usize) -> usize {
+        let lines = self.line_rows.len();
+        self.line_starts
+            .partition_point(|&s| s <= cursor)
+            .saturating_sub(1)
+            .min(lines.saturating_sub(1))
+    }
+
+    /// Sync, then report how many rows that sync re-wrapped.
+    #[cfg(test)]
+    fn rewrapped_rows_for_test(&mut self, text: &str, width: usize) -> usize {
+        self.sync(text, width);
+        self.rewrapped
+    }
+
+    /// The wrapped text, for slicing a row's characters out of.
+    pub fn chars(&self) -> &[char] {
+        &self.chars
+    }
+
+    pub fn row_count(&self) -> usize {
+        *self.row_prefix.last().unwrap_or(&0)
+    }
+
+    /// Row `i`, in absolute char offsets.
+    pub fn row(&self, i: usize) -> Option<VisualRow> {
+        if i >= self.row_count() {
+            return None;
+        }
+        let li = self
+            .row_prefix
+            .partition_point(|&r| r <= i)
+            .saturating_sub(1);
+        let r = self.line_rows[li][i - self.row_prefix[li]];
+        let base = self.line_starts[li];
+        Some(VisualRow {
+            start: base + r.start,
+            end: base + r.end,
+        })
+    }
+
+    /// `height` rows from `scroll` — what a renderer needs, instead of
+    /// building a `Line` for every row of a draft to then throw all but a
+    /// screenful away.
+    pub fn window(&self, scroll: usize, height: usize) -> Vec<VisualRow> {
+        (scroll..scroll.saturating_add(height))
+            .map_while(|i| self.row(i))
+            .collect()
+    }
+
+    /// The caret's `(row, col)` — the answer `caret_in_rows` gives over the
+    /// whole row list, found by two binary searches instead of a scan.
+    pub fn caret(&self, cursor: usize) -> (usize, usize) {
+        if self.line_rows.is_empty() {
+            return (0, 0);
+        }
+        let cursor = cursor.min(self.chars.len());
+        let li = self.line_of(cursor);
+        let base = self.line_starts[li];
+        let rel = cursor.saturating_sub(base);
+        let rows = &self.line_rows[li];
+        let ri = rows
+            .partition_point(|r| r.start <= rel)
+            .saturating_sub(1)
+            .min(rows.len().saturating_sub(1));
+        let row = rows[ri];
+        (
+            self.row_prefix[li] + ri,
+            span_cells(&self.chars, base + row.start, cursor.min(base + row.end)),
+        )
+    }
+
+    /// The char index a click at visual `(row, col)` lands on — the cached
+    /// twin of `caret_at_cell`, with the same past-the-end behaviour.
+    pub fn caret_at_cell(&self, row: usize, col: usize) -> usize {
+        let Some(r) = self
+            .row(row)
+            .or_else(|| self.row(self.row_count().saturating_sub(1)))
+        else {
+            return 0;
+        };
+        let mut used = 0usize;
+        let mut i = r.start;
+        while i < r.end {
+            let cw = char_cells(self.chars[i]);
+            if used + cw > col {
+                break;
+            }
+            used += cw;
+            i += 1;
+        }
+        i
+    }
+
+    /// Move the caret `delta` visual rows, keeping the desired column — the
+    /// cached twin of `move_vertical`.
+    pub fn move_vertical(&self, cursor: &mut usize, desired: &mut Option<usize>, delta: isize) {
+        let rows = self.row_count();
+        if rows == 0 {
+            return;
+        }
+        let (row, col) = self.caret(*cursor);
+        let want = (*desired).unwrap_or(col);
+        *desired = Some(want);
+        let target = (row as isize + delta).clamp(0, rows as isize - 1) as usize;
+        if target == row {
+            return;
+        }
+        *cursor = self.caret_at_cell(target, want);
+    }
+}
+
+/// Split `chars[start..end]` on newlines and wrap each logical line, with
+/// row offsets relative to that line's start.
+fn wrap_segment(
+    chars: &[char],
+    start: usize,
+    end: usize,
+    width: usize,
+) -> (Vec<usize>, Vec<Vec<VisualRow>>) {
+    let mut starts = Vec::new();
+    let mut rows = Vec::new();
+    let mut ls = start;
+    loop {
+        let mut le = ls;
+        while le < end && chars[le] != '\n' {
+            le += 1;
+        }
+        starts.push(ls);
+        let mut line = Vec::new();
+        wrap_logical_line(chars, ls, le, width.max(1), &mut line);
+        for r in &mut line {
+            r.start -= ls;
+            r.end -= ls;
+        }
+        rows.push(line);
+        if le >= end {
+            return (starts, rows);
+        }
+        ls = le + 1;
+    }
+}
+
 /// The caret's `(row, col)` in `rows`, col measured in cells.
 pub fn caret_in_rows(chars: &[char], rows: &[VisualRow], cursor: usize) -> (usize, usize) {
     let cursor = cursor.min(chars.len());
@@ -507,6 +782,38 @@ pub fn visible_window<T: Clone>(lines: &[T], scroll: usize, height: u16) -> Vec<
     lines[start..end].to_vec()
 }
 
+/// The `Line`s a viewport shows of a cached body: the visible rows of the
+/// wrap, then whatever trailing lines the screen appends (an error, a
+/// "Sending…" note). Only the window is materialised — building a `Line`
+/// per row cost a `String` per row of the whole draft, every frame (#678).
+pub fn window_lines(
+    wrap: &WrapCache,
+    tail: &[ratatui::text::Line<'static>],
+    scroll: usize,
+    height: u16,
+    style: ratatui::style::Style,
+) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::text::{Line, Span};
+    let rows = wrap.row_count();
+    let total = rows + tail.len();
+    let start = scroll.min(total);
+    let end = start.saturating_add(height as usize).min(total);
+    let chars = wrap.chars();
+    (start..end)
+        .map(|i| {
+            if i < rows {
+                let r = wrap.row(i).unwrap_or(VisualRow { start: 0, end: 0 });
+                Line::from(Span::styled(
+                    chars[r.start..r.end].iter().collect::<String>(),
+                    style,
+                ))
+            } else {
+                tail[i - rows].clone()
+            }
+        })
+        .collect()
+}
+
 /// Normalise control characters before they ever reach the buffer (issue
 /// #559): expand `\t` to spaces up to the next 4-column stop (column tracked
 /// in terminal *cells*, so a CJK character covers two of them) and drop every
@@ -648,6 +955,133 @@ mod tests {
         let mut c4 = 100;
         kill_to_start(&mut s4, &mut c4);
         assert_eq!(s4, "");
+    }
+
+    // ---------- the incremental wrap cache (issue #678) ----------
+
+    /// A deterministic pseudo-random stream, so the corpus below is varied
+    /// but the failure is always the same failure.
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed >> 33
+    }
+
+    /// The contract, in both directions: whatever sequence of edits the
+    /// cache has seen, its rows are exactly `visual_rows_of`'s. The caret
+    /// model and the renderer read the cache, so a disagreement here is a
+    /// caret drawn on the wrong row.
+    #[test]
+    fn the_wrap_cache_agrees_with_the_reference_wrap() {
+        let alphabet: Vec<char> = "ab \n\u{6f22}c  \nde".chars().collect();
+        let mut seed = 0x5eed_1234u64;
+        for width in [1usize, 3, 7, 12, 40] {
+            let mut cache = WrapCache::default();
+            let mut text = String::new();
+            for step in 0..200 {
+                // Insert, delete a span, or paste a block — the three shapes
+                // a composer actually produces.
+                match lcg(&mut seed) % 3 {
+                    0 => {
+                        let at = if text.is_empty() {
+                            0
+                        } else {
+                            (lcg(&mut seed) as usize) % (text.chars().count() + 1)
+                        };
+                        let c = alphabet[(lcg(&mut seed) as usize) % alphabet.len()];
+                        let mut chars: Vec<char> = text.chars().collect();
+                        chars.insert(at, c);
+                        text = chars.into_iter().collect();
+                    }
+                    1 => {
+                        let n = text.chars().count();
+                        if n > 0 {
+                            let at = (lcg(&mut seed) as usize) % n;
+                            let len = 1 + (lcg(&mut seed) as usize) % 5.min(n - at).max(1);
+                            let mut chars: Vec<char> = text.chars().collect();
+                            chars.drain(at..(at + len).min(n));
+                            text = chars.into_iter().collect();
+                        }
+                    }
+                    _ => {
+                        let n = text.chars().count();
+                        let at = if n == 0 { 0 } else { (lcg(&mut seed) as usize) % (n + 1) };
+                        let block: String = (0..8)
+                            .map(|_| alphabet[(lcg(&mut seed) as usize) % alphabet.len()])
+                            .collect();
+                        let mut chars: Vec<char> = text.chars().collect();
+                        for (i, c) in block.chars().enumerate() {
+                            chars.insert(at + i, c);
+                        }
+                        text = chars.into_iter().collect();
+                    }
+                }
+
+                cache.sync(&text, width);
+                let chars: Vec<char> = text.chars().collect();
+                let want = visual_rows_of(&chars, width);
+                assert_eq!(
+                    cache.window(0, cache.row_count()),
+                    want,
+                    "width {width}, step {step}, text {text:?}"
+                );
+                assert_eq!(cache.row_count(), want.len(), "row count, step {step}");
+
+                // The caret model must agree at every position, including
+                // the very end of the text.
+                for cursor in [0usize, chars.len() / 3, chars.len() / 2, chars.len()] {
+                    assert_eq!(
+                        cache.caret(cursor),
+                        caret_in_rows(&chars, &want, cursor),
+                        "caret at {cursor}, width {width}, step {step}, text {text:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A width change re-wraps from scratch rather than reusing rows cut for
+    /// the old width — the one case the prefix/suffix diff cannot see.
+    #[test]
+    fn the_wrap_cache_rewraps_when_the_width_changes() {
+        let text = "the quick brown fox jumps over the lazy dog";
+        let chars: Vec<char> = text.chars().collect();
+        let mut cache = WrapCache::default();
+        for width in [40usize, 9, 80, 5] {
+            cache.sync(text, width);
+            assert_eq!(
+                cache.window(0, cache.row_count()),
+                visual_rows_of(&chars, width),
+                "width {width}"
+            );
+        }
+    }
+
+    /// The point of the cache (#678): a one-character edit in a large draft
+    /// re-wraps the line it touched, not the whole buffer. Counted through
+    /// the rows the cache rebuilt — before this, every keystroke rebuilt all
+    /// 20 000 of them.
+    #[test]
+    fn a_keystroke_rewraps_one_logical_line_not_the_whole_draft() {
+        let mut text: String = (0..20_000)
+            .map(|i| format!("line {i} of a pasted log file\n"))
+            .collect();
+        let mut cache = WrapCache::default();
+        cache.sync(&text, 40);
+        let rows_before = cache.row_count();
+        assert!(rows_before >= 20_000, "test setup: a big draft");
+
+        // Type one character into the middle line.
+        let at = text.char_indices().nth(text.chars().count() / 2).expect("a midpoint").0;
+        text.insert(at, 'x');
+        let touched = cache.rewrapped_rows_for_test(&text, 40);
+        assert!(
+            touched <= 4,
+            "a one-character edit re-wrapped {touched} rows; it must only re-wrap the line it touched"
+        );
+
+        // …and the result is still exactly the reference wrap.
+        let chars: Vec<char> = text.chars().collect();
+        assert_eq!(cache.window(0, cache.row_count()), visual_rows_of(&chars, 40));
     }
 
     #[test]
