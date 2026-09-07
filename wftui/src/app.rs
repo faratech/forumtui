@@ -378,6 +378,9 @@ pub struct App {
     pub screens: Vec<Screen>,
     pub me: Option<User>,
     pub alerts_unread: u32,
+    /// Which screen each breadcrumb names, stamped every frame beside the
+    /// header's hit boxes (#700).
+    crumb_targets: Vec<usize>,
     pub convos_unread: u32,
     pub status: String,
     /// When the current `status` was shown as a toast (`Some`) — cleared by
@@ -694,6 +697,7 @@ pub async fn run(images: crate::images::Images) -> u8 {
         screens: Vec::new(),
         me: None,
         alerts_unread: 0,
+        crumb_targets: Vec::new(),
         convos_unread: 0,
         status: "Starting…".into(),
         status_set_at: None,
@@ -1231,6 +1235,9 @@ impl App {
             // Debounced palette member lookup: the loop's idle path is the
             // only place with a clock, and typing must not fan out requests.
             self.poll_palette_member();
+            // Infinite scroll (#700): one path for every way of moving down
+            // a list — keys, wheel, `G`, a click.
+            self.autoload_more();
             // Wait up to 50ms for input; yields periodically to allow background tasks / pollers to refresh status.
             if let Some(first) = crate::event::next(&reader, Duration::from_millis(50)) {
                 let mut inputs = vec![first];
@@ -1319,20 +1326,30 @@ impl App {
         // other screen contributes exactly its own crumb; Login contributes
         // none (it is a gate, not a place).
         let mut crumbs: Vec<String> = Vec::with_capacity(self.screens.len() + 1);
-        for s in &self.screens {
+        // Which screen each crumb stands for, so clicking one can pop back to
+        // exactly that place (#700). Home contributes two crumbs and both
+        // point at Home — "Forums" and the forum it is showing are one screen.
+        let mut crumb_targets: Vec<usize> = Vec::with_capacity(self.screens.len() + 1);
+        for (i, s) in self.screens.iter().enumerate() {
             match s {
                 Screen::Login(_) => {}
                 Screen::Home(h) => {
                     crumbs.push("Forums".to_string());
+                    crumb_targets.push(i);
                     if !h.list.title.is_empty() {
                         crumbs.push(h.list.title.clone());
+                        crumb_targets.push(i);
                     }
                 }
-                other => crumbs.push(other.crumb()),
+                other => {
+                    crumbs.push(other.crumb());
+                    crumb_targets.push(i);
+                }
             }
         }
+        self.crumb_targets = crumb_targets;
         let me_name = self.me.as_ref().map(|u| u.username.as_str());
-        let (header, badges) = chrome::header_line_hits(
+        let (header, badges, crumb_hits) = chrome::header_line_hits(
             &self.theme,
             &self.glyphs,
             &crumbs,
@@ -1434,6 +1451,15 @@ impl App {
             self.hits.push(
                 ratatui::layout::Rect::new(b.x, top.y, b.width, 1),
                 Hit::Badge(b.tab),
+            );
+        }
+        // Crumbs after the badges: the badges sit on the right of the same
+        // row and must win where they overlap nothing, but last-registered
+        // wins and the two never share cells anyway.
+        for c in crumb_hits {
+            self.hits.push(
+                ratatui::layout::Rect::new(c.x, top.y, c.width, 1),
+                Hit::Crumb(c.index),
             );
         }
         for c in caps {
@@ -2043,6 +2069,78 @@ impl App {
         });
     }
 
+    /// Infinite scroll (#700): keep the list ahead of the reader.
+    ///
+    /// The viewport fill (#699) tops a list up to what the pane can show;
+    /// this is the same idea carried forward as they move — once the
+    /// selection is within a screenful of the last loaded row, the next
+    /// server page is fetched and appended. One page in flight at a time
+    /// (`loading` is the interlock), so a fast scroll walks forward a page
+    /// per reply instead of firing a burst at the gate.
+    ///
+    /// Called once per tick rather than from the key handlers, so the wheel,
+    /// the keys, `G`, and a click all feed it through one path.
+    fn autoload_more(&mut self) {
+        let Some(screen) = self.screens.last_mut() else { return };
+        let list = match screen {
+            Screen::Home(h) => &mut h.list,
+            Screen::ThreadList(l) => l,
+            _ => return,
+        };
+        if list.loading || list.error.is_some() || list.visible == 0 {
+            return;
+        }
+        let rows = list.threads.len();
+        let next = list.page.max(1) + list.pages_loaded.max(1);
+        if next > list.last_page {
+            return;
+        }
+        // A screenful of lead, so the rows are there before the reader
+        // arrives rather than after.
+        let lead = list.visible;
+        if rows == 0 || list.sel + lead < rows {
+            return;
+        }
+        let node_id = list.node_id;
+        list.loading = true;
+        self.load_forum_page(node_id, next, true);
+    }
+
+    /// Navigate to a clicked breadcrumb (#700): pop everything the crumb is
+    /// an ancestor of. The brand (`usize::MAX`) is the root — Home.
+    ///
+    /// Popping rather than pushing is what makes this navigation and not a
+    /// new place: the crumb names a screen that is already on the stack, and
+    /// clicking it returns to that screen exactly as Esc would, so its
+    /// scroll position, selection and loaded pages survive.
+    fn go_to_crumb(&mut self, index: usize) {
+        // Never through the sign-in gate: it owns the screen while it is up.
+        if matches!(self.screens.last(), Some(Screen::Login(_))) {
+            return;
+        }
+        let target = if index == usize::MAX {
+            self.screens
+                .iter()
+                .position(|s| matches!(s, Screen::Home(_)))
+                .unwrap_or(0)
+        } else {
+            match self.crumb_targets.get(index) {
+                Some(&i) => i,
+                None => return,
+            }
+        };
+        if target + 1 >= self.screens.len() {
+            // Already there — a click on the last crumb is a no-op, not a
+            // pop of the screen the reader is looking at.
+            return;
+        }
+        self.screens.truncate(target + 1);
+        // Any overlay was raised over the screen we just left.
+        self.palette = None;
+        self.show_help = false;
+        self.prefix = Prefix::default();
+    }
+
     fn run_palette_target(&mut self, target: overlay::Target) {
         use overlay::Target as T;
         match target {
@@ -2458,6 +2556,7 @@ impl App {
                     screen.select_post(i);
                 }
             }
+            Hit::Crumb(index) => self.go_to_crumb(index),
             Hit::Pane(_) => {
                 if let Some(screen) = self.screens.last_mut() {
                     screen.focus_pane_at(pos.0, pos.1);
@@ -7613,6 +7712,7 @@ mod tests {
         let client = offline_client();
         let (tx, rx) = mpsc::unbounded_channel();
         App {
+            crumb_targets: Vec::new(),
             api: Arc::new(RecordingApi::default()),
             client,
             tx,
@@ -7979,6 +8079,101 @@ mod tests {
             matches!(app.screens.last(), Some(Screen::Resources(_))),
             "and the resources row opens the resource catalog"
         );
+    }
+
+    /// #700: clicking a breadcrumb goes back to the place it names — a pop,
+    /// so the screen it returns to keeps its scroll, selection and pages.
+    /// The last crumb is where you already are, and clicking it must not pop
+    /// the screen out from under the reader.
+    #[tokio::test]
+    async fn clicking_a_breadcrumb_returns_to_that_screen() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::ThreadList(screens::ThreadListState {
+            node_id: 4,
+            title: "Windows News".into(),
+            ..Default::default()
+        }));
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 1, title: "A thread".into(), ..Default::default() },
+            ..Default::default()
+        }));
+        // Home(0), ThreadList(1), ThreadView(2) — the crumb row the frame
+        // built for exactly that stack.
+        app.crumb_targets = vec![0, 0, 1, 2];
+
+        // The ThreadList crumb: back to the list, thread view gone.
+        app.go_to_crumb(2);
+        assert_eq!(app.screens.len(), 2);
+        assert!(matches!(app.screens.last(), Some(Screen::ThreadList(_))));
+
+        // The crumb for where we already are is inert.
+        app.go_to_crumb(2);
+        assert_eq!(app.screens.len(), 2, "the last crumb must not pop anything");
+
+        // The brand is the root.
+        app.go_to_crumb(usize::MAX);
+        assert_eq!(app.screens.len(), 1);
+        assert!(matches!(app.screens.last(), Some(Screen::Home(_))));
+    }
+
+    /// The sign-in gate owns the screen while it is up: no crumb click may
+    /// pop it (the same rule Esc follows, issue #556).
+    #[tokio::test]
+    async fn a_breadcrumb_click_cannot_escape_the_sign_in_gate() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(screens::login_state());
+        app.crumb_targets = vec![0, 0];
+        app.go_to_crumb(0);
+        assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
+    }
+
+    /// #700: infinite scroll — arriving within a screenful of the last
+    /// loaded row pulls the next page in, and it stays quiet until then.
+    #[tokio::test]
+    async fn scrolling_towards_the_end_pulls_the_next_page_in() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        if let Some(Screen::Home(h)) = app.screens.last_mut() {
+            h.list.node_id = 4;
+            h.list.threads = (0..40)
+                .map(|i| Thread { thread_id: i, ..Default::default() })
+                .collect();
+            h.list.page = 1;
+            h.list.pages_loaded = 2;
+            h.list.per_page = 20;
+            h.list.last_page = 22;
+            h.list.visible = 10;
+            h.list.sel = 5;
+        }
+        app.autoload_more();
+        let loading = |app: &App| match app.screens.last() {
+            Some(Screen::Home(h)) => h.list.loading,
+            _ => panic!("home"),
+        };
+        assert!(!loading(&app), "near the top: nothing to fetch yet");
+
+        // Within a screenful of the end.
+        if let Some(Screen::Home(h)) = app.screens.last_mut() {
+            h.list.sel = 32;
+        }
+        app.autoload_more();
+        assert!(loading(&app), "approaching the end must fetch the next page");
+
+        // And it never fires twice at once.
+        app.autoload_more();
+        assert!(loading(&app));
+
+        // On the last page there is nothing left to pull.
+        if let Some(Screen::Home(h)) = app.screens.last_mut() {
+            h.list.loading = false;
+            h.list.page = 21;
+            h.list.pages_loaded = 2;
+            h.list.sel = 39;
+        }
+        app.autoload_more();
+        assert!(!loading(&app), "no page after the last one");
     }
 
     /// #699: XF fixes the page size server-side (20 rows, and it ignores
@@ -8726,6 +8921,53 @@ mod tests {
 
     /// The Home frame's geometry, spelled out once because the rest of these
     /// tests read it: header row 0, body rows 1..=21, key bar row 22, status
+    /// #700: the crumb row really is clickable — the hit boxes land on the
+    /// crumb text the frame drew, and each one names the screen it stands
+    /// for. Measured off a drawn frame rather than recomputed, because a
+    /// second guess at the header's overflow ladder is exactly the bug.
+    #[test]
+    fn the_breadcrumb_row_maps_each_crumb_to_its_screen() {
+        let mut app = home_app();
+        app.screens.push(Screen::ThreadList(screens::ThreadListState {
+            node_id: 4,
+            title: "Windows News".into(),
+            ..Default::default()
+        }));
+        frame(&mut app, 120, 24);
+
+        // Row 0 is the header. Walk it and collect what each cell answers.
+        let mut seen: Vec<(usize, u16)> = Vec::new();
+        for x in 0..120u16 {
+            if let Some(Hit::Crumb(i)) = app.hits.at(x, 0) {
+                seen.push((*i, x));
+            }
+        }
+        assert!(!seen.is_empty(), "the crumb row registered nothing");
+        // The brand at the far left is the root.
+        assert!(
+            seen.iter().any(|(i, x)| *i == usize::MAX && *x < 6),
+            "the brand must be the root crumb: {seen:?}"
+        );
+        // Every other index is a real screen this stack has.
+        for (i, _) in &seen {
+            assert!(
+                *i == usize::MAX || app.crumb_targets.get(*i).is_some(),
+                "crumb {i} names no screen: targets {:?}",
+                app.crumb_targets
+            );
+        }
+        // The last crumb is the screen on top, and clicking it changes
+        // nothing; the one before it pops back one place.
+        let deepest = seen.iter().map(|(i, _)| *i).filter(|i| *i != usize::MAX).max().unwrap();
+        let depth_before = app.screens.len();
+        app.go_to_crumb(deepest);
+        assert_eq!(app.screens.len(), depth_before, "the current crumb is inert");
+        if deepest > 0 {
+            app.go_to_crumb(deepest - 1);
+            assert!(app.screens.len() < depth_before, "an ancestor crumb pops back");
+        }
+    }
+
     /// row 23. The Forums panel is 37 wide (inner x 1..=35, y from 2): the
     /// QUICK block is rows 2..=6 (` QUICK`, then L/1/2/3), row 7 is blank and
     /// the nodes start at row 8. The thread list's inner starts at x 38, with

@@ -177,6 +177,16 @@ pub struct BadgeHit {
     pub tab: crate::screens::InboxTab,
 }
 
+/// Where a crumb was drawn, and which crumb of the *original* path it is —
+/// the row elides its middle when it does not fit, so the drawn position and
+/// the caller's index part company (#700).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrumbHit {
+    pub x: u16,
+    pub width: u16,
+    pub index: usize,
+}
+
 /// [`header_line`] plus the badges' cell ranges, for the frame's hit map.
 /// One function builds both so the row and the hit boxes can never disagree
 /// about where the overflow ladder left them.
@@ -190,19 +200,28 @@ pub fn header_line_hits(
     alerts: u32,
     online: Option<u32>,
     width: u16,
-) -> (Line<'static>, Vec<BadgeHit>) {
+) -> (Line<'static>, Vec<BadgeHit>, Vec<CrumbHit>) {
     let w = width as usize;
     let brand = brand_spans(theme);
     let brand_w = spans_width(&brand);
     // One leading space before the mark, one minimum gap before the right side.
     const LEAD: usize = 1;
     const GAP: usize = 1;
-    let needed = |crumbs: &[String], right_w: usize| {
-        LEAD + brand_w + crumbs_width(g, crumbs) + right_w + GAP
+    let needed = |crumbs: &[(String, Option<usize>)], right_w: usize| {
+        let texts: Vec<String> = crumbs.iter().map(|(c, _)| c.clone()).collect();
+        LEAD + brand_w + crumbs_width(g, &texts) + right_w + GAP
     };
 
     let (mut right, mut marks) = right_spans(theme, user, inbox, alerts, online);
-    let mut crumbs: Vec<String> = crumbs.to_vec();
+    // Each crumb keeps the index it had in the caller's path, so a click on
+    // a drawn crumb still means the place the caller named — the rungs below
+    // drop and rewrite crumbs, and a positional index would then point at
+    // the wrong screen (#700).
+    let mut crumbs: Vec<(String, Option<usize>)> = crumbs
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.clone(), Some(i)))
+        .collect();
 
     // Rung 1: the online count is the least load-bearing thing on the row.
     if needed(&crumbs, spans_width(&right)) > w && online.is_some() {
@@ -212,18 +231,20 @@ pub fn header_line_hits(
     if needed(&crumbs, spans_width(&right)) > w && crumbs.len() > 2 {
         let last = crumbs.pop().unwrap_or_default();
         let first = crumbs.remove(0);
-        crumbs = vec![first, ELLIPSIS.to_string(), last];
+        // The ellipsis stands for crumbs that are not drawn, so it is not a
+        // click target: no index.
+        crumbs = vec![first, (ELLIPSIS.to_string(), None), last];
     }
     // Rung 3: clip the last crumb into whatever is left.
     let right_w = spans_width(&right);
     if needed(&crumbs, right_w) > w && !crumbs.is_empty() {
         let last_idx = crumbs.len() - 1;
-        let others: Vec<String> = crumbs[..last_idx].to_vec();
+        let others = crumbs[..last_idx].to_vec();
         // The last crumb costs its text plus its own 3-cell " > " separator.
         let fixed = needed(&others, right_w) + 3;
         let budget = w.saturating_sub(fixed);
         if budget >= 2 {
-            crumbs[last_idx] = truncate(&crumbs[last_idx], budget);
+            crumbs[last_idx].0 = truncate(&crumbs[last_idx].0, budget);
         } else {
             crumbs.truncate(last_idx);
         }
@@ -231,15 +252,32 @@ pub fn header_line_hits(
 
     let mut spans = vec![Span::styled(" ", theme.chrome())];
     spans.extend(brand);
+    // The brand itself is the path's root — clicking it goes Home (#700).
+    let mut crumb_hits: Vec<CrumbHit> = vec![CrumbHit {
+        x: LEAD as u16,
+        width: brand_w as u16,
+        index: usize::MAX,
+    }];
     let last_idx = crumbs.len().saturating_sub(1);
-    for (i, c) in crumbs.iter().enumerate() {
+    for (i, (c, origin)) in crumbs.iter().enumerate() {
         spans.push(Span::styled(format!(" {} ", g.crumb), theme.chrome_dim()));
         let style = if i == last_idx {
             theme.chrome_bold()
         } else {
             theme.chrome()
         };
+        // Measured off the spans actually pushed, never a second guess at
+        // the layout — the same rule the badges follow.
+        let x = spans_width(&spans);
         spans.push(Span::styled(c.clone(), style));
+        if let Some(origin) = origin {
+            let width = spans_width(&spans) - x;
+            crumb_hits.push(CrumbHit {
+                x: x as u16,
+                width: width as u16,
+                index: *origin,
+            });
+        }
     }
 
     let used = spans_width(&spans);
@@ -277,7 +315,9 @@ pub fn header_line_hits(
             spans.push(Span::styled(" ".repeat(w - used), theme.chrome()));
         }
     }
-    (Line::from(clip_spans(spans, w)), badges)
+    // A crumb the width ladder pushed off the row is not clickable.
+    crumb_hits.retain(|c| (c.x as usize) < w && c.width > 0);
+    (Line::from(clip_spans(spans, w)), badges, crumb_hits)
 }
 
 fn brand_spans(theme: &Theme) -> Vec<Span<'static>> {

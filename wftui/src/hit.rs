@@ -65,6 +65,9 @@ pub enum Hit {
     Field(usize),
     /// A BBCode cap on the composer's caps row (`^B`, `^I`, …).
     Cap(&'static str),
+    /// A breadcrumb segment: the index of the screen it names, or
+    /// `usize::MAX` for the brand at the far left, which is Home (#700).
+    Crumb(usize),
     /// A go-to palette row: index into the palette's filtered list.
     PaletteRow(usize),
     /// Anywhere outside an open overlay: closes it.
