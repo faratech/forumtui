@@ -102,16 +102,34 @@ plain-enum errors, no anyhow/thiserror, inline `#[cfg(test)]` tests, `rust-versi
   literal text, `[CODE]`/`[ICODE]` bodies are verbatim, `[USER]` already carries
   the `@`). `osc.rs` — OSC 8 hyperlinks + OSC 52 clipboard with tmux DCS
   passthrough (a `screen*` TERM without `$TMUX` is tmux-over-ssh: dual-deliver).
-  `config.rs` — constants + the `WFTUI_*` env overrides.
+  `drafts.rs` — unsent composer drafts, stored like the token set (one JSON
+  file, `0600`, temp-file-plus-rename) but with the opposite failure policy: a
+  corrupt store is quarantined and read as *no drafts* rather than surfaced as
+  an error, because a convenience file must never stand between the user and
+  the composer, and an unknown key kind is dropped so a newer build's store
+  cannot brick an older one. `config.rs` — constants + the `WFTUI_*` env
+  overrides.
 
 ### `wftui/` — the binary
 
 - `main.rs` runs graphics detection (reads stdin — before the reader thread), then
   `app::run`. `event.rs` is the dedicated blocking reader thread (hard rule 3).
   `tty.rs` snapshots termios before detection and re-applies it on every exit path.
-- `app.rs` (the largest file) is one `App` with an event loop ticking every 50 ms,
-  a `Msg` pump (every async result is a `Msg` variant handled in `handle_msg`),
-  `handle_key` / `handle_mouse`, and `draw`. Screens never see `App`: they own
+- `app/` is one `App` with an event loop ticking every 50 ms, a `Msg` pump
+  (every async result is a `Msg` variant handled in `handle_msg`),
+  `handle_key` / `handle_mouse`, and `draw`. It is split across continuation
+  `impl App` blocks (#714), so a method's home is a filing decision and
+  nothing else: `mod.rs` holds `App`/`Msg`/`TaskError`/`TerminalGuard`,
+  `event_loop`, `draw`, the screen stack and the tests; `msg.rs` holds
+  `handle_msg`; `actions.rs` holds `execute_action` and the fetches it
+  spawns; `input.rs` keys, mouse and selection; `session.rs` bootstrap,
+  recovery, pollers, teardown and logout. A method moved out of `mod.rs` is
+  `pub(super)` — the same scope a private `fn` in `app` always had, just
+  spelled out. **A source-scan test that reads `include_str!` must list every
+  one of these files**; `every_app_module_is_covered_by_the_source_scans`
+  fails when a new module is not added to that list, because a scan of one
+  file would otherwise keep passing while covering almost nothing.
+  Screens never see `App`: they own
   their state, render into a `Rect`, and return `Action`s from `on_key`; the app
   executes actions (`execute_action`) by spawning tasks that send `Msg`s back.
   Loads carry their identity and stale replies are dropped — copy that
@@ -309,6 +327,28 @@ The thread view's write keys are `r` reply, `Q` quote (see below), `e` edit,
   from a keystroke.
 - **A failed write keeps the draft.** The editor stays open with its text and
   the error; losing a rewritten post to a 403 is worse than the 403.
+- **So does Esc.** Esc closes the composer instantly — no confirm prompt, so
+  the ordinary empty-composer case pays nothing — and the draft is saved and
+  offered back the next time *that same composer* opens (#715). `^X` discards
+  a resumed draft, and puts back whatever the composer would have shown
+  without one: for an edit that is the post's current text, so discarding a
+  draft must never empty the post.
+
+Draft rules worth knowing before touching `pop_screen` or `push_screen`:
+
+- **Restore lives in `push_screen`, save in `pop_screen`.** Every composer
+  reaches the stack through `push_screen`, so a new opener cannot forget to
+  restore. Do not add a composer that bypasses it.
+- **The successful-write arms must not go through `pop_screen`,** which
+  *saves*. They call `close_sent_composer`, which removes the screen and
+  forgets the draft: the post is on the site, so the next reply to that
+  thread must not come up pre-filled with it.
+- **Drafts are keyed by `ComposeTarget` identity**, so an edit of post 5 and
+  a reply to the thread holding it never share one.
+- **Drafts are cleared on an explicit sign-out and on an identity change**
+  (the #581 teardown), because an unsent post is private writing and the next
+  person to sign in on that machine must not be offered it. A session that
+  merely *expires* keeps them — that user is coming back.
 
 ## Quoting — the ContentIntegrity contract
 
@@ -426,6 +466,27 @@ field on that model is `#[serde(default)]`.
 
 ## Testing without touching production
 
+- **The politeness gates are real time in tests too.** A second write on one
+  client sleeps the full 30 s `WRITE_COOLDOWN_MS`, and one test doing that was
+  30.6 s of the `common` suite's 36.8 s — 36.8 s of wall clock for 1.9 s of
+  CPU (#712). A test about *what* goes on the wire calls `open_gates` before
+  **each** write (a successful write `penalize`s the gate back to the full
+  cool-down, so once up front is not enough).
+  `write_gate_is_opened_in_every_test_that_writes_twice` fails when a new
+  multi-write test forgets. Tests whose subject *is* the spacing —
+  `upload_attachment_re_anchors_the_write_gate_on_success`, the `ratelimit`
+  module's own, and the image-lane test that queues ten fetches — keep
+  waiting on purpose and are allowlisted. `start_paused = true` works only for
+  pure-timer tests: a wiremock server over loopback stalls on a paused clock.
+- **A fixture is a whole captured body, in a file.** They live in
+  `common/src/testdata/*.json` and come in through `include_str!`; capture
+  them with `cargo run -p common --example capture_fixture`, which never
+  selects fields. Three bugs shipped behind fixtures that disagreed with the
+  wire (#696, #698, #709) — #698 specifically because a re-capture was piped
+  through `jq`, which silently dropped `tags`. Note the root `.gitignore`
+  excludes `*.json`; `common/src/testdata/.gitignore` negates it for that
+  directory, so a new fixture there is committable — that is why the older
+  `styled_posts.txt` is a `.txt`.
 - **No test may resolve the real config dir or the live site.** The suite once
   overwrote the operator's `~/.config/wftui/token.json` with a fixture and
   `GET /api/me`'d the live site with the real bearer. Build test clients with
@@ -578,4 +639,4 @@ an image past either returns `Err` and falls back to the placeholder.
   (`XFMG:Albums`, `XFMG:Comments`), and a resource shows its description but
   not its updates, reviews or versions (`XFRM:ResourceUpdates`,
   `ResourceReviews`, `ResourceVersions`). All of those endpoints exist.
-- Composer drafts do not survive Esc, and there is no @mention completion.
+- There is no @mention completion.

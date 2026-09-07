@@ -203,8 +203,12 @@ so, since XF gates `is_banned` to viewers who may bypass user privacy.
 * **Reply** (`c2.png` bottom): editor panel `Reply` (72) + `Preview` (48) rendering
   the draft through common::bbcode; editor bottom line = BBCode caps ^B ^I ^K ^Q ^U
   and char count. Keys: ^S send · ^O preview on/off · ^F attach · ^Y paste · Tab
-  field · Esc discard. `^F` opens a one-line path prompt — a terminal has no
+  field · Esc close. `^F` opens a one-line path prompt — a terminal has no
   file picker — and the uploaded file lands at the caret as `[ATTACH]id[/ATTACH]`.
+  Esc **closes without discarding**: the draft is saved and offered back the
+  next time this same composer opens, and a resumed composer grows one more
+  cap, `^X discard draft`, which restores what it would have shown without a
+  draft (for an edit, the post's current text).
 * **Sign in** (`c3.png` top, `c5.png` bottom): centered 72-wide panel with the white
   bubble mark (rounded top-left/top-right/bottom-left, square bottom-right — matching
   `wf-logo.png` — carrying bold blue `WF`), steps 1-2-3, the short link in its own box,
@@ -286,7 +290,7 @@ the post-writing set in the thread view — `Q` quote, `e` edit, `D` delete
 ```bash
 cd /web/wftui_app
 cargo check                                            # while iterating
-cargo test --workspace                                 # 523 tests today; keep them green, add yours
+cargo test --workspace                                 # 549 tests today; keep them green, add yours
 cargo test -p wftui --no-default-features              # the no-images build must stay green too
 cargo clippy --all-targets --release -- -D warnings    # must stay at 0
 cargo build --release && cp target/release/wftui bin/wftui
