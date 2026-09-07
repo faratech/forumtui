@@ -2,13 +2,16 @@
 resolver = "2"
 members = ["common", "wftui"]
 
-# TUI, not a hot proxy: thin LTO and parallel codegen keep link times sane.
+# An interactive client, not a build artifact: fat LTO and a single codegen
+# unit buy cross-crate inlining for the per-frame span building (the draw
+# path calls into common/bbcode + chrome constantly) at the cost of slower
+# release links — the right trade for a 20 fps UI (#676).
 # panic MUST stay "unwind": main.rs wraps the run loop in catch_unwind and a
 # TerminalGuard Drop restores raw mode / alternate screen during unwind. A TUI
 # that aborts leaves the user's terminal broken. Same precedent as deltamud.
 [profile.release]
 opt-level = 3
-lto = "thin"
-codegen-units = 16
+lto = "fat"
+codegen-units = 1
 panic = "unwind"
 strip = "symbols"
