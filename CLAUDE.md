@@ -152,6 +152,28 @@ If `/me` reports a different user, the old identity is torn down and a hint name
 the new one. `logout()` forgets tokens synchronously before the (slow) revoke
 calls. Writes carry the session generation and are aborted by `end_session`.
 
+## Attachments (#709)
+
+`^F` in the composer opens a path prompt — a terminal has no file picker, so
+the path is typed (`~` expands) — and the file is uploaded, inserted at the
+caret as `[ATTACH]id[/ATTACH]`, and remembered.
+
+The **attachment key** is the whole mechanism: an upload is attached to
+nothing until a write carries the same key, and XF checks the key's context
+against that write (`context[thread_id]` for a reply, `context[node_id]` for
+a new thread, `context[post_id]` for an edit — `AttachContext`). One key per
+draft: the first file mints it, later files reuse it, and
+`ComposeState::attachment_key` is what `reply`/`create_thread`/`edit_post`
+carry. Conversations take attachments under a different content type this
+client does not upload to, so `^F` is not offered there at all.
+
+Two wire shapes worth remembering, both of which the old code had wrong while
+its tests passed on invented fixtures:
+`POST /attachments/new-key` returns **`{"key": …}`**, not `attachment_key`,
+and `POST /attachments/` returns **`{"attachment": {…}}`** — decoding that
+envelope as a bare `Attachment` yields a silently *blank* one, because every
+field on that model is `#[serde(default)]`.
+
 ## Writing: reply, quote, edit, delete, solution
 
 The thread view's write keys are `r` reply, `Q` quote (see below), `e` edit,

@@ -351,6 +351,16 @@ impl WfApiClient {
 
     // ---- attachments (inherent; not part of the trait) ----
 
+    /// Upload one file and return it **with the key it was uploaded under**
+    /// (#709).
+    ///
+    /// The key is the whole point: an upload is only attached to anything
+    /// once a write carries the same key, and further files can be uploaded
+    /// under it. Returning only the `Attachment` — as this did until now —
+    /// left the caller holding a file nothing could reference.
+    ///
+    /// Pass `existing_key` to add a file to a key already minted, so one
+    /// post's attachments share one key.
     pub async fn upload_attachment(
         &self,
         content_type: &str,
@@ -358,38 +368,49 @@ impl WfApiClient {
         filename: String,
         bytes: Vec<u8>,
         mime: &str,
-    ) -> Result<Attachment> {
+        existing_key: Option<&str>,
+    ) -> Result<(String, Attachment)> {
         self.api_gate.wait().await;
         self.write_gate.wait().await;
         let token = self.valid_token().await?;
 
-        let mut form: Vec<(&str, String)> = vec![("type", content_type.to_string())];
-        for (k, v) in context {
-            form.push((k, v.clone()));
-        }
-        let key_url = format!("{}/attachments/new-key", self.api_base());
-        let key_resp = self
-            .http
-            .post(key_url)
-            .form(&form)
-            .bearer_auth(&token)
-            .timeout(config::UPLOAD_TIMEOUT)
-            .send()
-            .await?;
-        #[derive(serde::Deserialize)]
-        struct NewKey {
-            attachment_key: String,
-        }
-        let new_key: NewKey = decode(key_resp)
-            .await
-            .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate, &self.write_gate]))?;
+        // One key per post: mint it on the first file, reuse it after.
+        let key = match existing_key {
+            Some(k) => k.to_string(),
+            None => {
+                let mut form: Vec<(&str, String)> = vec![("type", content_type.to_string())];
+                for (k, v) in context {
+                    form.push((k, v.clone()));
+                }
+                let key_url = format!("{}/attachments/new-key", self.api_base());
+                let key_resp = self
+                    .http
+                    .post(key_url)
+                    .form(&form)
+                    .bearer_auth(&token)
+                    .timeout(config::UPLOAD_TIMEOUT)
+                    .send()
+                    .await?;
+                #[derive(serde::Deserialize)]
+                struct NewKey {
+                    #[serde(alias = "attachment_key")]
+                    key: String,
+                }
+                let new_key: NewKey = decode(key_resp)
+                    .await
+                    .inspect_err(|e| {
+                        self.note_rate_limit(e, &[&self.api_gate, &self.write_gate])
+                    })?;
+                new_key.key
+            }
+        };
 
         self.api_gate.wait().await;
         let upload_url = format!("{}/attachments/", self.api_base());
         let file_part =
             reqwest::multipart::Part::bytes(bytes).file_name(filename).mime_str(mime)?;
         let form = reqwest::multipart::Form::new()
-            .text("key", new_key.attachment_key)
+            .text("key", key.clone())
             .part("attachment", file_part);
         let resp = self
             .http
@@ -399,7 +420,18 @@ impl WfApiClient {
             .timeout(config::UPLOAD_TIMEOUT)
             .send()
             .await?;
-        let out: Result<Attachment> = decode(resp).await;
+        // The envelope is `{"attachment": {...}}` — decoding it as a bare
+        // `Attachment` yielded a silently BLANK one, because every field on
+        // that model is `#[serde(default)]` (#709). A tolerant model turns a
+        // wrong shape into empty data rather than an error, so the shape has
+        // to be right.
+        #[derive(serde::Deserialize)]
+        struct Uploaded {
+            #[serde(default)]
+            attachment: Attachment,
+        }
+        let out: Result<Uploaded> = decode(resp).await;
+        let out = out.map(|u| (key, u.attachment));
         if out.is_ok() {
             // Anchor the following post's cool-down here, like `post_form`
             // does: the attachment is a flood-checked write, so the reply it
@@ -645,8 +677,18 @@ pub trait WfApi: Send + Sync {
     async fn threads(&self, page: u32) -> Result<ThreadsReply>;
     async fn thread(&self, id: u32, page: u32) -> Result<ThreadReply>;
     async fn thread_posts(&self, id: u32, page: u32) -> Result<PostsReply>;
-    async fn reply(&self, thread_id: u32, message: &str) -> Result<Post>;
-    async fn create_thread(&self, node_id: u32, title: &str, message: &str) -> Result<Thread>;
+    /// `attachment_key` ties files already uploaded under that key to this
+    /// post (#709). XF requires the key's context to match: `thread_id` for
+    /// a reply, `node_id` for a new thread, `post_id` for an edit.
+    async fn reply(&self, thread_id: u32, message: &str, attachment_key: Option<&str>)
+        -> Result<Post>;
+    async fn create_thread(
+        &self,
+        node_id: u32,
+        title: &str,
+        message: &str,
+        attachment_key: Option<&str>,
+    ) -> Result<Thread>;
     /// Mark a thread read up to `date` (a post's timestamp), or to now when
     /// `None`. XF refuses to move the marker backwards, so a partial read
     /// marks partially and re-reading is idempotent (#694).
@@ -656,7 +698,8 @@ pub trait WfApi: Send + Sync {
     /// highlighted (#694).
     async fn mark_alerts_viewed(&self) -> Result<()>;
     /// Edit a post's message (#708). `POST /posts/{id}`.
-    async fn edit_post(&self, id: u32, message: &str) -> Result<()>;
+    async fn edit_post(&self, id: u32, message: &str, attachment_key: Option<&str>)
+        -> Result<()>;
     /// Delete a post — soft by default, which is what XF's own UI does and
     /// what leaves the content recoverable (#708).
     async fn delete_post(&self, id: u32, hard: bool) -> Result<()>;
@@ -736,37 +779,50 @@ impl WfApi for WfApiClient {
             .await
     }
 
-    async fn reply(&self, thread_id: u32, message: &str) -> Result<Post> {
+    async fn reply(
+        &self,
+        thread_id: u32,
+        message: &str,
+        attachment_key: Option<&str>,
+    ) -> Result<Post> {
         #[derive(serde::Deserialize)]
         struct PostCreated {
             post: Post,
         }
-        let created: PostCreated = self
-            .post_form(
-                "/posts",
-                &[
-                    ("thread_id", thread_id.to_string()),
-                    ("message", message.to_string()),
-                ],
-                None,
-            )
-            .await?;
+        let mut form = vec![
+            ("thread_id", thread_id.to_string()),
+            ("message", message.to_string()),
+        ];
+        if let Some(key) = attachment_key {
+            form.push(("attachment_key", key.to_string()));
+        }
+        let created: PostCreated = self.post_form("/posts", &form, None).await?;
         Ok(created.post)
     }
 
-    async fn create_thread(&self, node_id: u32, title: &str, message: &str) -> Result<Thread> {
+    async fn create_thread(
+        &self,
+        node_id: u32,
+        title: &str,
+        message: &str,
+        attachment_key: Option<&str>,
+    ) -> Result<Thread> {
         #[derive(serde::Deserialize)]
         struct ThreadCreated {
             thread: Thread,
         }
+        let mut form = vec![
+            ("node_id", node_id.to_string()),
+            ("title", title.to_string()),
+            ("message", message.to_string()),
+        ];
+        if let Some(key) = attachment_key {
+            form.push(("attachment_key", key.to_string()));
+        }
         let created: ThreadCreated = self
             .post_form(
                 "/threads",
-                &[
-                    ("node_id", node_id.to_string()),
-                    ("title", title.to_string()),
-                    ("message", message.to_string()),
-                ],
+                &form,
                 Some(Duration::from_millis(config::NEW_THREAD_COOLDOWN_MS)),
             )
             .await?;
@@ -787,12 +843,20 @@ impl WfApi for WfApiClient {
             .await
     }
 
-    async fn edit_post(&self, id: u32, message: &str) -> Result<()> {
+    async fn edit_post(
+        &self,
+        id: u32,
+        message: &str,
+        attachment_key: Option<&str>,
+    ) -> Result<()> {
         // An edit is a write like any other: it goes through the write gate,
         // which is what keeps this client inside the zone's flood budget.
         self.write_gate.wait().await;
-        self.post_unit(&format!("/posts/{id}"), &[("message", message.to_string())])
-            .await
+        let mut form = vec![("message", message.to_string())];
+        if let Some(key) = attachment_key {
+            form.push(("attachment_key", key.to_string()));
+        }
+        self.post_unit(&format!("/posts/{id}"), &form).await
     }
 
     async fn delete_post(&self, id: u32, hard: bool) -> Result<()> {
@@ -1240,6 +1304,43 @@ mod tests {
     /// pick up what the sibling wrote — and must report `false` (nothing to
     /// recover) when the file is missing or already the token set in memory,
     /// so the caller can end the session instead of looping.
+    /// #709: a second file goes up under the key the first one minted, so
+    /// one post's attachments share one key — and the key request is not
+    /// repeated.
+    #[tokio::test]
+    async fn a_second_upload_reuses_the_first_keys() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-upload-reuse");
+        Mock::given(method("POST"))
+            .and(path("/api/attachments/new-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "key": "key-1"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/attachments/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "attachment": {"attachment_id": 55, "filename": "shot.png"}
+            })))
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let (key, _) = c
+            .upload_attachment("post", &[], "a.png".into(), vec![1], "image/png", None)
+            .await
+            .unwrap();
+        let (key2, _) = c
+            .upload_attachment("post", &[], "b.png".into(), vec![2], "image/png", Some(&key))
+            .await
+            .unwrap();
+        assert_eq!(key2, key, "the second file joins the first one's key");
+        // `expect(1)` on the key mock is the other half: it must not be
+        // minted twice.
+    }
+
     /// #697: the gallery's full-size bytes come from the API itself
     /// (`/api/media/{id}/data`) and need the bearer token — but an image URL
     /// is attacker-influenced (any post can carry an `[IMG]` pointing
@@ -2542,8 +2643,13 @@ mod tests {
         let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-upload-gate");
         Mock::given(method("POST"))
             .and(path("/api/attachments/new-key"))
+            // The REAL shape: `AttachmentsController::actionPostNewKey`
+            // returns `['key' => ...]`. This fixture said `attachment_key`
+            // and the decoder believed it, so the upload path would have
+            // failed against production while the test passed (#709, and the
+            // same lesson as #696).
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "attachment_key": "key-1"
+                "key": "key-1"
             })))
             .mount(&server)
             .await;
@@ -2557,9 +2663,13 @@ mod tests {
 
         let c = logged_in_client("tok-1").await;
         let before = c.write_gate.pending_wait();
-        c.upload_attachment("post", &[], "shot.png".into(), vec![1, 2, 3], "image/png")
+        let (key, attachment) = c
+            .upload_attachment("post", &[], "shot.png".into(), vec![1, 2, 3], "image/png", None)
             .await
             .unwrap();
+        // The key is what ties the upload to the post that follows it.
+        assert_eq!(key, "key-1");
+        assert_eq!(attachment.attachment_id, 55);
         let after = c.write_gate.pending_wait();
         assert!(
             after >= before + Duration::from_secs(29),

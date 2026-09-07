@@ -97,6 +97,52 @@ impl TaskErrorKind {
 /// "it downloaded many pages and the pagination kept changing".
 const FILL_PAGE_BUDGET: u8 = 3;
 
+/// Ceiling on a file this client will upload (#709). XF has its own limit,
+/// usually lower, but reading a huge file into memory to be refused by the
+/// server is worse than saying so first.
+const MAX_UPLOAD_BYTES: u64 = 24 * 1024 * 1024;
+
+/// `~` in a typed path means what the shell means by it — the prompt is
+/// where a path is typed, and a terminal user types `~/shot.png`.
+fn shellexpand_home(path: &str) -> String {
+    let trimmed = path.trim();
+    let Some(rest) = trimmed.strip_prefix('~') else {
+        return trimmed.to_string();
+    };
+    let Some(home) = std::env::var_os("HOME") else {
+        return trimmed.to_string();
+    };
+    let mut out = std::path::PathBuf::from(home);
+    let rest = rest.trim_start_matches('/');
+    if !rest.is_empty() {
+        out.push(rest);
+    }
+    out.to_string_lossy().to_string()
+}
+
+/// The content type for an upload, from the file's extension. XF sniffs the
+/// bytes itself and this is only what the multipart part declares, so the
+/// list stays short and honest: the types a support forum actually receives.
+fn mime_for(filename: &str) -> &'static str {
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "txt" | "log" => "text/plain",
+        "zip" => "application/zip",
+        "pdf" => "application/pdf",
+        "dmp" | "etl" => "application/octet-stream",
+        _ => "application/octet-stream",
+    }
+}
+
 /// Serializable error payload crossing from background tasks into the UI.
 #[derive(Debug, Clone)]
 pub struct TaskError {
@@ -302,6 +348,9 @@ pub enum Msg {
     ResourceLoaded { page: u32, result: TaskResult<ResourceListReply> },
     /// The gallery's category tree, and one resource's page (#697).
     MediaCategoriesLoaded(TaskResult<common::models::MediaCategoriesReply>),
+    /// An attachment upload finished (#709): the key it went under and the
+    /// file, or a message saying why not.
+    AttachmentUploaded(std::result::Result<(String, common::models::Attachment), String>),
     /// Post edits, deletions and solution toggles (#708).
     PostEdited { post_id: u32, result: TaskResult<()> },
     PostDeleted { post_id: u32, thread_id: u32, result: TaskResult<()> },
@@ -1903,12 +1952,26 @@ impl App {
                     ..Default::default()
                 }));
             }
+            Action::UploadAttachment { path, context } => {
+                let api = self.client.clone();
+                let tx = self.tx.clone();
+                let key = self.compose_attachment_key();
+                if let Some(Screen::Compose(c)) = self.screens.last_mut() {
+                    c.uploading = true;
+                    c.error = None;
+                }
+                self.spawn_write(async move {
+                    let result = App::upload_from_path(&api, &path, context, key.as_deref()).await;
+                    tx.send(Msg::AttachmentUploaded(result)).ok();
+                });
+            }
             Action::SubmitEdit { post_id, message } => {
                 let api = self.api.clone();
+                let key = self.compose_attachment_key();
                 let tx = self.tx.clone();
                 self.spawn_write(async move {
                     let result = api
-                        .edit_post(post_id, &message)
+                        .edit_post(post_id, &message, key.as_deref())
                         .await
                         .map_err(|e| TaskError::of(&e));
                     tx.send(Msg::PostEdited { post_id, result }).ok();
@@ -1970,17 +2033,24 @@ impl App {
             Action::SubmitReply { thread_id, message } => {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
+                // Whatever this draft uploaded under: without the key the
+                // files are attached to nothing (#709).
+                let key = self.compose_attachment_key();
                 self.spawn_write(async move {
-                    let result = api.reply(thread_id, &message).await.map_err(|e| TaskError::of(&e));
+                    let result = api
+                        .reply(thread_id, &message, key.as_deref())
+                        .await
+                        .map_err(|e| TaskError::of(&e));
                     tx.send(Msg::ReplySent(result)).ok();
                 });
             }
             Action::SubmitThread { node_id, title, message } => {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
+                let key = self.compose_attachment_key();
                 self.spawn_write(async move {
                     let result = api
-                        .create_thread(node_id, &title, &message)
+                        .create_thread(node_id, &title, &message, key.as_deref())
                         .await
                         .map_err(|e| TaskError::of(&e));
                     tx.send(Msg::ThreadCreated(result)).ok();
@@ -2175,6 +2245,57 @@ impl App {
             self.report_read(view);
         }
         true
+    }
+
+    /// Read a file and upload it as an attachment (#709).
+    ///
+    /// The read is capped: a terminal client is not the place to push a
+    /// 500 MB file at the forum, and XF would refuse it anyway — better to
+    /// say so before spending the upload.
+    async fn upload_from_path(
+        api: &common::api::WfApiClient,
+        path: &str,
+        context: screens::AttachContext,
+        key: Option<&str>,
+    ) -> Result<(String, common::models::Attachment), String> {
+        use screens::AttachContext;
+        let expanded = shellexpand_home(path);
+        let meta = std::fs::metadata(&expanded)
+            .map_err(|e| format!("{expanded}: {e}"))?;
+        if !meta.is_file() {
+            return Err(format!("{expanded} is not a file."));
+        }
+        if meta.len() > MAX_UPLOAD_BYTES {
+            return Err(format!(
+                "{expanded} is {} MB; the limit here is {} MB.",
+                meta.len() / (1024 * 1024),
+                MAX_UPLOAD_BYTES / (1024 * 1024)
+            ));
+        }
+        let bytes = std::fs::read(&expanded)
+            .map_err(|e| format!("{expanded}: {e}"))?;
+        let filename = std::path::Path::new(&expanded)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| "upload".to_string());
+        let mime = mime_for(&filename);
+        let ctx: Vec<(&str, String)> = match context {
+            AttachContext::Thread(id) => vec![("context[thread_id]", id.to_string())],
+            AttachContext::Node(id) => vec![("context[node_id]", id.to_string())],
+            AttachContext::Post(id) => vec![("context[post_id]", id.to_string())],
+        };
+        api.upload_attachment("post", &ctx, filename, bytes, mime, key)
+            .await
+            .map_err(|e| TaskError::of(&e).message)
+    }
+
+    /// The attachment key of the composer on top, if it uploaded anything
+    /// (#709).
+    fn compose_attachment_key(&self) -> Option<String> {
+        self.screens.iter().rev().find_map(|s| match s {
+            Screen::Compose(c) => c.attachment_key.clone(),
+            _ => None,
+        })
     }
 
     /// Mark what was actually read (#694).
@@ -4417,6 +4538,36 @@ impl App {
                     }
                 }
             }
+            Msg::AttachmentUploaded(result) => {
+                let Some(Screen::Compose(c)) = self.screens.last_mut() else {
+                    return;
+                };
+                c.uploading = false;
+                match result {
+                    Ok((key, attachment)) => {
+                        // One key per draft, minted by the first file.
+                        c.attachment_key = Some(key);
+                        // The reference goes in at the caret, which is where
+                        // the writer was: an attachment belongs to the
+                        // sentence that mentions it, not to the end of the
+                        // post.
+                        let tag = format!("[ATTACH]{}[/ATTACH]", attachment.attachment_id);
+                        let mut chars: Vec<char> = c.body.chars().collect();
+                        let at = c.body_cursor.min(chars.len());
+                        for (i, ch) in tag.chars().enumerate() {
+                            chars.insert(at + i, ch);
+                        }
+                        c.body = chars.into_iter().collect();
+                        c.body_cursor = at + tag.chars().count();
+                        let name = attachment.filename.clone();
+                        c.attachments.push(attachment);
+                        self.set_status(format!("Attached {name}."));
+                    }
+                    Err(message) => {
+                        c.error = Some(message);
+                    }
+                }
+            }
             Msg::PostEdited { post_id, result } => match result {
                 Ok(()) => {
                     // Close the editor and reload the page the post is on,
@@ -5704,7 +5855,8 @@ mod tests {
         /// `(thread_id, message)` per `reply` call that actually reached the
         /// stub — issue #567 is "the write went out after sign-out", so the
         /// absence of an entry here is the assertion.
-        replies: std::sync::Mutex<Vec<(u32, String)>>,
+        /// #709: replies now record the attachment key they carried.
+        replies: std::sync::Mutex<Vec<(u32, String, Option<String>)>>,
         /// `post_id` per `react_post` call that reached the stub, under the
         /// same `write_delay` contract as `replies` — a like is a write
         /// (issue #567's rule) and "the reaction went out after sign-out" is
@@ -5739,7 +5891,7 @@ mod tests {
         fn conversations_created(&self) -> Vec<(Vec<u32>, String, String)> {
             self.conversations_created.lock().expect("lock").clone()
         }
-        fn replies(&self) -> Vec<(u32, String)> {
+        fn replies(&self) -> Vec<(u32, String, Option<String>)> {
             self.replies.lock().expect("lock").clone()
         }
         fn reactions(&self) -> Vec<u32> {
@@ -5768,18 +5920,38 @@ mod tests {
         async fn thread_posts(&self, _: u32, _: u32) -> common::error::Result<common::models::PostsReply> {
             Err(common::error::Error::NoToken)
         }
-        async fn reply(&self, thread_id: u32, message: &str) -> common::error::Result<common::models::Post> {
+        async fn reply(
+            &self,
+            thread_id: u32,
+            message: &str,
+            attachment_key: Option<&str>,
+        ) -> common::error::Result<common::models::Post> {
+            // Recorded AFTER the simulated gate, not before: several tests
+            // assert that nothing went out while the write was still
+            // waiting, and an early record would make them pass on a lie.
             tokio::time::sleep(self.write_delay).await;
-            self.replies
-                .lock()
-                .expect("lock")
-                .push((thread_id, message.to_string()));
+            self.replies.lock().expect("lock").push((
+                thread_id,
+                message.to_string(),
+                attachment_key.map(str::to_string),
+            ));
             Err(common::error::Error::NoToken)
         }
-        async fn create_thread(&self, _: u32, _: &str, _: &str) -> common::error::Result<Thread> {
+        async fn create_thread(
+            &self,
+            _: u32,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+        ) -> common::error::Result<Thread> {
             Err(common::error::Error::NoToken)
         }
-        async fn edit_post(&self, id: u32, message: &str) -> common::error::Result<()> {
+        async fn edit_post(
+            &self,
+            id: u32,
+            message: &str,
+            _: Option<&str>,
+        ) -> common::error::Result<()> {
             self.edits.lock().expect("lock").push((id, message.to_string()));
             Ok(())
         }
@@ -8402,6 +8574,87 @@ mod tests {
             matches!(app.screens.last(), Some(Screen::Resources(_))),
             "and the resources row opens the resource catalog"
         );
+    }
+
+    /// #709: an uploaded file lands at the caret as `[ATTACH]id[/ATTACH]`,
+    /// its key is remembered, and the write that follows carries that key —
+    /// without it the upload is attached to nothing.
+    #[tokio::test]
+    async fn an_upload_lands_at_the_caret_and_its_key_reaches_the_write() {
+        let api = std::sync::Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 9,
+                thread_title: "A thread".into(),
+            }),
+            body: "See: after".into(),
+            // Right after "See: ".
+            body_cursor: 5,
+            uploading: true,
+            ..Default::default()
+        }));
+
+        app.handle_msg(Msg::AttachmentUploaded(Ok((
+            "key-1".to_string(),
+            common::models::Attachment {
+                attachment_id: 55,
+                filename: "shot.png".into(),
+                ..Default::default()
+            },
+        ))));
+        match app.screens.last() {
+            Some(Screen::Compose(c)) => {
+                assert_eq!(c.body, "See: [ATTACH]55[/ATTACH]after", "inserted at the caret");
+                assert_eq!(c.body_cursor, 5 + "[ATTACH]55[/ATTACH]".chars().count());
+                assert_eq!(c.attachment_key.as_deref(), Some("key-1"));
+                assert!(!c.uploading);
+                assert_eq!(c.attachments.len(), 1);
+            }
+            _ => panic!("the composer should still be open"),
+        }
+
+        // And the reply carries the key.
+        app.execute_action(Action::SubmitReply {
+            thread_id: 9,
+            message: "See: [ATTACH]55[/ATTACH]after".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let sent = api.replies();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].2.as_deref(), Some("key-1"), "the write carries the key");
+    }
+
+    /// A failed upload says why and leaves the draft alone — the file is the
+    /// point of the post often enough that silently dropping it would be
+    /// worse than the failure.
+    #[tokio::test]
+    async fn a_failed_upload_reports_and_keeps_the_draft() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 9,
+                thread_title: "A thread".into(),
+            }),
+            body: "my draft".into(),
+            uploading: true,
+            ..Default::default()
+        }));
+        app.handle_msg(Msg::AttachmentUploaded(Err(
+            "/tmp/nope.png: No such file or directory".into(),
+        )));
+        match app.screens.last() {
+            Some(Screen::Compose(c)) => {
+                assert_eq!(c.body, "my draft");
+                assert!(!c.uploading);
+                assert!(c.attachment_key.is_none());
+                assert!(c.error.as_deref().is_some_and(|e| e.contains("No such file")));
+            }
+            _ => panic!("the composer should still be open"),
+        }
     }
 
     /// #708: editing a post sends the edit, closes the editor and reloads

@@ -410,6 +410,58 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
         s.body_desired_col = None;
     }
 
+    // #709: the file prompt owns the keyboard while it is up — a terminal
+    // has no file picker, so the path is typed here.
+    if let Some(path) = s.file_prompt.clone() {
+        match key.code {
+            KeyCode::Esc => {
+                s.file_prompt = None;
+                return Action::None;
+            }
+            KeyCode::Enter => {
+                s.file_prompt = None;
+                if path.trim().is_empty() {
+                    return Action::None;
+                }
+                let Some(context) = attach_context(s) else {
+                    return Action::Notice("Nothing to attach this to.".into());
+                };
+                return Action::UploadAttachment { path, context };
+            }
+            KeyCode::Backspace => {
+                let mut chars: Vec<char> = path.chars().collect();
+                if s.file_prompt_cursor > 0 && s.file_prompt_cursor <= chars.len() {
+                    chars.remove(s.file_prompt_cursor - 1);
+                    s.file_prompt_cursor -= 1;
+                }
+                s.file_prompt = Some(chars.into_iter().collect());
+                return Action::None;
+            }
+            KeyCode::Left => {
+                s.file_prompt_cursor = s.file_prompt_cursor.saturating_sub(1);
+                s.file_prompt = Some(path);
+                return Action::None;
+            }
+            KeyCode::Right => {
+                s.file_prompt_cursor =
+                    (s.file_prompt_cursor + 1).min(path.chars().count());
+                s.file_prompt = Some(path);
+                return Action::None;
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let mut chars: Vec<char> = path.chars().collect();
+                let at = s.file_prompt_cursor.min(chars.len());
+                chars.insert(at, c);
+                s.file_prompt_cursor = at + 1;
+                s.file_prompt = Some(chars.into_iter().collect());
+                return Action::None;
+            }
+            _ => {
+                s.file_prompt = Some(path);
+                return Action::None;
+            }
+        }
+    }
     if key.code == KeyCode::Esc {
         return Action::PopScreen;
     }
@@ -468,6 +520,20 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
                         };
                     }
                 }
+            }
+            KeyCode::Char('f') => {
+                // #709: attach a file. One upload at a time — a second `^F`
+                // while one is in flight would race the key that ties them
+                // together.
+                if s.uploading {
+                    return Action::Notice("Still uploading — one moment.".into());
+                }
+                if attach_context(s).is_none() {
+                    return Action::Notice("Attachments are not supported here.".into());
+                }
+                s.file_prompt = Some(String::new());
+                s.file_prompt_cursor = 0;
+                return Action::None;
             }
             KeyCode::Char('y') | KeyCode::Char('v') => {
                 return Action::PasteClipboard;
@@ -659,6 +725,20 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
 
 /// One PageUp/PageDown step: a pane's worth of visual rows, less one for
 /// context. 1 until the editor has been drawn once.
+/// Where this draft's attachment key is anchored (#709). Conversations take
+/// attachments under a different content type, which this client does not
+/// upload to, so they answer `None` and the key is never offered.
+fn attach_context(s: &super::ComposeState) -> Option<super::AttachContext> {
+    match s.target.as_ref()? {
+        ComposeTarget::ThreadReply { thread_id, .. } => {
+            Some(super::AttachContext::Thread(*thread_id))
+        }
+        ComposeTarget::NewThread { node_id } => Some(super::AttachContext::Node(*node_id)),
+        ComposeTarget::EditPost { post_id, .. } => Some(super::AttachContext::Post(*post_id)),
+        ComposeTarget::ConversationReply { .. } => None,
+    }
+}
+
 fn compose_page(s: &super::ComposeState) -> isize {
     (s.body_height.saturating_sub(1)).max(1) as isize
 }
@@ -676,25 +756,23 @@ pub fn compose_hints(s: &super::ComposeState) -> Hints {
     let is_new_thread = matches!(s.target, Some(ComposeTarget::NewThread { .. }));
     let primary = if is_new_thread { "post thread" } else { "send" };
     let primary_short = if is_new_thread { "post" } else { "send" };
-    // Issue #577: `^A attach` was advertised here while Ctrl+A actually
-    // moves the caret to the start of the line in both fields (there is no
-    // `Action` for attachments — upload is implemented in `common` but not
-    // wired into this screen, per CLAUDE.md's "Known gaps"). Never advertise
-    // a key and then do something else / refuse silently (the same rule
-    // that dropped `N`/`m` from the Latest list). Drop the cap until upload
-    // is wired; Ctrl+A stays bound to move-home, just not in this namespace.
+    // Issue #577 dropped a `^A attach` cap that did nothing, because upload
+    // was not wired up. It is now (#709), under `^F` — and the cap appears
+    // only where an attachment can actually go: a conversation reply takes
+    // them under a content type this client does not upload to, so it does
+    // not advertise one.
+    let can_attach = attach_context(s).is_some();
     // Issue #605: Tab only switches fields in the new-thread flow (Title <->
     // body) — everywhere else (ThreadReply/ConversationReply) it inserts
     // four spaces, so the cap must say "indent", not "field".
     let tab_desc = if is_new_thread { "field" } else { "indent" };
+    let mut keys: Vec<(&str, &str)> = vec![("^S", primary), ("^O", "preview on/off")];
+    if can_attach {
+        keys.push(("^F", if s.uploading { "uploading\u{2026}" } else { "attach" }));
+    }
+    keys.extend_from_slice(&[("^Y", "paste"), ("Tab", tab_desc), ("Esc", "discard")]);
     Hints::with_short(
-        &[
-            ("^S", primary),
-            ("^O", "preview on/off"),
-            ("^Y", "paste"),
-            ("Tab", tab_desc),
-            ("Esc", "discard"),
-        ],
+        &keys,
         &[
             ("^S", primary_short),
             ("^O", "preview"),
@@ -923,7 +1001,34 @@ fn draw_editor_panel(
     );
     f.render_widget(Paragraph::new(window), body_area);
 
-    f.render_widget(rule_line(chunks[3].width), chunks[3]);
+    // #709: the file prompt takes the row above the rule while it is up, so
+    // it never covers the draft the writer is looking at.
+    if let Some(path) = &s.file_prompt {
+        let label = "Attach file: ";
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(label, theme.dim()),
+                Span::styled(path.clone(), theme.base()),
+            ])),
+            chunks[3],
+        );
+        let caret = chrome::cell_width(label)
+            + crate::editor::prefix_cells(path, s.file_prompt_cursor);
+        f.set_cursor_position((
+            chunks[3].x + (caret as u16).min(chunks[3].width.saturating_sub(1)),
+            chunks[3].y,
+        ));
+    } else if s.uploading {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{} Uploading\u{2026}", chrome::spinner(g, chrome::spinner_tick())),
+                theme.dim(),
+            ))),
+            chunks[3],
+        );
+    } else {
+        f.render_widget(rule_line(chunks[3].width), chunks[3]);
+    }
     let title_focused = is_new_thread && s.title_field;
     f.render_widget(
         caps_line(theme, s.body.chars().count(), chunks[4].width, title_focused),
@@ -3845,6 +3950,69 @@ mod tests {
             })
         });
         assert!(found, "the sign-in link must be clickable");
+    }
+
+    /// #709: `^F` opens a path prompt (a terminal has no file picker), the
+    /// prompt owns the keyboard while it is up, and Enter uploads with the
+    /// context the draft is for.
+    #[test]
+    fn attaching_a_file_prompts_for_a_path() {
+        let mut s = reply_state("draft");
+        let ctrl = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let plain = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+
+        assert!(matches!(compose_key(&mut s, ctrl('f')), Action::None));
+        assert_eq!(s.file_prompt.as_deref(), Some(""), "the prompt is up");
+
+        for c in "~/shot.png".chars() {
+            compose_key(&mut s, plain(c));
+        }
+        assert_eq!(s.file_prompt.as_deref(), Some("~/shot.png"));
+        // While the prompt is up it owns the keys: typing goes to the path,
+        // not into the post.
+        assert_eq!(s.body, "draft", "the draft is untouched");
+
+        match compose_key(&mut s, KeyEvent::from(KeyCode::Enter)) {
+            Action::UploadAttachment { path, context } => {
+                assert_eq!(path, "~/shot.png");
+                assert_eq!(context, crate::screens::AttachContext::Thread(1));
+            }
+            _ => panic!("Enter must start the upload"),
+        }
+        assert!(s.file_prompt.is_none(), "and the prompt closes");
+
+        // Esc abandons it without touching the draft.
+        compose_key(&mut s, ctrl('f'));
+        compose_key(&mut s, plain('x'));
+        assert!(matches!(compose_key(&mut s, KeyEvent::from(KeyCode::Esc)), Action::None));
+        assert!(s.file_prompt.is_none());
+        assert_eq!(s.body, "draft");
+
+        // One upload at a time.
+        s.uploading = true;
+        assert!(matches!(compose_key(&mut s, ctrl('f')), Action::Notice(_)));
+    }
+
+    /// A conversation takes attachments under a content type this client
+    /// does not upload to, so the key is neither advertised nor accepted
+    /// there — never advertise a key that cannot work (#561).
+    #[test]
+    fn a_conversation_reply_does_not_offer_attachments() {
+        let mut s = ComposeState {
+            target: Some(ComposeTarget::ConversationReply {
+                conversation_id: 3,
+                conversation_title: "A DM".into(),
+                participants: "kemical".into(),
+            }),
+            body: "draft".into(),
+            ..Default::default()
+        };
+        let caps: Vec<&str> = compose_hints(&s).keys.iter().map(|(k, _)| *k).collect();
+        assert!(!caps.contains(&"^F"), "{caps:?}");
+        assert!(matches!(
+            compose_key(&mut s, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+            Action::Notice(_)
+        ));
     }
 
 }

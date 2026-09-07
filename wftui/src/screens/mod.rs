@@ -278,6 +278,17 @@ pub struct ComposeState {
     /// Narrow-layout (< 110 cols) toggle: false shows the editor, true shows
     /// the rendered preview. `^O` flips it; unused once both panels fit.
     pub preview: bool,
+    /// The key this draft's uploads share, minted by the first one (#709).
+    /// The write carries it, and without it an uploaded file is attached to
+    /// nothing.
+    pub attachment_key: Option<String>,
+    /// `^F` opens a one-line path prompt; `Some` while it is up. A terminal
+    /// has no file picker, so the path is typed (or pasted) here.
+    pub file_prompt: Option<String>,
+    pub file_prompt_cursor: usize,
+    /// Set while an upload is in flight, so a second `^F` cannot start one
+    /// on top of it.
+    pub uploading: bool,
     /// Attachments this draft may reference with `[ATTACH]id[/ATTACH]`.
     /// Nothing populates it yet — attachment *upload* is implemented in
     /// `common` but not wired into compose (CLAUDE.md "Known gaps") — so in
@@ -682,6 +693,17 @@ pub enum Screen {
     ImageView(ImageViewState),
 }
 
+/// Where an upload's attachment key is anchored (#709). XF checks this
+/// against the write that later carries the key: a reply's key must have
+/// been minted for that thread, a new thread's for that forum, an edit's for
+/// that post.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachContext {
+    Thread(u32),
+    Node(u32),
+    Post(u32),
+}
+
 /// What Esc means on the screen that is on top (see `Screen::esc_intent`).
 pub enum EscIntent {
     /// The app's own Esc handling applies: pane focus, then pop/quit.
@@ -751,6 +773,9 @@ pub enum Action {
     /// offered only where the API said this reader may.
     StartEditPost(Thread, Box<Post>),
     SubmitEdit { post_id: u32, message: String },
+    /// Upload a file into the draft (#709). The context comes from what is
+    /// being written, because XF requires the key's context to match.
+    UploadAttachment { path: String, context: AttachContext },
     DeletePost { post_id: u32, thread_id: u32 },
     MarkSolution { post_id: u32, thread_id: u32 },
     StartReplyConversation(Conversation),
@@ -1952,6 +1977,9 @@ mod dispatch_tests {
                     ..Default::default()
                 }),
                 skip: &[
+                    // `^F` opens the file prompt: screen state, no Action (#709).
+                    "^F",
+                    
                     "Tab",
                     // `^O` only flips the narrow-layout preview toggle —
                     // screen state, no `Action` (see its arm in
@@ -2096,7 +2124,9 @@ mod dispatch_tests {
                     title_field: true,
                     ..Default::default()
                 }),
-                skip: &["Tab", "^O", "^Y"],
+                // `^F` opens the file prompt — screen state, no `Action` of
+                // its own, like `^O`'s preview toggle (#709).
+                skip: &["Tab", "^O", "^Y", "^F"],
             },
             Case {
                 // The view pane focused (#605's state): `r` replies and `p`
