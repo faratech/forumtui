@@ -1281,6 +1281,45 @@ fn cell_width(s: &str) -> usize {
 /// The body is drawn with `Paragraph::new(..).scroll(..)` and no `Wrap`, so
 /// anything over-long is silently clipped at the panel edge rather than
 /// folded.
+/// `wrap_spans`, then aligned (#702). `[CENTER]`/`[RIGHT]` belong to the
+/// line, and only here is the line's width known — the parser can carry the
+/// intent but not the padding.
+///
+/// The alignment of a row is the alignment its content asked for: the first
+/// span that carries a non-default one wins, so a centred paragraph with a
+/// bold word inside it stays centred.
+pub(crate) fn wrap_spans_aligned(
+    spans: &[Span<'static>],
+    width: usize,
+    align: common::bbcode::Align,
+) -> Vec<Vec<Span<'static>>> {
+    use common::bbcode::Align;
+    let rows = wrap_spans(spans, width);
+    if matches!(align, Align::Left | Align::Justify) {
+        // Justify is left here on purpose: stretching inter-word gaps in a
+        // terminal reads as damage, not as typesetting.
+        return rows;
+    }
+    rows.into_iter()
+        .map(|row| {
+            let used: usize = row.iter().map(|s| cell_width(s.content.as_ref())).sum();
+            let pad = width.saturating_sub(used);
+            let lead = match align {
+                Align::Center => pad / 2,
+                Align::Right => pad,
+                _ => 0,
+            };
+            if lead == 0 {
+                return row;
+            }
+            let mut out = Vec::with_capacity(row.len() + 1);
+            out.push(Span::raw(" ".repeat(lead)));
+            out.extend(row);
+            out
+        })
+        .collect()
+}
+
 pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
     let width = width.max(1);
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
@@ -1414,12 +1453,41 @@ pub(crate) fn chunk_lines(
     theme: &Theme,
     reveal_spoilers: bool,
 ) -> Vec<Vec<Span<'static>>> {
+    chunk_lines_aligned(chunks, links, theme, reveal_spoilers)
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect()
+}
+
+/// `chunk_lines`, keeping each logical line's alignment (#702). Alignment is
+/// a property of the line, not of a span, so it has to survive the trip from
+/// the parser to the wrapper — which is the only place the width is known.
+pub(crate) fn chunk_lines_aligned(
+    chunks: &[Chunk],
+    links: &mut Vec<String>,
+    theme: &Theme,
+    reveal_spoilers: bool,
+) -> Vec<(Vec<Span<'static>>, common::bbcode::Align)> {
+    let mut aligns: Vec<common::bbcode::Align> = Vec::new();
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
     // Borrow, not clone: the old `iter().cloned()` deep-copied every
     // Chunk (labels, urls, whole text bodies) per render before copying
     // the pieces it needs into spans anyway (#677).
+    // The alignment in force as the lines are emitted: the chunk being read
+    // when a line was flushed is the chunk that line belongs to.
+    let mut cur_align = common::bbcode::Align::Left;
+    let flush_align = |aligns: &mut Vec<common::bbcode::Align>, a: common::bbcode::Align| {
+        aligns.push(a);
+    };
     for chunk in chunks {
+        let chunk_align = match chunk {
+            Chunk::Text(_, st) | Chunk::Link(_, _, st) | Chunk::Attach(_, st) => st.align,
+            Chunk::Image { style, .. } => style.align,
+        };
+        if !matches!(chunk_align, common::bbcode::Align::Left) {
+            cur_align = chunk_align;
+        }
         match chunk {
             Chunk::Text(t, s) => {
                 if t.is_empty() {
@@ -1433,6 +1501,10 @@ pub(crate) fn chunk_lines(
                 for (i, seg) in t.split('\n').enumerate() {
                     if i > 0 {
                         out.push(std::mem::take(&mut current));
+                        flush_align(&mut aligns, cur_align);
+                        // A new line starts with whatever the enclosing tag
+                        // says, not with the line before it.
+                        cur_align = chunk_align;
                     }
                     if !seg.is_empty() {
                         current.push(Span::styled(seg.to_string(), style_from(theme, s, reveal_spoilers)));
@@ -1446,6 +1518,8 @@ pub(crate) fn chunk_lines(
                 for (i, seg) in label.split('\n').enumerate() {
                     if i > 0 {
                         out.push(std::mem::take(&mut current));
+                        flush_align(&mut aligns, cur_align);
+                        cur_align = chunk_align;
                     }
                     if !seg.is_empty() {
                         current.push(Span::styled(seg.to_string(), style_from(theme, s, reveal_spoilers)));
@@ -1495,8 +1569,11 @@ pub(crate) fn chunk_lines(
     }
     if !current.is_empty() {
         out.push(current);
+        flush_align(&mut aligns, cur_align);
     }
-    out
+    // One alignment per line, whatever happened above.
+    aligns.resize(out.len(), common::bbcode::Align::Left);
+    out.into_iter().zip(aligns).collect()
 }
 
 /// Back-compat wrapper kept for the golden tests and any caller that just
@@ -1665,13 +1742,13 @@ impl ThreadViewState {
             };
 
             for &at in &imgs.inline_at {
-                for logical in chunk_lines(
+                for (logical, align) in chunk_lines_aligned(
                     &chunks[run_start..at],
                     &mut links,
                     theme,
                     self.reveal_spoilers,
                 ) {
-                    for wrapped in wrap_spans(&logical, body_w) {
+                    for wrapped in wrap_spans_aligned(&logical, body_w, align) {
                         lines.push(gutter(wrapped));
                     }
                 }
@@ -1685,13 +1762,13 @@ impl ThreadViewState {
                     ord,
                 );
             }
-            for logical in chunk_lines(
+            for (logical, align) in chunk_lines_aligned(
                 &chunks[run_start..],
                 &mut links,
                 theme,
                 self.reveal_spoilers,
             ) {
-                for wrapped in wrap_spans(&logical, body_w) {
+                for wrapped in wrap_spans_aligned(&logical, body_w, align) {
                     lines.push(gutter(wrapped));
                 }
             }
@@ -3593,6 +3670,100 @@ mod tests {
     /// #693: a picture the message references renders WHERE the message
     /// puts it, and only the attachments the message never mentioned are
     /// listed underneath — the same split XenForo renders.
+    /// #702: `[CENTER]` and `[RIGHT]` land where the eye expects, and
+    /// `[JUSTIFY]` deliberately does not stretch gaps — in a terminal that
+    /// reads as damage, not as typesetting.
+    #[test]
+    fn alignment_pads_the_wrapped_rows() {
+        use common::bbcode::Align;
+        let theme = Theme::truecolor();
+        let spans = vec![Span::styled("abc".to_string(), theme.base())];
+        let text = |rows: Vec<Vec<Span<'static>>>| -> Vec<String> {
+            rows.iter()
+                .map(|r| r.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        assert_eq!(text(wrap_spans_aligned(&spans, 11, Align::Left)), vec!["abc"]);
+        assert_eq!(
+            text(wrap_spans_aligned(&spans, 11, Align::Center)),
+            vec!["    abc"],
+            "(11 - 3) / 2 = 4"
+        );
+        assert_eq!(
+            text(wrap_spans_aligned(&spans, 11, Align::Right)),
+            vec!["        abc"]
+        );
+        assert_eq!(
+            text(wrap_spans_aligned(&spans, 11, Align::Justify)),
+            vec!["abc"],
+            "justify is left in a terminal"
+        );
+        // Every wrapped row of a centred paragraph is centred, and none of
+        // them overflows the width.
+        let long = vec![Span::styled("one two three four five".to_string(), theme.base())];
+        for row in wrap_spans_aligned(&long, 10, Align::Center) {
+            let w: usize = row.iter().map(|s| cell_width(s.content.as_ref())).sum();
+            assert!(w <= 10, "row overflowed: {w}");
+        }
+    }
+
+    /// The post body really carries the colour, the highlight and the
+    /// centring through to the drawn cells (#702) — the parser knowing them
+    /// is only half the parity.
+    #[test]
+    fn a_posts_colors_and_alignment_reach_the_drawn_cells() {
+        use ratatui::style::{Color, Modifier};
+        let theme = Theme::truecolor();
+        let mut s = thread_view_fixture();
+        s.posts[0].message =
+            "[COLOR=#ff0000]danger[/COLOR] [HIGHLIGHT]note[/HIGHLIGHT]\n[CENTER]mid[/CENTER]"
+                .into();
+        s.posts[0].attachments.clear();
+        s.width = 0;
+        s.rebuild_lines(&theme, &UNICODE);
+
+        let mut red = None;
+        let mut highlighted = false;
+        for line in &s.lines {
+            for sp in &line.spans {
+                if sp.content.contains("danger") {
+                    red = sp.style.fg;
+                }
+                if sp.content.contains("note") && sp.style.add_modifier.contains(Modifier::REVERSED)
+                {
+                    highlighted = true;
+                }
+            }
+        }
+        assert_eq!(red, Some(Color::Rgb(255, 0, 0)), "the colour reaches the cell");
+        assert!(highlighted, "highlight paints as XF's marker pen");
+
+        // The centred line is padded, and the ones around it are not.
+        let row = s
+            .lines
+            .iter()
+            .find(|l| l.spans.iter().any(|sp| sp.content.contains("mid")))
+            .expect("the centred line");
+        let text: String = row.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        // Past the gutter (" | "), the centred word sits well inside the row.
+        let body: String = text.chars().skip(3).collect();
+        let lead = body.chars().take_while(|c| *c == ' ').count();
+        assert!(lead > 4, "a centred line is padded: {text:?}");
+        // A left-aligned line in the same post is not.
+        let plain = s
+            .lines
+            .iter()
+            .find(|l| l.spans.iter().any(|sp| sp.content.contains("danger")))
+            .expect("the plain line");
+        let ptext: String = plain.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        let pbody: String = ptext.chars().skip(3).collect();
+        assert_eq!(
+            pbody.chars().take_while(|c| *c == ' ').count(),
+            0,
+            "an unaligned line keeps its own margin: {ptext:?}"
+        );
+    }
+
     #[test]
     fn a_referenced_attachment_renders_where_the_message_puts_it() {
         let theme = Theme::truecolor();

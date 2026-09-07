@@ -1281,6 +1281,55 @@ pub(crate) fn style_from(
         // every terminal, where Modifier::HIDDEN is widely unimplemented.
         st = Style::new().fg(Color::Black).bg(Color::Black);
     }
+    // #702: the post's own colour. After `code`/`quote` (which set a colour
+    // of their own) and before the spoiler check below, because a hidden
+    // spoiler must stay black-on-black whatever colour it carries.
+    if let Some(rgb) = s.color
+        && !s.code
+        && let Some(c) = crate::theme::quantize(theme.tier, rgb)
+    {
+        st = st.fg(c);
+    }
+    // `[FONT=monospace]` and friends: a terminal is already monospace, so
+    // the only honest reading is "the author meant this as code". The code
+    // foreground says that without the block background a real [CODE] gets.
+    if s.mono && !s.code {
+        st = st.fg(theme.code_fg);
+    }
+    if s.highlight {
+        // XF's marker pen. Reversed rather than a fixed background: it has
+        // to stay legible against whatever colour the text already carries,
+        // and on every tier including mono.
+        st = st.add_modifier(Modifier::REVERSED);
+    }
+    // A terminal cannot scale glyphs, so XF's 1-7 size scale reads as
+    // emphasis: above normal is bold, below it is dim. Headings are sizes
+    // the author meant structurally, so they carry both bold and the
+    // accent colour the rest of the chrome uses for headings.
+    if let Some(level) = s.heading {
+        // XF's three levels are h2/h3/h4 — a real hierarchy, so they get
+        // three weights here rather than one: the top one is underlined as
+        // well as bold, the middle one keeps the accent colour, and the
+        // third is bold alone.
+        st = st.add_modifier(Modifier::BOLD);
+        if level <= 2 && theme.tier != crate::theme::Tier::Mono && s.color.is_none() {
+            st = st.fg(theme.accent);
+        }
+        if level == 1 {
+            st = st.add_modifier(Modifier::UNDERLINED);
+        }
+    } else if let Some(size) = s.size {
+        match size {
+            1..=3 => st = st.add_modifier(Modifier::DIM),
+            5..=7 => st = st.add_modifier(Modifier::BOLD),
+            _ => {}
+        }
+    }
+    if s.spoiler && !reveal_spoilers {
+        // Re-applied after colour and size: a hidden spoiler is hidden
+        // whatever it carries (#621).
+        st = Style::new().fg(Color::Black).bg(Color::Black);
+    }
     if s.bold {
         st = st.add_modifier(Modifier::BOLD);
     }

@@ -152,6 +152,42 @@ If `/me` reports a different user, the old identity is torn down and a hint name
 the new one. `logout()` forgets tokens synchronously before the (slow) revoke
 calls. Writes carry the session generation and are aborted by `end_session`.
 
+## BBCode parity — the styling tags
+
+`common/src/bbcode.rs` carries `color`, `size`, `heading`, `align`,
+`highlight` and `mono` on `Style`; `screens::style_from` turns them into
+terminal attributes and `wrap_spans_aligned` does the alignment, because only
+the renderer knows a line's width.
+
+**Semantics come from `XF\BbCode\Renderer\Html`, not from intuition** — two
+of them go the opposite way to the obvious reading, and both are common in
+this site's posts:
+
+- `getTextSize`: a *pure integer* maps onto XF's 9/10/12/15/18/22/26-px
+  ladder, and anything **above 7 is the top of it** (`[SIZE=200]` is the
+  largest, not an error); an integer ≤ 0 is no size; otherwise only a bare
+  `Npx` counts, clamped 8–36. `[SIZE=+2]`, `[SIZE=-1]`, `1.5em` and `120%`
+  therefore render with **no size change at all** — and note Rust's own
+  `parse` accepts `"+2"` as 2, so the naive reading draws "two steps larger"
+  as near-smallest.
+- `getHeadingTagMap`: `[HEADING=1/2/3]` are h2/h3/h4 and **everything else is
+  a plain `div`** — no value, `0`, `9` or a word carries no heading weight.
+  This is the site's most-used tag (100k+ posts), so its edges matter.
+
+Colours accept what CSS accepts (named, `#rgb`, `#rrggbb`, `rgb()`/`rgba()`,
+including `%` channels); a value CSS would reject leaves the enclosing colour
+in force, as CSS does. `theme::quantize` brings a colour down to the
+terminal's tier — exact on TrueColor, nearest cube/grey-ramp entry on 256,
+nearest basic on 16, and dropped entirely on mono.
+
+Terminals cannot scale glyphs, so size reads as emphasis (5–7 bold, 1–3 dim)
+and headings as bold + accent + underline by level. `[HIGHLIGHT]` is
+`REVERSED` (legible over any colour, on every tier), not bold.
+
+`real_posts_parse_completely_and_carry_their_styles` runs the parser over 40
+captured live post bodies in `common/src/testdata/`; that corpus is what
+caught the `SIZE` reading. Re-capture it when the parser changes.
+
 ## Images, reading state and navigation
 
 - **Images render where the message puts them** (#693). `ThreadViewState::rebuild_lines`

@@ -14,6 +14,99 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+/// A BBCode colour, brought down to what the terminal can actually show
+/// (#702).
+///
+/// TrueColor gets the exact value; 256-colour terminals get the nearest cube
+/// entry; 16-colour terminals get the nearest basic colour, which is a
+/// coarse but honest approximation. On the mono tier a post's colours are
+/// dropped entirely rather than approximated into noise — the reader asked
+/// for no colour.
+pub fn quantize(tier: Tier, c: common::bbcode::Rgb) -> Option<Color> {
+    let (r, g, b) = (c.r, c.g, c.b);
+    match tier {
+        Tier::TrueColor => Some(Color::Rgb(r, g, b)),
+        Tier::Ansi256 => Some(Color::Indexed(xterm256_index(r, g, b))),
+        Tier::Ansi16 => Some(basic16(r, g, b)),
+        Tier::Mono => None,
+    }
+}
+
+/// xterm's 6x6x6 cube (16-231) plus its 24-step greyscale ramp (232-255),
+/// whichever is closer.
+fn xterm256_index(r: u8, g: u8, b: u8) -> u8 {
+    let level = |v: u8| -> u8 {
+        // The cube's levels are 0, 95, 135, 175, 215, 255.
+        const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+        let mut best = 0usize;
+        let mut best_d = u16::MAX;
+        for (i, l) in LEVELS.iter().enumerate() {
+            let d = (*l as i16 - v as i16).unsigned_abs();
+            if d < best_d {
+                best_d = d;
+                best = i;
+            }
+        }
+        best as u8
+    };
+    let (ri, gi, bi) = (level(r), level(g), level(b));
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let cube = (
+        LEVELS[ri as usize],
+        LEVELS[gi as usize],
+        LEVELS[bi as usize],
+    );
+    let cube_idx = 16 + 36 * ri + 6 * gi + bi;
+
+    // The grey ramp can be a much better match for near-greys.
+    let avg = ((r as u16 + g as u16 + b as u16) / 3) as u8;
+    let grey_step = ((avg as i16 - 8) / 10).clamp(0, 23) as u8;
+    let grey_val = 8 + 10 * grey_step;
+    let dist = |a: (u8, u8, u8)| -> u32 {
+        let d = |x: u8, y: u8| ((x as i32 - y as i32) * (x as i32 - y as i32)) as u32;
+        d(a.0, r) + d(a.1, g) + d(a.2, b)
+    };
+    if dist((grey_val, grey_val, grey_val)) < dist(cube) {
+        232 + grey_step
+    } else {
+        cube_idx
+    }
+}
+
+/// Nearest of the 16 terminal colours, by squared distance against their
+/// conventional values.
+fn basic16(r: u8, g: u8, b: u8) -> Color {
+    const TABLE: [(u8, u8, u8, Color); 16] = [
+        (0, 0, 0, Color::Black),
+        (128, 0, 0, Color::Red),
+        (0, 128, 0, Color::Green),
+        (128, 128, 0, Color::Yellow),
+        (0, 0, 128, Color::Blue),
+        (128, 0, 128, Color::Magenta),
+        (0, 128, 128, Color::Cyan),
+        (192, 192, 192, Color::Gray),
+        (128, 128, 128, Color::DarkGray),
+        (255, 0, 0, Color::LightRed),
+        (0, 255, 0, Color::LightGreen),
+        (255, 255, 0, Color::LightYellow),
+        (0, 0, 255, Color::LightBlue),
+        (255, 0, 255, Color::LightMagenta),
+        (0, 255, 255, Color::LightCyan),
+        (255, 255, 255, Color::White),
+    ];
+    let mut best = Color::White;
+    let mut best_d = u32::MAX;
+    for (tr, tg, tb, c) in TABLE {
+        let d = |x: u8, y: u8| ((x as i32 - y as i32) * (x as i32 - y as i32)) as u32;
+        let dist = d(tr, r) + d(tg, g) + d(tb, b);
+        if dist < best_d {
+            best_d = dist;
+            best = c;
+        }
+    }
+    best
+}
+
 /// Color fidelity of the attached terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
@@ -514,4 +607,35 @@ mod tests {
         assert_eq!(t.keycap(true).bg, Some(t.accent_bg));
         assert_eq!(t.keycap(false).bg, Some(t.keycap_bg));
     }
+    /// #702: a post's colour, brought down to what the terminal can show.
+    #[test]
+    fn quantize_matches_the_terminals_fidelity() {
+        use common::bbcode::Rgb;
+        let red = Rgb { r: 255, g: 0, b: 0 };
+        assert_eq!(
+            quantize(Tier::TrueColor, red),
+            Some(Color::Rgb(255, 0, 0)),
+            "truecolor is exact"
+        );
+        // 16 + 36*5 + 6*0 + 0 = 196, xterm's pure red.
+        assert_eq!(quantize(Tier::Ansi256, red), Some(Color::Indexed(196)));
+        assert_eq!(quantize(Tier::Ansi16, red), Some(Color::LightRed));
+        assert_eq!(quantize(Tier::Mono, red), None, "mono means no colour");
+
+        // A near-grey should take the grey ramp, not the cube.
+        let grey = Rgb { r: 120, g: 122, b: 121 };
+        match quantize(Tier::Ansi256, grey) {
+            Some(Color::Indexed(i)) => {
+                assert!((232..=255).contains(&i), "expected the grey ramp, got {i}")
+            }
+            other => panic!("{other:?}"),
+        }
+        // Every tier answers for every colour, and never panics.
+        for tier in [Tier::TrueColor, Tier::Ansi256, Tier::Ansi16, Tier::Mono] {
+            for (r, g, b) in [(0, 0, 0), (255, 255, 255), (13, 200, 77), (1, 1, 1)] {
+                let _ = quantize(tier, Rgb { r, g, b });
+            }
+        }
+    }
+
 }

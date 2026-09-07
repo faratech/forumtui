@@ -15,7 +15,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use super::browse::{chunk_lines, truncate, wrap_spans};
+use super::browse::{chunk_lines_aligned, truncate, wrap_spans, wrap_spans_aligned};
 use super::{Action, HitMap, MediaItem, Resource};
 use crate::hit::{Hit, HitPane};
 use crate::chrome::{self, Hints};
@@ -571,8 +571,8 @@ pub fn rebuild_resource_lines(s: &mut super::ResourceViewState, theme: &Theme, g
         )));
     } else {
         let chunks = bbcode::render(&r.description);
-        for logical in chunk_lines(&chunks, &mut s.links, theme, true) {
-            for wrapped in wrap_spans(&logical, width) {
+        for (logical, align) in chunk_lines_aligned(&chunks, &mut s.links, theme, true) {
+            for wrapped in wrap_spans_aligned(&logical, width, align) {
                 s.lines.push(Line::from(wrapped));
             }
         }

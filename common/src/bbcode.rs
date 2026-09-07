@@ -21,6 +21,216 @@ pub struct Style {
     pub quote_depth: u8,
     /// List nesting depth — the UI hangs bullets by depth.
     pub list_depth: u8,
+    /// `[COLOR=…]`, resolved to RGB (#702). Innermost wins, and a value CSS
+    /// would reject leaves the enclosing colour in place, as CSS does.
+    pub color: Option<Rgb>,
+    /// `[SIZE=n]` on XF's 1–7 scale, 4 being normal. A terminal cannot scale
+    /// glyphs, so the renderer reads this as emphasis, not as points.
+    pub size: Option<u8>,
+    /// `[HEADING=n]` / `[H1]`–`[H3]`.
+    pub heading: Option<u8>,
+    /// `[CENTER]`, `[RIGHT]`, `[JUSTIFY]` — carried here because alignment
+    /// belongs to the line, and only the renderer knows how wide a line is.
+    pub align: Align,
+    /// `[HIGHLIGHT]`.
+    pub highlight: bool,
+    /// `[FONT=…]` naming a monospace family — the one font distinction a
+    /// terminal can honestly make.
+    pub mono: bool,
+}
+
+/// A colour as XF resolves one: 8 bits per channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+/// Where a line sits in its width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Align {
+    #[default]
+    Left,
+    Center,
+    Right,
+    Justify,
+}
+
+impl Align {
+    fn parse(raw: &str) -> Option<Align> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "center" | "centre" => Some(Align::Center),
+            "right" => Some(Align::Right),
+            "justify" => Some(Align::Justify),
+            "left" => Some(Align::Left),
+            _ => None,
+        }
+    }
+}
+
+/// Parse a CSS colour the way XF's own output does: a named colour, `#rgb`,
+/// `#rrggbb`, or `rgb()`/`rgba()`. Anything else is not a colour, and the
+/// enclosing one stays in force (#702).
+pub fn parse_color(raw: &str) -> Option<Rgb> {
+    let v = raw.trim().trim_matches('"').trim_matches('\'').trim();
+    if let Some(hex) = v.strip_prefix('#') {
+        let n = |s: &str| u8::from_str_radix(s, 16).ok();
+        return match hex.len() {
+            3 => {
+                let d: Vec<char> = hex.chars().collect();
+                Some(Rgb {
+                    r: n(&format!("{}{}", d[0], d[0]))?,
+                    g: n(&format!("{}{}", d[1], d[1]))?,
+                    b: n(&format!("{}{}", d[2], d[2]))?,
+                })
+            }
+            6 => Some(Rgb {
+                r: n(&hex[0..2])?,
+                g: n(&hex[2..4])?,
+                b: n(&hex[4..6])?,
+            }),
+            _ => None,
+        };
+    }
+    let lower = v.to_ascii_lowercase();
+    if let Some(rest) = lower
+        .strip_prefix("rgba(")
+        .or_else(|| lower.strip_prefix("rgb("))
+    {
+        let body = rest.strip_suffix(')')?;
+        let parts: Vec<&str> = body.split(',').collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        let chan = |s: &str| -> Option<u8> {
+            let s = s.trim();
+            if let Some(pct) = s.strip_suffix('%') {
+                let f: f32 = pct.trim().parse().ok()?;
+                return Some((f.clamp(0.0, 100.0) * 2.55).round() as u8);
+            }
+            let f: f32 = s.parse().ok()?;
+            Some(f.clamp(0.0, 255.0).round() as u8)
+        };
+        return Some(Rgb {
+            r: chan(parts[0])?,
+            g: chan(parts[1])?,
+            b: chan(parts[2])?,
+        });
+    }
+    named_color(&lower)
+}
+
+/// The CSS named colours XF's colour picker offers, plus the rest of the
+/// basic set posts actually use. Not the full 148-name table: these are the
+/// ones that appear in this site's own posts, and an unknown name correctly
+/// falls through to "not a colour".
+fn named_color(name: &str) -> Option<Rgb> {
+    let rgb = |r, g, b| Some(Rgb { r, g, b });
+    match name {
+        "black" => rgb(0, 0, 0),
+        "white" => rgb(255, 255, 255),
+        "red" => rgb(255, 0, 0),
+        "darkred" => rgb(139, 0, 0),
+        "green" => rgb(0, 128, 0),
+        "lime" | "limegreen" => rgb(50, 205, 50),
+        "darkgreen" => rgb(0, 100, 0),
+        "blue" => rgb(0, 0, 255),
+        "darkblue" => rgb(0, 0, 139),
+        "royalblue" => rgb(65, 105, 225),
+        "navy" => rgb(0, 0, 128),
+        "yellow" => rgb(255, 255, 0),
+        "orange" => rgb(255, 165, 0),
+        "darkorange" => rgb(255, 140, 0),
+        "purple" => rgb(128, 0, 128),
+        "rebeccapurple" => rgb(102, 51, 153),
+        "magenta" | "fuchsia" => rgb(255, 0, 255),
+        "pink" => rgb(255, 192, 203),
+        "cyan" | "aqua" => rgb(0, 255, 255),
+        "teal" => rgb(0, 128, 128),
+        "gray" | "grey" => rgb(128, 128, 128),
+        "darkgray" | "darkgrey" => rgb(169, 169, 169),
+        "lightgray" | "lightgrey" => rgb(211, 211, 211),
+        "silver" => rgb(192, 192, 192),
+        "maroon" => rgb(128, 0, 0),
+        "olive" => rgb(128, 128, 0),
+        "brown" => rgb(165, 42, 42),
+        "gold" => rgb(255, 215, 0),
+        "indigo" => rgb(75, 0, 130),
+        "violet" => rgb(238, 130, 238),
+        "tan" => rgb(210, 180, 140),
+        "transparent" => None,
+        _ => None,
+    }
+}
+
+/// Size values, mirroring `XF\BbCode\Renderer\Html::getTextSize` exactly
+/// rather than guessing (#702).
+///
+/// XF's rule, and it is not the obvious one: a **pure integer** string maps
+/// onto its 9/10/12/15/18/22/26-px ladder, where anything above 7 is the
+/// TOP of that ladder (`[SIZE=200]` is the largest size, not an error); an
+/// integer at or below zero means no size at all; otherwise only a bare
+/// `Npx` is accepted, clamped to 8-36. Everything else — `+2`, `-1`,
+/// `1.5em`, `120%` — renders with no size change, because XF's own
+/// `strval(intval($x)) == strval($x)` test rejects them.
+///
+/// This site's posts carry all of those spellings, which is how the
+/// difference was noticed: read as "two steps larger", `[SIZE=+2]` would
+/// have drawn bold where the site draws nothing.
+fn parse_size(raw: &str) -> Option<u8> {
+    let v = raw
+        .trim()
+        .trim_matches('"')
+        .replace("&quot;", "")
+        .trim()
+        .to_ascii_lowercase();
+    // XF's "is this a pure integer?" test: the round-trip through intval.
+    let pure_int = !v.is_empty()
+        && v.strip_prefix('-').unwrap_or(&v).chars().all(|c| c.is_ascii_digit())
+        && !v.starts_with('+')
+        && (v.len() == 1 || !v.starts_with('0'));
+    if pure_int {
+        let n: i64 = v.parse().ok()?;
+        if n <= 0 {
+            return None;
+        }
+        // 1-6 are themselves; XF's `default` arm puts everything above on
+        // the top rung.
+        return Some(if n >= 7 { 7 } else { n as u8 });
+    }
+    let num = v.strip_suffix("px")?;
+    if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let px: u32 = num.parse().ok()?;
+    Some(px_to_scale(px.clamp(8, 36) as f32))
+}
+
+/// A pixel size onto XF's ladder (9, 10, 12, 15, 18, 22, 26 px), by nearest
+/// rung — the inverse of `getTextSize`'s own table.
+fn px_to_scale(px: f32) -> u8 {
+    const LADDER: [f32; 7] = [9.0, 10.0, 12.0, 15.0, 18.0, 22.0, 26.0];
+    let mut best = 4u8;
+    let mut best_d = f32::MAX;
+    for (i, rung) in LADDER.iter().enumerate() {
+        let d = (rung - px).abs();
+        if d < best_d {
+            best_d = d;
+            best = i as u8 + 1;
+        }
+    }
+    best
+}
+
+/// True for the families a terminal can honestly claim to render: it is all
+/// monospace, so the only `[FONT]` distinction worth keeping is whether the
+/// author asked for monospace on purpose.
+fn is_monospace_font(raw: &str) -> bool {
+    let v = raw.replace("&quot;", "").to_ascii_lowercase();
+    ["monospace", "courier", "consolas", "menlo", "monaco", "mono"]
+        .iter()
+        .any(|f| v.contains(f))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +315,12 @@ impl Style {
             spoiler: c.spoiler > 0,
             quote_depth: c.quote.min(u8::MAX as u32) as u8,
             list_depth: c.list.min(u8::MAX as u32) as u8,
+            color: c.colors.last().copied().flatten(),
+            size: c.sizes.last().copied().flatten(),
+            heading: c.headings.last().copied().flatten(),
+            align: c.aligns.last().copied().unwrap_or_default(),
+            highlight: c.highlight > 0,
+            mono: c.mono > 0,
         }
     }
 }
@@ -114,7 +330,7 @@ impl Style {
 /// walking the stack, and nesting is limited by nothing but input size
 /// (#622): XF declares `$maxDepth` but never enforces it, and real posts
 /// nest 33 deep.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct FrameCounts {
     bold: u32,
     italic: u32,
@@ -124,6 +340,16 @@ struct FrameCounts {
     code: u32,
     quote: u32,
     list: u32,
+    highlight: u32,
+    mono: u32,
+    /// Value frames (#702). A count cannot express "innermost wins", so each
+    /// of these is a stack of the *effective* value at that depth: push
+    /// resolves against what was already in force, pop restores it, and both
+    /// stay O(1) like the counters.
+    colors: Vec<Option<Rgb>>,
+    sizes: Vec<Option<u8>>,
+    headings: Vec<Option<u8>>,
+    aligns: Vec<Align>,
 }
 
 /// Apply (or, with `on = false`, reverse) `frame`'s style contribution.
@@ -147,12 +373,55 @@ fn apply_frame(frame: &Frame, c: &mut FrameCounts, on: bool) {
         Frame::Quote { .. } => bump!(quote),
         Frame::List(_) => bump!(list),
         // A heading always carries bold; popping it drops the contribution.
-        Frame::Heading(_) | Frame::TableHeader => bump!(bold),
-        Frame::Color(_)
-        | Frame::Size(_)
-        | Frame::Font(_)
-        | Frame::Align(_)
-        | Frame::Link(_)
+        Frame::TableHeader => bump!(bold),
+        // `XF\BbCode\Renderer\Html::getHeadingTagMap`: 1/2/3 are h2/h3/h4
+        // and everything else is a plain `div` — a block, but carrying no
+        // heading weight at all. Level 0 here IS that div (#702).
+        Frame::Heading(level) => {
+            let real = (1..=3).contains(level);
+            if real {
+                bump!(bold);
+            }
+            if on {
+                c.headings.push(real.then_some(*level));
+            } else {
+                c.headings.pop();
+            }
+        }
+        // #702: the value frames. Each pushes the value that is in force
+        // inside it — its own when the value parses, the enclosing one when
+        // it does not, which is how CSS treats a value it cannot read.
+        Frame::Color(v) => {
+            if on {
+                let inherited = c.colors.last().copied().flatten();
+                c.colors.push(parse_color(v).or(inherited));
+            } else {
+                c.colors.pop();
+            }
+        }
+        Frame::Size(v) => {
+            if on {
+                let inherited = c.sizes.last().copied().flatten();
+                c.sizes.push(parse_size(v).or(inherited));
+            } else {
+                c.sizes.pop();
+            }
+        }
+        Frame::Align(v) => {
+            if on {
+                let inherited = c.aligns.last().copied().unwrap_or_default();
+                c.aligns.push(Align::parse(v).unwrap_or(inherited));
+            } else {
+                c.aligns.pop();
+            }
+        }
+        Frame::Font(v) => {
+            if is_monospace_font(v) {
+                bump!(mono);
+            }
+        }
+        Frame::Highlight => bump!(highlight),
+        Frame::Link(_)
         | Frame::Table
         | Frame::TableRow
         | Frame::TableCell => {}
@@ -264,6 +533,7 @@ enum Frame {
     InlineCode,
     Heading(u8),
     Color(String),
+    Highlight,
     Size(String),
     Font(String),
     Align(String),
@@ -457,7 +727,12 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         push_frame(&mut stack, &mut counts, &mut style, Frame::Strike)
                     }
                     "sub" | "sup" => push_frame(&mut stack, &mut counts, &mut style, Frame::Italic),
-                    "highlight" => push_frame(&mut stack, &mut counts, &mut style, Frame::Bold),
+                    // #702: highlight is XF's marker pen, not bold — the
+                    // renderer paints it as a background, which is what a
+                    // reader recognises it by.
+                    "highlight" => {
+                        push_frame(&mut stack, &mut counts, &mut style, Frame::Highlight)
+                    }
                     "icode" | "inlinecode" => {
                         // XF's `icode` rule is `['plain' => true]` — children
                         // are literal, like [CODE]/[PHP]/[HTML]. Pushing a
@@ -562,10 +837,14 @@ pub fn render(src: &str) -> Vec<Chunk> {
                         Frame::Align("indent".into()),
                     ),
                     "heading" => {
+                        // `intval($option)`, then the 1/2/3 map — anything
+                        // else (absent, 0, 9, "big") is a div, which this
+                        // model spells level 0 (#702).
                         let level = value
                             .as_deref()
-                            .and_then(|v| strip_quotes(v).parse::<u8>().ok())
-                            .unwrap_or(1);
+                            .and_then(|v| strip_quotes(v).trim().parse::<u8>().ok())
+                            .filter(|n| (1..=3).contains(n))
+                            .unwrap_or(0);
                         if !out.is_empty() && !ends_with_newline(&out) {
                             flush_before_chunk(&mut out, &mut link_label, &style);
                             out.push(Chunk::Text("\n".into(), style.clone()));
@@ -2276,4 +2555,243 @@ mod tests {
             let _ = render(&src); // must not panic
         }
     }
+    // ---------- colour, size, alignment (#702) ----------
+
+    fn style_of(src: &str, needle: &str) -> Style {
+        for c in render(src) {
+            if let Chunk::Text(t, st) = &c
+                && t.contains(needle)
+            {
+                return st.clone();
+            }
+        }
+        panic!("{needle:?} not found in {src:?}");
+    }
+
+    /// Real post bodies from this site, styled tags and all: the parser
+    /// must terminate, keep every character of visible text, and produce
+    /// the styles the tags asked for. CLAUDE.md's rule — parser changes get
+    /// verified against real posts, because that is where the BBCode bugs
+    /// have always been.
+    #[test]
+    fn real_posts_parse_completely_and_carry_their_styles() {
+        // Captured from `xf_post` (the newest 40 posts using a styling tag).
+        let corpus = include_str!("testdata/styled_posts.txt");
+        let mut styled = 0usize;
+        let mut posts = 0usize;
+        for body in corpus.split("===WFTUI-POST-BOUNDARY===") {
+            if body.trim().is_empty() {
+                continue;
+            }
+            posts += 1;
+            let chunks = render(body);
+            for c in &chunks {
+                if let Chunk::Text(_, st) = c
+                    && (st.color.is_some()
+                        || st.size.is_some()
+                        || st.heading.is_some()
+                        || st.align != Align::Left
+                        || st.highlight
+                        || st.mono)
+                {
+                    styled += 1;
+                }
+            }
+            assert!(!chunks.is_empty(), "a real post rendered to nothing");
+            // No tag this parser claims to handle may survive into the text
+            // a reader sees — a leaked `[HEADING=1]` is the visible symptom
+            // of a tag the parser stopped recognising.
+            let plain = to_plain(body);
+            for tag in [
+                "[HEADING", "[heading", "[COLOR", "[color", "[SIZE", "[size",
+                "[CENTER", "[center", "[B]", "[/B]", "[FONT", "[font",
+            ] {
+                assert!(
+                    !plain.contains(tag),
+                    "{tag} leaked into the rendered text of a real post"
+                );
+            }
+        }
+        assert!(posts >= 10, "the corpus should hold real posts, got {posts}");
+        assert!(
+            styled >= posts,
+            "these posts all carry styling tags: {styled} styled runs across {posts} posts"
+        );
+    }
+
+    /// Every colour spelling XF's editor and its users actually produce.
+    #[test]
+    fn colors_parse_the_way_css_does() {
+        for (src, want) in [
+            ("#ff0000", Some(Rgb { r: 255, g: 0, b: 0 })),
+            ("#F00", Some(Rgb { r: 255, g: 0, b: 0 })),
+            ("red", Some(Rgb { r: 255, g: 0, b: 0 })),
+            ("  Red ", Some(Rgb { r: 255, g: 0, b: 0 })),
+            ("\"#00ff00\"", Some(Rgb { r: 0, g: 255, b: 0 })),
+            ("rgb(18, 52, 86)", Some(Rgb { r: 18, g: 52, b: 86 })),
+            ("rgba(18,52,86,0.5)", Some(Rgb { r: 18, g: 52, b: 86 })),
+            ("rgb(100%, 0%, 0%)", Some(Rgb { r: 255, g: 0, b: 0 })),
+            ("rebeccapurple", Some(Rgb { r: 102, g: 51, b: 153 })),
+            ("nonsense", None),
+            ("#12345", None),
+            ("transparent", None),
+        ] {
+            assert_eq!(parse_color(src), want, "{src:?}");
+        }
+    }
+
+    /// Colour reaches the text, nests innermost-first, and a value CSS would
+    /// reject leaves the enclosing colour in force rather than clearing it.
+    #[test]
+    fn color_tags_style_their_text_and_nest() {
+        assert_eq!(
+            style_of("[COLOR=red]hot[/COLOR]", "hot").color,
+            Some(Rgb { r: 255, g: 0, b: 0 })
+        );
+        assert_eq!(
+            style_of("[COLOR=red]a[COLOR=#0000ff]b[/COLOR]c[/COLOR]", "b").color,
+            Some(Rgb { r: 0, g: 0, b: 255 }),
+            "innermost wins"
+        );
+        assert_eq!(
+            style_of("[COLOR=red]a[COLOR=#0000ff]b[/COLOR]c[/COLOR]", "c").color,
+            Some(Rgb { r: 255, g: 0, b: 0 }),
+            "and the outer one comes back"
+        );
+        assert_eq!(
+            style_of("[COLOR=red]a[COLOR=bogus]b[/COLOR]c[/COLOR]", "b").color,
+            Some(Rgb { r: 255, g: 0, b: 0 }),
+            "an unreadable value inherits, as CSS does"
+        );
+        assert_eq!(style_of("[COLOR=red]a[/COLOR]b", "b").color, None);
+        // Colour rides alongside the other marks rather than replacing them.
+        let st = style_of("[B][COLOR=#008000]bold green[/COLOR][/B]", "bold green");
+        assert!(st.bold && st.color == Some(Rgb { r: 0, g: 128, b: 0 }));
+    }
+
+    /// Sizes on XF's 1-7 scale, and the CSS lengths it also accepts.
+    #[test]
+    fn sizes_parse_on_xfs_scale() {
+        assert_eq!(style_of("[SIZE=6]big[/SIZE]", "big").size, Some(6));
+        assert_eq!(style_of("[SIZE=2]small[/SIZE]", "small").size, Some(2));
+        assert_eq!(style_of("[SIZE=\"5\"]q[/SIZE]", "q").size, Some(5));
+        assert_eq!(style_of("[SIZE=26px]px[/SIZE]", "px").size, Some(7));
+        assert_eq!(style_of("[SIZE=nope]bad[/SIZE]", "bad").size, None);
+    }
+
+    /// Headings carry their level and bold; `[HIGHLIGHT]` is its own mark,
+    /// not a synonym for bold.
+    /// Every size spelling that appears in this site's own posts — checked
+    /// against the live table, which is where the two surprises came from:
+    /// `[SIZE=+2]` (relative, and Rust reads "+2" as 2) and `[SIZE=200]`
+    /// (a pixel size past the 1-7 scale).
+    /// Every size spelling this site's own posts carry, checked against
+    /// `XF\BbCode\Renderer\Html::getTextSize` rather than against
+    /// intuition — the two that matter both go the opposite way to the
+    /// obvious reading:
+    ///
+    /// - `[SIZE=+2]` is NOT "two steps larger": XF's integer test rejects
+    ///   the `+`, the px regex rejects it too, and the tag renders with no
+    ///   size at all. (Rust's own `parse` accepts "+2" as 2, so the naive
+    ///   version drew this near-smallest.)
+    /// - `[SIZE=200]` is not out of range, it is XF's `default` arm — the
+    ///   LARGEST size.
+    #[test]
+    fn sizes_cover_the_spellings_real_posts_use() {
+        assert_eq!(parse_size("+2"), None, "XF renders no size change for +n");
+        assert_eq!(parse_size("+0"), None);
+        assert_eq!(parse_size("-1"), None, "an integer <= 0 is no size");
+        assert_eq!(parse_size("0"), None);
+        assert_eq!(parse_size("200"), Some(7), "past the scale is the top of it");
+        assert_eq!(parse_size("9"), Some(7));
+        assert_eq!(parse_size("\"3\""), Some(3));
+        assert_eq!(parse_size("4"), Some(4));
+        // Only a bare `Npx` is a length; XF clamps it to 8-36.
+        assert_eq!(parse_size("9px"), Some(1));
+        assert_eq!(parse_size("100px"), Some(7), "clamped to 36px");
+        assert_eq!(parse_size("1.5em"), None);
+        assert_eq!(parse_size("120%"), None);
+    }
+
+    #[test]
+    fn headings_and_highlight_carry_their_own_meaning() {
+        let h = style_of("[HEADING=2]Title[/HEADING]", "Title");
+        assert_eq!(h.heading, Some(2));
+        assert!(h.bold);
+        let h1 = style_of("[H1]Big[/H1]", "Big");
+        assert_eq!(h1.heading, Some(1));
+
+        // The most-used tag on this site (100k+ posts), so its edges matter:
+        // XF maps 1/2/3 to h2/h3/h4 and EVERYTHING else to a plain div, which
+        // carries no heading weight at all.
+        assert_eq!(style_of("[HEADING=3]C[/HEADING]", "C").heading, Some(3));
+        for src in [
+            "[HEADING]none[/HEADING]",
+            "[HEADING=0]zero[/HEADING]",
+            "[HEADING=9]nine[/HEADING]",
+            "[HEADING=big]word[/HEADING]",
+        ] {
+            let st = style_of(src, src.split(']').nth(1).unwrap().split('[').next().unwrap());
+            assert_eq!(st.heading, None, "{src}");
+            assert!(!st.bold, "a div is not bold either: {src}");
+        }
+        // Lowercase spelling is what most of this site's posts actually use.
+        assert_eq!(style_of("[heading=2]lower[/heading]", "lower").heading, Some(2));
+
+        let hl = style_of("[HIGHLIGHT]look[/HIGHLIGHT]", "look");
+        assert!(hl.highlight, "highlight is its own mark");
+        assert!(!hl.bold, "and it is not bold (#702)");
+    }
+
+    /// Alignment is carried on the style, because only the renderer knows
+    /// how wide a line is.
+    #[test]
+    fn alignment_is_carried_to_the_renderer() {
+        assert_eq!(
+            style_of("[CENTER]middle[/CENTER]", "middle").align,
+            Align::Center
+        );
+        assert_eq!(style_of("[RIGHT]end[/RIGHT]", "end").align, Align::Right);
+        assert_eq!(
+            style_of("[JUSTIFY]even[/JUSTIFY]", "even").align,
+            Align::Justify
+        );
+        assert_eq!(style_of("plain", "plain").align, Align::Left);
+        // Nesting: the inner block wins, and the outer one comes back.
+        assert_eq!(
+            style_of("[CENTER]a[RIGHT]b[/RIGHT]c[/CENTER]", "b").align,
+            Align::Right
+        );
+        assert_eq!(
+            style_of("[CENTER]a[RIGHT]b[/RIGHT]c[/CENTER]", "c").align,
+            Align::Center
+        );
+    }
+
+    /// A terminal is all monospace, so the only `[FONT]` distinction worth
+    /// keeping is whether the author asked for monospace on purpose.
+    #[test]
+    fn a_monospace_font_is_the_only_font_distinction() {
+        assert!(style_of("[FONT=Courier New]code-ish[/FONT]", "code-ish").mono);
+        assert!(style_of("[FONT=monospace]m[/FONT]", "m").mono);
+        assert!(!style_of("[FONT=Georgia]serif[/FONT]", "serif").mono);
+    }
+
+    /// Unbalanced value tags must not leak their value past the post, the
+    /// way #622's unbalanced marks must not.
+    #[test]
+    fn an_unclosed_value_tag_does_not_leak_past_its_line() {
+        let chunks = render("[COLOR=red]a[/COLOR][SIZE=7]b");
+        let last = chunks
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                Chunk::Text(t, st) if t.contains('b') => Some(st.clone()),
+                _ => None,
+            })
+            .expect("b");
+        assert_eq!(last.size, Some(7));
+        assert_eq!(last.color, None, "the closed colour is gone");
+    }
+
 }
