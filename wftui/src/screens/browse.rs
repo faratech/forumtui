@@ -221,7 +221,12 @@ pub(crate) fn thread_row(
     spans.push(Span::raw(" ".repeat(tw.saturating_sub(used + tlen))));
 
     spans.push(Span::raw("  "));
-    spans.push(Span::styled(lj(&t.username, gram.author()), theme.dim()));
+    spans.push(chrome::username_span(
+        theme,
+        &lj(&t.username, gram.author()),
+        t.author_banned(),
+        theme.dim(),
+    ));
     spans.push(Span::raw(" ".repeat(gram.gap())));
     spans.push(Span::styled(
         rj(&t.reply_count.to_string(), gram.replies()),
@@ -1973,8 +1978,10 @@ fn post_header_line(post: &Post, number: u64, theme: &Theme, width: usize) -> Li
         // initials chip is the same size so nothing reflows when it does.
         chrome::initials_chip(theme, &post.username),
         Span::raw("  "),
-        Span::styled(
-            post.username.clone(),
+        chrome::username_span(
+            theme,
+            &post.username,
+            post.author_banned(),
             theme.base().add_modifier(Modifier::BOLD),
         ),
     ];
@@ -1985,6 +1992,12 @@ fn post_header_line(post: &Post, number: u64, theme: &Theme, width: usize) -> Li
     if post.user.as_ref().is_some_and(|u| u.is_staff) {
         spans.push(Span::raw(" "));
         spans.push(chrome::chip(theme, "STAFF"));
+    }
+    // #706: a struck-through name reads as "banned" on its own, but only
+    // once you know the convention — the chip is what teaches it.
+    if post.author_banned() {
+        spans.push(Span::raw(" "));
+        spans.push(chrome::chip(theme, "BANNED"));
     }
     let right = vec![
         Span::styled(fmt_stamp(post.post_date), theme.dim()),
@@ -3748,6 +3761,69 @@ mod tests {
     /// #693: a picture the message references renders WHERE the message
     /// puts it, and only the attachments the message never mentioned are
     /// listed underneath — the same split XenForo renders.
+    /// #706: a banned member's name is struck through wherever it appears,
+    /// the way the website strikes it — and only when the API actually said
+    /// so, because XF gates `is_banned` to viewers who may bypass user
+    /// privacy. An absent flag means "not told", never "not banned".
+    #[test]
+    fn a_banned_members_name_is_struck_through() {
+        use ratatui::style::Modifier;
+        let theme = Theme::truecolor();
+        let banned = |is_banned: bool| User {
+            user_id: 7,
+            username: "spammer".into(),
+            is_banned,
+            ..Default::default()
+        };
+
+        // On a thread row.
+        let row = |u: Option<User>| {
+            let t = Thread {
+                thread_id: 1,
+                title: "A thread".into(),
+                username: "spammer".into(),
+                user: u,
+                ..Default::default()
+            };
+            thread_row(&t, &theme, &UNICODE, Grammar::Wide, 100)
+        };
+        let struck = |line: &ratatui::text::Line<'static>| {
+            line.spans
+                .iter()
+                .any(|s| {
+                    s.content.contains("spammer")
+                        && s.style.add_modifier.contains(Modifier::CROSSED_OUT)
+                })
+        };
+        assert!(struck(&row(Some(banned(true)))), "a banned author is struck");
+        assert!(!struck(&row(Some(banned(false)))), "an ordinary author is not");
+        assert!(
+            !struck(&row(None)),
+            "no flag means not told, and the client says nothing"
+        );
+
+        // On a post header, with the chip that teaches the convention.
+        let header = |u: Option<User>| {
+            let post = Post {
+                post_id: 1,
+                username: "spammer".into(),
+                user: u,
+                ..Default::default()
+            };
+            post_header_line(&post, 1, &theme, 100)
+        };
+        let h = header(Some(banned(true)));
+        assert!(struck(&h));
+        let text: String = h.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("BANNED"), "{text:?}");
+        let text: String = header(Some(banned(false)))
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(!text.contains("BANNED"), "{text:?}");
+    }
+
     /// #704: a moderator sees deleted and awaiting-approval content in the
     /// same lists as everything else, so the row has to say which is which.
     /// The struck-through title is what the eye catches; the chip names it.

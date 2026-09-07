@@ -82,6 +82,21 @@ pub fn keycap(theme: &Theme, key: &str, primary: bool) -> Span<'static> {
 }
 
 /// A neutral inline chip: ` Win11 ` on the key-cap background.
+/// A member's name, struck through when the payload said they are banned
+/// (#706) — the same thing the website does with `username--banned`.
+///
+/// `banned` is only ever true when the API actually told us: XF gates
+/// `is_banned` to viewers who may bypass user privacy, so an ordinary
+/// member's client is never told and correctly strikes nothing.
+pub fn username_span(theme: &Theme, name: &str, banned: bool, base: Style) -> Span<'static> {
+    let style = if banned {
+        base.add_modifier(Modifier::CROSSED_OUT).fg(theme.dim)
+    } else {
+        base
+    };
+    Span::styled(name.to_string(), style)
+}
+
 pub fn chip(theme: &Theme, text: &str) -> Span<'static> {
     Span::styled(format!(" {text} "), theme.keycap(false))
 }

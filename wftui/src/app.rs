@@ -90,6 +90,13 @@ impl TaskErrorKind {
     }
 }
 
+/// Pages one navigation may pull in to fill the pane (#705). Two extra
+/// pages cover any realistic terminal at XF's 20 rows a page; without a
+/// bound, a pane measured from the previous screen — or a forum whose pages
+/// come back short — walks page after page, which is what the reader saw as
+/// "it downloaded many pages and the pagination kept changing".
+const FILL_PAGE_BUDGET: u8 = 3;
+
 /// Serializable error payload crossing from background tasks into the UI.
 #[derive(Debug, Clone)]
 pub struct TaskError {
@@ -257,7 +264,7 @@ pub enum Msg {
     /// `append` marks a viewport-fill page (#699): it extends the list
     /// rather than replacing it, so a tall terminal is not left showing 20
     /// rows in a pane with room for 45.
-    ForumLoaded { node_id: u32, page: u32, append: bool, result: TaskResult<ForumReply> },
+    ForumLoaded { node_id: u32, page: u32, append: bool, seq: u64, result: TaskResult<ForumReply> },
     ThreadLoaded { id: u32, page: u32, result: TaskResult<ThreadReply> },
     ReplySent(TaskResult<Post>),
     ThreadCreated(TaskResult<Thread>),
@@ -381,6 +388,8 @@ pub struct App {
     /// Which screen each breadcrumb names, stamped every frame beside the
     /// header's hit boxes (#700).
     crumb_targets: Vec<usize>,
+    /// Mints `ThreadListState::load_seq` (#705).
+    next_list_seq: u64,
     pub convos_unread: u32,
     pub status: String,
     /// When the current `status` was shown as a toast (`Some`) — cleared by
@@ -686,6 +695,7 @@ pub async fn run(images: crate::images::Images) -> u8 {
     }
 
     let mut app = App {
+        next_list_seq: 1,
         api: client.clone(),
         client,
         tx,
@@ -2136,6 +2146,10 @@ impl App {
 
     /// Infinite scroll (#700): keep the list ahead of the reader.
     ///
+    /// Distinct from the automatic viewport fill in `Msg::ForumLoaded`: this
+    /// one only fires once the selection is within a screenful of the last
+    /// loaded row, so it cannot run without the reader moving.
+    ///
     /// The viewport fill (#699) tops a list up to what the pane can show;
     /// this is the same idea carried forward as they move — once the
     /// selection is within a screenful of the last loaded row, the next
@@ -2157,7 +2171,7 @@ impl App {
         }
         let rows = list.threads.len();
         let next = list.page.max(1) + list.pages_loaded.max(1);
-        if next > list.last_page {
+        if next > list.last_page || list.fill_budget == 0 {
             return;
         }
         // A screenful of lead, so the rows are there before the reader
@@ -2167,8 +2181,13 @@ impl App {
             return;
         }
         let node_id = list.node_id;
+        let seq = list.load_seq;
         list.loading = true;
-        self.load_forum_page(node_id, next, true);
+        // No budget spent here (#705): this fires because the reader has
+        // scrolled to within a screenful of the end, which is intent. The
+        // budget bounds the *automatic* fill, which runs without anyone
+        // asking and is the one that ran away.
+        self.load_forum_page(node_id, next, true, seq);
     }
 
     /// Navigate to a clicked breadcrumb (#700): pop everything the crumb is
@@ -3027,12 +3046,25 @@ impl App {
         });
     }
 
+    /// A fresh load: mints a new generation, so every reply still in flight
+    /// for this list is now stale and will be dropped (#705).
     pub fn load_forum(&mut self, node_id: u32, page: u32) {
-        self.load_forum_page(node_id, page, false);
+        let seq = self.next_list_seq;
+        self.next_list_seq += 1;
+        if let Some(list) = self.list_mut_for(node_id) {
+            list.load_seq = seq;
+            // A fresh load starts the window over: leaving `pages_loaded`
+            // where the previous forum left it made the first fill ask for
+            // `page + pages_loaded` — page 4 of a forum just opened (#705).
+            list.pages_loaded = 1;
+            list.fill_budget = FILL_PAGE_BUDGET;
+        }
+        self.load_forum_page(node_id, page, false, seq);
     }
 
     /// `append` marks a viewport-fill page (#699) — see `Msg::ForumLoaded`.
-    pub fn load_forum_page(&mut self, node_id: u32, page: u32, append: bool) {
+    /// `seq` is the generation the caller is filling for, never a new one.
+    pub fn load_forum_page(&mut self, node_id: u32, page: u32, append: bool, seq: u64) {
         let api = self.api.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -3053,7 +3085,7 @@ impl App {
             } else {
                 api.forum(node_id, page).await.map_err(|e| TaskError::of(&e))
             };
-            tx.send(Msg::ForumLoaded { node_id, page, append, result }).ok();
+            tx.send(Msg::ForumLoaded { node_id, page, append, seq, result }).ok();
         });
     }
 
@@ -3132,6 +3164,7 @@ impl App {
             h.list.threads.clear();
             h.list.sticky_count = 0;
             h.list.sel = 0;
+            h.list.scroll_reset();
             h.list.error = None;
             h.list.loading = true;
             h.focus = screens::Pane::List;
@@ -3142,6 +3175,8 @@ impl App {
             node_id,
             title,
             page: 1,
+            pages_loaded: 1,
+            fill_budget: FILL_PAGE_BUDGET,
             loading: true,
             ..Default::default()
         }));
@@ -3728,9 +3763,16 @@ impl App {
                     }
                 }
             }
-            Msg::ForumLoaded { node_id, page, append, result } => {
-                let mut fill_next: Option<(u32, u32)> = None;
-                let list = self.list_mut_for(node_id);
+            Msg::ForumLoaded { node_id, page, append, seq, result } => {
+                let mut fill_next: Option<(u32, u32, u64)> = None;
+                let list = self
+                    .list_mut_for(node_id)
+                    // #705: a reply for a load this list is no longer waiting
+                    // on is not this list's reply. Clicking through forums
+                    // fast left pages from the forum just left behind landing
+                    // in the list that replaced it — appended into it, even,
+                    // when the page number happened to line up.
+                    .filter(|list| list.load_seq == seq);
                 if let Some(list) = list {
                     match result {
                         Ok(reply) => {
@@ -3770,9 +3812,20 @@ impl App {
                             // firing a burst at the gate.
                             let rows = list.threads.len();
                             let next = list.page + list.pages_loaded;
-                            if rows < list.visible && next <= list.last_page {
+                            // The automatic fill: top the pane up to what it
+                            // can show. `visible` is zero until a render has
+                            // stamped it for THIS list (#705) — filling
+                            // against a figure measured on the previous
+                            // screen is what walked a 233-page forum — and
+                            // the budget bounds it even then.
+                            if list.visible > 0
+                                && rows < list.visible
+                                && next <= list.last_page
+                                && list.fill_budget > 0
+                            {
+                                list.fill_budget -= 1;
                                 list.loading = true;
-                                fill_next = Some((node_id, next));
+                                fill_next = Some((node_id, next, seq));
                             }
                         }
                         Err(e) => {
@@ -3786,8 +3839,8 @@ impl App {
                         }
                     }
                 }
-                if let Some((node_id, page)) = fill_next {
-                    self.load_forum_page(node_id, page, true);
+                if let Some((node_id, page, seq)) = fill_next {
+                    self.load_forum_page(node_id, page, true, seq);
                 }
             }
             Msg::ThreadLoaded { id, page, result } => {
@@ -5033,6 +5086,7 @@ mod tests {
             node_id: 1,
             page: 1,
             append: false,
+            seq: 0,
             result: Ok(ForumReply::default()),
         });
         {
@@ -7117,6 +7171,7 @@ mod tests {
             node_id: 0,
             page: 1,
             append: false,
+            seq: 0,
             result: Err(TaskError {
                 message: "not logged in".into(),
                 code: None,
@@ -7797,6 +7852,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         App {
             crumb_targets: Vec::new(),
+            next_list_seq: 1,
             api: Arc::new(RecordingApi::default()),
             client,
             tx,
@@ -8335,6 +8391,9 @@ mod tests {
             h.list.last_page = 22;
             h.list.visible = 10;
             h.list.sel = 5;
+            // What a real load grants (#705): a budget of pages this
+            // navigation may pull in.
+            h.list.fill_budget = FILL_PAGE_BUDGET;
         }
         app.autoload_more();
         let loading = |app: &App| match app.screens.last() {
@@ -8363,6 +8422,211 @@ mod tests {
         }
         app.autoload_more();
         assert!(!loading(&app), "no page after the last one");
+    }
+
+    /// #705: clicking through forums fast used to leave pages from the
+    /// forum just left behind landing in the list that replaced it — the
+    /// reply was routed by `node_id` alone, and a fresh load did not reset
+    /// the loaded window, so the first fill of a new forum asked for
+    /// `page + pages_loaded` carried over from the old one.
+    #[tokio::test]
+    async fn a_reply_for_a_load_the_list_moved_on_from_is_dropped() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        if let Some(Screen::Home(h)) = app.screens.last_mut() {
+            h.list.node_id = 4;
+            h.list.threads = vec![Thread { thread_id: 1, ..Default::default() }];
+            h.list.page = 1;
+            h.list.pages_loaded = 3;
+            h.list.load_seq = 7;
+        }
+        let reply = |page: u32| ForumReply {
+            forum: common::models::Forum { node_id: 4, title: "News".into(), ..Default::default() },
+            threads: vec![Thread { thread_id: 900 + page, ..Default::default() }],
+            sticky: Vec::new(),
+            pagination: common::models::Pagination {
+                current_page: page,
+                last_page: 22,
+                total: 431,
+                per_page: 20,
+            },
+        };
+
+        // A page from the generation before this one: dropped whole, whether
+        // it would have appended or replaced.
+        app.handle_msg(Msg::ForumLoaded {
+            node_id: 4,
+            page: 4,
+            append: true,
+            seq: 6,
+            result: Ok(reply(4)),
+        });
+        app.handle_msg(Msg::ForumLoaded {
+            node_id: 4,
+            page: 2,
+            append: false,
+            seq: 6,
+            result: Ok(reply(2)),
+        });
+        match app.screens.last() {
+            Some(Screen::Home(h)) => {
+                assert_eq!(h.list.threads.len(), 1, "a stale reply must not land");
+                assert_eq!(h.list.page, 1);
+                assert_eq!(h.list.pages_loaded, 3);
+            }
+            _ => panic!("home"),
+        }
+
+        // The generation this list IS waiting on lands normally.
+        app.handle_msg(Msg::ForumLoaded {
+            node_id: 4,
+            page: 1,
+            append: false,
+            seq: 7,
+            result: Ok(reply(1)),
+        });
+        match app.screens.last() {
+            Some(Screen::Home(h)) => assert_eq!(h.list.threads[0].thread_id, 901),
+            _ => panic!("home"),
+        }
+    }
+
+    /// Opening a forum starts its window over. Carrying `pages_loaded` from
+    /// the previous forum made the first fill request page 4 of a forum the
+    /// reader had just opened, and the cap then claimed pages the list did
+    /// not hold (#705).
+    #[tokio::test]
+    async fn opening_a_forum_starts_a_fresh_window() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(true));
+        if let Some(Screen::Home(h)) = app.screens.last_mut() {
+            // `dual` is stamped by the renderer; open_list keeps the Home
+            // list only when the layout has one.
+            h.dual = true;
+            h.list.node_id = 4;
+            h.list.pages_loaded = 3;
+            h.list.per_page = 20;
+            h.list.visible = 40;
+            h.list.load_seq = 999;
+        }
+        app.open_list(307, "BSOD".into());
+        match app.screens.last() {
+            Some(Screen::Home(h)) => {
+                assert_eq!(h.list.node_id, 307);
+                assert_eq!(h.list.page, 1);
+                assert_eq!(h.list.pages_loaded, 1, "the window starts over");
+                assert_eq!(h.list.per_page, 0, "and so does the page size");
+                assert_ne!(
+                    h.list.load_seq, 999,
+                    "a fresh load mints a new generation, so replies still in \
+                     flight for the old one are already stale"
+                );
+                assert_eq!(h.list.fill_budget, FILL_PAGE_BUDGET);
+            }
+            _ => panic!("home"),
+        }
+    }
+
+    /// #705, the shape the reader actually hit: a pane figure measured on
+    /// the screen before must never drive a fill. `visible` is zeroed by a
+    /// fresh load and only a render of THIS list stamps it again, so the
+    /// automatic fill cannot start against a number that was never about
+    /// this forum.
+    #[tokio::test]
+    async fn the_automatic_fill_waits_for_a_real_measurement() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        if let Some(Screen::Home(h)) = app.screens.last_mut() {
+            h.list.node_id = 307;
+            h.list.load_seq = 5;
+            h.list.fill_budget = FILL_PAGE_BUDGET;
+            h.list.visible = 0; // what a fresh load leaves behind
+        }
+        app.handle_msg(Msg::ForumLoaded {
+            node_id: 307,
+            page: 1,
+            append: false,
+            seq: 5,
+            result: Ok(ForumReply {
+                forum: common::models::Forum {
+                    node_id: 307,
+                    title: "BSOD".into(),
+                    ..Default::default()
+                },
+                threads: (0..20)
+                    .map(|i| Thread { thread_id: i, ..Default::default() })
+                    .collect(),
+                sticky: Vec::new(),
+                pagination: common::models::Pagination {
+                    current_page: 1,
+                    last_page: 233,
+                    total: 4645,
+                    per_page: 20,
+                },
+            }),
+        });
+        match app.screens.last() {
+            Some(Screen::Home(h)) => {
+                assert!(!h.list.loading, "no fill against an unmeasured pane");
+                assert_eq!(h.list.threads.len(), 20);
+            }
+            _ => panic!("home"),
+        }
+    }
+
+    /// The fill is bounded (#705). A pane measured from the previous screen,
+    /// or a forum whose pages come back short, must not walk page after page
+    /// — which is what "it downloaded many pages and the pagination kept
+    /// changing" was.
+    #[tokio::test]
+    async fn the_viewport_fill_is_bounded() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        if let Some(Screen::Home(h)) = app.screens.last_mut() {
+            h.list.node_id = 307;
+            h.list.load_seq = 5;
+            h.list.fill_budget = FILL_PAGE_BUDGET;
+            // A pane claiming room for far more than the forum will ever
+            // give it in one page.
+            h.list.visible = 500;
+        }
+        let short_page = |page: u32| ForumReply {
+            forum: common::models::Forum { node_id: 307, title: "BSOD".into(), ..Default::default() },
+            threads: vec![Thread { thread_id: page, ..Default::default() }],
+            sticky: Vec::new(),
+            pagination: common::models::Pagination {
+                current_page: page,
+                last_page: 233,
+                total: 4645,
+                per_page: 20,
+            },
+        };
+        let mut page = 1u32;
+        let mut fetches = 0;
+        // Drive the chain: every reply that asks for another page gets one.
+        loop {
+            app.handle_msg(Msg::ForumLoaded {
+                node_id: 307,
+                page,
+                append: page > 1,
+                seq: 5,
+                result: Ok(short_page(page)),
+            });
+            let still_loading = match app.screens.last() {
+                Some(Screen::Home(h)) => h.list.loading,
+                _ => panic!("home"),
+            };
+            if !still_loading {
+                break;
+            }
+            page += 1;
+            fetches += 1;
+            assert!(fetches <= 10, "the fill never stopped: {fetches} pages");
+        }
+        assert!(
+            fetches <= FILL_PAGE_BUDGET as u32,
+            "a 233-page forum must not be walked: {fetches} extra pages"
+        );
     }
 
     /// #699: XF fixes the page size server-side (20 rows, and it ignores
@@ -8396,12 +8660,14 @@ mod tests {
         if let Some(Screen::Home(h)) = app.screens.last_mut() {
             h.list.visible = 45;
             h.list.node_id = 4;
+            h.list.fill_budget = FILL_PAGE_BUDGET;
         }
 
         app.handle_msg(Msg::ForumLoaded {
             node_id: 4,
             page: 1,
             append: false,
+            seq: 0,
             result: Ok(page_of(1, 20)),
         });
         let list = |app: &App| match app.screens.last() {
@@ -8419,6 +8685,7 @@ mod tests {
             node_id: 4,
             page: 2,
             append: true,
+            seq: 0,
             result: Ok(page_of(2, 20)),
         });
         assert_eq!(list(&app), (40, 1, 2, true), "still short of 45: keep going");
@@ -8427,6 +8694,7 @@ mod tests {
             node_id: 4,
             page: 3,
             append: true,
+            seq: 0,
             result: Ok(page_of(3, 10)),
         });
         let (rows, page, loaded, loading) = list(&app);
@@ -8438,6 +8706,7 @@ mod tests {
             node_id: 4,
             page: 2,
             append: false,
+            seq: 0,
             result: Ok(page_of(2, 20)),
         });
         let (rows, page, loaded, _) = list(&app);
@@ -8462,6 +8731,7 @@ mod tests {
             node_id: 4,
             page: 2,
             append: true,
+            seq: 0,
             result: Err(TaskError {
                 message: "gateway timeout".into(),
                 code: None,

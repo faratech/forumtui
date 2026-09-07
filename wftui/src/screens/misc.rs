@@ -2315,11 +2315,19 @@ pub fn render_profile(
     let mut user_spans = vec![
         chrome::initials_chip(theme, &user.username),
         Span::raw(" "),
-        Span::styled(
-            user.username.clone(),
+        chrome::username_span(
+            theme,
+            &user.username,
+            user.is_banned,
             theme.title().add_modifier(Modifier::BOLD),
         ),
     ];
+    // #706: on the member's own page the ban is the headline fact about
+    // them, so it leads the chips.
+    if user.is_banned {
+        user_spans.push(Span::raw(" "));
+        user_spans.push(chrome::chip(theme, "BANNED"));
+    }
     if user.is_admin {
         user_spans.push(Span::raw(" "));
         user_spans.push(chrome::chip(theme, "ADMIN"));

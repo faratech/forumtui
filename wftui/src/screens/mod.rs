@@ -101,6 +101,16 @@ pub struct ThreadListState {
     /// Consecutive pages held, starting at `page`. 1 unless the viewport
     /// asked for more.
     pub pages_loaded: u32,
+    /// Which load this list is waiting on (#705). Every fresh load mints a
+    /// new one and a fill inherits it, so a reply from the forum the reader
+    /// just clicked away from can never be adopted by the list that
+    /// replaced it — matching on `node_id` alone let a stale page land in a
+    /// list that had been reset under it.
+    pub load_seq: u64,
+    /// Pages a single navigation may pull in to fill the pane. Without a
+    /// bound, a pane sized from the previous screen (or a forum whose pages
+    /// come back short) walks page after page.
+    pub fill_budget: u8,
     /// `pagination.per_page`, so the range footer stays right across a
     /// multi-page fill.
     pub per_page: u32,
@@ -113,6 +123,17 @@ pub struct ThreadListState {
     pub visible: usize,
     pub loading: bool,
     pub error: Option<String>,
+}
+
+impl ThreadListState {
+    /// Everything a fresh forum invalidates about the loaded window (#705).
+    /// `load_forum` mints the generation; this is the part that must be
+    /// forgotten the moment the reader picks a different forum.
+    pub fn scroll_reset(&mut self) {
+        self.pages_loaded = 1;
+        self.per_page = 0;
+        self.visible = 0;
+    }
 }
 
 #[derive(Default)]
@@ -612,6 +633,14 @@ pub struct ProfileState {
 
 // ---------- screen enum + dispatch ----------
 
+// The stack holds a handful of screens (five is a deep session), so the
+// largest variant costing ~950 bytes is noise — a push moves less than a
+// single wrapped line of a post. Boxing `ThreadView` to satisfy the lint
+// would put a `Box` in the way of every `match` on this enum, and there are
+// dozens, in exchange for nothing a reader would ever notice. Measured, not
+// assumed: the per-frame work this crate actually cares about was profiled
+// in #674-#677 and none of it touches the size of this enum.
+#[allow(clippy::large_enum_variant)]
 pub enum Screen {
     Login(LoginState),
     Home(HomeState),

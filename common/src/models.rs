@@ -96,6 +96,11 @@ pub struct Forum {
 pub struct Thread {
     #[serde(default)]
     pub thread_id: u32,
+    /// The author, when the payload carried the relation — XF sends `User`
+    /// on threads as it does on posts. It is what tells the client an author
+    /// is banned (#706).
+    #[serde(default, rename = "User")]
+    pub user: Option<User>,
     /// `visible`, `moderated` or `deleted` (#704). The API only sends a
     /// thread the caller may see at all, so a non-visible state arriving
     /// here means the reader is allowed to see it — the client's job is to
@@ -593,6 +598,13 @@ pub struct User {
     pub is_admin: bool,
     #[serde(default, rename = "is_moderator")]
     pub is_moderator: bool,
+    /// #706. XF gates this to viewers who may bypass user privacy — a
+    /// moderator sees it, an ordinary member does not receive the field at
+    /// all — so an absent flag means "not told", never "not banned". The
+    /// client strikes the name where it is told and says nothing where it
+    /// is not.
+    #[serde(default, deserialize_with = "null_default")]
+    pub is_banned: bool,
     #[serde(default, rename = "last_activity")]
     pub last_activity: i64,
     #[serde(default)]
@@ -1185,11 +1197,22 @@ impl Thread {
     pub fn state(&self) -> ContentState {
         ContentState::parse(&self.discussion_state)
     }
+
+    /// True only when the payload said so (#706): the flag is
+    /// permission-gated, so its absence means "not told", not "not banned".
+    pub fn author_banned(&self) -> bool {
+        self.user.as_ref().is_some_and(|u| u.is_banned)
+    }
 }
 
 impl Post {
     pub fn state(&self) -> ContentState {
         ContentState::parse(&self.message_state)
+    }
+
+    /// See `Thread::author_banned` (#706).
+    pub fn author_banned(&self) -> bool {
+        self.user.as_ref().is_some_and(|u| u.is_banned)
     }
 }
 
