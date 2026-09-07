@@ -1277,13 +1277,13 @@ pub(crate) fn chunk_lines(
                 // (issue #559): ratatui's grapheme filter drops a raw tab
                 // outright when drawing a span, so a `[CODE]` block's
                 // tab-separated columns would otherwise fuse together.
-                let t = crate::editor::normalize_control_chars(&t);
+                let t = crate::editor::normalize_control_chars(t);
                 for (i, seg) in t.split('\n').enumerate() {
                     if i > 0 {
                         out.push(std::mem::take(&mut current));
                     }
                     if !seg.is_empty() {
-                        current.push(Span::styled(seg.to_string(), style_from(theme, &s, reveal_spoilers)));
+                        current.push(Span::styled(seg.to_string(), style_from(theme, s, reveal_spoilers)));
                     }
                 }
             }
@@ -1296,7 +1296,7 @@ pub(crate) fn chunk_lines(
                         out.push(std::mem::take(&mut current));
                     }
                     if !seg.is_empty() {
-                        current.push(Span::styled(seg.to_string(), style_from(theme, &s, reveal_spoilers)));
+                        current.push(Span::styled(seg.to_string(), style_from(theme, s, reveal_spoilers)));
                     }
                 }
                 // A link inside a hidden spoiler dims its marker too: the
@@ -1320,7 +1320,7 @@ pub(crate) fn chunk_lines(
                 // XF renders <a href=full><img src=thumb></a> — so the
                 // registered link opens the anchor, the picture still paints.
                 links.push(link.clone().unwrap_or_else(|| url.clone()));
-                current.push(Span::styled("[image]".to_string(), style_from(theme, &s, reveal_spoilers)));
+                current.push(Span::styled("[image]".to_string(), style_from(theme, s, reveal_spoilers)));
                 // The marker dims inside a hidden spoiler like the link
                 // marker does: an invisible picture must not invite o/1-9.
                 let marker_style = if s.spoiler && !reveal_spoilers {
@@ -1336,7 +1336,7 @@ pub(crate) fn chunk_lines(
             Chunk::Attach(id, s) => {
                 current.push(Span::styled(
                     format!("[attachment {id}]"),
-                    style_from(theme, &s, reveal_spoilers),
+                    style_from(theme, s, reveal_spoilers),
                 ));
             }
         }

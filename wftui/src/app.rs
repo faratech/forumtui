@@ -900,7 +900,9 @@ impl App {
     /// `SessionLost` inside the window swallowed as "stale" forever: a
     /// genuinely signed-out session would then never reach the Login screen
     /// (issue #587).
-    fn expire_session_recovery_timeout(&mut self) {
+    /// Returns true when the backstop fired this tick — the caller owes the
+    /// screen one redraw (#674).
+    fn expire_session_recovery_timeout(&mut self) -> bool {
         if self.session_recovery_pending
             && let Some(started) = self.session_recovery_started_at
             && started.elapsed() >= Duration::from_secs(SESSION_RECOVERY_TIMEOUT_SECS)
@@ -924,7 +926,9 @@ impl App {
             } else {
                 self.end_session("Session check timed out; log in again.");
             }
+            return true;
         }
+        false
     }
 
     /// Show a status *toast* — a one-off success/failure notice ("Reply
@@ -954,13 +958,28 @@ impl App {
     /// row through everything the reader does next (issue #571). A no-op
     /// for a persistent hint (`status_set_at` is `None`) or a toast that
     /// hasn't aged out yet.
-    fn expire_status_toast(&mut self) {
+    /// Returns true when the toast expired this tick — the caller owes the
+    /// screen one redraw (#674).
+    fn expire_status_toast(&mut self) -> bool {
         if let Some(at) = self.status_set_at
             && at.elapsed() >= Duration::from_secs(STATUS_TOAST_SECS)
         {
             self.status.clear();
             self.status_set_at = None;
+            return true;
         }
+        false
+    }
+
+    /// Does the next tick owe the screen a repaint even if no event or
+    /// message arrived (#674)? Only things that ANIMATE on the wall clock
+    /// qualify: the write-gate countdown (its seconds and bar fill
+    /// continuously) and any in-flight fetch's spinner (8 fps off the wall
+    /// clock). Everything else — toasts expiring, the recovery backstop,
+    /// poller replies — marks the loop dirty exactly once via its own path.
+    fn needs_continuous_redraw(&self) -> bool {
+        !self.client.write_gate.pending_wait().is_zero()
+            || self.screens.iter().any(|s| s.is_loading())
     }
 
     /// The single place a session ends. Every session-ending failure routes
@@ -1157,19 +1176,41 @@ impl App {
         // that the client exits through the normal terminal-restoring
         // teardown with a nonzero code.
         let mut reader_deaths = 0u32;
+        // The dirty flag is the idle-CPU fix (#674): the frame is rebuilt
+        // only when something happened (input, message, a timer boundary)
+        // or while something animates (gate countdown, loading spinners).
+        // An idle session's loop costs one 50 ms `recv_timeout` and nothing
+        // else. `last_drawn_gate` catches the countdown's zero crossing —
+        // the tick where the gate frees must still paint "Ready".
+        let mut dirty = true;
+        let mut last_drawn_gate = self.client.write_gate.pending_wait();
         loop {
-            self.expire_status_toast();
-            self.expire_session_recovery_timeout();
-            let _ = terminal.draw(|f| self.draw(f));
+            if self.expire_status_toast() {
+                dirty = true;
+            }
+            if self.expire_session_recovery_timeout() {
+                dirty = true;
+            }
+            let gate_pending = self.client.write_gate.pending_wait();
+            if dirty || gate_pending != last_drawn_gate || self.needs_continuous_redraw() {
+                let _ = terminal.draw(|f| self.draw(f));
+                last_drawn_gate = gate_pending;
+                dirty = false;
+            }
             // Drain background messages.
+            let mut got_msg = false;
             while let Ok(msg) = self.rx.try_recv() {
                 self.handle_msg(msg);
+                got_msg = true;
                 if self.should_quit {
                     break;
                 }
             }
             if self.should_quit {
                 return 0;
+            }
+            if got_msg {
+                dirty = true;
             }
             // Debounced palette member lookup: the loop's idle path is the
             // only place with a clock, and typing must not fan out requests.
@@ -1233,6 +1274,9 @@ impl App {
                         };
                     }
                 }
+                // Any input batch may have changed state (even a Resize's
+                // `terminal.clear` needs the repaint that follows).
+                dirty = true;
             }
         }
     }
@@ -7610,6 +7654,57 @@ mod tests {
         let view = inbox.view.as_ref().expect("the view survives");
         assert_eq!(view.page, 7, "the in-flight load was not replaced");
         assert!(view.loading);
+    }
+
+    /// #674: the idle-skip predicate — an idle session needs no redraw,
+    /// a pending write gate (its countdown animates) or any in-flight
+    /// fetch's spinner does.
+    #[test]
+    fn needs_continuous_redraw_tracks_animation_sources_only() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        assert!(
+            !app.needs_continuous_redraw(),
+            "an idle session must not force redraws"
+        );
+
+        // A static busy text (compose "Sending…") does NOT animate.
+        app.screens.clear();
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            busy: true,
+            ..Default::default()
+        }));
+        assert!(
+            !app.needs_continuous_redraw(),
+            "static busy text must not force redraws"
+        );
+
+        // A pending write gate animates its countdown.
+        app.client.write_gate.penalize(Duration::from_secs(30));
+        assert!(app.needs_continuous_redraw());
+
+        // A loading screen animates its spinner.
+        app.screens.clear();
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 42, ..Default::default() },
+            loading: true,
+            ..Default::default()
+        }));
+        assert!(app.needs_continuous_redraw());
+    }
+
+    /// #674: the toast-expiry boundary marks dirty exactly once — while a
+    /// toast is live nothing redraws, the tick that clears it does.
+    #[test]
+    fn toast_expiry_marks_dirty_exactly_once() {
+        let mut app = test_app();
+        app.set_status("Reply posted.");
+        assert!(!app.expire_status_toast(), "a fresh toast is not expired");
+        app.status_set_at = Some(
+            std::time::Instant::now() - Duration::from_secs(STATUS_TOAST_SECS + 1),
+        );
+        assert!(app.expire_status_toast(), "the boundary tick clears it");
+        assert!(!app.expire_status_toast(), "and only once");
     }
 
     /// The signal forwarder keeps opting the process out of the default

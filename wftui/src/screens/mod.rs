@@ -781,6 +781,31 @@ impl Screen {
         }
     }
 
+    /// Does this screen have a fetch in flight — i.e. does it animate a
+    /// spinner that needs the event loop redrawing while it runs (#674)?
+    /// Static busy text ("Sending…") does not count: nothing on screen
+    /// changes until a message arrives.
+    pub fn is_loading(&self) -> bool {
+        match self {
+            Screen::Home(h) => h.tree.loading || h.list.loading,
+            Screen::ForumTree(t) => t.loading,
+            Screen::ThreadList(l) => l.loading,
+            Screen::ThreadView(v) => v.loading,
+            Screen::Inbox(i) => {
+                i.convos.loading
+                    || i.alerts.loading
+                    || i.view.as_ref().is_some_and(|v| v.loading)
+            }
+            Screen::ConversationView(v) => v.loading,
+            Screen::Search(s) => s.loading,
+            Screen::Profile(p) => p.loading,
+            // The Login Waiting stage animates its "waiting for approval"
+            // spinner too — but only while a flow is live.
+            Screen::Login(l) => l.busy || matches!(l.stage, LoginStage::Waiting),
+            Screen::Compose(_) | Screen::NewConversation(_) => false,
+        }
+    }
+
     /// The site URL for whatever this screen currently has selected — what a
     /// right click (a long press on a phone terminal) opens, and the same
     /// thing `u` opens in the thread view. `None` when the payload carried
