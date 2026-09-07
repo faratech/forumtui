@@ -1233,6 +1233,28 @@ mod tests {
         c
     }
 
+    /// Issue #712: the politeness gates run on real time in tests too. A
+    /// second write on one client therefore sleeps the full 30 s
+    /// `WRITE_COOLDOWN_MS` — 30.6 s of the `common` suite's 36.8 s was one
+    /// test doing exactly that, and the suite burned 36.8 s of wall clock
+    /// for 1.9 s of CPU.
+    ///
+    /// A test that is about *what* goes on the wire, rather than about the
+    /// spacing between requests, opens the gates first. The gate behaviour
+    /// itself stays covered, and deliberately still waits, in
+    /// `upload_attachment_re_anchors_the_write_gate_on_success` and the
+    /// `ratelimit` module's own tests; the guard against a new multi-write
+    /// test re-introducing the wait is
+    /// `write_gate_is_opened_in_every_test_that_writes_twice`.
+    ///
+    /// Call it before *each* write, not once up front: a successful write
+    /// `penalize`s the gate back to the full cool-down, which a fresh
+    /// zero-`min` gate is the simplest way to clear.
+    fn open_gates(c: &mut WfApiClient) {
+        c.write_gate = Arc::new(Gate::new(0));
+        c.image_gate = Arc::new(Gate::new(0));
+    }
+
     /// GUARD (issue #565). The suite must never read or write the machine
     /// owner's real config dir, and must never send a request to the live
     /// site. It once did both: `WfApiClient::new()` resolved
@@ -1299,6 +1321,65 @@ mod tests {
         let _ = std::fs::remove_file(poison_base);
     }
 
+    /// Issue #712: the `common` suite once took 36.8 s of wall clock for
+    /// 1.9 s of CPU, because one test did two `upload_attachment` calls on
+    /// one client and slept the real 30 s `WRITE_COOLDOWN_MS` between them.
+    ///
+    /// The gates are deliberately real everywhere else, so nothing stops the
+    /// next multi-write test from doing it again — and a 30 s test reads as
+    /// "the suite is just slow", not as a mistake. This scan is the guard: a
+    /// test that calls a write-gated method more than once must also call
+    /// `open_gates`, or be named here as one that waits on purpose.
+    ///
+    /// It checks that `open_gates` is *mentioned*, not that it is called
+    /// often enough — a successful write re-`penalize`s the gate, so a test
+    /// with three writes needs three calls. That part is self-evident to
+    /// whoever writes it, because the test is slow until they get it right.
+    #[test]
+    fn write_gate_is_opened_in_every_test_that_writes_twice() {
+        // The methods that `wait()` on `write_gate`, directly or through
+        // `post_form`. `delete_post` and `mark_solution` are not here: they
+        // take the api gate only.
+        const WRITE_CALLS: [&str; 6] = [
+            ".reply(",
+            ".create_thread(",
+            ".reply_conversation(",
+            ".create_conversation(",
+            ".edit_post(",
+            ".upload_attachment(",
+        ];
+        // Tests whose subject *is* the spacing, so they must keep waiting.
+        const WAITS_ON_PURPOSE: [&str; 1] =
+            ["upload_attachment_re_anchors_the_write_gate_on_success"];
+
+        let src = include_str!("api.rs");
+        // Split on the test-function boundary; the first chunk is everything
+        // before the first test and is not one.
+        let mut offenders = Vec::new();
+        for chunk in src.split("    async fn ").skip(1) {
+            let name = chunk
+                .split(['(', '<'])
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if WAITS_ON_PURPOSE.contains(&name.as_str()) {
+                continue;
+            }
+            let writes: usize = WRITE_CALLS.iter().map(|m| chunk.matches(m).count()).sum();
+            if writes >= 2 && !chunk.contains("open_gates") {
+                offenders.push(format!("{name} ({writes} write calls)"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these tests write more than once without opening the write gate, so \
+             each extra write sleeps the real {} ms cool-down (#712): {:?}",
+            config::WRITE_COOLDOWN_MS,
+            offenders
+        );
+    }
+
     /// Issue #557: two instances sharing one config dir rotate each other's
     /// refresh token out from under themselves. `adopt_stored_tokens` must
     /// pick up what the sibling wrote — and must report `false` (nothing to
@@ -1327,11 +1408,19 @@ mod tests {
             .mount(&server)
             .await;
 
-        let c = logged_in_client("tok-1").await;
+        // Two writes on one client: without this the second `upload_attachment`
+        // sleeps the full 30 s write cool-down for a test that is about key
+        // reuse, not spacing (#712).
+        let mut c = logged_in_client("tok-1").await;
+        open_gates(&mut c);
         let (key, _) = c
             .upload_attachment("post", &[], "a.png".into(), vec![1], "image/png", None)
             .await
             .unwrap();
+        // A *successful* upload re-anchors the cool-down by `penalize`-ing the
+        // gate (#644), so opening it once up front is not enough — the second
+        // call would still sleep the full 30 s.
+        open_gates(&mut c);
         let (key2, _) = c
             .upload_attachment("post", &[], "b.png".into(), vec![2], "image/png", Some(&key))
             .await
