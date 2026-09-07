@@ -334,6 +334,40 @@ The thread view's write keys are `r` reply, `Q` quote (see below), `e` edit,
   without one: for an edit that is the post's current text, so discarding a
   draft must never empty the post.
 
+**Drafts are shared with the website** through the TuiLink relay
+(`/api/wf-tui-drafts`, #716). Stock XF has no draft endpoint — `xf_draft` is
+written only by `XF\ControllerPlugin\DraftPlugin` from the Pub controllers,
+i.e. the web editor's autosave — so without the relay the two stores never
+met. Three things about it are not obvious:
+
+- **XF has no draft for a post *edit*.** Its keys, from the entity relation
+  conditions, are `thread-<thread_id>`, `forum-<node_id>` and
+  `conversation-reply-<conversation_id>`. `DraftKey::xf_key` returns `None`
+  for `EditPost`, and that `None` is the whole "edits stay local" rule.
+- **The REST API never deletes drafts, but XF's web controller does** on a
+  successful post. So `close_sent_composer` must delete explicitly, or every
+  post made from here leaves a stale draft in the browser's editor.
+- **Attachments cross one way only.** A web draft stores
+  `extra_data.attachment_hash` = `xf_attachment.temp_hash`; the API hands
+  clients an `ApiAttachmentKey` that *wraps* a hash and whose `_preSave`
+  generates both and refuses to let either be set. So the relay resolves a
+  client key to its hash (TUI → web works) but cannot mint a key for an
+  existing hash (web → TUI does not) — a draft resumed from the website says
+  its attachments stay there rather than losing them silently.
+
+The relay is a mirror, not the store: every call is fire-and-forget and a
+failure is only logged. `drafts.json` stays the thing the composer reads, so a
+500, an offline session or the server's 24 h prune cannot cost the words. No
+new OAuth scope was minted for it — a new scope is absent from the 90-day
+tokens already issued and would 403 every live session until re-auth (#695),
+so each draft kind asserts the scope its content type already implies.
+
+**A draft you cannot find is a draft you have lost**, so there are three ways
+to see one: the drafts list (`g d`, or the palette row, which shows a count),
+the thread view's `r` cap reading "resume draft" instead of "reply", and the
+composer itself. The list is the important one — a new-thread draft belongs to
+no thread, so no thread view can ever hint at it.
+
 Draft rules worth knowing before touching `pop_screen` or `push_screen`:
 
 - **Restore lives in `push_screen`, save in `pop_screen`.** Every composer

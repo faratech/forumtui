@@ -149,6 +149,8 @@ pub enum Target {
     /// palette twins of the `g m` / `g r` chords.
     MediaGallery,
     Resources,
+    /// Unsent composer drafts (#716) — the palette twin of `g d`.
+    Drafts,
     Search,
     SignOut,
     Quit,
@@ -579,6 +581,8 @@ pub enum GoTarget {
     Alerts,
     Media,
     Resources,
+    /// Unsent composer drafts (#716).
+    Drafts,
     Home,
     Profile,
     Top,
@@ -629,6 +633,7 @@ impl Prefix {
             KeyCode::Char('a') => PrefixEvent::Go(GoTarget::Alerts),
             KeyCode::Char('m') => PrefixEvent::Go(GoTarget::Media),
             KeyCode::Char('r') => PrefixEvent::Go(GoTarget::Resources),
+            KeyCode::Char('d') => PrefixEvent::Go(GoTarget::Drafts),
             KeyCode::Char('h') => PrefixEvent::Go(GoTarget::Home),
             KeyCode::Char('p') => PrefixEvent::Go(GoTarget::Profile),
             KeyCode::Char('g') => PrefixEvent::Go(GoTarget::Top),
@@ -641,7 +646,7 @@ impl Prefix {
 const WHICH_KEY: [[(&str, &str); 3]; 4] = [
     [("n", "news"), ("s", "security"), ("t", "tutorials")],
     [("l", "latest"), ("i", "inbox"), ("a", "alerts")],
-    [("m", "media"), ("r", "resources"), ("", "")],
+    [("m", "media"), ("r", "resources"), ("d", "drafts")],
     [("h", "home"), ("p", "profile"), ("g", "top")],
 ];
 

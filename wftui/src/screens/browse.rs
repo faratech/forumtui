@@ -2453,7 +2453,10 @@ pub fn thread_view_hints(s: &ThreadViewState) -> Hints {
     let sel = s.posts.get(s.sel_post);
     let can_edit = sel.is_some_and(|p| p.can_edit);
     let can_delete = sel.is_some_and(|p| p.can_soft_delete);
-    let mut keys: Vec<(&str, &str)> = vec![("r", "reply"), ("Q", "quote")];
+    // #716: say so where the reader would look. A draft they forgot about is
+    // otherwise reachable only by pressing `r` and being surprised.
+    let reply_cap = if s.has_draft { "resume draft" } else { "reply" };
+    let mut keys: Vec<(&str, &str)> = vec![("r", reply_cap), ("Q", "quote")];
     // #710: only where there is something to play — a cap for a post with no
     // video is a cap that does nothing.
     if !post_videos(sel).is_empty() {

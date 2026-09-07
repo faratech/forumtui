@@ -1110,6 +1110,140 @@ pub fn image_view_hints(s: &super::ImageViewState) -> Hints {
 
 
 
+// ================= the drafts list (#716) =================
+
+/// Every unsent draft, in one place.
+///
+/// Before this a draft could only be seen by reopening the exact composer that
+/// made it, so a new-thread draft in a forum you were not looking at was
+/// effectively invisible and "what am I part-way through?" had no answer.
+pub fn render_drafts(
+    s: &mut super::DraftsState,
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    g: &Glyphs,
+    hits: &mut HitMap,
+) {
+    let bottom = match s.rows.len() {
+        0 => String::new(),
+        1 => "1 draft".to_string(),
+        n => format!("{n} drafts"),
+    };
+    let block = chrome::panel(
+        theme,
+        g,
+        "Drafts",
+        true,
+        None,
+        if bottom.is_empty() { None } else { Some(bottom.as_str()) },
+    );
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    if s.rows.is_empty() {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled("No unsent drafts.", theme.dim())),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Press Esc in a composer and whatever you had written is kept here.",
+                    theme.dim(),
+                )),
+            ])
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+            inner,
+        );
+        return;
+    }
+
+    let w = inner.width as usize;
+    let items: Vec<ListItem> = s
+        .rows
+        .iter()
+        .map(|r| {
+            let label = if r.label.is_empty() {
+                "(untitled)".to_string()
+            } else {
+                r.label.clone()
+            };
+            let mut meta = fmt_age(r.saved_at);
+            if !r.shared {
+                // An edit has no XF draft to sync to, so say why this one is
+                // not on the website rather than let it look like a failure.
+                meta.push_str(" \u{b7} this device only");
+            }
+            let mut lines = vec![catalog_line(theme, &label, &meta, w)];
+            if !r.preview.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("   {}", truncate(&r.preview, w.saturating_sub(3))),
+                    theme.dim(),
+                )));
+            }
+            ListItem::new(lines)
+        })
+        .collect();
+    let mut state = ListState::default().with_selected(Some(s.sel.min(s.rows.len() - 1)));
+    let heights: Vec<u16> = s
+        .rows
+        .iter()
+        .map(|r| if r.preview.is_empty() { 1 } else { 2 })
+        .collect();
+    f.render_stateful_widget(
+        List::new(items).highlight_style(theme.selected()),
+        inner,
+        &mut state,
+    );
+    hits.list(inner, state.offset(), &heights, Hit::Row);
+}
+
+pub fn drafts_hints(s: &super::DraftsState) -> Hints {
+    if s.rows.is_empty() {
+        return Hints::new(&[("Esc", "back")], 0);
+    }
+    Hints::new(
+        &[
+            ("Enter", "resume"),
+            ("D", "delete"),
+            ("j/k", "move"),
+            ("Esc", "back"),
+        ],
+        0,
+    )
+}
+
+pub fn drafts_key(s: &mut super::DraftsState, key: KeyEvent) -> Action {
+    if s.rows.is_empty() {
+        return Action::None;
+    }
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            s.sel = (s.sel + 1).min(s.rows.len().saturating_sub(1));
+            Action::None
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            s.sel = s.sel.saturating_sub(1);
+            Action::None
+        }
+        KeyCode::Enter => s
+            .rows
+            .get(s.sel)
+            .map(|r| Action::ResumeDraft(r.key))
+            .unwrap_or(Action::None),
+        // Capital `D`, matching the thread view's delete: a lowercase key
+        // next to `j`/`k` would throw away someone's writing on a mistype.
+        KeyCode::Char('D') => s
+            .rows
+            .get(s.sel)
+            .map(|r| Action::DropDraft(r.key))
+            .unwrap_or(Action::None),
+        _ => Action::None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

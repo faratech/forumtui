@@ -208,7 +208,13 @@ so, since XF gates `is_banned` to viewers who may bypass user privacy.
   Esc **closes without discarding**: the draft is saved and offered back the
   next time this same composer opens, and a resumed composer grows one more
   cap, `^X discard draft`, which restores what it would have shown without a
-  draft (for an edit, the post's current text).
+  draft (for an edit, the post's current text). Drafts are shared with the
+  website (#716), so a reply started in a browser is offered here too.
+* **Drafts** (`g d`, or the palette's `Drafts (n)` row): every unsent draft in
+  one place, newest first — target in words, first line of the body, age, and
+  "this device only" on an edit draft, which XenForo has no draft for. Enter
+  resumes, `D` deletes. A thread with an unsent reply also says so in its own
+  key bar: `r resume draft` rather than `r reply`.
 * **Sign in** (`c3.png` top, `c5.png` bottom): centered 72-wide panel with the white
   bubble mark (rounded top-left/top-right/bottom-left, square bottom-right — matching
   `wf-logo.png` — carrying bold blue `WF`), steps 1-2-3, the short link in its own box,
@@ -290,7 +296,7 @@ the post-writing set in the thread view — `Q` quote, `e` edit, `D` delete
 ```bash
 cd /web/wftui_app
 cargo check                                            # while iterating
-cargo test --workspace                                 # 549 tests today; keep them green, add yours
+cargo test --workspace                                 # 566 tests today; keep them green, add yours
 cargo test -p wftui --no-default-features              # the no-images build must stay green too
 cargo clippy --all-targets --release -- -D warnings    # must stay at 0
 cargo build --release && cp target/release/wftui bin/wftui

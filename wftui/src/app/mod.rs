@@ -1087,7 +1087,19 @@ impl App {
         // rows for inline images while it wraps text, so a tier change has to
         // reach it before `render` rebuilds the lines.
         let policy = self.images.policy();
+        // #716: whether this thread has an unsent reply waiting. Stamped per
+        // frame rather than on open, so returning from the composer with Esc
+        // updates the cap immediately.
+        let draft_here = match self.screens.last() {
+            Some(Screen::ThreadView(v)) => self
+                .drafts
+                .contains_key(&common::drafts::DraftKey::ThreadReply(v.thread.thread_id)),
+            _ => false,
+        };
         let screen = self.screens.last_mut().expect("screen stack never empty");
+        if let Screen::ThreadView(v) = screen {
+            v.has_draft = draft_here;
+        }
         screen.set_image_policy(policy, self.images.sizes());
         let screen_title = screen.title().to_string();
         screen.render(f, body, &self.theme, &self.glyphs, &mut self.hits);
@@ -1359,6 +1371,15 @@ impl App {
             "gr",
             Target::Resources,
         ));
+        // Named with a count, because the whole point is that a draft you
+        // forgot about is otherwise invisible (#716).
+        if !self.drafts.is_empty() {
+            items.push(Item::action(
+                format!("Drafts ({})", self.drafts.len()),
+                "gd",
+                Target::Drafts,
+            ));
+        }
         items.push(Item::action("Search".to_string(), "/", Target::Search));
         items.push(Item::action("Sign out".to_string(), "^L", Target::SignOut));
         items.push(Item::action("Quit".to_string(), "q", Target::Quit));
@@ -1445,6 +1466,7 @@ impl App {
             body: c.body.clone(),
             attachment_key: c.attachment_key.clone(),
             saved_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+            label: self.draft_label(c.target.as_ref()),
             // Whatever the website's copy carried, this one is now ours and
             // its files (if any) are reachable through `attachment_key`.
             remote_attachments: false,
@@ -1516,6 +1538,125 @@ impl App {
         }
         if let Err(e) = self.draft_store.erase() {
             tracing::warn!("could not clear drafts: {e}");
+        }
+    }
+
+    /// The drafts list's rows, newest first.
+    fn draft_rows(&self) -> Vec<screens::DraftRow> {
+        let mut rows: Vec<screens::DraftRow> = self
+            .drafts
+            .iter()
+            .map(|(key, d)| screens::DraftRow {
+                key: *key,
+                label: d.label.clone(),
+                // First non-empty line, so a row says what was written rather
+                // than just that something was.
+                preview: d
+                    .body
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("")
+                    .to_string(),
+                saved_at: d.saved_at,
+                shared: key.xf_key().is_some(),
+            })
+            .collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.saved_at));
+        rows
+    }
+
+    fn open_drafts(&mut self) {
+        let rows = self.draft_rows();
+        self.push_screen(Screen::Drafts(screens::DraftsState { rows, sel: 0 }));
+    }
+
+    /// Reopen the composer a listed draft belongs to.
+    ///
+    /// The composer is built from the key plus the draft's own label — we do
+    /// not have the thread or conversation here, and do not need it:
+    /// `push_screen` fills the body from the draft, and the write carries the
+    /// id, not the object.
+    fn resume_draft(&mut self, key: common::drafts::DraftKey) {
+        use common::drafts::DraftKey;
+        let label = self.drafts.get(&key).map(|d| d.label.clone()).unwrap_or_default();
+        match key {
+            DraftKey::ThreadReply(thread_id) => {
+                self.push_screen(Screen::Compose(screens::ComposeState {
+                    target: Some(ComposeTarget::ThreadReply {
+                        thread_id,
+                        thread_title: label,
+                    }),
+                    author: self.me_name(),
+                    ..Default::default()
+                }));
+            }
+            DraftKey::NewThread(node_id) => {
+                self.push_screen(Screen::Compose(screens::ComposeState {
+                    target: Some(ComposeTarget::NewThread { node_id }),
+                    title_field: true,
+                    author: self.me_name(),
+                    ..Default::default()
+                }));
+            }
+            DraftKey::ConversationReply(conversation_id) => {
+                self.push_screen(Screen::Compose(screens::ComposeState {
+                    target: Some(ComposeTarget::ConversationReply {
+                        conversation_id,
+                        conversation_title: label,
+                        participants: String::new(),
+                    }),
+                    author: self.me_name(),
+                    ..Default::default()
+                }));
+            }
+            DraftKey::EditPost(post_id) => {
+                // An edit draft carries no thread id of its own. The label
+                // still names the thread, and the write is by post id.
+                self.push_screen(Screen::Compose(screens::ComposeState {
+                    target: Some(ComposeTarget::EditPost {
+                        post_id,
+                        thread_id: 0,
+                        thread_title: label,
+                    }),
+                    author: self.me_name(),
+                    ..Default::default()
+                }));
+            }
+        }
+    }
+
+    /// Name a draft's target in words, for the drafts list. "thread-51465" is
+    /// not an answer to "what was I writing?", and the key is all the list
+    /// would otherwise have.
+    fn draft_label(&self, target: Option<&ComposeTarget>) -> String {
+        match target {
+            Some(ComposeTarget::ThreadReply { thread_title, .. }) => thread_title.clone(),
+            Some(ComposeTarget::EditPost { thread_title, .. }) => {
+                format!("Edit in {thread_title}")
+            }
+            Some(ComposeTarget::NewThread { node_id }) => {
+                // Name the forum when the tree is loaded; the id alone is no
+                // better than the key.
+                let forum = self
+                    .screens
+                    .iter()
+                    .find_map(|s| match s {
+                        Screen::Home(h) => Some(&h.tree),
+                        Screen::ForumTree(t) => Some(t),
+                        _ => None,
+                    })
+                    .and_then(|t| t.nodes.iter().find(|n| n.node_id == *node_id))
+                    .map(|n| n.title.clone());
+                match forum {
+                    Some(title) => format!("New thread in {title}"),
+                    None => "New thread".to_string(),
+                }
+            }
+            Some(ComposeTarget::ConversationReply { conversation_title, .. }) => {
+                conversation_title.clone()
+            }
+            None => String::new(),
         }
     }
 
@@ -1592,6 +1733,9 @@ impl App {
                     attachment_key: self.drafts.get(&key).and_then(|d| d.attachment_key.clone()),
                     saved_at: r.last_update,
                     remote_attachments: r.has_attachments,
+                    // The relay sends no name for the target, so keep any
+                    // label we already had rather than blanking the list row.
+                    label: self.drafts.get(&key).map(|d| d.label.clone()).unwrap_or_default(),
                 },
             );
             changed = true;
@@ -1676,6 +1820,7 @@ impl App {
             T::Alerts => self.open_inbox(screens::InboxTab::Alerts),
             T::MediaGallery => self.execute_action(Action::OpenMediaGallery),
             T::Resources => self.execute_action(Action::OpenResources),
+            T::Drafts => self.execute_action(Action::OpenDrafts),
             T::Search => self.push_screen(screens::search_state()),
             T::SignOut => self.logout(),
             T::Quit => self.should_quit = true,
@@ -1705,6 +1850,7 @@ impl App {
             GoTarget::Latest => self.execute_action(Action::OpenLatestThreads),
             GoTarget::Media => self.execute_action(Action::OpenMediaGallery),
             GoTarget::Resources => self.execute_action(Action::OpenResources),
+            GoTarget::Drafts => self.execute_action(Action::OpenDrafts),
             GoTarget::Inbox => self.open_inbox(screens::InboxTab::Conversations),
             GoTarget::Alerts => self.open_inbox(screens::InboxTab::Alerts),
             GoTarget::Home => {
@@ -5658,6 +5804,143 @@ mod tests {
             "but never deleted from the account they belong to"
         );
         let _ = std::fs::remove_file(app.draft_store.path());
+    }
+
+    /// #716: the gap that made the store nearly useless — a draft could only
+    /// be seen by reopening the exact composer that made it, so a new-thread
+    /// draft in a forum you were not looking at was invisible, and there was
+    /// no answer at all to "what am I part-way through?".
+    #[tokio::test]
+    async fn the_drafts_list_shows_every_draft_and_reopens_the_right_composer() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+
+        // A new-thread draft: the exact shape that was invisible, because no
+        // thread view could ever hint at it.
+        app.new_thread(304);
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.title = "Tet".into();
+            c.body = "Test 1 2 3".into();
+        }
+        app.pop_screen();
+
+        app.execute_action(Action::OpenDrafts);
+        match app.screens.last() {
+            Some(Screen::Drafts(d)) => {
+                assert_eq!(d.rows.len(), 1);
+                assert_eq!(d.rows[0].preview, "Test 1 2 3", "the row says what was written");
+                assert!(d.rows[0].shared, "a new-thread draft syncs to the site");
+            }
+            other => panic!("expected the drafts list, got {:?}", other.map(|s| s.title())),
+        }
+
+        // Enter resumes it, and the composer comes back with the words.
+        app.execute_action(Action::ResumeDraft(common::drafts::DraftKey::NewThread(304)));
+        match app.screens.last() {
+            Some(Screen::Compose(c)) => {
+                assert_eq!(c.body, "Test 1 2 3");
+                assert_eq!(c.title, "Tet");
+                assert!(matches!(
+                    c.target,
+                    Some(ComposeTarget::NewThread { node_id: 304 })
+                ));
+            }
+            _ => panic!("expected the composer"),
+        }
+    }
+
+    /// An edit draft has no XF key, so the list must say it lives here only
+    /// rather than let it look like the sync failed.
+    #[tokio::test]
+    async fn the_drafts_list_marks_what_does_not_sync() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        let thread = Thread { thread_id: 7, title: "A thread".into(), ..Default::default() };
+        let post = Post { post_id: 500, thread_id: 7, ..Default::default() };
+        app.execute_action(Action::StartEditPost(thread, Box::new(post)));
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "an edit".into();
+        }
+        app.pop_screen();
+
+        app.execute_action(Action::OpenDrafts);
+        match app.screens.last() {
+            Some(Screen::Drafts(d)) => {
+                assert_eq!(d.rows.len(), 1);
+                assert!(!d.rows[0].shared, "an edit has no XF draft to sync to");
+                assert_eq!(d.rows[0].label, "Edit in A thread");
+            }
+            _ => panic!("expected the drafts list"),
+        }
+    }
+
+    /// `D` on a row deletes that draft and leaves you looking at the rest.
+    #[tokio::test]
+    async fn deleting_from_the_list_keeps_the_list_open() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        for id in [7u32, 8] {
+            app.reply_to_thread(&Thread {
+                thread_id: id,
+                title: format!("Thread {id}"),
+                ..Default::default()
+            });
+            if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+                c.body = format!("draft {id}");
+            }
+            app.pop_screen();
+        }
+        app.execute_action(Action::OpenDrafts);
+        app.execute_action(Action::DropDraft(common::drafts::DraftKey::ThreadReply(7)));
+        match app.screens.last() {
+            Some(Screen::Drafts(d)) => {
+                assert_eq!(d.rows.len(), 1, "the list stays open, one row lighter");
+                assert_eq!(d.rows[0].key, common::drafts::DraftKey::ThreadReply(8));
+            }
+            _ => panic!("the list must stay open"),
+        }
+    }
+
+    /// The other half of the answer: the thread view itself says a reply is
+    /// waiting, since that is where a reader would look for it.
+    #[tokio::test]
+    async fn the_thread_view_says_when_a_reply_is_waiting() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 7, title: "A thread".into(), ..Default::default() },
+            ..Default::default()
+        }));
+
+        let bar = |app: &mut App| {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
+                .expect("terminal");
+            term.draw(|f| app.draw(f)).expect("draw");
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        assert!(bar(&mut app).contains("reply"), "test setup: the reply cap is shown");
+        assert!(
+            !bar(&mut app).contains("resume draft"),
+            "with no draft it must just say reply"
+        );
+
+        app.drafts.insert(
+            common::drafts::DraftKey::ThreadReply(7),
+            common::drafts::Draft { body: "waiting".into(), ..Default::default() },
+        );
+        assert!(
+            bar(&mut app).contains("resume draft"),
+            "an unsent reply to this thread must be visible from the thread"
+        );
     }
 
     /// GUARD (issue #565). No test may read or write the machine owner's

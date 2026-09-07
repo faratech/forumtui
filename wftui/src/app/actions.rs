@@ -162,6 +162,21 @@ impl App {
                     tx.send(Msg::PostToggled { verb, result }).ok();
                 });
             }
+            Action::OpenDrafts => self.open_drafts(),
+            Action::ResumeDraft(key) => self.resume_draft(key),
+            Action::DropDraft(key) => {
+                self.discard_draft(key);
+                self.set_status("Draft deleted.");
+                // Rebuild in place rather than popping: deleting one draft
+                // should leave you looking at the rest.
+                if let Some(Screen::Drafts(_)) = self.screens.last() {
+                    let rows = self.draft_rows();
+                    if let Some(Screen::Drafts(d)) = self.screens.last_mut() {
+                        d.sel = d.sel.min(rows.len().saturating_sub(1));
+                        d.rows = rows;
+                    }
+                }
+            }
             Action::DiscardDraft => {
                 if let Some(Screen::Compose(c)) = self.screens.last()
                     && let Some(key) = c.target.as_ref().map(|t| t.draft_key())

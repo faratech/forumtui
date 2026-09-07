@@ -118,6 +118,13 @@ pub struct Draft {
     /// still carries the files that were attached before Esc.
     #[serde(default)]
     pub attachment_key: Option<String>,
+    /// What this draft is a reply to, in words — "Windows 11 won't boot",
+    /// "New thread in Windows Support". Stored rather than derived because
+    /// the drafts list has only the key to go on otherwise, and "thread-51465"
+    /// is not an answer to "what was I writing?" (#716). Empty for a draft
+    /// that arrived from the website, which sends no title for the target.
+    #[serde(default)]
+    pub label: String,
     /// Unix seconds, for the eviction order and for telling the user how old
     /// the thing they just got back is.
     #[serde(default)]
@@ -278,6 +285,7 @@ mod tests {
             attachment_key: None,
             saved_at,
             remote_attachments: false,
+            label: String::new(),
         }
     }
 
@@ -293,6 +301,7 @@ mod tests {
                 attachment_key: Some("key-1".into()),
                 saved_at: 1_700_000_000,
                 remote_attachments: false,
+                label: "A thread".into(),
             },
         );
         store.save(&map).unwrap();

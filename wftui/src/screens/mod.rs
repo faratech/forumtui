@@ -138,6 +138,11 @@ impl ThreadListState {
 
 #[derive(Default)]
 pub struct ThreadViewState {
+    /// An unsent reply to this thread is waiting (#716). Stamped each frame
+    /// from the app's draft map, so `r` can say "resume draft" instead of
+    /// "reply" — otherwise a draft is invisible from the one screen where you
+    /// would look for it.
+    pub has_draft: bool,
     pub thread: Thread,
     /// Name of the forum the thread lives in, for the first line of the card
     /// stack. `Thread` carries only `node_id`, so the app resolves it from the
@@ -609,6 +614,31 @@ pub struct ResourceListState {
     pub error: Option<String>,
 }
 
+/// One row of the drafts list.
+pub struct DraftRow {
+    pub key: common::drafts::DraftKey,
+    /// What it is a reply to, in words.
+    pub label: String,
+    /// The first line or so of the body, so the row says what was written.
+    pub preview: String,
+    pub saved_at: i64,
+    /// This one is shared with the website (#716); an edit draft is not,
+    /// because XF has no draft for an edit to sync to.
+    pub shared: bool,
+}
+
+/// Every unsent draft, in one place (#716).
+///
+/// Without this a draft was only ever visible by reopening the exact composer
+/// that made it — so a new-thread draft in a forum you were not looking at was
+/// effectively invisible, and there was no way to answer "what am I part-way
+/// through?" at all.
+#[derive(Default)]
+pub struct DraftsState {
+    pub rows: Vec<DraftRow>,
+    pub sel: usize,
+}
+
 /// The resource page (#697): one resource rendered in the client, from the
 /// same BBCode the site renders.
 #[derive(Default)]
@@ -727,6 +757,7 @@ pub enum Screen {
     ResourceView(ResourceViewState),
     /// One picture, as large as the pane allows (#697).
     ImageView(ImageViewState),
+    Drafts(DraftsState),
 }
 
 /// Where an upload's attachment key is anchored (#709). XF checks this
@@ -756,6 +787,12 @@ pub enum Action {
     None,
     /// Forget the draft this composer resumed (#715).
     DiscardDraft,
+    /// Open the drafts list (#716).
+    OpenDrafts,
+    /// Reopen the composer a listed draft belongs to.
+    ResumeDraft(common::drafts::DraftKey),
+    /// Throw away a listed draft without opening it.
+    DropDraft(common::drafts::DraftKey),
     PopScreen,
     OpenThreadList(u32, String),
     OpenLatestThreads,
@@ -870,6 +907,7 @@ impl Screen {
             Screen::Resources(s) => library::render_resources(s, f, area, theme, g, hits),
             Screen::ResourceView(s) => library::render_resource_view(s, f, area, theme, g, hits),
             Screen::ImageView(s) => library::render_image_view(s, f, area, theme, g, hits),
+            Screen::Drafts(s) => library::render_drafts(s, f, area, theme, g, hits),
         }
     }
 
@@ -941,6 +979,7 @@ impl Screen {
             Screen::Profile(_) => misc::profile_hints(),
             Screen::MediaGallery(s) => library::media_hints(s),
             Screen::Resources(s) => library::resources_hints(s),
+            Screen::Drafts(s) => library::drafts_hints(s),
             Screen::ResourceView(s) => library::resource_view_hints(s),
             Screen::ImageView(s) => library::image_view_hints(s),
         }
@@ -963,6 +1002,7 @@ impl Screen {
             Screen::Profile(s) => s.title.clone(),
             Screen::MediaGallery(_) => "Media Gallery".into(),
             Screen::Resources(_) => "Resources".into(),
+            Screen::Drafts(_) => "Drafts".into(),
             Screen::ResourceView(s) => s
                 .resource
                 .as_ref()
@@ -987,6 +1027,7 @@ impl Screen {
             Screen::Profile(s) => misc::profile_key(s, key),
             Screen::MediaGallery(s) => library::media_list_key(s, key),
             Screen::Resources(s) => library::resources_list_key(s, key),
+            Screen::Drafts(s) => library::drafts_key(s, key),
             Screen::ResourceView(s) => library::resource_view_key(s, key),
             Screen::ImageView(s) => library::image_view_key(s, key),
         }
@@ -1048,6 +1089,7 @@ impl Screen {
                 MediaPane::Items => m.sel,
             }),
             Screen::Resources(r) => Some(r.sel),
+            Screen::Drafts(d) => Some(d.sel),
             _ => None,
         }
     }
@@ -1082,6 +1124,7 @@ impl Screen {
                 MediaPane::Items => set(&mut m.sel, m.items.len(), i),
             },
             Screen::Resources(r) => set(&mut r.sel, r.items.len(), i),
+            Screen::Drafts(d) => set(&mut d.sel, d.rows.len(), i),
             _ => {}
         }
     }
@@ -1137,6 +1180,7 @@ impl Screen {
             Screen::Profile(p) => p.loading,
             Screen::MediaGallery(m) => m.loading,
             Screen::Resources(r) => r.loading,
+            Screen::Drafts(_) => false,
             Screen::ResourceView(r) => r.loading,
             Screen::ImageView(v) => v.loading,
             // The Login Waiting stage animates its "waiting for approval"
@@ -1186,6 +1230,7 @@ impl Screen {
             Screen::Search(s) => s.results.get(s.sel).and_then(|h| h.view_url.clone()),
             Screen::MediaGallery(m) => m.items.get(m.sel).and_then(|m| m.view_url.clone()),
             Screen::Resources(r) => r.items.get(r.sel).and_then(|r| r.view_url.clone()),
+            Screen::Drafts(_) => None,
             Screen::ResourceView(r) => r.resource.as_ref().and_then(|r| r.view_url.clone()),
             Screen::ImageView(v) => v.web_url.clone(),
             Screen::Profile(p) => p.user.as_ref().and_then(|u| u.view_url.clone()),
@@ -1286,6 +1331,7 @@ impl Screen {
                 m.scroll = 0;
             }
             Screen::Resources(r) => r.sel = 0,
+            Screen::Drafts(d) => d.sel = 0,
             Screen::ResourceView(r) => r.scroll = 0,
             _ => {}
         }
@@ -1328,6 +1374,7 @@ impl Screen {
             Screen::Search(s) => s.sel = s.results.len().saturating_sub(1),
             Screen::MediaGallery(m) => m.sel = m.items.len().saturating_sub(1),
             Screen::Resources(r) => r.sel = r.items.len().saturating_sub(1),
+            Screen::Drafts(d) => d.sel = d.rows.len().saturating_sub(1),
             Screen::ResourceView(r) => r.scroll = r.lines.len().saturating_sub(1),
             _ => {}
         }
@@ -1347,6 +1394,7 @@ impl Screen {
             Screen::Profile(_) => "THIS MEMBER",
             Screen::MediaGallery(_) => "THIS GALLERY",
             Screen::Resources(_) => "THESE RESOURCES",
+            Screen::Drafts(_) => "THESE DRAFTS",
             Screen::ResourceView(_) => "THIS RESOURCE",
             Screen::ImageView(_) => "THIS IMAGE",
         }
@@ -1367,6 +1415,7 @@ impl Screen {
             Screen::Profile(s) => &s.title,
             Screen::MediaGallery(_) => "Media Gallery",
             Screen::Resources(_) => "Resources",
+            Screen::Drafts(_) => "Drafts",
             Screen::ResourceView(_) => "Resource",
             Screen::ImageView(_) => "Image",
         }
@@ -1656,6 +1705,19 @@ mod dispatch_tests {
                 total: 80,
                 ..Default::default()
             }),
+            Screen::Drafts(DraftsState {
+                rows: vec![DraftRow {
+                    key: common::drafts::DraftKey::ThreadReply(7),
+                    label: "Windows 11 won't boot".into(),
+                    preview: "I tried the usual things and".into(),
+                    saved_at: 1_700_000_000,
+                    shared: true,
+                }],
+                sel: 0,
+            }),
+            // The empty state renders a different body, so it needs covering
+            // at 20x5 too.
+            Screen::Drafts(DraftsState::default()),
             Screen::Resources(ResourceListState {
                 items: vec![Resource {
                     resource_id: 150883,
@@ -2128,6 +2190,22 @@ mod dispatch_tests {
             Case {
                 // The Resource Manager catalog: same shape, resources carry
                 // tag lines and download counts.
+                name: "Drafts",
+                factory: || Screen::Drafts(DraftsState {
+                    rows: vec![DraftRow {
+                        key: common::drafts::DraftKey::ThreadReply(7),
+                        label: "A thread".into(),
+                        preview: "half a reply".into(),
+                        saved_at: 1_700_000_000,
+                        shared: true,
+                    }],
+                    sel: 0,
+                }),
+                // Esc is the app's (pop the screen), like every other
+                // pushable list here.
+                skip: &["Esc"],
+            },
+            Case {
                 name: "Resources",
                 factory: || Screen::Resources(ResourceListState {
                     items: vec![Resource {
