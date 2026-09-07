@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
 use common::bbcode::{self, Chunk};
-use common::models::{Node, Post, Thread};
+use common::models::{ContentState, Node, Post, Thread};
 
 use super::{
     Action, ForumTreeState, HomeState, Pane, ThreadListState, ThreadViewState, link_style,
@@ -149,10 +149,17 @@ pub(crate) fn thread_row(
     inner: usize,
 ) -> Line<'static> {
     let (type_glyph, type_style) = type_mark(t, theme, g);
-    let title_style = if t.is_unread {
-        theme.base().add_modifier(Modifier::BOLD)
-    } else {
-        theme.base()
+    let state = t.state();
+    // #704: a moderator sees deleted and awaiting-approval threads in the
+    // same list as visible ones, so the row has to say which is which — the
+    // struck-through title is the part the eye catches before any label.
+    let title_style = match state {
+        ContentState::Deleted => theme
+            .dim()
+            .add_modifier(Modifier::CROSSED_OUT),
+        ContentState::Moderated => theme.base().add_modifier(Modifier::ITALIC),
+        ContentState::Visible if t.is_unread => theme.base().add_modifier(Modifier::BOLD),
+        ContentState::Visible => theme.base(),
     };
 
     let tw = gram.title_width(inner);
@@ -180,6 +187,20 @@ pub(crate) fn thread_row(
     // Title field: the prefix chip is *inside* it, so a long prefix costs
     // title cells rather than shifting the right-hand columns.
     let mut used = 0usize;
+    // The state chip comes first, ahead of the prefix: what a moderator
+    // needs to know about a deleted thread is that it is deleted.
+    if let Some(label) = state.label() {
+        let chip = Span::styled(
+            format!(" {label} "),
+            Style::new().fg(theme.error).add_modifier(Modifier::REVERSED),
+        );
+        let w = chip.width();
+        if w + 4 < tw {
+            spans.push(chip);
+            spans.push(Span::raw(" "));
+            used += w + 1;
+        }
+    }
     if let Some(prefix) = &t.prefix
         && !prefix.trim().is_empty()
     {
@@ -1723,6 +1744,21 @@ impl ThreadViewState {
                 lines.push(gutter(vec![Span::styled(
                     format!("{} marked solution", g.solved),
                     Style::new().fg(theme.ok).add_modifier(Modifier::BOLD),
+                )]));
+            }
+
+            // #704: a post a moderator can see but an ordinary reader cannot
+            // says so on its own row, above the body. The API only sends
+            // what the caller may see, so this is labelling, never gating.
+            if let Some(label) = post.state().label() {
+                let what = match post.state() {
+                    ContentState::Deleted => "deleted \u{b7} visible to moderators",
+                    ContentState::Moderated => "awaiting approval \u{b7} not yet public",
+                    ContentState::Visible => label,
+                };
+                lines.push(gutter(vec![Span::styled(
+                    truncate(what, body_w),
+                    Style::new().fg(theme.error).add_modifier(Modifier::BOLD),
                 )]));
             }
 
@@ -3712,6 +3748,106 @@ mod tests {
     /// #693: a picture the message references renders WHERE the message
     /// puts it, and only the attachments the message never mentioned are
     /// listed underneath — the same split XenForo renders.
+    /// #704: a moderator sees deleted and awaiting-approval content in the
+    /// same lists as everything else, so the row has to say which is which.
+    /// The struck-through title is what the eye catches; the chip names it.
+    #[test]
+    fn a_threads_state_shows_on_its_row() {
+        use ratatui::style::Modifier;
+        let theme = Theme::truecolor();
+        let row_of = |state: &str| {
+            let t = Thread {
+                thread_id: 1,
+                title: "A thread".into(),
+                discussion_state: state.into(),
+                is_unread: true,
+                ..Default::default()
+            };
+            thread_row(&t, &theme, &UNICODE, Grammar::Wide, 100)
+        };
+
+        let deleted = row_of("deleted");
+        let text: String = deleted.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("deleted"), "the state is named: {text:?}");
+        let title = deleted
+            .spans
+            .iter()
+            .find(|s| s.content.contains("A thread"))
+            .expect("the title");
+        assert!(
+            title.style.add_modifier.contains(Modifier::CROSSED_OUT),
+            "a deleted thread's title is struck through"
+        );
+
+        let moderated = row_of("moderated");
+        let text: String = moderated.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("awaiting approval"), "{text:?}");
+
+        // A visible thread is untouched: unread still means bold, and no
+        // chip steals title cells.
+        let visible = row_of("visible");
+        let text: String = visible.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!text.contains("deleted") && !text.contains("awaiting"), "{text:?}");
+        let title = visible
+            .spans
+            .iter()
+            .find(|s| s.content.contains("A thread"))
+            .expect("the title");
+        assert!(title.style.add_modifier.contains(Modifier::BOLD));
+        assert!(!title.style.add_modifier.contains(Modifier::CROSSED_OUT));
+
+        // Every row still fits its panel exactly, chip and all.
+        for state in ["visible", "deleted", "moderated"] {
+            for inner in 20..60usize {
+                let t = Thread {
+                    thread_id: 1,
+                    title: "A rather longer thread title here".into(),
+                    discussion_state: state.into(),
+                    ..Default::default()
+                };
+                let row = thread_row(&t, &theme, &UNICODE, Grammar::Wide, inner);
+                assert!(row.width() <= inner, "{state} overflowed at {inner}");
+            }
+        }
+    }
+
+    /// A post whose state an ordinary reader would never see says so above
+    /// its body — the API only sends what the caller may see, so this is
+    /// labelling, never gating.
+    #[test]
+    fn a_posts_state_is_named_above_its_body() {
+        let theme = Theme::truecolor();
+        let mut s = thread_view_fixture();
+        s.posts[0].message_state = "deleted".into();
+        s.posts[0].message = "the body".into();
+        s.posts[0].attachments.clear();
+        s.width = 0;
+        s.rebuild_lines(&theme, &UNICODE);
+        let text: Vec<String> = s
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+            .collect();
+        let banner = text
+            .iter()
+            .position(|l| l.contains("deleted"))
+            .unwrap_or_else(|| panic!("{text:#?}"));
+        let body = text.iter().position(|l| l.contains("the body")).expect("body");
+        assert!(banner < body, "the state is stated before the body");
+        assert!(text[banner].contains("visible to moderators"), "{:?}", text[banner]);
+
+        // A visible post gets no banner at all.
+        s.posts[0].message_state = "visible".into();
+        s.width = 0;
+        s.rebuild_lines(&theme, &UNICODE);
+        let text: Vec<String> = s
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+            .collect();
+        assert!(!text.iter().any(|l| l.contains("visible to moderators")), "{text:#?}");
+    }
+
     /// #703: `[HR]` is a rule across the pane, not three dashes dropped
     /// mid-line. 52,557 posts on this site use it — every AI news article
     /// writes one — and XF renders it as `<hr />`.

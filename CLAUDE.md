@@ -152,6 +152,27 @@ If `/me` reports a different user, the old identity is torn down and a hint name
 the new one. `logout()` forgets tokens synchronously before the (slow) revoke
 calls. Writes carry the session generation and are aborted by `end_session`.
 
+## Visibility and content state
+
+**The server is the gate; the client is the label** (#704). XF's API only
+sends content the token's user may see — a deleted post is simply absent for
+a reader without `viewDeleted`, and a hidden node's threads never arrive — so
+the client must never invent visibility rules of its own, and must never
+refuse to draw something the server chose to send (that would hide a
+moderator's own queue from them).
+
+What the client owes is saying *which state* a thing is in, because a
+moderator gets deleted and awaiting-approval items in the same lists as
+everything else:
+
+- `Thread::discussion_state` / `Post::message_state` map to
+  `models::ContentState` (`Visible` / `Moderated` / `Deleted`); anything
+  unrecognised, absent or null is Visible.
+- A deleted thread's row is struck through and dimmed; a moderated one is
+  italic. Both carry a chip naming the state, ahead of the prefix.
+- A non-visible post says so on its own row above the body ("deleted ·
+  visible to moderators", "awaiting approval · not yet public").
+
 ## BBCode parity — the styling tags
 
 `common/src/bbcode.rs` carries `color`, `size`, `heading`, `align`,

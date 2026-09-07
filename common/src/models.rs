@@ -96,6 +96,12 @@ pub struct Forum {
 pub struct Thread {
     #[serde(default)]
     pub thread_id: u32,
+    /// `visible`, `moderated` or `deleted` (#704). The API only sends a
+    /// thread the caller may see at all, so a non-visible state arriving
+    /// here means the reader is allowed to see it — the client's job is to
+    /// say which state it is in, never to decide who may look.
+    #[serde(default, deserialize_with = "null_default")]
+    pub discussion_state: String,
     #[serde(default)]
     pub node_id: u32,
     #[serde(default)]
@@ -182,6 +188,10 @@ impl Thread {
 pub struct Post {
     #[serde(default)]
     pub post_id: u32,
+    /// `visible`, `moderated` or `deleted` — the post twin of
+    /// `Thread::discussion_state` (#704).
+    #[serde(default, deserialize_with = "null_default")]
+    pub message_state: String,
     #[serde(default)]
     pub thread_id: u32,
     #[serde(default)]
@@ -1133,6 +1143,56 @@ impl Attachment {
     }
 }
 
+/// What XenForo says about a piece of content's visibility (#704).
+///
+/// The API never sends content the caller may not see, so this is only ever
+/// about *labelling* what did arrive: a moderator gets deleted and moderated
+/// items alongside visible ones and needs to tell them apart at a glance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContentState {
+    #[default]
+    Visible,
+    /// Awaiting approval.
+    Moderated,
+    /// Soft-deleted: still there for those who may see it.
+    Deleted,
+}
+
+impl ContentState {
+    pub fn parse(raw: &str) -> ContentState {
+        match raw {
+            "deleted" => ContentState::Deleted,
+            "moderated" => ContentState::Moderated,
+            _ => ContentState::Visible,
+        }
+    }
+
+    pub fn is_visible(self) -> bool {
+        matches!(self, ContentState::Visible)
+    }
+
+    /// The word a reader sees on the row or the card.
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            ContentState::Visible => None,
+            ContentState::Moderated => Some("awaiting approval"),
+            ContentState::Deleted => Some("deleted"),
+        }
+    }
+}
+
+impl Thread {
+    pub fn state(&self) -> ContentState {
+        ContentState::parse(&self.discussion_state)
+    }
+}
+
+impl Post {
+    pub fn state(&self) -> ContentState {
+        ContentState::parse(&self.message_state)
+    }
+}
+
 /// `#[serde(default)]` covers a *missing* field, not a field explicitly sent
 /// as `null` — that still fails the whole reply. XF sends both: `review_count`
 /// arrives as `null` on a resource nobody has reviewed, and a missing-vs-null
@@ -1487,4 +1547,43 @@ mod tests {
             "the poller's badge count must see the one truly-unread conversation"
         );
     }
+    /// #704: XF's exact vocabulary, and the rule that the client labels
+    /// rather than decides. Anything unrecognised is treated as visible,
+    /// because the API had already decided the caller may see it — refusing
+    /// to draw content the server chose to send would hide a moderator's
+    /// own queue from them.
+    #[test]
+    fn content_state_reads_xfs_vocabulary() {
+        assert_eq!(ContentState::parse("visible"), ContentState::Visible);
+        assert_eq!(ContentState::parse("moderated"), ContentState::Moderated);
+        assert_eq!(ContentState::parse("deleted"), ContentState::Deleted);
+        assert_eq!(ContentState::parse(""), ContentState::Visible);
+        assert_eq!(ContentState::parse("something_new"), ContentState::Visible);
+        assert!(ContentState::Visible.label().is_none(), "no chip on normal content");
+        assert_eq!(ContentState::Deleted.label(), Some("deleted"));
+        assert_eq!(ContentState::Moderated.label(), Some("awaiting approval"));
+    }
+
+    /// The state rides on the wire shapes the client already decodes, and a
+    /// payload without it (older endpoints, or a null) is visible.
+    #[test]
+    fn thread_and_post_states_decode_from_the_wire() {
+        let t: Thread = serde_json::from_str(
+            r#"{"thread_id": 1, "title": "x", "discussion_state": "deleted"}"#,
+        )
+        .expect("thread");
+        assert_eq!(t.state(), ContentState::Deleted);
+
+        let t: Thread = serde_json::from_str(r#"{"thread_id": 1, "title": "x"}"#).expect("thread");
+        assert_eq!(t.state(), ContentState::Visible, "absent means visible");
+
+        let p: Post =
+            serde_json::from_str(r#"{"post_id": 2, "message_state": null}"#).expect("post");
+        assert_eq!(p.state(), ContentState::Visible, "an explicit null too");
+
+        let p: Post =
+            serde_json::from_str(r#"{"post_id": 2, "message_state": "moderated"}"#).expect("post");
+        assert_eq!(p.state(), ContentState::Moderated);
+    }
+
 }
