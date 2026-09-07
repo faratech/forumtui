@@ -5,6 +5,7 @@
 //! `App` reference — that keeps borrows trivial and screens testable.
 
 mod browse;
+mod library;
 mod misc;
 mod social;
 
@@ -450,6 +451,31 @@ impl SearchState {
     }
 }
 
+/// The Media Gallery catalog screen's state (#680): one fetched page of
+/// XFMG media items plus the house paged-list bookkeeping.
+#[derive(Default)]
+pub struct MediaListState {
+    pub items: Vec<MediaListItem>,
+    pub page: u32,
+    pub last_page: u32,
+    pub total: u64,
+    pub sel: usize,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+/// The Resource Manager catalog screen's state (#680).
+#[derive(Default)]
+pub struct ResourceListState {
+    pub items: Vec<ResourceListItem>,
+    pub page: u32,
+    pub last_page: u32,
+    pub total: u64,
+    pub sel: usize,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Default)]
 pub struct ProfileState {
     pub title: String,
@@ -484,6 +510,10 @@ pub enum Screen {
     NewConversation(NewConversationState),
     Search(SearchState),
     Profile(ProfileState),
+    /// The Media Gallery (XFMG) catalog — `g m` / palette (#680).
+    MediaGallery(MediaListState),
+    /// The Resource Manager (XFRM) catalog — `g r` / palette (#680).
+    Resources(ResourceListState),
 }
 
 /// What Esc means on the screen that is on top (see `Screen::esc_intent`).
@@ -520,6 +550,13 @@ pub enum Action {
     LoadAlerts,
     LoadNodes,
     RunSearchQuery(SearchQuery),
+    /// Browse the Media Gallery catalog, fetching page 1 (#680).
+    OpenMediaGallery,
+    /// Browse the Resource Manager catalog, fetching page 1 (#680).
+    OpenResources,
+    /// Fetch one page of the media / resource catalogs (#680).
+    LoadMedia(u32),
+    LoadResources(u32),
     /// One page of a member's threads/posts (issue #548). `content` is
     /// XenForo's `content` parameter for `/search/member`: "thread" or "post".
     LoadMemberContent {
@@ -582,6 +619,8 @@ impl Screen {
             }
             Screen::Search(s) => misc::render_search(s, f, area, theme, g, hits),
             Screen::Profile(s) => misc::render_profile(s, f, area, theme, g),
+            Screen::MediaGallery(s) => library::render_media_gallery(s, f, area, theme, g, hits),
+            Screen::Resources(s) => library::render_resources(s, f, area, theme, g, hits),
         }
     }
 
@@ -637,6 +676,8 @@ impl Screen {
             Screen::NewConversation(_) => social::new_conversation_hints(),
             Screen::Search(s) => misc::search_hints(s),
             Screen::Profile(_) => misc::profile_hints(),
+            Screen::MediaGallery(s) => library::media_hints(s),
+            Screen::Resources(s) => library::resources_hints(s),
         }
     }
 
@@ -655,6 +696,8 @@ impl Screen {
             Screen::NewConversation(_) => "New conversation".into(),
             Screen::Search(s) => misc::search_crumb(s),
             Screen::Profile(s) => s.title.clone(),
+            Screen::MediaGallery(_) => "Media Gallery".into(),
+            Screen::Resources(_) => "Resources".into(),
         }
     }
 
@@ -671,6 +714,8 @@ impl Screen {
             Screen::NewConversation(s) => social::new_conversation_key(s, key),
             Screen::Search(s) => misc::search_key(s, key),
             Screen::Profile(s) => misc::profile_key(s, key),
+            Screen::MediaGallery(s) => library::media_list_key(s, key),
+            Screen::Resources(s) => library::resources_list_key(s, key),
         }
     }
 
@@ -718,6 +763,8 @@ impl Screen {
                 InboxTab::Alerts => ib.alerts.sel,
             }),
             Screen::Search(s) => Some(s.sel),
+            Screen::MediaGallery(m) => Some(m.sel),
+            Screen::Resources(r) => Some(r.sel),
             _ => None,
         }
     }
@@ -746,6 +793,8 @@ impl Screen {
                 InboxTab::Alerts => set(&mut ib.alerts.sel, ib.alerts.alerts.len(), i),
             },
             Screen::Search(s) => set(&mut s.sel, s.results.len(), i),
+            Screen::MediaGallery(m) => set(&mut m.sel, m.items.len(), i),
+            Screen::Resources(r) => set(&mut r.sel, r.items.len(), i),
             _ => {}
         }
     }
@@ -799,6 +848,8 @@ impl Screen {
             Screen::ConversationView(v) => v.loading,
             Screen::Search(s) => s.loading,
             Screen::Profile(p) => p.loading,
+            Screen::MediaGallery(m) => m.loading,
+            Screen::Resources(r) => r.loading,
             // The Login Waiting stage animates its "waiting for approval"
             // spinner too — but only while a flow is live.
             Screen::Login(l) => l.busy || matches!(l.stage, LoginStage::Waiting),
@@ -844,6 +895,8 @@ impl Screen {
             },
             Screen::ConversationView(v) => v.conversation.view_url.clone(),
             Screen::Search(s) => s.results.get(s.sel).and_then(|h| h.view_url.clone()),
+            Screen::MediaGallery(m) => m.items.get(m.sel).and_then(|m| m.view_url.clone()),
+            Screen::Resources(r) => r.items.get(r.sel).and_then(|r| r.view_url.clone()),
             Screen::Profile(p) => p.user.as_ref().and_then(|u| u.view_url.clone()),
             _ => None,
         }
@@ -937,6 +990,8 @@ impl Screen {
                 v.sel_msg = 0;
             }
             Screen::Search(s) => s.sel = 0,
+            Screen::MediaGallery(m) => m.sel = 0,
+            Screen::Resources(r) => r.sel = 0,
             _ => {}
         }
     }
@@ -976,6 +1031,8 @@ impl Screen {
                 v.sel_msg = v.messages.len().saturating_sub(1);
             }
             Screen::Search(s) => s.sel = s.results.len().saturating_sub(1),
+            Screen::MediaGallery(m) => m.sel = m.items.len().saturating_sub(1),
+            Screen::Resources(r) => r.sel = r.items.len().saturating_sub(1),
             _ => {}
         }
     }
@@ -992,6 +1049,8 @@ impl Screen {
             Screen::ConversationView(_) => "THIS CONVERSATION",
             Screen::Search(_) => "THIS SEARCH",
             Screen::Profile(_) => "THIS MEMBER",
+            Screen::MediaGallery(_) => "THIS GALLERY",
+            Screen::Resources(_) => "THESE RESOURCES",
         }
     }
 
@@ -1008,6 +1067,8 @@ impl Screen {
             Screen::NewConversation(_) => "New Conversation",
             Screen::Search(_) => "Search",
             Screen::Profile(s) => &s.title,
+            Screen::MediaGallery(_) => "Media Gallery",
+            Screen::Resources(_) => "Resources",
         }
     }
 }
@@ -1231,6 +1292,35 @@ mod dispatch_tests {
                 }],
                 page: 1,
                 last_page: 2,
+                ..Default::default()
+            }),
+            Screen::MediaGallery(MediaListState {
+                items: vec![MediaListItem {
+                    media_id: 33005,
+                    title: "Registry Explained".into(),
+                    username: "op".into(),
+                    media_date: 1_700_000_000,
+                    ..Default::default()
+                }],
+                page: 1,
+                last_page: 4,
+                total: 80,
+                ..Default::default()
+            }),
+            Screen::Resources(ResourceListState {
+                items: vec![ResourceListItem {
+                    resource_id: 150883,
+                    title: "Handy tool".into(),
+                    tag_line: "does things".into(),
+                    username: "author".into(),
+                    resource_date: 1_700_000_000,
+                    download_count: 42,
+                    rating_average: Some(4.5),
+                    ..Default::default()
+                }],
+                page: 1,
+                last_page: 1,
+                total: 1,
                 ..Default::default()
             }),
             Screen::Profile(ProfileState {
@@ -1640,6 +1730,43 @@ mod dispatch_tests {
                     ..Default::default()
                 }),
                 skip: &["Tab", "Esc"],
+            },
+            Case {
+                // The Media Gallery catalog: with items present Enter/o open
+                // the selected media page; R refreshes.
+                name: "MediaGallery",
+                factory: || Screen::MediaGallery(MediaListState {
+                    items: vec![MediaListItem {
+                        media_id: 33005,
+                        title: "Registry Explained".into(),
+                        username: "op".into(),
+                        view_url: Some("https://windowsforum.com/media/registry.33005/".into()),
+                        ..Default::default()
+                    }],
+                    page: 1,
+                    last_page: 2,
+                    ..Default::default()
+                }),
+                skip: &["Esc"],
+            },
+            Case {
+                // The Resource Manager catalog: same shape, resources carry
+                // tag lines and download counts.
+                name: "Resources",
+                factory: || Screen::Resources(ResourceListState {
+                    items: vec![ResourceListItem {
+                        resource_id: 150883,
+                        title: "Handy tool".into(),
+                        tag_line: "does things".into(),
+                        username: "author".into(),
+                        view_url: Some("https://windowsforum.com/resources/handy.150883/".into()),
+                        ..Default::default()
+                    }],
+                    page: 1,
+                    last_page: 1,
+                    ..Default::default()
+                }),
+                skip: &["Esc"],
             },
             Case {
                 // `end_session` and every first run land here: Enter begins

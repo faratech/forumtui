@@ -819,6 +819,61 @@ pub struct SearchResultsReply {
     pub pagination: Pagination,
 }
 
+/// One XFMG media item from `GET /api/media/` (issue #680). Tolerant like
+/// every other model: the list controller returns `media_id`, `title`,
+/// `username`, `media_date` and `view_url` per item.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MediaListItem {
+    #[serde(default)]
+    pub media_id: u32,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub media_date: i64,
+    #[serde(default)]
+    pub view_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MediaListReply {
+    #[serde(default)]
+    pub media: Vec<MediaListItem>,
+    #[serde(default)]
+    pub pagination: Pagination,
+}
+
+/// One XFRM resource from `GET /api/resources/` (issue #680).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ResourceListItem {
+    #[serde(default)]
+    pub resource_id: u32,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub tag_line: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub resource_date: i64,
+    #[serde(default)]
+    pub view_url: Option<String>,
+    #[serde(default)]
+    pub download_count: u64,
+    /// XFRM stores the average rating as a decimal string ("4.50").
+    #[serde(default, deserialize_with = "deserialize_opt_f64")]
+    pub rating_average: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ResourceListReply {
+    #[serde(default)]
+    pub resources: Vec<ResourceListItem>,
+    #[serde(default)]
+    pub pagination: Pagination,
+}
+
 /// Mirrors the wire shape from `XF\Entity\Attachment::setupApiResultData()` +
 /// `getStructure()` exactly — nothing guessed. Real fields present on every
 /// attachment: `attachment_id` (`autoIncrement`, always emitted regardless of
@@ -890,6 +945,21 @@ impl Attachment {
     pub fn open_url(&self) -> Option<&str> {
         self.direct_url.as_deref().or(self.view_url.as_deref())
     }
+}
+
+/// XFRM ratings are `numeric` columns the API serializes as strings
+/// ("4.50"); accept numbers too, and survive nulls (#680).
+fn deserialize_opt_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let v: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    Ok(match v {
+        Some(serde_json::Value::String(s)) => s.parse::<f64>().ok(),
+        Some(serde_json::Value::Number(n)) => n.as_f64(),
+        _ => None,
+    })
 }
 
 #[cfg(test)]

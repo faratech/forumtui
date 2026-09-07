@@ -653,6 +653,10 @@ pub trait WfApi: Send + Sync {
     async fn alerts(&self, page: u32) -> Result<AlertsReply>;
     async fn mark_alert_read(&self, id: u32) -> Result<()>;
     async fn search(&self, keywords: &str, page: u32) -> Result<SearchResultsReply>;
+    /// XFMG's media list (`GET /api/media/`, issue #680).
+    async fn media_list(&self, page: u32) -> Result<MediaListReply>;
+    /// XFRM's resource list (`GET /api/resources/`, issue #680).
+    async fn resources_list(&self, page: u32) -> Result<ResourceListReply>;
     async fn search_advanced(&self, query: &SearchQuery) -> Result<SearchResultsReply>;
     async fn search_member(
         &self,
@@ -875,6 +879,18 @@ impl WfApi for WfApiClient {
             &[("page", query.page.to_string())],
         )
         .await
+    }
+
+    /// XFMG media list (issue #680): `GET /media/?page=N` — the addon's
+    /// REST list controller returns `{media: [...], pagination}`.
+    async fn media_list(&self, page: u32) -> Result<MediaListReply> {
+        self.get("/media", &[("page", page.to_string())]).await
+    }
+
+    /// XFRM resource list (issue #680): `GET /resources/?page=N` —
+    /// `{resources: [...], pagination}`.
+    async fn resources_list(&self, page: u32) -> Result<ResourceListReply> {
+        self.get("/resources", &[("page", page.to_string())]).await
     }
 
     async fn search_member(
@@ -1132,6 +1148,68 @@ mod tests {
     /// pick up what the sibling wrote — and must report `false` (nothing to
     /// recover) when the file is missing or already the token set in memory,
     /// so the caller can end the session instead of looping.
+    /// #680: the XFMG media list maps the addon's `{media, pagination}`
+    /// envelope, including the item's view_url for `o`/Enter.
+    #[tokio::test]
+    async fn media_list_maps_the_gallery_envelope() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-medialist");
+        Mock::given(method("GET"))
+            .and(path("/api/media"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media": [
+                    {"media_id": 33005, "title": "Registry Explained", "username":
+                     "op", "media_date": 1_700_000_000,
+                     "view_url": "https://windowsforum.com/media/registry.33005/"},
+                    {"media_id": 759}
+                ],
+                "pagination": {"current_page": 1, "last_page": 4, "total": 80}
+            })))
+            .mount(&server)
+            .await;
+        let c = logged_in_client("tok-1").await;
+        let reply = c.media_list(1).await.unwrap();
+        assert_eq!(reply.media.len(), 2);
+        assert_eq!(reply.media[0].title, "Registry Explained");
+        assert_eq!(reply.media[0].username, "op");
+        assert_eq!(
+            reply.media[0].view_url.as_deref(),
+            Some("https://windowsforum.com/media/registry.33005/")
+        );
+        assert_eq!(reply.pagination.last_page, 4);
+        assert_eq!(reply.media[1].view_url, None);
+    }
+
+    /// #680: the XFRM resource list maps `{resources, pagination}`, and the
+    /// decimal rating arrives as a string ("4.50") — it must decode.
+    #[tokio::test]
+    async fn resources_list_maps_the_resource_envelope_and_rating() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-reslist");
+        Mock::given(method("GET"))
+            .and(path("/api/resources"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "resources": [
+                    {"resource_id": 150883, "title": "Handy tool", "tag_line":
+                     "does things", "username": "author", "resource_date":
+                     1_700_000_000, "view_url":
+                     "https://windowsforum.com/resources/handy.150883/",
+                     "download_count": 42, "rating_average": "4.50"}
+                ],
+                "pagination": {"current_page": 1, "last_page": 1, "total": 1}
+            })))
+            .mount(&server)
+            .await;
+        let c = logged_in_client("tok-1").await;
+        let reply = c.resources_list(1).await.unwrap();
+        assert_eq!(reply.resources.len(), 1);
+        let r = &reply.resources[0];
+        assert_eq!(r.resource_id, 150883);
+        assert_eq!(r.tag_line, "does things");
+        assert_eq!(r.download_count, 42);
+        assert_eq!(r.rating_average, Some(4.5));
+    }
+
     /// `take_tokens` must hand back the live grant *and* leave nothing
     /// behind in one step — logout revokes from the snapshot, so if anything
     /// (memory or disk) survived, a grant the user believes revoked would

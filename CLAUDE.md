@@ -147,6 +147,22 @@ If `/me` reports a different user, the old identity is torn down and a hint name
 the new one. `logout()` forgets tokens synchronously before the (slow) revoke
 calls. Writes carry the session generation and are aborted by `end_session`.
 
+## Media Gallery and Resource Manager (XFMG / XFRM)
+
+Both add-ons ship REST list APIs on this server and the client browses them:
+`GET /api/media/?page=N` → `{media, pagination}` and `GET /api/resources/?page=N`
+→ `{resources, pagination}` back `Screen::MediaGallery` / `Screen::Resources`
+(`screens/library.rs`). Reach them with `g m` / `g r` or the go-to palette's
+"Media Gallery" / "Resources" rows; `j/k` moves, `[`/`]` pages, `R` refreshes,
+Enter/`o` opens the item on the site. Both wear the house `solo_panel` with the
+`page N of M` cap, and both are read-only — there is no upload path.
+
+XFRM serves `rating_average` as a decimal *string* (`"4.50"`), so
+`models::deserialize_opt_f64` accepts either shape. Search's type cycler already
+covers the same content (`xfmg_media`, `resource`, issue #673), and
+`[GALLERY=media, <id>]caption` embeds in posts render as the caption linked to
+the media page.
+
 ## Hard rules (each closes a real bug — do not regress)
 
 1. **Never embed OSC/escape sequences in ratatui span content.** Ratatui re-emits

@@ -181,12 +181,12 @@ Narrow (< 90): drop Started by, author 9 wide, age 6.
 * **Inbox** (`c3.png` bottom): `Inbox` panel 50 wide with tab row `Conversations 2 |
   Alerts 5`, two-line conversation rows; view panel 70 wide with message cards.
 * **Search** (`c4.png` top): `/ query` line with `author` and `in` on the right,
-  chip row (All/Threads/Posts · Latest/Relevance), results as two lines: kind label +
+  chip row (All/Threads/Posts/Media/Resources · Latest/Relevance), results as two lines: kind label +
   title with hits in warn-bold, forum · age right-aligned, dim snippet.
 * **Go-to palette + g which-key** (`c2.png` top): Ctrl+K or `:` opens a 60-wide
   `Go to` panel over the dimmed body (forums, actions with their key, members);
   `g` shows a small which-key panel bottom-right (n news · s security · t tutorials ·
-  l latest · i inbox · a alerts · h home · p profile · g top).
+  l latest · i inbox · a alerts · m media · r resources · h home · p profile · g top).
 * **Keys card** (`c4.png` bottom): `?` opens a 96-wide two-column card grouped
   MOVE / THIS THREAD / EVERYWHERE / MOUSE & CLIPBOARD, any key closes.
 

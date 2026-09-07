@@ -33,7 +33,7 @@ pub const PALETTE_WIDTH: u16 = 60;
 pub const PALETTE_ROWS: usize = 8;
 /// Which-key panel size.
 const WHICH_KEY_WIDTH: u16 = 52;
-const WHICH_KEY_HEIGHT: u16 = 5;
+const WHICH_KEY_HEIGHT: u16 = 6;
 /// Keys card size (`Help.dc.html`: 96 × 16).
 const KEYS_CARD_WIDTH: u16 = 96;
 /// DESIGN.md specifies 96 x 16; the card grew by the three rows the mouse
@@ -145,6 +145,10 @@ pub enum Target {
     MarkForumRead(u32),
     Inbox,
     Alerts,
+    /// The XFMG media catalog and the XFRM resource catalog (#680) — the
+    /// palette twins of the `g m` / `g r` chords.
+    MediaGallery,
+    Resources,
     Search,
     SignOut,
     Quit,
@@ -573,6 +577,8 @@ pub enum GoTarget {
     Latest,
     Inbox,
     Alerts,
+    Media,
+    Resources,
     Home,
     Profile,
     Top,
@@ -621,6 +627,8 @@ impl Prefix {
             KeyCode::Char('l') => PrefixEvent::Go(GoTarget::Latest),
             KeyCode::Char('i') => PrefixEvent::Go(GoTarget::Inbox),
             KeyCode::Char('a') => PrefixEvent::Go(GoTarget::Alerts),
+            KeyCode::Char('m') => PrefixEvent::Go(GoTarget::Media),
+            KeyCode::Char('r') => PrefixEvent::Go(GoTarget::Resources),
             KeyCode::Char('h') => PrefixEvent::Go(GoTarget::Home),
             KeyCode::Char('p') => PrefixEvent::Go(GoTarget::Profile),
             KeyCode::Char('g') => PrefixEvent::Go(GoTarget::Top),
@@ -630,9 +638,10 @@ impl Prefix {
 }
 
 /// The rows of the which-key panel, in the order the design shows them.
-const WHICH_KEY: [[(&str, &str); 3]; 3] = [
+const WHICH_KEY: [[(&str, &str); 3]; 4] = [
     [("n", "news"), ("s", "security"), ("t", "tutorials")],
     [("l", "latest"), ("i", "inbox"), ("a", "alerts")],
+    [("m", "media"), ("r", "resources"), ("", "")],
     [("h", "home"), ("p", "profile"), ("g", "top")],
 ];
 
@@ -669,6 +678,11 @@ pub fn render_which_key(f: &mut Frame, body: Rect, theme: &Theme, g: &Glyphs, hi
             let mut spans = vec![Span::raw(" ")];
             for &(key, label) in row {
                 let start: usize = spans.iter().map(Span::width).sum();
+                if key.is_empty() {
+                    // Grid filler (11 targets in 12 slots): padding only.
+                    spans.push(Span::raw(" ".repeat(stride)));
+                    continue;
+                }
                 // The whole `cap label` cell is the target, not the two-cell
                 // cap: the chord's key is pressed through `handle_key`, so an
                 // armed `g` resolves exactly as it does from the keyboard.

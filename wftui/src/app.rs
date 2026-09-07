@@ -280,6 +280,11 @@ pub enum Msg {
     RecipientResolved { name: String, id: TaskResult<Option<u32>> },
     AlertsLoaded(TaskResult<AlertsReply>),
     AlertMarked(TaskResult<()>),
+    /// Media Gallery / Resource Manager catalog pages (issue #680). Replies
+    /// adopt the topmost matching screen; the screens' loading guards keep
+    /// one fetch in flight, so page stamping is enough identity.
+    MediaLoaded { page: u32, result: TaskResult<MediaListReply> },
+    ResourceLoaded { page: u32, result: TaskResult<ResourceListReply> },
     SearchDone { generation: u64, page: u32, result: TaskResult<SearchResultsReply> },
     /// A go-to palette member lookup came back. `query` is the palette query
     /// that asked, so a stale answer to an edited query is dropped.
@@ -1759,6 +1764,24 @@ impl App {
                 self.load_nodes();
             }
             Action::RunSearchQuery(query) => self.run_search_query(query),
+            Action::OpenMediaGallery => {
+                self.push_screen(Screen::MediaGallery(screens::MediaListState {
+                    page: 1,
+                    loading: true,
+                    ..Default::default()
+                }));
+                self.load_media(1);
+            }
+            Action::OpenResources => {
+                self.push_screen(Screen::Resources(screens::ResourceListState {
+                    page: 1,
+                    loading: true,
+                    ..Default::default()
+                }));
+                self.load_resources(1);
+            }
+            Action::LoadMedia(page) => self.load_media(page),
+            Action::LoadResources(page) => self.load_resources(page),
             Action::LoadMemberContent {
                 user_id,
                 content,
@@ -1953,6 +1976,16 @@ impl App {
         }
         items.push(Item::action("Inbox".to_string(), "c", Target::Inbox));
         items.push(Item::action("Alerts".to_string(), "a", Target::Alerts));
+        items.push(Item::action(
+            "Media Gallery".to_string(),
+            "gm",
+            Target::MediaGallery,
+        ));
+        items.push(Item::action(
+            "Resources".to_string(),
+            "gr",
+            Target::Resources,
+        ));
         items.push(Item::action("Search".to_string(), "/", Target::Search));
         items.push(Item::action("Sign out".to_string(), "^L", Target::SignOut));
         items.push(Item::action("Quit".to_string(), "q", Target::Quit));
@@ -1994,6 +2027,8 @@ impl App {
             T::MarkForumRead(node_id) => self.execute_action(Action::MarkForumRead(node_id)),
             T::Inbox => self.open_inbox(screens::InboxTab::Conversations),
             T::Alerts => self.open_inbox(screens::InboxTab::Alerts),
+            T::MediaGallery => self.execute_action(Action::OpenMediaGallery),
+            T::Resources => self.execute_action(Action::OpenResources),
             T::Search => self.push_screen(screens::search_state()),
             T::SignOut => self.logout(),
             T::Quit => self.should_quit = true,
@@ -2021,6 +2056,8 @@ impl App {
                 self.open_quick_node(screens::TUTORIALS_NODE, "Windows Tutorials")
             }
             GoTarget::Latest => self.execute_action(Action::OpenLatestThreads),
+            GoTarget::Media => self.execute_action(Action::OpenMediaGallery),
+            GoTarget::Resources => self.execute_action(Action::OpenResources),
             GoTarget::Inbox => self.open_inbox(screens::InboxTab::Conversations),
             GoTarget::Alerts => self.open_inbox(screens::InboxTab::Alerts),
             GoTarget::Home => {
@@ -3961,6 +3998,59 @@ impl App {
                     self.alerts_unread = n;
                 }
             }
+            Msg::MediaLoaded { page, result } => {
+                // Topmost gallery only; the screen's loading guard keeps one
+                // fetch in flight, so `page` stamping suffices (#657 family).
+                let gallery = self.screens.iter_mut().rev().find_map(|s| match s {
+                    Screen::MediaGallery(m) => Some(m),
+                    _ => None,
+                });
+                if let Some(m) = gallery
+                    && m.loading
+                {
+                    match result {
+                        Ok(reply) => {
+                            // See ForumLoaded (issue #537).
+                            m.error = None;
+                            m.items = reply.media;
+                            m.page = page;
+                            m.last_page = reply.pagination.last_page.max(1);
+                            m.total = reply.pagination.total;
+                            m.loading = false;
+                            m.sel = 0;
+                        }
+                        Err(e) => {
+                            m.loading = false;
+                            m.error = Some(e.message);
+                        }
+                    }
+                }
+            }
+            Msg::ResourceLoaded { page, result } => {
+                let resources = self.screens.iter_mut().rev().find_map(|s| match s {
+                    Screen::Resources(r) => Some(r),
+                    _ => None,
+                });
+                if let Some(r) = resources
+                    && r.loading
+                {
+                    match result {
+                        Ok(reply) => {
+                            r.error = None;
+                            r.items = reply.resources;
+                            r.page = page;
+                            r.last_page = reply.pagination.last_page.max(1);
+                            r.total = reply.pagination.total;
+                            r.loading = false;
+                            r.sel = 0;
+                        }
+                        Err(e) => {
+                            r.loading = false;
+                            r.error = Some(e.message);
+                        }
+                    }
+                }
+            }
             Msg::AlertMarked(result) => match result {
                 Ok(()) => {
                     self.load_alerts();
@@ -4131,6 +4221,26 @@ impl App {
                 .await
                 .map_err(|e| TaskError::of(&e));
             tx.send(Msg::SearchDone { generation, page, result }).ok();
+        });
+    }
+
+    /// Fetch one page of the XFMG media catalog (issue #680).
+    pub fn load_media(&mut self, page: u32) {
+        let api = self.api.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = api.media_list(page).await.map_err(|e| TaskError::of(&e));
+            tx.send(Msg::MediaLoaded { page, result }).ok();
+        });
+    }
+
+    /// Fetch one page of the XFRM resource catalog (issue #680).
+    pub fn load_resources(&mut self, page: u32) {
+        let api = self.api.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = api.resources_list(page).await.map_err(|e| TaskError::of(&e));
+            tx.send(Msg::ResourceLoaded { page, result }).ok();
         });
     }
 
@@ -4378,6 +4488,8 @@ fn session_error_of(msg: &Msg) -> Option<&TaskError> {
         | Msg::ConvoCreated(Err(e))
         | Msg::ConversationMarked(_, Err(e))
         | Msg::AlertsLoaded(Err(e))
+        | Msg::MediaLoaded { result: Err(e), .. }
+        | Msg::ResourceLoaded { result: Err(e), .. }
         | Msg::AlertMarked(Err(e))
         | Msg::SearchDone { result: Err(e), .. }
         | Msg::ProfileLoaded { result: Err(e), .. }
@@ -4419,6 +4531,8 @@ fn mark_retryable(msg: &mut Msg) {
         | Msg::ConvoCreated(Err(e))
         | Msg::ConversationMarked(_, Err(e))
         | Msg::AlertsLoaded(Err(e))
+        | Msg::MediaLoaded { result: Err(e), .. }
+        | Msg::ResourceLoaded { result: Err(e), .. }
         | Msg::AlertMarked(Err(e))
         | Msg::SearchDone { result: Err(e), .. }
         | Msg::ProfileLoaded { result: Err(e), .. }
@@ -5176,6 +5290,18 @@ mod tests {
         }
         async fn search(&self, _: &str, _: u32) -> common::error::Result<SearchResultsReply> {
             Err(common::error::Error::NoToken)
+        }
+        async fn media_list(
+            &self,
+            _: u32,
+        ) -> common::error::Result<common::models::MediaListReply> {
+            Ok(common::models::MediaListReply::default())
+        }
+        async fn resources_list(
+            &self,
+            _: u32,
+        ) -> common::error::Result<common::models::ResourceListReply> {
+            Ok(common::models::ResourceListReply::default())
         }
         async fn search_advanced(
             &self,
@@ -7654,6 +7780,96 @@ mod tests {
         let view = inbox.view.as_ref().expect("the view survives");
         assert_eq!(view.page, 7, "the in-flight load was not replaced");
         assert!(view.loading);
+    }
+
+    /// #680: both navigation surfaces reach the new catalogs — `g m` / `g r`
+    /// and the go-to palette's rows — each pushing its screen and firing the
+    /// page-1 fetch through the stub.
+    #[tokio::test]
+    async fn the_gallery_and_resources_are_reachable_by_chord_and_palette() {
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.screens.push(screens::home_state(false));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        let Some(Screen::MediaGallery(m)) = app.screens.last() else {
+            panic!("g m must open the Media Gallery, got {:?}", app.screens.last().map(|s| s.title()));
+        };
+        assert!(m.loading, "the page-1 fetch is in flight");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        let Some(Screen::Resources(r)) = app.screens.last() else {
+            panic!("g r must open Resources, got {:?}", app.screens.last().map(|s| s.title()));
+        };
+        assert!(r.loading, "the page-1 fetch is in flight");
+
+        // The palette teaches the same two destinations: typing the row's
+        // name and pressing Enter runs the same opener the chord does.
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        for c in "media gallery".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(app.screens.last(), Some(Screen::MediaGallery(_))),
+            "the palette row must open the gallery too"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        for c in "resources".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Resources(_))),
+            "and the resources row opens the resource catalog"
+        );
+    }
+
+    /// #680: a catalog page fills the topmost screen it belongs to, and a
+    /// reply that arrives for a screen which is not waiting on one is
+    /// dropped — the same stale-reply discipline every other load follows.
+    #[tokio::test]
+    async fn a_catalog_page_fills_its_screen_and_a_stale_reply_is_dropped() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.execute_action(Action::OpenMediaGallery);
+
+        app.handle_msg(Msg::MediaLoaded {
+            page: 1,
+            result: Ok(common::models::MediaListReply {
+                media: vec![common::models::MediaListItem {
+                    media_id: 33005,
+                    title: "Registry Explained".into(),
+                    ..Default::default()
+                }],
+                pagination: common::models::Pagination {
+                    current_page: 1,
+                    last_page: 4,
+                    total: 80,
+                },
+            }),
+        });
+        let Some(Screen::MediaGallery(m)) = app.screens.last() else {
+            panic!("the gallery must still be on top");
+        };
+        assert!(!m.loading, "the fetch is finished");
+        assert_eq!(m.items.len(), 1);
+        assert_eq!(m.last_page, 4);
+        assert_eq!(m.total, 80);
+
+        // Nothing is in flight now, so a late second reply must not land.
+        app.handle_msg(Msg::MediaLoaded {
+            page: 2,
+            result: Ok(common::models::MediaListReply::default()),
+        });
+        let Some(Screen::MediaGallery(m)) = app.screens.last() else {
+            panic!("the gallery must still be on top");
+        };
+        assert_eq!(m.items.len(), 1, "a reply nobody is waiting on must be dropped");
+        assert_eq!(m.page, 1, "and it must not renumber the page either");
     }
 
     /// #674: the idle-skip predicate — an idle session needs no redraw,
