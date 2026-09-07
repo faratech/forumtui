@@ -192,7 +192,11 @@ so, since XF gates `is_banned` to viewers who may bypass user privacy.
   underneath. Keys: r reply · Q quote · e edit · D delete (twice) · S solution ·
   j/k scroll · n/N post · l like · v vote · o links · 1-9 / Enter open the
   picture in the viewer · x spoilers · u open in web · Esc back. `e`, `D` and
-  `S` appear only where the API said this reader may.
+  `S` appear only where the API said this reader may, and `W` only where the
+  post has a video. A video renders as its own row — `▶ Play YouTube video`,
+  in link styling, where the message put it — which is a click target as well
+  as what `W` plays; the client hands the terminal to `mpv` (kitty/sixel where
+  the terminal has them, true-colour text blocks otherwise) and takes it back.
 * **Reply** (`c2.png` bottom): editor panel `Reply` (72) + `Preview` (48) rendering
   the draft through common::bbcode; editor bottom line = BBCode caps ^B ^I ^K ^Q ^U
   and char count. Keys: ^S send · ^O preview on/off · ^F attach · ^Y paste · Tab
@@ -270,8 +274,9 @@ i, n, ?, q, Esc, Tab, Ctrl+S, Ctrl+Y, Ctrl+C, Ctrl+L, [ ], j/k, arrows, mouse.
 New: `/` (search, alias of s), `g` prefix (now including `m` media and `r`
 resources), Ctrl+K / `:` palette, `1-9` images, `w` watch, `x` spoilers, and
 the post-writing set in the thread view — `Q` quote, `e` edit, `D` delete
-(twice, and any other key disarms it), `S` solution — plus `^F` attach in the
-composer. Mouse and touch add no keys: every click resolves to one of the above.
+(twice, and any other key disarms it), `S` solution, `W` watch a video — plus
+`^F` attach in the composer. `v`/`V` remain the vote pair; the video key is
+`W` precisely so it shadows neither. Mouse and touch add no keys: every click resolves to one of the above.
 
 ## Gates
 

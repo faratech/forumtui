@@ -4,7 +4,7 @@
 //! app executes them (spawning tasks, pushing screens). Screens never hold an
 //! `App` reference — that keeps borrows trivial and screens testable.
 
-mod browse;
+pub(crate) mod browse;
 mod library;
 mod misc;
 mod social;
@@ -163,6 +163,9 @@ pub struct ThreadViewState {
     /// flat span run, so nothing else in it remembers what a row was.
     pub link_lines: Vec<(usize, usize)>,
     pub image_lines: Vec<(usize, usize)>,
+    /// `(line, index into the post's videos)` for each play row (#710), so a
+    /// click on one plays that video rather than the post's first.
+    pub video_lines: Vec<(usize, usize)>,
     pub link_popup: bool,
     pub sel_local: usize,
     pub sel_post: usize,
@@ -753,6 +756,10 @@ pub enum Action {
     LoadResource(u32),
     /// Show one picture full size in the client (#697).
     OpenImage(Box<ImageOpen>),
+    /// Play a video in the terminal (#710). The app suspends the TUI, hands
+    /// the screen to the player and restores afterwards, so this carries
+    /// only what the player needs.
+    PlayVideo { url: String, title: String },
     /// One page of a member's threads/posts (issue #548). `content` is
     /// XenForo's `content` parameter for `/search/member`: "thread" or "post".
     LoadMemberContent {

@@ -343,6 +343,50 @@ addon can be run over it directly. That is how the current implementation was
 confirmed (`valid=true, violations: 0`), and how the three failure modes
 above were confirmed to fire.
 
+## Watching a video in the terminal (#710)
+
+A video renders as a **row you can press** — `▶ Play YouTube video`, where
+the message put it — rather than a link with a `[n]` marker. Click it, or
+press `W` for the selected post's first one. 25,839 posts here carry
+`[MEDIA=youtube]`, which the parser already resolves to a watch URL, so
+`browse::post_videos` recognises those URLs rather than re-parsing the tag —
+which also picks up a plain YouTube link somebody pasted without one.
+
+The play rows join the same block walk as inline images (#693), sorted by
+chunk position so a post that alternates pictures and videos renders them in
+the order it wrote them; `video_lines` maps each row to its own index, so
+clicking the second video plays the second.
+
+**This client decodes nothing.** It hands the URL to `mpv`, which already
+knows how to resolve a YouTube page through `yt-dlp` (installed here) and how
+to paint frames. `video.rs` owns only the argv and the refusal reasons —
+both testable without a terminal, unlike playback. The video output follows
+the graphics tier: kitty and sixel are mpv's own, iTerm2 reads sixel, and
+everything else gets `--vo=tct` (true-colour text blocks), which is what
+makes this work over a plain SSH session. Mono is refused with a reason,
+because there is nothing honest to paint with.
+
+mpv is **optional and not installed here**: `W` says so and names the install
+rather than failing obscurely. `WFTUI_PLAYER` overrides the binary.
+
+The handover is the part to be careful with, and it lives in `app::play_video`
+because only `run` owns the terminal and the reader thread:
+
+- The reader thread stays the **only** thing reading stdin (hard rule 3). mpv
+  gets a **pipe**, and keys arrive here and are forwarded down it as the bytes
+  a terminal would have sent (`video::key_bytes`). Two readers on one tty
+  would race for every keystroke.
+- That also keeps hard rule 2: the child's stdin is ours, not the tty.
+- `q`/Esc/`^C` are handled here rather than forwarded, so a player that
+  ignores its input can still be stopped — we kill the child.
+- Raw mode **stays on** through playback (the reader needs it); what is handed
+  over is the alternate screen and mouse capture, both taken back afterwards
+  with a full redraw, since the player painted over everything ratatui
+  believed was there.
+
+`playing_forwards_keys_to_the_player_and_stops_on_q` drives all of that
+against a stand-in player via `WFTUI_PLAYER`.
+
 ## Attachments
 
 `^F` in the composer opens a path prompt — a terminal has no file picker, so

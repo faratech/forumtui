@@ -52,6 +52,9 @@ pub struct Glyphs {
     pub external: &'static str,
     /// Attachment placeholder. ASCII spelling `[img]` is five cells.
     pub image: &'static str,
+    /// A playable video (#710). Single cell, like every other glyph here —
+    /// no emoji, which are double-width or blank in too many terminals.
+    pub play: &'static str,
     /// Alert kind: reply. ASCII spelling `->` is two cells.
     pub reply_alert: &'static str,
     /// Alert kind: mention.
@@ -81,6 +84,7 @@ pub const UNICODE: Glyphs = Glyphs {
     more: "\u{25BE}",         // ▾
     external: "\u{2197}",     // ↗
     image: "\u{25A3}",        // ▣
+    play: "\u{25B6}",         // ▶
     reply_alert: "\u{21A9}",  // ↩
     mention: "@",
     quote_alert: "\u{275D}",  // ❝
@@ -106,6 +110,7 @@ pub const ASCII: Glyphs = Glyphs {
     more: "v",
     external: "^",
     image: "[img]",
+    play: ">",
     reply_alert: "->",
     mention: "@",
     quote_alert: "\"",

@@ -581,6 +581,33 @@ fn attachment_px(att: &common::models::Attachment) -> Option<(u32, u32)> {
     }
 }
 
+/// Every video a post links, in the order it mentions them (#710).
+///
+/// `[MEDIA=youtube]` is already a `Chunk::Link` by the time it gets here, so
+/// this recognises the URLs rather than re-parsing the tag — which also picks
+/// up a plain YouTube link somebody pasted without the tag.
+pub(crate) fn post_videos(post: Option<&Post>) -> Vec<(String, &'static str)> {
+    let Some(post) = post else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for chunk in common::bbcode::render(&post.message) {
+        let url = match chunk {
+            Chunk::Link(_, url, _) => url,
+            Chunk::Image { link: Some(url), .. } => url,
+            _ => continue,
+        };
+        if let Some(site) = common::bbcode::video_site(&url)
+            && !seen.contains(&url)
+        {
+            seen.push(url.clone());
+            out.push((url, site));
+        }
+    }
+    out
+}
+
 /// What Enter (or a digit) on a post's picture opens in the viewer (#693).
 /// `None` when the API gave nothing to paint — the caller then falls back to
 /// the browser, which is all that picture ever had.
@@ -1693,6 +1720,7 @@ impl ThreadViewState {
         // post" on: the `[n] url` rows, and every row an image occupies.
         let mut link_lines: Vec<(usize, usize)> = Vec::new();
         let mut image_lines: Vec<(usize, usize)> = Vec::new();
+        let mut video_lines: Vec<(usize, usize)> = Vec::new();
 
         lines.push(thread_summary_line(self, theme, g, width));
         lines.push(Line::from(Span::raw("")));
@@ -1776,6 +1804,7 @@ impl ThreadViewState {
             // a wall of text followed by unlabelled images.
             let chunks = common::bbcode::render(&post.message);
             let imgs = post_images(post, &chunks);
+            let videos = post_videos(Some(post));
             let image_count = imgs.all.len();
             let mut ord = 0usize;
             let mut run_start = 0usize;
@@ -1822,7 +1851,34 @@ impl ThreadViewState {
                 }
             };
 
-            for &at in &imgs.inline_at {
+            // #710: videos become their own playable row, the way images
+            // became their own block in #693 — a link with a `[n]` marker is
+            // something to read, and a video is something to press.
+            let mut video_at: Vec<(usize, usize)> = Vec::new();
+            {
+                let mut seen: Vec<String> = Vec::new();
+                for (i, chunk) in chunks.iter().enumerate() {
+                    let url = match chunk {
+                        Chunk::Link(_, url, _) => url.clone(),
+                        _ => continue,
+                    };
+                    if common::bbcode::video_site(&url).is_some() && !seen.contains(&url) {
+                        video_at.push((i, seen.len()));
+                        seen.push(url);
+                    }
+                }
+            }
+            // One ordered list of block positions, so a post that alternates
+            // pictures and videos renders them in the order it wrote them.
+            let mut blocks: Vec<(usize, Option<usize>)> = imgs
+                .inline_at
+                .iter()
+                .map(|&at| (at, None))
+                .chain(video_at.iter().map(|&(at, n)| (at, Some(n))))
+                .collect();
+            blocks.sort_by_key(|(at, _)| *at);
+
+            for &(at, video) in &blocks {
                 for (logical, align) in chunk_lines_aligned(
                     &chunks[run_start..at],
                     &mut links,
@@ -1835,14 +1891,29 @@ impl ThreadViewState {
                     }
                 }
                 run_start = at + 1;
-                ord += 1;
-                push_image(
-                    &mut lines,
-                    &mut slots,
-                    &mut image_lines,
-                    &imgs.all[ord - 1],
-                    ord,
-                );
+                let Some(video_n) = video else {
+                    ord += 1;
+                    push_image(
+                        &mut lines,
+                        &mut slots,
+                        &mut image_lines,
+                        &imgs.all[ord - 1],
+                        ord,
+                    );
+                    continue;
+                };
+                // The play row. Styled like the link it is, with the play
+                // glyph leading, and registered so a click plays THIS video
+                // rather than the post's first.
+                let site = videos.get(video_n).map(|(_, s)| *s).unwrap_or("video");
+                video_lines.push((lines.len(), video_n));
+                lines.push(gutter(vec![
+                    Span::styled(format!("{} ", g.play), link_style(theme)),
+                    Span::styled(
+                        truncate(&format!("Play {site} video"), body_w.saturating_sub(2)),
+                        link_style(theme).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
             }
             for (logical, align) in chunk_lines_aligned(
                 &chunks[run_start..],
@@ -1919,6 +1990,7 @@ impl ThreadViewState {
         self.image_slots = slots;
         self.link_lines = link_lines;
         self.image_lines = image_lines;
+        self.video_lines = video_lines;
     }
 }
 
@@ -2172,6 +2244,17 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
         },
         // `Q` quotes the selected post into a reply (#707) — `q` is taken by
         // "back", and quoting is the reply path, not a separate screen.
+        // #710: play the selected post's first video in the terminal. `W`,
+        // not `V` — `v`/`V` are the vote pair, and shadowing a vote with a
+        // video player is exactly the kind of key collision the dispatch
+        // test exists to catch.
+        KeyCode::Char('W') => match post_videos(s.posts.get(s.sel_post)).first() {
+            Some((url, site)) => Action::PlayVideo {
+                url: url.clone(),
+                title: format!("{site} video"),
+            },
+            None => Action::Notice("No video in this post.".into()),
+        },
         KeyCode::Char('Q') => match s.posts.get(s.sel_post) {
             Some(post) => {
                 Action::StartReplyQuoting(s.thread.clone(), Box::new(post.clone()))
@@ -2372,6 +2455,11 @@ pub fn thread_view_hints(s: &ThreadViewState) -> Hints {
     let can_edit = sel.is_some_and(|p| p.can_edit);
     let can_delete = sel.is_some_and(|p| p.can_soft_delete);
     let mut keys: Vec<(&str, &str)> = vec![("r", "reply"), ("Q", "quote")];
+    // #710: only where there is something to play — a cap for a post with no
+    // video is a cap that does nothing.
+    if !post_videos(sel).is_empty() {
+        keys.push(("W", "watch video"));
+    }
     if can_edit {
         keys.push(("e", "edit"));
     }
@@ -2557,6 +2645,15 @@ pub fn render_thread_view(
         }
         let y = inner.y + (line - s.scroll) as u16;
         hits.push(Rect::new(inner.x, y, inner.width, 1), Hit::Image(n));
+    }
+    // #710: the play rows. After the image rows, so a row that is somehow
+    // both answers as the video it is.
+    for &(line, n) in &s.video_lines {
+        if line < s.scroll || line >= s.scroll + inner.height as usize {
+            continue;
+        }
+        let y = inner.y + (line - s.scroll) as u16;
+        hits.push(Rect::new(inner.x, y, inner.width, 1), Hit::Video(n));
     }
 
     // What the reader has actually had on screen (#694): the newest post
@@ -3820,6 +3917,118 @@ mod tests {
     /// #693: a picture the message references renders WHERE the message
     /// puts it, and only the attachments the message never mentioned are
     /// listed underneath — the same split XenForo renders.
+    /// #710: a video in a post renders as a row you can press, not a link
+    /// with a marker — and the row is where the message put it.
+    #[test]
+    fn a_video_renders_as_a_play_row_where_the_message_puts_it() {
+        let theme = Theme::truecolor();
+        let mut s = thread_view_fixture();
+        s.posts[0].attachments.clear();
+        s.posts[0].message =
+            "Before.\n[MEDIA=youtube]dQw4w9WgXcQ[/MEDIA]\nAfter.".into();
+        s.width = 0;
+        s.rebuild_lines(&theme, &UNICODE);
+
+        let text: Vec<String> = s
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+            .collect();
+        let row = text
+            .iter()
+            .position(|l| l.contains("Play YouTube video"))
+            .unwrap_or_else(|| panic!("{text:#?}"));
+        let before = text.iter().position(|l| l.contains("Before.")).expect("before");
+        let after = text.iter().position(|l| l.contains("After.")).expect("after");
+        assert!(before < row && row < after, "{before} {row} {after}");
+        assert!(text[row].contains('\u{25B6}'), "the play glyph: {:?}", text[row]);
+
+        // And the row is mapped, so a click can play THAT video.
+        assert_eq!(s.video_lines, vec![(row, 0)], "{:?}", s.video_lines);
+
+        // ASCII terminals get the ASCII glyph, never a missing one.
+        s.width = 0;
+        s.rebuild_lines(&theme, &crate::glyph::ASCII);
+        let ascii: Vec<String> = s
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+            .collect();
+        assert!(ascii.iter().any(|l| l.contains("> Play YouTube")), "{ascii:#?}");
+    }
+
+    /// Two videos get two rows, mapped to their own indices, in message
+    /// order — so clicking the second plays the second.
+    #[test]
+    fn each_video_gets_its_own_mapped_row() {
+        let theme = Theme::truecolor();
+        let mut s = thread_view_fixture();
+        s.posts[0].attachments.clear();
+        s.posts[0].message =
+            "[MEDIA=youtube]aaa[/MEDIA]\nmiddle\n[MEDIA=youtube]bbb[/MEDIA]".into();
+        s.width = 0;
+        s.rebuild_lines(&theme, &UNICODE);
+        assert_eq!(s.video_lines.len(), 2, "{:?}", s.video_lines);
+        assert_eq!(s.video_lines[0].1, 0);
+        assert_eq!(s.video_lines[1].1, 1);
+        assert!(s.video_lines[0].0 < s.video_lines[1].0, "in message order");
+
+        let videos = post_videos(s.posts.first());
+        assert!(videos[0].0.contains("aaa") && videos[1].0.contains("bbb"));
+    }
+
+    /// #710: `W` plays the selected post's video, and the cap appears only
+    /// where there is one — 25,839 posts on this site carry a YouTube embed,
+    /// and every other post must not advertise a key that does nothing.
+    #[test]
+    fn w_plays_a_posts_video_and_only_offers_itself_when_there_is_one() {
+        let mut s = thread_view_fixture();
+        s.sel_post = 0;
+        s.posts[0].message = "Just text, no video.".into();
+
+        let caps: Vec<&str> = thread_view_hints(&s).keys.iter().map(|(k, _)| *k).collect();
+        assert!(!caps.contains(&"W"), "no video, no cap: {caps:?}");
+        assert!(matches!(thread_view_key(&mut s, key('W')), Action::Notice(_)));
+
+        // The `[MEDIA]` tag this site's posts actually use.
+        s.posts[0].message = "Look:\n[MEDIA=youtube]dQw4w9WgXcQ[/MEDIA]\nGood, isn't it".into();
+        let caps: Vec<&str> = thread_view_hints(&s).keys.iter().map(|(k, _)| *k).collect();
+        assert!(caps.contains(&"W"), "{caps:?}");
+        match thread_view_key(&mut s, key('W')) {
+            Action::PlayVideo { url, title } => {
+                assert!(url.contains("dQw4w9WgXcQ"), "{url}");
+                assert!(title.contains("YouTube"), "{title}");
+            }
+            _ => panic!("W must play the post's video"),
+        }
+
+        // `v`/`V` are still the vote pair — the video key must not have
+        // shadowed them.
+        assert!(matches!(
+            thread_view_key(&mut s, key('V')),
+            Action::VotePost(_, _)
+        ));
+    }
+
+    /// A post's videos come out in the order it mentions them, once each,
+    /// and a plain pasted link counts.
+    #[test]
+    fn post_videos_are_found_in_order_without_duplicates() {
+        let post = Post {
+            post_id: 1,
+            message: "[MEDIA=youtube]aaa[/MEDIA] then https://youtu.be/bbb \
+                      and again [MEDIA=youtube]aaa[/MEDIA] plus \
+                      https://windowsforum.com/threads/x.1/"
+                .into(),
+            ..Default::default()
+        };
+        let found = post_videos(Some(&post));
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].0.contains("aaa"), "{found:?}");
+        assert!(found[1].0.contains("bbb"), "{found:?}");
+        assert!(post_videos(None).is_empty());
+    }
+
     /// #708: edit, delete and mark-solution are offered only where the API
     /// said this reader may — advertising a key that 403s is the bug #561
     /// fixed, and the server enforces regardless of what the bar says.

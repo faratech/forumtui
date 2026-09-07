@@ -624,6 +624,37 @@ fn parse_quote_byline(raw: &str) -> (String, Option<u32>) {
 }
 
 /// Resolve XenForo [MEDIA=site]id[/MEDIA] tags to valid hyperlinks and readable labels.
+/// The video sites this client can hand to a player (#710).
+///
+/// Matched against the URLs `resolve_media` builds, so this is recognition of
+/// our own output rather than a guess at the shape of the web — plus the
+/// `youtu.be` short form and a bare `youtube.com/watch`, which posts carry as
+/// plain links rather than `[MEDIA]` tags.
+pub fn video_site(url: &str) -> Option<&'static str> {
+    let u = url.trim().to_ascii_lowercase();
+    let host_and_path = u
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&u)
+        .trim_start_matches("www.");
+    if host_and_path.starts_with("youtube.com/watch")
+        || host_and_path.starts_with("m.youtube.com/watch")
+        || host_and_path.starts_with("youtu.be/")
+        || host_and_path.starts_with("youtube.com/shorts/")
+    {
+        return Some("YouTube");
+    }
+    if host_and_path.starts_with("vimeo.com/") {
+        return Some("Vimeo");
+    }
+    if host_and_path.starts_with("dailymotion.com/")
+        || host_and_path.starts_with("dai.ly/")
+    {
+        return Some("Dailymotion");
+    }
+    None
+}
+
 fn resolve_media(site: &str, media_id: &str) -> (String, String) {
     let clean_id = media_id.trim();
     match site.to_ascii_lowercase().as_str() {
@@ -2721,6 +2752,34 @@ mod tests {
             styled >= posts,
             "these posts all carry styling tags: {styled} styled runs across {posts} posts"
         );
+    }
+
+    /// #710: the video URLs this client can hand to a player are the ones
+    /// its own `[MEDIA]` handling produces, plus the shapes people paste by
+    /// hand. Anything else is a link, not a video.
+    #[test]
+    fn video_urls_are_recognised_including_the_ones_we_build() {
+        // Exactly what `resolve_media` emits for the 25,839 posts on this
+        // site that carry `[MEDIA=youtube]`.
+        let (_, url) = resolve_media("youtube", "dQw4w9WgXcQ");
+        assert_eq!(video_site(&url), Some("YouTube"), "{url}");
+        let (_, url) = resolve_media("vimeo", "12345");
+        assert_eq!(video_site(&url), Some("Vimeo"), "{url}");
+
+        for (url, want) in [
+            ("https://youtu.be/dQw4w9WgXcQ", Some("YouTube")),
+            ("https://www.youtube.com/watch?v=x", Some("YouTube")),
+            ("http://m.youtube.com/watch?v=x", Some("YouTube")),
+            ("https://www.youtube.com/shorts/x", Some("YouTube")),
+            ("https://vimeo.com/12345", Some("Vimeo")),
+            ("https://dai.ly/x", Some("Dailymotion")),
+            // Not videos: a channel page, a lookalike host, an ordinary link.
+            ("https://www.youtube.com/@someone", None),
+            ("https://notyoutube.com/watch?v=x", None),
+            ("https://windowsforum.com/threads/x.1/", None),
+        ] {
+            assert_eq!(video_site(url), want, "{url}");
+        }
     }
 
     /// #707: the quote block this client writes has to survive

@@ -59,6 +59,9 @@ pub enum Hit {
     Link(String),
     /// The nth image (1-based, the digit that opens it) of the post it is in.
     Image(usize),
+    /// The nth video (0-based) of the post it is in — clicking plays it
+    /// (#710).
+    Video(usize),
     /// A text field: screen-local index (Compose 0 = title / 1 = body;
     /// New conversation 0 = to / 1 = title / 2 = message; Search 0 = query /
     /// 1 = author).
