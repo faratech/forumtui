@@ -251,6 +251,11 @@ pub enum Chunk {
         link: Option<String>,
         style: Style,
     },
+    /// `[HR]` — a horizontal rule. Its own variant because a rule spans the
+    /// pane, and the parser has no idea how wide that is: emitting a fixed
+    /// run of dashes (which is what this did until #703) draws a stub in the
+    /// middle of a line instead of the rule XF renders as `<hr />`.
+    Rule(Style),
     /// `[ATTACH]id[/ATTACH]` (and the `=full` / `type="full"` spellings) — an
     /// attachment referenced by id. Only whoever holds the post's (or the
     /// draft's) attachment list can turn the id into a URL, so the parser
@@ -661,6 +666,8 @@ fn ends_with_newline(chunks: &[Chunk]) -> bool {
         Chunk::Link(l, _, _) => l.ends_with('\n'),
         // Both render as a one-line placeholder, never a paragraph break.
         Chunk::Image { .. } | Chunk::Attach(..) => false,
+        // A rule always ends its own line (#703).
+        Chunk::Rule(_) => true,
     })
 }
 
@@ -878,7 +885,10 @@ pub fn render(src: &str) -> Vec<Chunk> {
                             out.push(Chunk::Text("\n".into(), style.clone()));
                         }
                         flush_before_chunk(&mut out, &mut link_label, &style);
-                        out.push(Chunk::Text("───\n".into(), style.clone()));
+                        // A rule is a block of its own: it owns its line, and
+                        // whatever follows starts on the next one (#703).
+                        out.push(Chunk::Rule(style.clone()));
+                        out.push(Chunk::Text("\n".into(), style.clone()));
                     }
                     "table" => {
                         if !out.is_empty() && !ends_with_newline(&out) {
@@ -1195,6 +1205,8 @@ pub fn to_plain(src: &str) -> String {
     for chunk in render(src) {
         match chunk {
             Chunk::Text(t, _) => s.push_str(&t),
+            // In a one-line preview a rule is a separator, not a wall.
+            Chunk::Rule(_) => s.push(' '),
             Chunk::Link(label, url, _) => {
                 s.push_str(&label);
                 if label != url && !url.is_empty() {
@@ -1955,13 +1967,22 @@ mod tests {
     /// the close is consumed silently.
     #[test]
     fn hr_close_tag_is_consumed_not_rendered() {
-        let text = texts(&render("[HR][/HR]\nText after")).concat();
+        let chunks = render("[HR][/HR]\nText after");
+        let text = texts(&chunks).concat();
         assert!(!text.contains("[/HR]"), "{text:?}");
-        assert!(text.contains("───"), "{text:?}");
+        // #703: the rule is a chunk of its own now, not dashes in the text —
+        // the renderer draws it across the pane.
+        assert_eq!(
+            chunks.iter().filter(|c| matches!(c, Chunk::Rule(_))).count(),
+            1,
+            "{chunks:#?}"
+        );
         assert!(text.contains("Text after"), "{text:?}");
-        // Search snippets go through `to_plain` and must not carry it either
-        // (the rule text itself survives, space-joined by to_plain).
-        assert_eq!(to_plain("[HR][/HR]rule"), "─── rule");
+        // Search snippets go through `to_plain`, which must carry neither
+        // the tag nor a stub of dashes.
+        let plain = to_plain("[HR][/HR]rule");
+        assert!(!plain.contains("[/HR]") && !plain.contains('\u{2500}'), "{plain:?}");
+        assert!(plain.contains("rule"), "{plain:?}");
     }
 
     /// Uncapped nesting must not change what a normally-nested post renders
@@ -2617,6 +2638,44 @@ mod tests {
             styled >= posts,
             "these posts all carry styling tags: {styled} styled runs across {posts} posts"
         );
+    }
+
+    /// #703: `[HR]` is a rule of its own, not a run of dashes glued into the
+    /// text. XF renders `<hr />`, and 52,557 posts here use it — including
+    /// the `[HR][/HR]` spelling the news template writes (#610).
+    #[test]
+    fn a_rule_is_its_own_chunk() {
+        let chunks = render("above[HR]below");
+        let rules = chunks.iter().filter(|c| matches!(c, Chunk::Rule(_))).count();
+        assert_eq!(rules, 1, "{chunks:#?}");
+        // It separates the two runs rather than joining them.
+        let rule_at = chunks.iter().position(|c| matches!(c, Chunk::Rule(_))).unwrap();
+        let text_before: String = chunks[..rule_at]
+            .iter()
+            .filter_map(|c| match c {
+                Chunk::Text(t, _) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        let text_after: String = chunks[rule_at..]
+            .iter()
+            .filter_map(|c| match c {
+                Chunk::Text(t, _) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text_before.contains("above") && !text_before.contains("below"));
+        assert!(text_after.contains("below"));
+
+        // The closing half of `[HR][/HR]` still emits nothing extra (#610).
+        assert_eq!(
+            render("[HR][/HR]")
+                .iter()
+                .filter(|c| matches!(c, Chunk::Rule(_)))
+                .count(),
+            1
+        );
+        assert!(!to_plain("a[HR]b").contains('\u{2500}'), "no dashes in a preview");
     }
 
     /// Every colour spelling XF's editor and its users actually produce.

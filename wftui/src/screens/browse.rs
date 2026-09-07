@@ -1453,7 +1453,7 @@ pub(crate) fn chunk_lines(
     theme: &Theme,
     reveal_spoilers: bool,
 ) -> Vec<Vec<Span<'static>>> {
-    chunk_lines_aligned(chunks, links, theme, reveal_spoilers)
+    chunk_lines_aligned(chunks, links, theme, reveal_spoilers, RuleWidth::default())
         .into_iter()
         .map(|(line, _)| line)
         .collect()
@@ -1462,11 +1462,38 @@ pub(crate) fn chunk_lines(
 /// `chunk_lines`, keeping each logical line's alignment (#702). Alignment is
 /// a property of the line, not of a span, so it has to survive the trip from
 /// the parser to the wrapper — which is the only place the width is known.
+/// How wide a `[HR]` should be drawn, and out of what (#703). A rule spans
+/// the pane, so only the caller knows it; `Default` is the narrow stub used
+/// where there is no width to speak of.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RuleWidth {
+    pub cells: usize,
+    pub ascii: bool,
+}
+
+impl Default for RuleWidth {
+    fn default() -> Self {
+        RuleWidth { cells: 3, ascii: false }
+    }
+}
+
+impl RuleWidth {
+    pub fn of(cells: usize, g: &Glyphs) -> Self {
+        RuleWidth { cells, ascii: g.ascii }
+    }
+
+    fn span(&self, theme: &Theme) -> Span<'static> {
+        let ch = if self.ascii { "-" } else { "\u{2500}" };
+        Span::styled(ch.repeat(self.cells.max(1)), theme.faint())
+    }
+}
+
 pub(crate) fn chunk_lines_aligned(
     chunks: &[Chunk],
     links: &mut Vec<String>,
     theme: &Theme,
     reveal_spoilers: bool,
+    rule: RuleWidth,
 ) -> Vec<(Vec<Span<'static>>, common::bbcode::Align)> {
     let mut aligns: Vec<common::bbcode::Align> = Vec::new();
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
@@ -1482,7 +1509,10 @@ pub(crate) fn chunk_lines_aligned(
     };
     for chunk in chunks {
         let chunk_align = match chunk {
-            Chunk::Text(_, st) | Chunk::Link(_, _, st) | Chunk::Attach(_, st) => st.align,
+            Chunk::Text(_, st)
+            | Chunk::Link(_, _, st)
+            | Chunk::Attach(_, st)
+            | Chunk::Rule(st) => st.align,
             Chunk::Image { style, .. } => style.align,
         };
         if !matches!(chunk_align, common::bbcode::Align::Left) {
@@ -1564,6 +1594,16 @@ pub(crate) fn chunk_lines_aligned(
                     format!("[attachment {id}]"),
                     style_from(theme, s, reveal_spoilers),
                 ));
+            }
+            // #703: a rule owns its line and spans the pane. XF renders
+            // `<hr />`; a fixed run of dashes mid-line is not that.
+            Chunk::Rule(_) => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                    flush_align(&mut aligns, cur_align);
+                }
+                out.push(vec![rule.span(theme)]);
+                flush_align(&mut aligns, common::bbcode::Align::Left);
             }
         }
     }
@@ -1747,6 +1787,7 @@ impl ThreadViewState {
                     &mut links,
                     theme,
                     self.reveal_spoilers,
+                    RuleWidth::of(body_w, g),
                 ) {
                     for wrapped in wrap_spans_aligned(&logical, body_w, align) {
                         lines.push(gutter(wrapped));
@@ -1767,6 +1808,7 @@ impl ThreadViewState {
                 &mut links,
                 theme,
                 self.reveal_spoilers,
+                RuleWidth::of(body_w, g),
             ) {
                 for wrapped in wrap_spans_aligned(&logical, body_w, align) {
                     lines.push(gutter(wrapped));
@@ -3670,6 +3712,55 @@ mod tests {
     /// #693: a picture the message references renders WHERE the message
     /// puts it, and only the attachments the message never mentioned are
     /// listed underneath — the same split XenForo renders.
+    /// #703: `[HR]` is a rule across the pane, not three dashes dropped
+    /// mid-line. 52,557 posts on this site use it — every AI news article
+    /// writes one — and XF renders it as `<hr />`.
+    #[test]
+    fn a_horizontal_rule_spans_the_pane_on_its_own_line() {
+        let theme = Theme::truecolor();
+        let mut s = thread_view_fixture();
+        s.posts[0].message = "above[HR]below".into();
+        s.posts[0].attachments.clear();
+        s.width = 0;
+        s.rebuild_lines(&theme, &UNICODE);
+
+        let text: Vec<String> = s
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+            .collect();
+        let rule_row = text
+            .iter()
+            .position(|l| l.contains("\u{2500}\u{2500}\u{2500}\u{2500}"))
+            .unwrap_or_else(|| panic!("no rule in {text:#?}"));
+        let above = text.iter().position(|l| l.contains("above")).expect("above");
+        let below = text.iter().position(|l| l.contains("below")).expect("below");
+        assert!(above < rule_row && rule_row < below, "the rule separates them");
+
+        // It spans the body, not a fixed stub, and shares its row with
+        // nothing but the gutter.
+        let rule_text = &text[rule_row];
+        let dashes = rule_text.chars().filter(|c| *c == '\u{2500}').count();
+        assert!(dashes > 20, "a rule spans the pane, got {dashes}: {rule_text:?}");
+        assert!(
+            !rule_text.contains("above") && !rule_text.contains("below"),
+            "the rule owns its line: {rule_text:?}"
+        );
+
+        // The ASCII glyph set draws it out of hyphens, like everything else.
+        s.width = 0;
+        s.rebuild_lines(&theme, &crate::glyph::ASCII);
+        let ascii: Vec<String> = s
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+            .collect();
+        assert!(
+            ascii.iter().any(|l| l.contains("-----") && !l.contains("above")),
+            "{ascii:#?}"
+        );
+    }
+
     /// #702: `[CENTER]` and `[RIGHT]` land where the eye expects, and
     /// `[JUSTIFY]` deliberately does not stretch gaps — in a terminal that
     /// reads as damage, not as typesetting.
