@@ -65,9 +65,17 @@ pub const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 /// WebP claiming 30000×30000 asks for a ~3.6 GB RGBA buffer, and some
 /// decoders allocate straight from the header). The allocation failure would
 /// abort the process — unwinding past `catch_unwind` and the terminal
-/// restore — so refuse anything over a generous 8K square before a pixel is
-/// read.
-pub const MAX_DECODE_DIM: u32 = 8192;
+/// restore — so refuse anything oversized before a pixel is read.
+///
+/// 4K per axis, not 8K (issue #679): the target is a thumbnail of at most
+/// ~200×24 cells, and 8192² RGBA is a 268 MB transient for something that
+/// ends up a few kilobytes of escape payload.
+pub const MAX_DECODE_DIM: u32 = 4096;
+/// Companion byte budget for the decoded buffer. A per-axis cap alone still
+/// admits 4096×4096 (67 MB); this is what the decoder actually bills its
+/// allocations against, so a lopsided 4096×2048×4 image is refused on the
+/// same rule as a square one.
+pub const MAX_DECODE_ALLOC: u64 = 64 * 1024 * 1024;
 /// Decoded protocols kept in memory. Each is an encoded payload sized for one
 /// rect, so this is bounded by roughly (visible images × panel sizes seen).
 pub const LRU_CAP: usize = 32;
@@ -806,9 +814,10 @@ pub fn decode(
     use ratatui::layout::Size;
     use ratatui_image::{FilterType, Resize};
     let mut limits = image::Limits::default();
-    // Enforce MAX_DECODE_DIM before any decoder allocates from the header.
+    // Enforce the caps before any decoder allocates from the header.
     limits.max_image_width = Some(MAX_DECODE_DIM);
     limits.max_image_height = Some(MAX_DECODE_DIM);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
     reader.limits(limits);
     let img = reader
@@ -976,6 +985,23 @@ mod tests {
                 || err.to_lowercase().contains("limit"),
             "expected a limits rejection, got: {err}"
         );
+    }
+
+    /// Issue #679: the old ceiling was 8K per axis, so a 6000×6000 image —
+    /// perfectly decodable, and pure waste for a thumbnail — cost a 144 MB
+    /// RGBA transient. It must now be refused and fall back to the
+    /// placeholder like any other unreadable image.
+    #[cfg(feature = "images")]
+    #[test]
+    fn decode_refuses_an_image_far_larger_than_any_thumbnail_needs() {
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        for (w, h) in [(6_000, 6_000), (4_000, 8_000)] {
+            let big = bmp(w, h, &[]);
+            assert!(
+                decode(&picker, &big, 39, 12).is_err(),
+                "{w}x{h} must be refused by the decode caps"
+            );
+        }
     }
 
     #[cfg(feature = "images")]
