@@ -579,7 +579,7 @@ pub fn rebuild_resource_lines(s: &mut super::ResourceViewState, theme: &Theme, g
     }
 
     if !r.tags.is_empty() {
-        let mut tags: Vec<String> = r.tags.values().map(|t| t.tag.clone()).collect();
+        let mut tags = r.tags.clone();
         tags.sort();
         s.lines.push(Line::from(Span::raw("")));
         s.lines.push(Line::from(Span::styled(

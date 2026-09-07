@@ -254,7 +254,10 @@ pub enum Msg {
     /// a reply that outraced a newer request is dropped instead of landing in
     /// whichever list happens to be on top (`Gate::wait` only spaces request
     /// *starts*, so two `load_forum` calls can finish out of order).
-    ForumLoaded { node_id: u32, page: u32, result: TaskResult<ForumReply> },
+    /// `append` marks a viewport-fill page (#699): it extends the list
+    /// rather than replacing it, so a tall terminal is not left showing 20
+    /// rows in a pane with room for 45.
+    ForumLoaded { node_id: u32, page: u32, append: bool, result: TaskResult<ForumReply> },
     ThreadLoaded { id: u32, page: u32, result: TaskResult<ThreadReply> },
     ReplySent(TaskResult<Post>),
     ThreadCreated(TaskResult<Thread>),
@@ -2851,6 +2854,11 @@ impl App {
     }
 
     pub fn load_forum(&mut self, node_id: u32, page: u32) {
+        self.load_forum_page(node_id, page, false);
+    }
+
+    /// `append` marks a viewport-fill page (#699) — see `Msg::ForumLoaded`.
+    pub fn load_forum_page(&mut self, node_id: u32, page: u32, append: bool) {
         let api = self.api.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -2871,7 +2879,7 @@ impl App {
             } else {
                 api.forum(node_id, page).await.map_err(|e| TaskError::of(&e))
             };
-            tx.send(Msg::ForumLoaded { node_id, page, result }).ok();
+            tx.send(Msg::ForumLoaded { node_id, page, append, result }).ok();
         });
     }
 
@@ -3546,7 +3554,8 @@ impl App {
                     }
                 }
             }
-            Msg::ForumLoaded { node_id, page, result } => {
+            Msg::ForumLoaded { node_id, page, append, result } => {
+                let mut fill_next: Option<(u32, u32)> = None;
                 let list = self.list_mut_for(node_id);
                 if let Some(list) = list {
                     match result {
@@ -3562,20 +3571,49 @@ impl App {
                             // excludes them from `threads`/`pagination` so
                             // they don't shift pagination); prepend them so
                             // they render first without inflating the count.
-                            list.sticky_count = reply.sticky.len();
-                            list.threads = reply.sticky;
-                            list.threads.extend(reply.threads);
-                            list.page = page;
+                            if append && page == list.page + list.pages_loaded {
+                                // A fill page: extend, and never re-prepend
+                                // the sticky rows (they belong to page 1).
+                                list.threads.extend(reply.threads);
+                                list.pages_loaded += 1;
+                            } else {
+                                list.sticky_count = reply.sticky.len();
+                                list.threads = reply.sticky;
+                                list.threads.extend(reply.threads);
+                                list.page = page;
+                                list.pages_loaded = 1;
+                            }
                             list.last_page = reply.pagination.last_page.max(1);
                             list.total = reply.pagination.total;
+                            if reply.pagination.per_page > 0 {
+                                list.per_page = reply.pagination.per_page;
+                            }
                             list.loading = false;
                             list.sel = list.sel.min(list.threads.len().saturating_sub(1));
+                            // Top up while the pane has room and pages remain
+                            // (#699). One page in flight at a time, so this
+                            // walks forward a page per reply rather than
+                            // firing a burst at the gate.
+                            let rows = list.threads.len();
+                            let next = list.page + list.pages_loaded;
+                            if rows < list.visible && next <= list.last_page {
+                                list.loading = true;
+                                fill_next = Some((node_id, next));
+                            }
                         }
                         Err(e) => {
                             list.loading = false;
-                            list.error = Some(e.message);
+                            // A fill page that fails leaves what is already
+                            // on screen alone: the rows the reader is looking
+                            // at are still good.
+                            if !append {
+                                list.error = Some(e.message);
+                            }
                         }
                     }
+                }
+                if let Some((node_id, page)) = fill_next {
+                    self.load_forum_page(node_id, page, true);
                 }
             }
             Msg::ThreadLoaded { id, page, result } => {
@@ -4820,6 +4858,7 @@ mod tests {
         app.handle_msg(Msg::ForumLoaded {
             node_id: 1,
             page: 1,
+            append: false,
             result: Ok(ForumReply::default()),
         });
         {
@@ -6894,6 +6933,7 @@ mod tests {
         app.handle_msg(Msg::ForumLoaded {
             node_id: 0,
             page: 1,
+            append: false,
             result: Err(TaskError {
                 message: "not logged in".into(),
                 code: None,
@@ -7941,6 +7981,120 @@ mod tests {
         );
     }
 
+    /// #699: XF fixes the page size server-side (20 rows, and it ignores
+    /// `per_page`/`limit`), so a tall terminal was left showing 20 rows in a
+    /// pane with room for 45. A reply that does not fill the pane pulls the
+    /// next page in and appends it — one page in flight at a time — and it
+    /// stops as soon as the pane is full or the pages run out.
+    #[tokio::test]
+    async fn a_short_page_pulls_in_the_next_one_until_the_pane_is_full() {
+        let page_of = |n: u32, count: usize| ForumReply {
+            forum: common::models::Forum { node_id: 4, title: "Windows News".into(), ..Default::default() },
+            threads: (0..count)
+                .map(|i| Thread {
+                    thread_id: n * 100 + i as u32,
+                    title: format!("thread {n}-{i}"),
+                    ..Default::default()
+                })
+                .collect(),
+            sticky: Vec::new(),
+            pagination: common::models::Pagination {
+                current_page: n,
+                last_page: 3,
+                total: 50,
+                per_page: 20,
+            },
+        };
+
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        // A pane with room for 45 rows.
+        if let Some(Screen::Home(h)) = app.screens.last_mut() {
+            h.list.visible = 45;
+            h.list.node_id = 4;
+        }
+
+        app.handle_msg(Msg::ForumLoaded {
+            node_id: 4,
+            page: 1,
+            append: false,
+            result: Ok(page_of(1, 20)),
+        });
+        let list = |app: &App| match app.screens.last() {
+            Some(Screen::Home(h)) => (
+                h.list.threads.len(),
+                h.list.page,
+                h.list.pages_loaded,
+                h.list.loading,
+            ),
+            _ => panic!("home"),
+        };
+        assert_eq!(list(&app), (20, 1, 1, true), "20 rows in a 45-row pane must ask for more");
+
+        app.handle_msg(Msg::ForumLoaded {
+            node_id: 4,
+            page: 2,
+            append: true,
+            result: Ok(page_of(2, 20)),
+        });
+        assert_eq!(list(&app), (40, 1, 2, true), "still short of 45: keep going");
+
+        app.handle_msg(Msg::ForumLoaded {
+            node_id: 4,
+            page: 3,
+            append: true,
+            result: Ok(page_of(3, 10)),
+        });
+        let (rows, page, loaded, loading) = list(&app);
+        assert_eq!((rows, page, loaded), (50, 1, 3));
+        assert!(!loading, "the last page ends the fill even though the pane has room");
+
+        // A fresh (non-append) load replaces rather than piling up.
+        app.handle_msg(Msg::ForumLoaded {
+            node_id: 4,
+            page: 2,
+            append: false,
+            result: Ok(page_of(2, 20)),
+        });
+        let (rows, page, loaded, _) = list(&app);
+        assert_eq!((rows, page, loaded), (20, 2, 1), "a real page turn starts over");
+    }
+
+    /// A fill page that fails leaves the rows already on screen alone: the
+    /// reader is looking at good data, and an error banner over it would be
+    /// a lie about what they can see.
+    #[tokio::test]
+    async fn a_failed_fill_page_does_not_error_the_rows_already_shown() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        if let Some(Screen::Home(h)) = app.screens.last_mut() {
+            h.list.node_id = 4;
+            h.list.threads = vec![Thread { thread_id: 1, ..Default::default() }];
+            h.list.page = 1;
+            h.list.pages_loaded = 1;
+            h.list.loading = true;
+        }
+        app.handle_msg(Msg::ForumLoaded {
+            node_id: 4,
+            page: 2,
+            append: true,
+            result: Err(TaskError {
+                message: "gateway timeout".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::Other,
+            }),
+        });
+        match app.screens.last() {
+            Some(Screen::Home(h)) => {
+                assert!(h.list.error.is_none(), "no banner over good rows");
+                assert_eq!(h.list.threads.len(), 1);
+                assert!(!h.list.loading);
+            }
+            _ => panic!("home"),
+        }
+    }
+
     /// #680: a catalog page fills the topmost screen it belongs to, and a
     /// reply that arrives for a screen which is not waiting on one is
     /// dropped — the same stale-reply discipline every other load follows.
@@ -7962,6 +8116,7 @@ mod tests {
                     current_page: 1,
                     last_page: 4,
                     total: 80,
+                    per_page: 12,
                 },
             }),
         });

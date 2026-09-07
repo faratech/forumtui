@@ -27,6 +27,12 @@ pub struct Pagination {
     pub last_page: u32,
     #[serde(default)]
     pub total: u64,
+    /// Rows the server puts on a page. Fixed server-side (XF ignores
+    /// `per_page`/`limit` on the API), and the client reads it rather than
+    /// inferring it from a page's length — an inferred figure is wrong as
+    /// soon as more than one page is on screen (#699).
+    #[serde(default)]
+    pub per_page: u32,
 }
 
 /// `{"errors":[{"code":..,"message":..,"params":..}]}`
@@ -864,6 +870,8 @@ pub struct MediaItem {
     pub rating_avg: Option<f64>,
     #[serde(default, deserialize_with = "null_default")]
     pub rating_count: u64,
+    #[serde(default, deserialize_with = "deserialize_tags")]
+    pub tags: Vec<String>,
 }
 
 impl MediaItem {
@@ -981,8 +989,12 @@ pub struct Resource {
     pub resource_category_id: u32,
     #[serde(default, rename = "Category")]
     pub category: Option<ResourceCategoryRef>,
-    #[serde(default, deserialize_with = "null_default")]
-    pub tags: std::collections::HashMap<String, TagRef>,
+    /// XF sends this as a plain array of strings here (`[]` when empty), but
+    /// keys it by tag id on some endpoints — `deserialize_tags` takes either
+    /// shape (#698). Assuming the map cost the whole Resources list: an
+    /// unexpected sequence fails the entire reply, not just the field.
+    #[serde(default, deserialize_with = "deserialize_tags")]
+    pub tags: Vec<String>,
 }
 
 /// The nested `Category` object the single-resource call includes.
@@ -994,11 +1006,43 @@ pub struct ResourceCategoryRef {
     pub title: String,
 }
 
-/// One entry of XF's `tags` map (`{"12": {"tag": "networking", …}}`).
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct TagRef {
-    #[serde(default, deserialize_with = "null_default")]
-    pub tag: String,
+/// Tags, whichever way XF spells them (#698): `["bg3"]` on the resource and
+/// media endpoints, `{"12": {"tag": "bg3"}}` where they are keyed by id, and
+/// `null` or absent on content that has none. Anything unrecognised inside
+/// is skipped rather than failing the reply — a tag is decoration, and no
+/// tag is worth losing a page over.
+/// Test-only alias so the tags decoder can be exercised directly.
+#[cfg(test)]
+pub(crate) fn deserialize_tags_for_test<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_tags(d)
+}
+
+fn deserialize_tags<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(Vec::new());
+    };
+    let one = |v: &serde_json::Value| -> Option<String> {
+        match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Object(o) => o
+                .get("tag")
+                .and_then(|t| t.as_str())
+                .map(|t| t.to_string()),
+            _ => None,
+        }
+    };
+    Ok(match value {
+        serde_json::Value::Array(items) => items.iter().filter_map(one).collect(),
+        serde_json::Value::Object(map) => map.values().filter_map(one).collect(),
+        _ => Vec::new(),
+    })
 }
 
 /// `GET /api/resources/{id}`.

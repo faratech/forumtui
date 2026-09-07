@@ -468,15 +468,36 @@ fn list_range(s: &ThreadListState) -> Option<String> {
         return None;
     }
     // Sticky threads are prepended into `threads` for display but are never
-    // part of `pagination.total` or this page's row count — exclude them.
+    // part of `pagination.total` or a page's row count — exclude them.
     let len = (s.threads.len() - s.sticky_count) as u64;
-    let (start, end) = if s.page >= s.last_page.max(1) && s.total >= len {
+    // The server's own page size when it sent one (#699): inferring it from
+    // `len` is wrong as soon as the viewport fill puts more than one page on
+    // screen, and wrong again on a short last page. Without it, keep the
+    // original reasoning — count backwards from the total on the last page,
+    // forwards everywhere else.
+    let (start, end) = if s.per_page > 0 {
+        let start = (s.page.max(1) as u64 - 1) * s.per_page as u64 + 1;
+        (start, (start + len - 1).min(s.total.max(start)))
+    } else if s.page >= s.last_page.max(1) && s.total >= len {
         (s.total - len + 1, s.total)
     } else {
         let start = (s.page.max(1) as u64 - 1) * len + 1;
         (start, start + len - 1)
     };
     Some(format!("{start}\u{2013}{end} of {}", s.total))
+}
+
+/// `page 2 of 18`, or `pages 2-3 of 18` once the viewport fill has pulled in
+/// more than one page (#699) — the cap must not claim a single page when the
+/// pane is showing two.
+pub(crate) fn page_cap(page: u32, pages_loaded: u32, last_page: u32) -> String {
+    let first = page.max(1);
+    let last = first + pages_loaded.max(1) - 1;
+    if last > first {
+        format!("pages {first}-{last} of {}", last_page.max(1))
+    } else {
+        format!("page {first} of {}", last_page.max(1))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -496,7 +517,7 @@ pub(crate) fn render_thread_panel(
     } else {
         s.title.clone()
     };
-    let right = format!("page {} of {}", s.page.max(1), s.last_page.max(1));
+    let right = page_cap(s.page, s.pages_loaded, s.last_page);
     let bottom = list_range(s);
     let block = chrome::panel(
         theme,
@@ -557,6 +578,8 @@ pub(crate) fn render_thread_panel(
         .map(|t| ListItem::new(thread_row(t, theme, g, gram, iw)))
         .collect();
     let mut state = ListState::default().with_selected(Some(s.sel.min(s.threads.len() - 1)));
+    // What "enough rows to fill the pane" means for the fill loop (#699).
+    s.visible = list_area.height as usize;
     let list = List::new(items);
     let list = if focused {
         list.highlight_style(theme.selected())
@@ -930,9 +953,13 @@ pub fn thread_list_key(s: &mut ThreadListState, key: KeyEvent) -> Action {
             if s.loading {
                 return Action::Notice("Already loading — one moment.".into());
             }
+            // The window, not one server page (#699): with pages 3-5 on
+            // screen, `[` goes back to the page before 3, so paging never
+            // re-shows rows the reader just passed.
             if s.page > 1 {
                 s.loading = true;
-                Action::LoadForum(s.node_id, s.page - 1)
+                let back = s.pages_loaded.max(1);
+                Action::LoadForum(s.node_id, s.page.saturating_sub(back).max(1))
             } else {
                 Action::None
             }
@@ -941,9 +968,13 @@ pub fn thread_list_key(s: &mut ThreadListState, key: KeyEvent) -> Action {
             if s.loading {
                 return Action::Notice("Already loading — one moment.".into());
             }
-            if s.page < s.last_page {
+            // Likewise forward: the next page is the one after the LAST page
+            // the fill pulled in, not `page + 1` — that one is already on
+            // screen.
+            let next = s.page.max(1) + s.pages_loaded.max(1);
+            if next <= s.last_page {
                 s.loading = true;
-                Action::LoadForum(s.node_id, s.page + 1)
+                Action::LoadForum(s.node_id, next)
             } else {
                 Action::None
             }
@@ -2468,6 +2499,71 @@ mod tests {
         // No total from the server -> no footer at all.
         s.total = 0;
         assert!(list_range(&s).is_none());
+    }
+
+    /// #699: paging moves by the WINDOW the fill built, not by one server
+    /// page. With pages 1-3 on screen, `]` must go to 4 — `page + 1` would
+    /// re-show page 2, which the reader has already scrolled past.
+    #[test]
+    fn paging_steps_over_every_page_the_fill_pulled_in() {
+        let base = || ThreadListState {
+            node_id: 4,
+            threads: vec![Thread::default(); 60],
+            page: 1,
+            pages_loaded: 3,
+            per_page: 20,
+            last_page: 22,
+            total: 431,
+            ..Default::default()
+        };
+        let mut s = base();
+        let act = thread_list_key(&mut s, KeyEvent::from(KeyCode::Char(']')));
+        assert!(
+            matches!(act, Action::LoadForum(4, 4)),
+            "] must skip the whole window"
+        );
+
+        let mut s = base();
+        s.page = 4;
+        let act = thread_list_key(&mut s, KeyEvent::from(KeyCode::Char('[')));
+        assert!(matches!(act, Action::LoadForum(4, 1)), "[ steps back a window");
+
+        // The window can run past the end: nothing to turn to then.
+        let mut s = base();
+        s.page = 20;
+        s.pages_loaded = 3;
+        let act = thread_list_key(&mut s, KeyEvent::from(KeyCode::Char(']')));
+        assert!(matches!(act, Action::None), "no page after the last one");
+    }
+
+    /// #699: once the viewport fill holds several pages, the range spans all
+    /// of them — and the arithmetic uses the server's own page size, because
+    /// a 40-row list on page 2 does NOT mean pages are 40 rows long.
+    #[test]
+    fn list_range_spans_every_page_the_viewport_fill_pulled_in() {
+        let s = ThreadListState {
+            threads: vec![Thread::default(); 40],
+            page: 1,
+            pages_loaded: 2,
+            per_page: 20,
+            last_page: 22,
+            total: 431,
+            ..Default::default()
+        };
+        assert_eq!(list_range(&s).as_deref(), Some("1\u{2013}40 of 431"));
+
+        let s = ThreadListState {
+            threads: vec![Thread::default(); 40],
+            page: 3,
+            pages_loaded: 2,
+            per_page: 20,
+            last_page: 22,
+            total: 431,
+            ..Default::default()
+        };
+        assert_eq!(list_range(&s).as_deref(), Some("41\u{2013}80 of 431"));
+        assert_eq!(page_cap(3, 2, 22), "pages 3-4 of 22");
+        assert_eq!(page_cap(3, 1, 22), "page 3 of 22");
     }
 
     /// Prepending sticky threads (issue #518) must not inflate the `1–20 of

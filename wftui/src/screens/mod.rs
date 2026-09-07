@@ -89,12 +89,24 @@ pub struct ThreadListState {
     /// counted towards `pagination.total` or a page's row count — see
     /// `list_range`).
     pub sticky_count: usize,
+    /// The FIRST page held in `threads`. More may follow it: a page is 20
+    /// rows server-side and a tall terminal shows far more, so the app keeps
+    /// fetching the next page until the pane is full (#699).
     pub page: u32,
     pub last_page: u32,
+    /// Consecutive pages held, starting at `page`. 1 unless the viewport
+    /// asked for more.
+    pub pages_loaded: u32,
+    /// `pagination.per_page`, so the range footer stays right across a
+    /// multi-page fill.
+    pub per_page: u32,
     /// `pagination.total` when the server sends one — the `1–20 of 431` panel
     /// footer. 0 means "unknown", and the footer is then omitted.
     pub total: u64,
     pub sel: usize,
+    /// Body rows the last render could show, stamped by the renderer: what
+    /// "enough to fill the pane" means for the fill loop.
+    pub visible: usize,
     pub loading: bool,
     pub error: Option<String>,
 }
