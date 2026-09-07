@@ -12,6 +12,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -56,6 +58,12 @@ jobs:
 
       - name: Build release tarball (no-images)
         run: packaging/linux/build-tarball.sh --no-images
+
+      - name: Generate artifact attestation (Linux)
+        uses: actions/attest-build-provenance@1a1e8bfc1e22a1bdc8daca44b85ce38c7eb72032 # v1
+        continue-on-error: true
+        with:
+          subject-path: dist/*.tar.gz*
 
       - name: Upload tarballs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -115,6 +123,14 @@ jobs:
               -Version '${{ steps.version.outputs.version }}' `
               -OutDir 'dist'
         shell: pwsh
+
+      - name: Generate artifact attestation (Windows)
+        uses: actions/attest-build-provenance@1a1e8bfc1e22a1bdc8daca44b85ce38c7eb72032 # v1
+        continue-on-error: true
+        with:
+          subject-path: |
+            dist/*.msix
+            dist/*.msixbundle
 
       - name: Upload MSIX packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
