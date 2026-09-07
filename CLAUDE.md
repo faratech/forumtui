@@ -370,6 +370,11 @@ no thread, so no thread view can ever hint at it.
 
 Draft rules worth knowing before touching `pop_screen` or `push_screen`:
 
+- **A seeded body wins; the draft goes under it.** `Q` seeds the composer
+  with a quote of a specific post the reader just asked for, so the draft
+  must not swallow it — it is appended below the quote, where a reply goes.
+  An edit is the exception: its seed is the post's current text and the draft
+  is a newer version of exactly that, so appending would duplicate the post.
 - **Restore lives in `push_screen`, save in `pop_screen`.** Every composer
   reaches the stack through `push_screen`, so a new opener cannot forget to
   restore. Do not add a composer that bypasses it.

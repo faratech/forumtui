@@ -1884,7 +1884,17 @@ impl App {
             c.seed_title = c.title.clone();
             c.seed_body = c.body.clone();
             c.title = draft.title.clone();
-            c.body = draft.body.clone();
+            // A seeded body is material the reader just asked for — `Q`'s
+            // quote of a specific post — so the draft must not swallow it.
+            // The draft goes UNDER the quote, where a reply goes. An edit is
+            // the exception: its seed is the post's current text and the
+            // draft is a newer version of exactly that, so appending would
+            // duplicate the post instead of editing it.
+            let is_edit = matches!(c.target, Some(ComposeTarget::EditPost { .. }));
+            c.body = match (c.body.trim().is_empty(), is_edit) {
+                (false, false) => format!("{}\n\n{}", c.body.trim_end(), draft.body),
+                _ => draft.body.clone(),
+            };
             // The files attached before Esc belong to this draft's key, and
             // without it they are attached to nothing (#709).
             c.attachment_key = draft.attachment_key.clone();
@@ -5941,6 +5951,79 @@ mod tests {
             bar(&mut app).contains("resume draft"),
             "an unsent reply to this thread must be visible from the thread"
         );
+    }
+
+    /// The question a reader actually asks: I wrote something, pressed Esc,
+    /// came back to the thread later and pressed `r` — is it there? Driven
+    /// through the real key handler, not by calling `reply_to_thread`, so it
+    /// covers the whole path from the keystroke.
+    #[tokio::test]
+    async fn pressing_r_in_a_thread_reopens_the_draft() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 7, title: "A thread".into(), ..Default::default() },
+            ..Default::default()
+        }));
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('r')));
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "half a reply".into();
+        } else {
+            panic!("r must open the composer");
+        }
+        app.pop_screen();
+        assert!(
+            matches!(app.screens.last(), Some(Screen::ThreadView(_))),
+            "Esc returns to the thread"
+        );
+
+        // ... later, from the same thread.
+        app.handle_key(KeyEvent::from(KeyCode::Char('r')));
+        match app.screens.last() {
+            Some(Screen::Compose(c)) => {
+                assert_eq!(c.body, "half a reply", "the draft must be waiting");
+                assert!(c.resumed);
+            }
+            other => panic!("expected the composer, got {:?}", other.map(|s| s.title())),
+        }
+    }
+
+    /// `Q` is different, and the difference matters: it seeds the composer
+    /// with a quote of the selected post. A draft must not silently swallow
+    /// that — the reader just asked for this specific quote, so the quote
+    /// wins and the draft is appended under it rather than thrown away.
+    #[tokio::test]
+    async fn quoting_keeps_both_the_quote_and_the_draft() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.drafts.insert(
+            common::drafts::DraftKey::ThreadReply(7),
+            common::drafts::Draft { body: "half a reply".into(), ..Default::default() },
+        );
+
+        let thread = Thread { thread_id: 7, title: "A thread".into(), ..Default::default() };
+        let post = Post {
+            post_id: 99,
+            thread_id: 7,
+            user_id: 3,
+            username: "someone".into(),
+            message: "the quoted words".into(),
+            ..Default::default()
+        };
+        app.execute_action(Action::StartReplyQuoting(thread, Box::new(post)));
+
+        match app.screens.last() {
+            Some(Screen::Compose(c)) => {
+                assert!(c.body.contains("the quoted words"), "the quote must survive: {:?}", c.body);
+                assert!(c.body.contains("half a reply"), "and so must the draft: {:?}", c.body);
+                assert!(
+                    c.body.find("the quoted words") < c.body.find("half a reply"),
+                    "the draft belongs under the quote, where a reply goes"
+                );
+            }
+            _ => panic!("expected the composer"),
+        }
     }
 
     /// GUARD (issue #565). No test may read or write the machine owner's
