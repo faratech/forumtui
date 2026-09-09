@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "base64ct",
@@ -3878,7 +3878,7 @@ dependencies = [
 
 [[package]]
 name = "wftui"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "common",

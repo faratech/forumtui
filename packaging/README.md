@@ -54,13 +54,10 @@ build box. What's checked in here is everything short of that:
 1. Rust (rustup) + the MSVC toolchain, and the Windows SDK (specifically the
    "MSIX Packaging Tool" / "Signing Tools for Desktop Apps" component, for
    `makeappx.exe`).
-2. Copy the signing kit from this server's `/root/.sign` to `C:\code\sign`
-   on the build box (or wherever `-SignKitRoot` will point). Fill in the
-   client secret in `.env.codesigning` there — see `C:\code\sign\CLAUDE.md`
-   for the full setup and troubleshooting notes; do not commit that
-   directory anywhere, it holds a live Azure credential.
-3. `C:\code\sign\test-signing.ps1` should report PASS before you run a real
-   build.
+2. Run `packaging/msix/signing/install-dlib.ps1` to restore the signing library.
+3. Set `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` in the environment. GitHub Actions reads these from repository secrets. Never commit their values.
+
+EXEs are dual-signed before packaging: Fara Technologies LLC first, Mike Fara second. MSIX packages keep the single Mike Fara signature matching their existing publisher identity.
 
 ### Build + sign
 

@@ -16,7 +16,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::token::{restrict_permissions, tmp_sibling};
+#[cfg(unix)]
+use crate::token::restrict_permissions;
+use crate::token::tmp_sibling;
 
 /// The largest draft that is written to disk. A draft above this stays in
 /// memory for the session — the editor deliberately supports very large
