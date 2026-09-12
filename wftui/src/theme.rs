@@ -294,6 +294,14 @@ impl Theme {
         if term.contains("256color") {
             return Theme::ansi256();
         }
+        if std::env::var_os("WT_SESSION").is_some() || std::env::var_os("WT_PROFILE_ID").is_some() {
+            return Theme::truecolor();
+        }
+        #[cfg(windows)]
+        {
+            return Theme::truecolor();
+        }
+        #[cfg(not(windows))]
         Theme::ansi16()
     }
 

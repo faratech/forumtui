@@ -955,7 +955,7 @@ pub fn decode(
     // ratatui-image 11 takes the target box as a `Size`, not a `Rect` (9 took
     // a Rect and ignored its origin).
     let decoded = picker
-        .new_protocol(img, Size::new(cols, rows), Resize::Fit(Some(FilterType::Triangle)))
+        .new_protocol(img, Size::new(cols, rows), Resize::Fit(Some(FilterType::Lanczos3)))
         .map_err(|e| e.to_string())?;
     Ok(Loaded { decoded, px })
 }
