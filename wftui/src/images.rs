@@ -596,6 +596,59 @@ pub enum DetectPlan {
     Fallback,
 }
 
+/// Infer graphics tier from environment variables without touching stdin.
+///
+/// Many modern terminals (Windows Terminal with Sixel, WezTerm with iTerm2,
+/// Ghostty with Kitty, VS Code with Sixel, Mintty with Sixel) support
+/// high-resolution graphics protocols out of the box and identify themselves
+/// via environment variables.
+pub fn env_graphics_tier<F>(var: &F) -> Option<Tier>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // Windows Terminal 1.22+ supports Sixel graphics.
+    if var("WT_SESSION").is_some() || var("WT_PROFILE_ID").is_some() {
+        return Some(Tier::Sixel);
+    }
+    // WezTerm supports iTerm2 (its cleanest protocol) and Sixel/Kitty.
+    if var("TERM_PROGRAM").as_deref() == Some("WezTerm") || var("WEZTERM_EXECUTABLE").is_some() {
+        return Some(Tier::Iterm2);
+    }
+    // Ghostty has native Kitty graphics protocol support.
+    if var("TERM_PROGRAM").as_deref() == Some("ghostty") {
+        return Some(Tier::Kitty);
+    }
+    // VS Code integrated terminal supports Sixel.
+    if var("TERM_PROGRAM").as_deref() == Some("vscode") {
+        return Some(Tier::Sixel);
+    }
+    // Mintty (Git Bash on Windows) supports Sixel.
+    if var("TERM_PROGRAM").as_deref() == Some("mintty")
+        || (var("TERM").as_deref() == Some("xterm") && var("MSYSTEM").is_some())
+    {
+        return Some(Tier::Sixel);
+    }
+    // Kitty terminal (or derivatives).
+    if var("KITTY_WINDOW_ID").is_some() {
+        return Some(Tier::Kitty);
+    }
+    if let Some(term) = var("TERM") {
+        let term_lower = term.to_ascii_lowercase();
+        if term_lower.contains("kitty") {
+            return Some(Tier::Kitty);
+        }
+        if term_lower.contains("sixel") {
+            return Some(Tier::Sixel);
+        }
+    }
+    if var("LC_TERMINAL").as_deref() == Some("iTerm2")
+        || var("TERM_PROGRAM").as_deref() == Some("iTerm.app")
+    {
+        return Some(Tier::Iterm2);
+    }
+    None
+}
+
 /// Decide the plan. The stdio query is the dangerous step (issue #532:
 /// `ratatui-image` leaks a thread blocked in `read()` with `ICANON`/`ECHO`
 /// cleared whenever the terminal does not answer within 2 s), so it is only
@@ -606,7 +659,10 @@ pub enum DetectPlan {
 /// * Windows never queries. `ratatui-image`'s own source documents ConPTY as
 ///   a terminal that does not reliably deliver the reply, so the query there
 ///   is a guaranteed 2 s stall plus a leaked reader that eats the user's first
-///   keystrokes and re-enables `ENABLE_PROCESSED_INPUT` behind the TUI;
+///   keystrokes and re-enables `ENABLE_PROCESSED_INPUT` behind the TUI.
+///   Instead, environment variables (like `WT_SESSION` for Windows Terminal,
+///   which natively supports Sixel, or `TERM_PROGRAM` for WezTerm / Ghostty /
+///   VS Code) identify high-resolution graphics capabilities without touching stdin;
 /// * a non-terminal stdin (pipe, `< /dev/null`) can never answer either.
 pub fn detect_plan<F>(var: F, windows: bool, stdin_is_tty: bool) -> DetectPlan
 where
@@ -627,8 +683,15 @@ where
             }
         }
     }
-    if windows || !stdin_is_tty {
-        DetectPlan::Fallback
+    if !stdin_is_tty {
+        return DetectPlan::Fallback;
+    }
+    if windows {
+        if let Some(tier) = env_graphics_tier(&var) {
+            DetectPlan::Forced(tier)
+        } else {
+            DetectPlan::Fallback
+        }
     } else {
         DetectPlan::Query
     }
@@ -760,7 +823,7 @@ impl Images {
                 if let Some(proto) = protocol_of(tier) {
                     p.set_protocol_type(proto);
                 }
-                tracing::debug!("graphics tier forced by WFTUI_GRAPHICS: {}", tier.label());
+                tracing::debug!("graphics tier chosen without stdio query: {}", tier.label());
                 p
             }
             DetectPlan::Fallback => {
@@ -1245,6 +1308,58 @@ mod tests {
             _ => None,
         };
         assert_eq!(detect_plan(both, false, true), DetectPlan::TextOnly);
+    }
+
+    #[test]
+    fn windows_detects_graphics_tier_from_terminal_environment() {
+        let wt = |k: &str| (k == "WT_SESSION").then(|| "{guid}".to_string());
+        assert_eq!(detect_plan(wt, true, true), DetectPlan::Forced(Tier::Sixel));
+
+        let wt_prof = |k: &str| (k == "WT_PROFILE_ID").then(|| "{guid}".to_string());
+        assert_eq!(detect_plan(wt_prof, true, true), DetectPlan::Forced(Tier::Sixel));
+
+        let wez = |k: &str| (k == "TERM_PROGRAM").then(|| "WezTerm".to_string());
+        assert_eq!(detect_plan(wez, true, true), DetectPlan::Forced(Tier::Iterm2));
+
+        let wez_exe = |k: &str| (k == "WEZTERM_EXECUTABLE").then(|| "wezterm.exe".to_string());
+        assert_eq!(detect_plan(wez_exe, true, true), DetectPlan::Forced(Tier::Iterm2));
+
+        let ghostty = |k: &str| (k == "TERM_PROGRAM").then(|| "ghostty".to_string());
+        assert_eq!(detect_plan(ghostty, true, true), DetectPlan::Forced(Tier::Kitty));
+
+        let vscode = |k: &str| (k == "TERM_PROGRAM").then(|| "vscode".to_string());
+        assert_eq!(detect_plan(vscode, true, true), DetectPlan::Forced(Tier::Sixel));
+
+        let mintty = |k: &str| (k == "TERM_PROGRAM").then(|| "mintty".to_string());
+        assert_eq!(detect_plan(mintty, true, true), DetectPlan::Forced(Tier::Sixel));
+
+        let kitty = |k: &str| (k == "KITTY_WINDOW_ID").then(|| "1".to_string());
+        assert_eq!(detect_plan(kitty, true, true), DetectPlan::Forced(Tier::Kitty));
+
+        let term_sixel = |k: &str| (k == "TERM").then(|| "xterm-sixel".to_string());
+        assert_eq!(detect_plan(term_sixel, true, true), DetectPlan::Forced(Tier::Sixel));
+
+        let iterm = |k: &str| (k == "LC_TERMINAL").then(|| "iTerm2".to_string());
+        assert_eq!(detect_plan(iterm, true, true), DetectPlan::Forced(Tier::Iterm2));
+
+        // When stdin is not a tty, always fallback
+        assert_eq!(detect_plan(wt, true, false), DetectPlan::Fallback);
+
+        // Explicit off switches still override terminal environment
+        let wt_off = |k: &str| match k {
+            "WT_SESSION" => Some("{guid}".to_string()),
+            "WFTUI_NO_IMAGES" => Some("1".to_string()),
+            _ => None,
+        };
+        assert_eq!(detect_plan(wt_off, true, true), DetectPlan::TextOnly);
+
+        // Explicit graphics override wins over terminal environment
+        let wt_override = |k: &str| match k {
+            "WT_SESSION" => Some("{guid}".to_string()),
+            "WFTUI_GRAPHICS" => Some("kitty".to_string()),
+            _ => None,
+        };
+        assert_eq!(detect_plan(wt_override, true, true), DetectPlan::Forced(Tier::Kitty));
     }
 
     #[test]
