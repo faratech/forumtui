@@ -14,10 +14,33 @@ pub const BASE_URL: &str = "https://windowsforum.com";
 
 /// Origin override for tests/staging (`WFTUI_BASE_URL`).
 pub fn base_url() -> String {
-    std::env::var("WFTUI_BASE_URL")
+    let raw = std::env::var("WFTUI_BASE_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| BASE_URL.to_string())
+        .unwrap_or_else(|| BASE_URL.to_string());
+    raw.trim().trim_end_matches('/').to_string()
+}
+
+/// Normalize and validate the configured site origin once at client
+/// construction. Endpoint builders assume this is an origin, not a path or
+/// query-bearing URL.
+pub fn validate_base_url(raw: &str) -> Result<String, Error> {
+    let normalized = raw.trim().trim_end_matches('/');
+    let url = reqwest::Url::parse(normalized)
+        .map_err(|e| Error::Config(format!("invalid site origin {raw:?}: {e}")))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || (url.path() != "" && url.path() != "/")
+    {
+        return Err(Error::Config(format!(
+            "site origin must be an http(s) origin without credentials, path, query, or fragment: {raw:?}"
+        )));
+    }
+    Ok(normalized.to_string())
 }
 
 pub const OAUTH_AUTHORIZE_PATH: &str = "/oauth2/authorize";
@@ -191,6 +214,24 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("WFTUI_BASE_URL") };
         assert_eq!(api_base(), "https://windowsforum.com/api");
+    }
+
+    #[test]
+    fn base_url_validation_normalizes_only_an_origin() {
+        assert_eq!(
+            validate_base_url("  https://example.test/// ").unwrap(),
+            "https://example.test"
+        );
+        for invalid in [
+            "example.test",
+            "ftp://example.test",
+            "https://example.test/api",
+            "https://user:pass@example.test",
+            "https://example.test/?x=1",
+            "https://example.test/#fragment",
+        ] {
+            assert!(validate_base_url(invalid).is_err(), "accepted {invalid:?}");
+        }
     }
 
     #[test]

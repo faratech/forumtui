@@ -6,6 +6,29 @@
 use super::*;
 
 impl App {
+    /// Spawn work tied to the current authenticated session and retain an
+    /// abort handle for the session boundary. Message-producing callers must
+    /// also wrap their result with `session_msg`; aborting alone cannot remove
+    /// a result that has already reached the channel.
+    pub(super) fn spawn_session_task<F>(&mut self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.session_handles.retain(|h| !h.is_finished());
+        self.session_handles.push(tokio::spawn(fut).abort_handle());
+    }
+
+    pub(super) fn abort_session_tasks(&mut self) {
+        for handle in self.session_handles.drain(..) {
+            handle.abort();
+        }
+    }
+
+    pub(super) fn begin_session(&mut self) {
+        self.abort_session_tasks();
+        self.session_generation = self.session_generation.wrapping_add(1);
+    }
+
     pub(super) async fn bootstrap(&mut self) {
         self.screens.push(screens::home_state(true));
         if self.client.has_tokens().await {
@@ -26,7 +49,7 @@ impl App {
         let api = self.api.clone();
         let tx = self.tx.clone();
         let generation = self.bootstrap_generation;
-        tokio::spawn(async move {
+        self.spawn_session_task(async move {
             let result = api.me().await.map_err(|e| TaskError::of(&e));
             tx.send(Msg::Bootstrap { generation, result }).ok();
         });
@@ -57,7 +80,7 @@ impl App {
         let api = self.api.clone();
         let tx = self.tx.clone();
         let generation = self.bootstrap_generation;
-        tokio::spawn(async move {
+        self.spawn_session_task(async move {
             // Issue #591: make the recheck's report infallible instead of
             // racing a short timer. If this task exits — normally, on a
             // panic, or dropped by a runtime shutdown — without having sent
@@ -191,6 +214,7 @@ impl App {
     /// header over panels that all say "not logged in" (issue #557).
     pub(super) fn end_session(&mut self, reason: &str) {
         self.stop_pollers();
+        self.abort_session_tasks();
         // A write (reply/thread/DM) still waiting on the politeness gates
         // belongs to the session that started it: it must never be sent
         // once that session is over — least of all with the *next*
@@ -198,6 +222,7 @@ impl App {
         self.abort_writes();
         // Anything already in flight belongs to the session being ended.
         self.bootstrap_generation = self.bootstrap_generation.wrapping_add(1);
+        self.session_generation = self.session_generation.wrapping_add(1);
         self.me = None;
         self.alerts_unread = 0;
         self.convos_unread = 0;
@@ -225,8 +250,14 @@ impl App {
         // invariant — nothing pushes over a session-less Login), so keeping
         // whichever one is already there is enough; only push a new one
         // when none survived.
-        self.screens
-            .retain(|s| matches!(s, Screen::Home(_) | Screen::ForumTree(_) | Screen::Login(_)));
+        // Expiry is recoverable state for the same user. Unwind active
+        // screens through the normal lifecycle path so an open composer is
+        // stashed instead of silently discarded (#3), and a thread gets a
+        // last best-effort read-position report. Explicit logout clears the
+        // resulting local drafts immediately after this teardown.
+        while self.screens.len() > 1 && !matches!(self.screens.last(), Some(Screen::Login(_))) {
+            self.pop_screen();
+        }
         if !matches!(self.screens.last(), Some(Screen::Login(_))) {
             self.screens.push(screens::login_state());
         }
@@ -259,13 +290,14 @@ impl App {
         // Alerts poller: unread count for the status bar.
         let api = self.api.clone();
         let tx = self.tx.clone();
+        let generation = self.session_generation;
         self.poller_handles.push(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(common::config::ALERT_POLL_SECS)).await;
                 match api.alerts(1).await {
                     Ok(page) => {
                         let unread = page.alerts.iter().filter(|a| !a.viewed()).count() as u32;
-                        tx.send(Msg::Notice(format!("alerts:{unread}"))).ok();
+                        tx.send(session_msg(generation, Msg::Notice(format!("alerts:{unread}")))).ok();
                     }
                     // A poller is the first thing to notice a session that
                     // has quietly ended (the user is reading, nothing else
@@ -276,7 +308,7 @@ impl App {
                     Err(e) => {
                         let err = TaskError::of(&e);
                         if err.ends_session() {
-                            tx.send(Msg::SessionLost(err)).ok();
+                            tx.send(session_msg(generation, Msg::SessionLost(err))).ok();
                             return;
                         }
                     }
@@ -286,6 +318,7 @@ impl App {
         // Conversations unread poller.
         let api = self.api.clone();
         let tx = self.tx.clone();
+        let generation = self.session_generation;
         self.poller_handles.push(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(
@@ -296,13 +329,13 @@ impl App {
                     Ok(page) => {
                         let unread =
                             common::models::count_unread_conversations(&page.conversations);
-                        tx.send(Msg::Notice(format!("convos:{unread}"))).ok();
+                        tx.send(session_msg(generation, Msg::Notice(format!("convos:{unread}")))).ok();
                     }
                     // See the alerts poller above (issue #557).
                     Err(e) => {
                         let err = TaskError::of(&e);
                         if err.ends_session() {
-                            tx.send(Msg::SessionLost(err)).ok();
+                            tx.send(session_msg(generation, Msg::SessionLost(err))).ok();
                             return;
                         }
                     }
@@ -322,18 +355,20 @@ impl App {
     pub(super) fn poll_unread_now(&mut self) {
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let generation = self.session_generation;
+        self.spawn_session_task(async move {
             if let Ok(page) = api.alerts(1).await {
                 let unread = page.alerts.iter().filter(|a| !a.viewed()).count() as u32;
-                tx.send(Msg::Notice(format!("alerts:{unread}"))).ok();
+                tx.send(session_msg(generation, Msg::Notice(format!("alerts:{unread}")))).ok();
             }
         });
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let generation = self.session_generation;
+        self.spawn_session_task(async move {
             if let Ok(page) = api.conversations(1).await {
                 let unread = common::models::count_unread_conversations(&page.conversations);
-                tx.send(Msg::Notice(format!("convos:{unread}"))).ok();
+                tx.send(session_msg(generation, Msg::Notice(format!("convos:{unread}")))).ok();
             }
         });
     }
@@ -381,6 +416,10 @@ impl App {
     /// and the generation bumped, so neither its poll loop nor a message that
     /// outraced the abort can touch the new flow.
     pub(super) fn begin_login(&mut self) {
+        if self.logout_pending {
+            self.set_hint("Signing out locally — login will be available in a moment.");
+            return;
+        }
         if let Some(task) = self.login_task.take() {
             task.abort();
         }
@@ -405,8 +444,13 @@ impl App {
     // ---- paste handling (bracketed paste and clipboard) ----
 
     pub fn logout(&mut self) {
+        if self.logout_pending {
+            return;
+        }
+        self.logout_pending = true;
         let client = self.client.clone();
         let tx = self.tx.clone();
+        let generation = self.session_generation.wrapping_add(1);
         tokio::spawn(async move {
             // Take the token set out of memory and erase the store *all at
             // once*, before either revoke round-trip — `take_tokens` holds
@@ -424,6 +468,11 @@ impl App {
                 Ok(tokens) => (tokens, Ok(())),
                 Err(e) => (None, Err(e)),
             };
+            let snapshot_result = forgotten
+                .as_ref()
+                .map(|_| ())
+                .map_err(ToString::to_string);
+            tx.send(Msg::LogoutSnapshot { generation, result: snapshot_result }).ok();
             // Revoke the refresh token first and the access token second,
             // each with its `token_type_hint` — the endpoint defaults to
             // `access_token`, so the old single call left the 90-day refresh
@@ -469,16 +518,18 @@ impl App {
                 )),
                 Ok(()) => Ok(()),
             };
-            tx.send(Msg::LoggedOut(result)).ok();
+            tx.send(Msg::LoggedOut { generation, result }).ok();
         });
         // Same teardown as any other session end — including the generation
         // bump that drops a `Msg::Bootstrap` still in flight from a restore
         // the user just signed out of (issue #557).
+        self.end_session("Logged out.");
         // Unsent drafts are this account's private writing: signing out must
         // not leave them on disk for whoever signs in next (#715). A session
-        // that merely *expires* keeps them — that user is coming back.
+        // that merely *expires* keeps them — that user is coming back. The
+        // teardown above first routes an open composer through `pop_screen`,
+        // so clear only after it has had the chance to stash the text.
         self.clear_all_drafts();
-        self.end_session("Logged out.");
     }
 
     // ---- message handling ----

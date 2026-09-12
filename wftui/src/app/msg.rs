@@ -8,6 +8,16 @@ use super::*;
 
 impl App {
     pub(super) fn handle_msg(&mut self, mut msg: Msg) {
+        // A task may finish just as logout or an identity change tears down
+        // the session. Abort handles stop work that is still running, but
+        // cannot retract a result already queued here; the generation wrapper
+        // closes that final race before any handler can touch the new user's
+        // screens or start follow-up work.
+        msg = match msg {
+            Msg::Session { generation, msg } if generation == self.session_generation => *msg,
+            Msg::Session { .. } => return,
+            msg => msg,
+        };
         // A stored-session check from a session that has since ended (the
         // user pressed Ctrl+L while "Restoring session…" was in flight) must
         // not sign anyone back in against an erased token store — issue #557,
@@ -126,6 +136,17 @@ impl App {
                 }
                 let _ = opts.write(true).create(true).truncate(true).open(&path)
                     .and_then(|mut f| std::io::Write::write_all(&mut f, url.as_bytes()));
+                // `OpenOptionsExt::mode` only controls a newly-created inode;
+                // an existing login-url.txt keeps whatever permissions it had
+                // before this login. Tighten both cases before exposing the
+                // new link on disk.
+                #[cfg(unix)]
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut permissions = meta.permissions();
+                    permissions.set_mode(0o600);
+                    let _ = std::fs::set_permissions(&path, permissions);
+                }
                 self.set_hint("Login link → clipboard + login-url.txt");
                 if let Some(Screen::Login(ls)) = self.screens.last_mut() {
                     ls.busy = false;
@@ -156,6 +177,7 @@ impl App {
                 self.login_task = None;
                 match result {
                     Ok(user) => {
+                        self.begin_session();
                         self.me = Some(user);
                         if self.screens.len() > 1
                             && matches!(self.screens.last(), Some(Screen::Login(_)))
@@ -259,6 +281,9 @@ impl App {
                 // ending it: the new identity IS signed in).
                 let previous_user_id = self.me.as_ref().map(|u| u.user_id);
                 let identity_changed = previous_user_id.is_some_and(|id| id != user.user_id);
+                if previous_user_id.is_none() || identity_changed {
+                    self.begin_session();
+                }
                 if identity_changed {
                     self.abort_writes();
                     self.screens.retain(|s| matches!(s, Screen::Home(_) | Screen::ForumTree(_)));
@@ -363,8 +388,12 @@ impl App {
                     self.arm_bootstrap_retry(&e);
                 }
             }
-            Msg::NodesLoaded(result) => {
-                let tree = self.tree_mut();
+            Msg::NodesLoaded { load_id, result } => {
+                let tree = self.screens.iter_mut().rev().find_map(|s| match s {
+                    Screen::ForumTree(tree) if tree.load_id == load_id => Some(tree),
+                    Screen::Home(home) if home.tree.load_id == load_id => Some(&mut home.tree),
+                    _ => None,
+                });
                 if let Some(tree) = tree {
                     match result {
                         Ok(nodes) => {
@@ -467,19 +496,23 @@ impl App {
                     self.load_forum_page(node_id, page, true, seq);
                 }
             }
-            Msg::ThreadLoaded { id, page, result } => {
+            Msg::ThreadLoaded { id, page, load_id, result } => {
                 // One-shot: a reload that only exists to refresh the ♡/▲
                 // counts must not scroll the reader back to the top or move
                 // the selection out from under the next `l`/`v` (issue #538).
-                let keep = self
-                    .keep_thread_position
-                    .take()
-                    .filter(|(kid, kpage, _, _)| *kid == id && *kpage == page);
                 let view = self.screens.iter_mut().rev().find_map(|s| match s {
-                    Screen::ThreadView(view) if view.thread.thread_id == id => Some(view),
+                    Screen::ThreadView(view)
+                        if view.thread.thread_id == id && view.load_id == load_id =>
+                    {
+                        Some(view)
+                    }
                     _ => None,
                 });
                 if let Some(view) = view {
+                    let keep = self
+                        .keep_thread_position
+                        .take()
+                        .filter(|(kid, kpage, _, _)| *kid == id && *kpage == page);
                     match result {
                         Ok(reply) => {
                             // See ForumLoaded: clear a stale error on success
@@ -517,14 +550,19 @@ impl App {
                     }
                 }
             }
-            Msg::ReplySent(result) => {
+            Msg::ReplySent { composer, result } => {
                 let (compose_idx, target) = self
                     .screens
                     .iter()
                     .enumerate()
                     .rev()
                     .find_map(|(idx, s)| match s {
-                        Screen::Compose(c) if matches!(c.target, Some(ComposeTarget::ThreadReply { .. })) => {
+                        Screen::Compose(c)
+                            if c.target.as_ref().is_some_and(|target| {
+                                target.draft_key() == composer
+                                    && matches!(target, ComposeTarget::ThreadReply { .. })
+                            }) =>
+                        {
                             Some((idx, c.target.clone()))
                         }
                         _ => None,
@@ -571,9 +609,12 @@ impl App {
                     }
                 }
             }
-            Msg::ThreadCreated(result) => {
+            Msg::ThreadCreated { composer, result } => {
                 let compose_idx = self.screens.iter().rposition(|s| match s {
-                    Screen::Compose(c) => matches!(c.target, Some(ComposeTarget::NewThread { .. })),
+                    Screen::Compose(c) => c
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| target.draft_key() == composer),
                     _ => false,
                 });
                 match result {
@@ -609,10 +650,18 @@ impl App {
             }
             Msg::MarkedRead(Ok(())) => self.set_status("Marked read."),
             Msg::MarkedRead(Err(e)) => self.set_status(format!("Mark-read failed: {e}")),
-            Msg::ConversationsLoaded { page, result } => {
+            Msg::ConversationsLoaded { page, load_id, result } => {
                 let mut new_unread: Option<u32> = None;
                 let mut auto_load: Option<u32> = None;
-                if let Some(inbox) = self.inbox_mut() {
+                if let Some(inbox) = self
+                    .screens
+                    .iter_mut()
+                    .rev()
+                    .find_map(|s| match s {
+                        Screen::Inbox(inbox) if inbox.convos.load_id == load_id => Some(inbox),
+                        _ => None,
+                    })
+                {
                     match result {
                         Ok(reply) => {
                             // See ForumLoaded (issue #537).
@@ -661,9 +710,20 @@ impl App {
                     self.load_conversation(cid, 1, false);
                 }
             }
-            Msg::ConversationLoaded { id, page, mark_read: user_opened, result } => {
+            Msg::ConversationLoaded { id, page, load_id, mark_read: user_opened, result } => {
                 let mut mark_read: Option<u32> = None;
-                if let Some(view) = self.conversation_view_mut(id) {
+                if let Some(view) = self.screens.iter_mut().rev().find_map(|s| match s {
+                    Screen::ConversationView(view)
+                        if view.conversation.conversation_id == id && view.load_id == load_id =>
+                    {
+                        Some(view)
+                    }
+                    Screen::Inbox(inbox) => inbox
+                        .view
+                        .as_mut()
+                        .filter(|view| view.conversation.conversation_id == id && view.load_id == load_id),
+                    _ => None,
+                }) {
                     match result {
                         Ok(reply) => {
                             // See ForumLoaded/ThreadLoaded (issue #537).
@@ -728,22 +788,25 @@ impl App {
                         self.convos_unread = unread;
                     }
                     let api = self.api.clone();
-                    let tx = self.tx.clone();
-                    tokio::spawn(async move {
+                    self.spawn_session_task(async move {
                         let _ = api.mark_conversation_read(cid).await;
-                        let _ = tx;
                     });
                 }
             }
-            Msg::DraftsLoaded(drafts) => self.merge_remote_drafts(drafts),
-            Msg::ConvoReplySent(result) => {
+            Msg::DraftsLoaded { epoch, drafts } => self.merge_remote_drafts(epoch, drafts),
+            Msg::ConvoReplySent { composer, result } => {
                 let (compose_idx, target) = self
                     .screens
                     .iter()
                     .enumerate()
                     .rev()
                     .find_map(|(idx, s)| match s {
-                        Screen::Compose(c) if matches!(c.target, Some(ComposeTarget::ConversationReply { .. })) => {
+                        Screen::Compose(c)
+                            if c.target.as_ref().is_some_and(|target| {
+                                target.draft_key() == composer
+                                    && matches!(target, ComposeTarget::ConversationReply { .. })
+                            }) =>
+                        {
                             Some((idx, c.target.clone()))
                         }
                         _ => None,
@@ -843,12 +906,13 @@ impl App {
                     if !ids.is_empty() {
                         let api = self.api.clone();
                         let tx = self.tx.clone();
+                        let generation = self.session_generation;
                         self.spawn_write(async move {
                             let result = api
                                 .create_conversation(&ids, &title, &body)
                                 .await
                                 .map_err(|e| TaskError::of(&e));
-                            tx.send(Msg::ConvoCreated(result)).ok();
+                            tx.send(session_msg(generation, Msg::ConvoCreated(result))).ok();
                         });
                     }
                 }
@@ -861,7 +925,10 @@ impl App {
                     while self.screens.len() > 1
                         && !matches!(self.screens.last(), Some(Screen::Inbox(_)))
                     {
-                        self.screens.pop();
+                        // Use the lifecycle path: a thread/profile stack can
+                        // sit underneath the new-conversation form, and a
+                        // thread leaving the stack still owes its read marker.
+                        self.pop_screen();
                     }
                     self.set_status("Conversation started.");
                     if let Some(inbox) = self.inbox_mut() {
@@ -887,16 +954,27 @@ impl App {
                     }
                 }
             },
-            Msg::AlertsLoaded(result) => {
+            Msg::AlertsLoaded { load_id, result } => {
                 let mut new_unread: Option<u32> = None;
-                if let Some(inbox) = self.inbox_mut() {
+                if let Some(inbox) = self
+                    .screens
+                    .iter_mut()
+                    .rev()
+                    .find_map(|s| match s {
+                        Screen::Inbox(inbox) if inbox.alerts.load_id == load_id => Some(inbox),
+                        _ => None,
+                    })
+                {
                     let alerts = &mut inbox.alerts;
                     match result {
                         Ok(page) => {
                             // See ForumLoaded (issue #537).
                             alerts.error = None;
-                            new_unread =
-                                Some(page.alerts.iter().filter(|a| !a.viewed()).count() as u32);
+                            new_unread = Some(if inbox.alerts_viewed {
+                                0
+                            } else {
+                                page.alerts.iter().filter(|a| !a.viewed()).count() as u32
+                            });
                             alerts.alerts = page.alerts;
                             alerts.loading = false;
                             alerts.sel = alerts.sel.min(alerts.alerts.len().saturating_sub(1));
@@ -911,15 +989,43 @@ impl App {
                     self.alerts_unread = n;
                 }
             }
-            Msg::MediaLoaded { page, result } => {
-                // Topmost gallery only; the screen's loading guard keeps one
-                // fetch in flight, so `page` stamping suffices (#657 family).
+            Msg::AlertsViewed { view_id, result } => {
+                let mut failed = None;
+                if let Some(inbox) = self
+                    .screens
+                    .iter_mut()
+                    .rev()
+                    .find_map(|s| match s {
+                        Screen::Inbox(inbox) if inbox.alerts_view_id == view_id => Some(inbox),
+                        _ => None,
+                    })
+                {
+                    inbox.alerts_view_pending = false;
+                    if let Err(e) = result {
+                        inbox.alerts_viewed = false;
+                        failed = Some(e.message);
+                    }
+                }
+                if let Some(message) = failed {
+                    self.set_status(format!("Alerts could not be marked viewed: {message}"));
+                    if let Some(inbox) = self.inbox_mut() {
+                        self.alerts_unread = inbox
+                            .alerts
+                            .alerts
+                            .iter()
+                            .filter(|alert| !alert.viewed())
+                            .count() as u32;
+                    }
+                }
+            }
+            Msg::MediaLoaded { page, load_id, result } => {
                 let gallery = self.screens.iter_mut().rev().find_map(|s| match s {
                     Screen::MediaGallery(m) => Some(m),
                     _ => None,
                 });
                 if let Some(m) = gallery
                     && m.loading
+                    && m.load_id == load_id
                 {
                     match result {
                         Ok(reply) => {
@@ -939,13 +1045,14 @@ impl App {
                     }
                 }
             }
-            Msg::ResourceLoaded { page, result } => {
+            Msg::ResourceLoaded { page, load_id, result } => {
                 let resources = self.screens.iter_mut().rev().find_map(|s| match s {
                     Screen::Resources(r) => Some(r),
                     _ => None,
                 });
                 if let Some(r) = resources
                     && r.loading
+                    && r.load_id == load_id
                 {
                     match result {
                         Ok(reply) => {
@@ -964,8 +1071,18 @@ impl App {
                     }
                 }
             }
-            Msg::AttachmentUploaded(result) => {
-                let Some(Screen::Compose(c)) = self.screens.last_mut() else {
+            Msg::AttachmentUploaded { composer, result } => {
+                let Some(idx) = self.screens.iter().rposition(|screen| {
+                    matches!(
+                        screen,
+                        Screen::Compose(c)
+                            if c.target.as_ref().is_some_and(|target| target.draft_key() == composer)
+                    )
+                }) else {
+                    return;
+                };
+                let mut status = None;
+                let Some(Screen::Compose(c)) = self.screens.get_mut(idx) else {
                     return;
                 };
                 c.uploading = false;
@@ -987,11 +1104,14 @@ impl App {
                         c.body_cursor = at + tag.chars().count();
                         let name = attachment.filename.clone();
                         c.attachments.push(attachment);
-                        self.set_status(format!("Attached {name}."));
+                        status = Some(format!("Attached {name}."));
                     }
                     Err(message) => {
                         c.error = Some(message);
                     }
+                }
+                if let Some(status) = status {
+                    self.set_status(status);
                 }
             }
             Msg::PostEdited { post_id, result } => match result {
@@ -1037,9 +1157,22 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    if let Some(Screen::Compose(c)) = self.screens.last_mut() {
+                    let compose_idx = self.screens.iter().rposition(|s| {
+                        matches!(
+                            s,
+                            Screen::Compose(c)
+                                if c.target.as_ref().is_some_and(|target| {
+                                    target.draft_key() == common::drafts::DraftKey::EditPost(post_id)
+                                })
+                        )
+                    });
+                    if let Some(idx) = compose_idx
+                        && let Some(Screen::Compose(c)) = self.screens.get_mut(idx)
+                    {
                         c.busy = false;
                         c.error = Some(e.message.clone());
+                    } else {
+                        self.set_status(format!("Edit failed: {}", e.message));
                     }
                 }
             },
@@ -1083,21 +1216,26 @@ impl App {
                 }
                 Err(e) => self.set_status(format!("Could not mark solution: {}", e.message)),
             },
-            Msg::MediaCategoriesLoaded(result) => {
+            Msg::MediaCategoriesLoaded { load_id, result } => {
                 // Categories are decoration for the item pane: a failure
                 // leaves "All media" working rather than failing the screen.
                 if let Ok(reply) = result
                     && let Some(Screen::MediaGallery(m)) =
                         self.screens.iter_mut().rev().find(|s| {
-                            matches!(s, Screen::MediaGallery(_))
+                            matches!(s, Screen::MediaGallery(m) if m.categories_load_id == load_id)
                         })
                 {
                     m.categories = reply.categories;
+                    // The list widget clamps its visual selection, but key
+                    // handling uses the stored index. Keep the synthetic
+                    // "All media" row plus the real categories in range
+                    // after a refresh shrinks the server response.
+                    m.cat_sel = m.cat_sel.min(m.categories.len());
                 }
             }
-            Msg::ResourceViewLoaded { id, result } => {
+            Msg::ResourceViewLoaded { id, load_id, result } => {
                 let view = self.screens.iter_mut().rev().find_map(|s| match s {
-                    Screen::ResourceView(r) if r.id == id => Some(r),
+                    Screen::ResourceView(r) if r.id == id && r.load_id == load_id => Some(r),
                     _ => None,
                 });
                 if let Some(view) = view {
@@ -1206,7 +1344,21 @@ impl App {
                     }
                 }
             }
-            Msg::LoggedOut(result) => match result {
+            Msg::LogoutSnapshot { generation, result } => {
+                if generation != self.session_generation {
+                    return;
+                }
+                self.logout_pending = false;
+                if let Err(e) = result {
+                    self.set_hint(format!("Local sign-out could not finish: {e}"));
+                }
+            }
+            Msg::LoggedOut { generation, result } => {
+                if generation != self.session_generation {
+                    return;
+                }
+                self.logout_pending = false;
+                match result {
                 Ok(()) => tracing::info!("logout complete"),
                 Err(e) => {
                     // The local token file is gone either way; say what did
@@ -1229,7 +1381,9 @@ impl App {
                         ls.error = Some(message);
                     }
                 }
-            },
+                }
+            }
+            Msg::Session { .. } => unreachable!("session messages are unwrapped at the boundary"),
         }
     }
 }

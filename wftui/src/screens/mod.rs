@@ -79,6 +79,8 @@ pub struct ForumTreeState {
     /// First rendered row of the Forums panel, kept so the selection stays
     /// visible without the panel jumping around on every keypress.
     pub scroll: usize,
+    /// Identity of the current node-tree request.
+    pub load_id: u64,
     pub loading: bool,
     pub error: Option<String>,
 }
@@ -138,6 +140,9 @@ impl ThreadListState {
 
 #[derive(Default)]
 pub struct ThreadViewState {
+    /// Identity of the current thread load. The thread id alone cannot
+    /// distinguish a reopened view from an older request still in flight.
+    pub load_id: u64,
     /// An unsent reply to this thread is waiting (#716). Stamped each frame
     /// from the app's draft map, so `r` can say "resume draft" instead of
     /// "reply" — otherwise a draft is invisible from the one screen where you
@@ -318,6 +323,10 @@ pub struct ComposeState {
     /// current text, which discarding must not throw away.
     pub seed_title: String,
     pub seed_body: String,
+    /// A website draft may mention attachments whose temporary hash cannot be
+    /// converted back into a TUI attachment key. Preserve that warning across
+    /// local resume and another Esc.
+    pub remote_attachments: bool,
     /// `^F` opens a one-line path prompt; `Some` while it is up. A terminal
     /// has no file picker, so the path is typed (or pasted) here.
     pub file_prompt: Option<String>,
@@ -369,6 +378,8 @@ pub struct ComposeState {
 
 #[derive(Default)]
 pub struct ConversationsState {
+    /// Identity of the current list request.
+    pub load_id: u64,
     pub conversations: Vec<Conversation>,
     pub page: u32,
     pub last_page: u32,
@@ -383,6 +394,8 @@ pub struct ConversationsState {
 
 #[derive(Default)]
 pub struct ConversationViewState {
+    /// Identity of the current conversation load, independent of its id.
+    pub load_id: u64,
     pub conversation: Conversation,
     pub messages: Vec<ConversationMessage>,
     pub page: u32,
@@ -445,6 +458,8 @@ pub struct NewConversationState {
 
 #[derive(Default)]
 pub struct AlertsState {
+    /// Identity of the current alerts request.
+    pub load_id: u64,
     pub alerts: Vec<Alert>,
     pub sel: usize,
     pub loading: bool,
@@ -497,6 +512,12 @@ pub struct InboxState {
     /// The panes' last-drawn rects — see `HomeState::tree_rect` (issue #549).
     pub list_rect: Rect,
     pub view_rect: Rect,
+    /// True after the Alerts tab has been entered for this Inbox instance.
+    /// The pending bit handles cold starts where the badge was zero before
+    /// the first alerts response arrived.
+    pub alerts_viewed: bool,
+    pub alerts_view_pending: bool,
+    pub alerts_view_id: u64,
 }
 
 #[derive(Default)]
@@ -597,6 +618,10 @@ pub struct MediaListState {
     pub cat_rect: ratatui::layout::Rect,
     pub items_rect: ratatui::layout::Rect,
     pub loading: bool,
+    /// Identity of the current item-page request.
+    pub load_id: u64,
+    /// Identity of the independent category-tree request.
+    pub categories_load_id: u64,
     pub error: Option<String>,
     pub images: crate::images::Policy,
     pub image_requests: Vec<crate::images::Request>,
@@ -611,6 +636,8 @@ pub struct ResourceListState {
     pub total: u64,
     pub sel: usize,
     pub loading: bool,
+    /// Identity of the current resource-page request.
+    pub load_id: u64,
     pub error: Option<String>,
 }
 
@@ -644,6 +671,8 @@ pub struct DraftsState {
 #[derive(Default)]
 pub struct ResourceViewState {
     pub id: u32,
+    /// Identity of the current resource request.
+    pub load_id: u64,
     pub resource: Option<Resource>,
     /// The laid-out page; rebuilt when the pane's width changes.
     pub lines: Vec<ratatui::text::Line<'static>>,
@@ -821,6 +850,9 @@ pub enum Action {
     /// scoped to a gallery category (#697).
     LoadMedia { category: Option<u32>, page: u32 },
     LoadResources(u32),
+    /// Switch the Inbox list tab through the app-owned transition so Alerts
+    /// viewed state and badge accounting stay in sync.
+    SwitchInboxTab(InboxTab),
     /// The gallery's category tree (#697).
     LoadMediaCategories,
     /// Open one resource's page in the client, and (re)fetch it (#697).
@@ -1228,7 +1260,14 @@ impl Screen {
             },
             Screen::ConversationView(v) => v.conversation.view_url.clone(),
             Screen::Search(s) => s.results.get(s.sel).and_then(|h| h.view_url.clone()),
-            Screen::MediaGallery(m) => m.items.get(m.sel).and_then(|m| m.view_url.clone()),
+            Screen::MediaGallery(m) => match m.focus {
+                MediaPane::Categories => m
+                    .cat_sel
+                    .checked_sub(1)
+                    .and_then(|i| m.categories.get(i))
+                    .and_then(|c| c.view_url.clone()),
+                MediaPane::Items => m.items.get(m.sel).and_then(|m| m.view_url.clone()),
+            },
             Screen::Resources(r) => r.items.get(r.sel).and_then(|r| r.view_url.clone()),
             Screen::Drafts(_) => None,
             Screen::ResourceView(r) => r.resource.as_ref().and_then(|r| r.view_url.clone()),
@@ -1263,8 +1302,12 @@ impl Screen {
             // The sign-in screen is a gate, not a place: Esc must not pop it
             // onto a session-less Home stuck loading forever (issue #556).
             Screen::Login(_) => EscIntent::Blocked("Sign in first, or press q to quit."),
-            Screen::Compose(c) if c.busy => EscIntent::Blocked(
-                "Sending\u{2026} Esc cannot cancel it \u{2014} wait for the result.",
+            Screen::Compose(c) if c.busy || c.uploading => EscIntent::Blocked(
+                if c.uploading {
+                    "Uploading\u{2026} Esc cannot cancel it \u{2014} wait for the result."
+                } else {
+                    "Sending\u{2026} Esc cannot cancel it \u{2014} wait for the result."
+                },
             ),
             // Issue #597: `busy` now spans the create write too, so Esc is
             // blocked for the whole lifecycle — it used to pop the screen out
@@ -1326,10 +1369,13 @@ impl Screen {
                 v.sel_msg = 0;
             }
             Screen::Search(s) => s.sel = 0,
-            Screen::MediaGallery(m) => {
-                m.sel = 0;
-                m.scroll = 0;
-            }
+            Screen::MediaGallery(m) => match m.focus {
+                MediaPane::Categories => m.cat_sel = 0,
+                MediaPane::Items => {
+                    m.sel = 0;
+                    m.scroll = 0;
+                }
+            },
             Screen::Resources(r) => r.sel = 0,
             Screen::Drafts(d) => d.sel = 0,
             Screen::ResourceView(r) => r.scroll = 0,
@@ -1372,7 +1418,10 @@ impl Screen {
                 v.sel_msg = v.messages.len().saturating_sub(1);
             }
             Screen::Search(s) => s.sel = s.results.len().saturating_sub(1),
-            Screen::MediaGallery(m) => m.sel = m.items.len().saturating_sub(1),
+            Screen::MediaGallery(m) => match m.focus {
+                MediaPane::Categories => m.cat_sel = m.categories.len(),
+                MediaPane::Items => m.sel = m.items.len().saturating_sub(1),
+            },
             Screen::Resources(r) => r.sel = r.items.len().saturating_sub(1),
             Screen::Drafts(d) => d.sel = d.rows.len().saturating_sub(1),
             Screen::ResourceView(r) => r.scroll = r.lines.len().saturating_sub(1),
@@ -1910,6 +1959,55 @@ mod dispatch_tests {
         }
     }
 
+    #[test]
+    fn media_gallery_navigation_and_web_url_follow_the_focused_pane() {
+        let category = |id: u32, url: &str| MediaCategory {
+            category_id: id,
+            title: format!("Category {id}"),
+            view_url: Some(url.into()),
+            ..Default::default()
+        };
+        let item = |id: u32, url: &str| MediaItem {
+            media_id: id,
+            title: format!("Media {id}"),
+            view_url: Some(url.into()),
+            ..Default::default()
+        };
+        let mut gallery = Screen::MediaGallery(MediaListState {
+            categories: vec![
+                category(1, "https://wf/media-categories/1/"),
+                category(2, "https://wf/media-categories/2/"),
+            ],
+            items: vec![item(9, "https://wf/media/9/")],
+            focus: MediaPane::Categories,
+            ..Default::default()
+        });
+
+        gallery.goto_bottom();
+        assert!(matches!(
+            &gallery,
+            Screen::MediaGallery(m) if m.cat_sel == 2 && m.sel == 0
+        ));
+        assert_eq!(
+            gallery.web_url().as_deref(),
+            Some("https://wf/media-categories/2/")
+        );
+
+        gallery.goto_top();
+        assert!(matches!(&gallery, Screen::MediaGallery(m) if m.cat_sel == 0));
+        assert_eq!(gallery.web_url(), None, "All media has no category URL");
+
+        if let Screen::MediaGallery(m) = &mut gallery {
+            m.focus = MediaPane::Items;
+        }
+        gallery.goto_bottom();
+        assert!(matches!(
+            &gallery,
+            Screen::MediaGallery(m) if m.sel == 0 && m.cat_sel == 0
+        ));
+        assert_eq!(gallery.web_url().as_deref(), Some("https://wf/media/9/"));
+    }
+
     /// A key-bar label's literal key(s), or `None` for a label with no
     /// single key to press: a compound/movement pair (`j/k`, `n/N`, `[/]`,
     /// `1/2/3`, `1-9`, ...) or `Tab`, which is a within-screen focus/field
@@ -2058,10 +2156,6 @@ mod dispatch_tests {
                     // `x` only flips `reveal_spoilers` — screen state, no
                     // `Action` (pinned directly by the spoiler-reveal test).
                     "x",
-                    // `w` (watch) is deliberately always `Action::None`:
-                    // XenForo's REST API has no thread-watch endpoint (see
-                    // the comment on its arm in `thread_view_key`).
-                    "w",
                     // `o` (links) opens a local popup overlay — a screen
                     // state change, not an `Action` — so it too always
                     // returns `Action::None` by design.

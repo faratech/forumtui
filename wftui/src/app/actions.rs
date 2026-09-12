@@ -68,6 +68,7 @@ impl App {
             // Paging inside a conversation the user already opened.
             Action::LoadConversation(id, page) => self.load_conversation(id, page, true),
             Action::LoadAlerts => self.load_alerts(),
+            Action::SwitchInboxTab(tab) => self.open_inbox(tab),
             Action::LoadNodes => {
                 if let Some(tree) = self.tree_mut() {
                     tree.loading = true;
@@ -128,12 +129,13 @@ impl App {
             Action::MarkForumRead(node_id) => {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
-                tokio::spawn(async move {
+                let generation = self.session_generation;
+                self.spawn_session_task(async move {
                     let result = api
                         .mark_forum_read(node_id)
                         .await
                         .map_err(|e| TaskError::of(&e));
-                    tx.send(Msg::MarkedRead(result)).ok();
+                    tx.send(session_msg(generation, Msg::MarkedRead(result))).ok();
                 });
             }
             Action::MarkAlertRead(id) => self.mark_alert_read(id),
@@ -145,21 +147,23 @@ impl App {
                 // under whatever token is live by the time it fires.
                 let api = self.api.clone();
                 let tx = self.tx.clone();
+                let generation = self.session_generation;
                 self.spawn_write(async move {
                     let result = api.react_post(post_id, 1).await.map_err(|e| TaskError::of(&e));
-                    tx.send(Msg::PostToggled { verb: PostVerb::Like, result }).ok();
+                    tx.send(session_msg(generation, Msg::PostToggled { verb: PostVerb::Like, result })).ok();
                 });
             }
             Action::VotePost(post_id, vote_type) => {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
                 let verb = PostVerb::of_vote(&vote_type);
+                let generation = self.session_generation;
                 self.spawn_write(async move {
                     let result = api
                         .vote_post(post_id, &vote_type)
                         .await
                         .map_err(|e| TaskError::of(&e));
-                    tx.send(Msg::PostToggled { verb, result }).ok();
+                    tx.send(session_msg(generation, Msg::PostToggled { verb, result })).ok();
                 });
             }
             Action::OpenDrafts => self.open_drafts(),
@@ -197,6 +201,7 @@ impl App {
                     }),
                     author: self.me_name(),
                     body: post.message.clone(),
+                    seed_body: post.message.clone(),
                     ..Default::default()
                 }));
             }
@@ -204,30 +209,39 @@ impl App {
                 let api = self.client.clone();
                 let tx = self.tx.clone();
                 let key = self.compose_attachment_key();
+                let generation = self.session_generation;
+                let Some(composer) = self.screens.iter().rev().find_map(|screen| match screen {
+                    Screen::Compose(c) => c.target.as_ref().map(|target| target.draft_key()),
+                    _ => None,
+                }) else {
+                    return;
+                };
                 if let Some(Screen::Compose(c)) = self.screens.last_mut() {
                     c.uploading = true;
                     c.error = None;
                 }
                 self.spawn_write(async move {
                     let result = App::upload_from_path(&api, &path, context, key.as_deref()).await;
-                    tx.send(Msg::AttachmentUploaded(result)).ok();
+                    tx.send(session_msg(generation, Msg::AttachmentUploaded { composer, result })).ok();
                 });
             }
             Action::SubmitEdit { post_id, message } => {
                 let api = self.api.clone();
-                let key = self.compose_attachment_key();
+                let key = self.compose_attachment_key_for(common::drafts::DraftKey::EditPost(post_id));
                 let tx = self.tx.clone();
+                let generation = self.session_generation;
                 self.spawn_write(async move {
                     let result = api
                         .edit_post(post_id, &message, key.as_deref())
                         .await
                         .map_err(|e| TaskError::of(&e));
-                    tx.send(Msg::PostEdited { post_id, result }).ok();
+                    tx.send(session_msg(generation, Msg::PostEdited { post_id, result })).ok();
                 });
             }
             Action::DeletePost { post_id, thread_id } => {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
+                let generation = self.session_generation;
                 self.spawn_write(async move {
                     // Soft delete, always: it is what XF's own UI does and it
                     // leaves the post recoverable. A hard delete from a
@@ -236,18 +250,19 @@ impl App {
                         .delete_post(post_id, false)
                         .await
                         .map_err(|e| TaskError::of(&e));
-                    tx.send(Msg::PostDeleted { post_id, thread_id, result }).ok();
+                    tx.send(session_msg(generation, Msg::PostDeleted { post_id, thread_id, result })).ok();
                 });
             }
             Action::MarkSolution { post_id, thread_id } => {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
+                let generation = self.session_generation;
                 self.spawn_write(async move {
                     let result = api
                         .mark_solution(post_id)
                         .await
                         .map_err(|e| TaskError::of(&e));
-                    tx.send(Msg::SolutionMarked { post_id, thread_id, result }).ok();
+                    tx.send(session_msg(generation, Msg::SolutionMarked { post_id, thread_id, result })).ok();
                 });
             }
             Action::StartReplyQuoting(thread, post) => {
@@ -281,38 +296,44 @@ impl App {
             Action::SubmitReply { thread_id, message } => {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
+                let generation = self.session_generation;
+                let composer = common::drafts::DraftKey::ThreadReply(thread_id);
                 // Whatever this draft uploaded under: without the key the
                 // files are attached to nothing (#709).
-                let key = self.compose_attachment_key();
+                let key = self.compose_attachment_key_for(composer);
                 self.spawn_write(async move {
                     let result = api
                         .reply(thread_id, &message, key.as_deref())
                         .await
                         .map_err(|e| TaskError::of(&e));
-                    tx.send(Msg::ReplySent(result)).ok();
+                    tx.send(session_msg(generation, Msg::ReplySent { composer, result })).ok();
                 });
             }
             Action::SubmitThread { node_id, title, message } => {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
-                let key = self.compose_attachment_key();
+                let composer = common::drafts::DraftKey::NewThread(node_id);
+                let key = self.compose_attachment_key_for(composer);
+                let generation = self.session_generation;
                 self.spawn_write(async move {
                     let result = api
                         .create_thread(node_id, &title, &message, key.as_deref())
                         .await
                         .map_err(|e| TaskError::of(&e));
-                    tx.send(Msg::ThreadCreated(result)).ok();
+                    tx.send(session_msg(generation, Msg::ThreadCreated { composer, result })).ok();
                 });
             }
             Action::SubmitConvoReply { id, message } => {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
+                let generation = self.session_generation;
+                let composer = common::drafts::DraftKey::ConversationReply(id);
                 self.spawn_write(async move {
                     let result = api
                         .reply_conversation(id, &message)
                         .await
                         .map_err(|e| TaskError::of(&e));
-                    tx.send(Msg::ConvoReplySent(result)).ok();
+                    tx.send(session_msg(generation, Msg::ConvoReplySent { composer, result })).ok();
                 });
             }
             Action::ResolveRecipients(names, _title, _body) => {
@@ -322,13 +343,14 @@ impl App {
                     let api = self.api.clone();
                     let tx = self.tx.clone();
                     let name_clone = name.clone();
-                    tokio::spawn(async move {
+                    let generation = self.session_generation;
+                    self.spawn_session_task(async move {
                         let id = api
                             .find_user(&name_clone)
                             .await
                             .map(|u| u.map(|u| u.user_id))
                             .map_err(|e| TaskError::of(&e));
-                        tx.send(Msg::RecipientResolved { name: name_clone, id }).ok();
+                        tx.send(session_msg(generation, Msg::RecipientResolved { name: name_clone, id })).ok();
                     });
                 }
             }
@@ -399,10 +421,26 @@ impl App {
     }
 
     /// The attachment key of the composer on top, if it uploaded anything
-    /// (#709).
+    /// (#709). Actions that carry a target identity should use
+    /// `compose_attachment_key_for` so a buried composer can never donate its
+    /// files to another write.
     pub(super) fn compose_attachment_key(&self) -> Option<String> {
         self.screens.iter().rev().find_map(|s| match s {
             Screen::Compose(c) => c.attachment_key.clone(),
+            _ => None,
+        })
+    }
+
+    pub(super) fn compose_attachment_key_for(
+        &self,
+        key: common::drafts::DraftKey,
+    ) -> Option<String> {
+        self.screens.iter().rev().find_map(|s| match s {
+            Screen::Compose(c)
+                if c.target.as_ref().is_some_and(|target| target.draft_key() == key) =>
+            {
+                c.attachment_key.clone()
+            }
             _ => None,
         })
     }
@@ -488,33 +526,51 @@ impl App {
         self.load_forum_page(node_id, next, true, seq);
     }
 
+    pub(super) fn next_load_id(&mut self) -> u64 {
+        self.next_load_id = self.next_load_id.wrapping_add(1).max(1);
+        self.next_load_id
+    }
+
     pub fn load_conversations(&mut self, page: u32) {
+        let load_id = self.next_load_id();
+        if let Some(inbox) = self.inbox_mut() {
+            inbox.convos.load_id = load_id;
+            inbox.convos.loading = true;
+        }
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
             let result = api.conversations(page).await.map_err(|e| TaskError::of(&e));
-            tx.send(Msg::ConversationsLoaded { page, result }).ok();
+            tx.send(session_msg(session_generation, Msg::ConversationsLoaded { page, load_id, result })).ok();
         });
     }
 
     pub fn load_alerts(&mut self) {
+        let load_id = self.next_load_id();
+        if let Some(inbox) = self.inbox_mut() {
+            inbox.alerts.load_id = load_id;
+            inbox.alerts.loading = true;
+        }
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
             let result = api.alerts(1).await.map_err(|e| TaskError::of(&e));
-            tx.send(Msg::AlertsLoaded(result)).ok();
+            tx.send(session_msg(session_generation, Msg::AlertsLoaded { load_id, result })).ok();
         });
     }
 
     pub fn mark_conversation_read(&mut self, id: u32) {
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
             let result = api
                 .mark_conversation_read(id)
                 .await
                 .map_err(|e| TaskError::of(&e));
-            tx.send(Msg::ConversationMarked(id, result)).ok();
+            tx.send(session_msg(session_generation, Msg::ConversationMarked(id, result))).ok();
         });
     }
 
@@ -539,7 +595,8 @@ impl App {
     pub fn load_forum_page(&mut self, node_id: u32, page: u32, append: bool, seq: u64) {
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
             let result = if node_id == 0 {
                 api.threads(page)
                     .await
@@ -557,7 +614,7 @@ impl App {
             } else {
                 api.forum(node_id, page).await.map_err(|e| TaskError::of(&e))
             };
-            tx.send(Msg::ForumLoaded { node_id, page, append, seq, result }).ok();
+            tx.send(session_msg(session_generation, Msg::ForumLoaded { node_id, page, append, seq, result })).ok();
         });
     }
 
@@ -569,38 +626,55 @@ impl App {
     // so a message handler never has to.
 
     pub fn load_thread(&mut self, id: u32, page: u32) {
+        let load_id = self.next_load_id();
+        if let Some(view) = self.screens.iter_mut().rev().find_map(|s| match s {
+            Screen::ThreadView(view) if view.thread.thread_id == id => Some(view),
+            _ => None,
+        }) {
+            view.load_id = load_id;
+            view.loading = true;
+        }
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
             let result = api.thread(id, page).await.map_err(|e| TaskError::of(&e));
-            tx.send(Msg::ThreadLoaded { id, page, result }).ok();
+            tx.send(session_msg(session_generation, Msg::ThreadLoaded { id, page, load_id, result })).ok();
         });
     }
 
     pub fn mark_thread_read(&mut self, id: u32, date: Option<i64>) {
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
             let result = api.mark_thread_read(id, date).await.map_err(|e| TaskError::of(&e));
-            tx.send(Msg::MarkedRead(result)).ok();
+            tx.send(session_msg(session_generation, Msg::MarkedRead(result))).ok();
         });
     }
 
     pub fn mark_alert_read(&mut self, id: u32) {
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
             let result = api.mark_alert_read(id).await.map_err(|e| TaskError::of(&e));
-            tx.send(Msg::AlertMarked(result)).ok();
+            tx.send(session_msg(session_generation, Msg::AlertMarked(result))).ok();
         });
     }
 
     pub fn load_nodes(&mut self) {
+        let load_id = self.next_load_id();
+        if let Some(tree) = self.tree_mut() {
+            tree.load_id = load_id;
+            tree.loading = true;
+        }
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
             let result = api.nodes().await.map_err(|e| TaskError::of(&e));
-            tx.send(Msg::NodesLoaded(result)).ok();
+            tx.send(session_msg(session_generation, Msg::NodesLoaded { load_id, result })).ok();
         });
     }
 
@@ -608,14 +682,27 @@ impl App {
     /// a conversation, paging inside it, the post-reply reload) — never for
     /// the dual-pane Inbox priming its view pane (issue #541).
     pub fn load_conversation(&mut self, id: u32, page: u32, mark_read: bool) {
+        let load_id = self.next_load_id();
+        if let Some(view) = self.screens.iter_mut().rev().find_map(|s| match s {
+            Screen::ConversationView(view) if view.conversation.conversation_id == id => Some(view),
+            Screen::Inbox(inbox) => inbox
+                .view
+                .as_mut()
+                .filter(|view| view.conversation.conversation_id == id),
+            _ => None,
+        }) {
+            view.load_id = load_id;
+            view.loading = true;
+        }
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
             let result = api
                 .conversation(id, page)
                 .await
                 .map_err(|e| TaskError::of(&e));
-            tx.send(Msg::ConversationLoaded { id, page, mark_read, result }).ok();
+            tx.send(session_msg(session_generation, Msg::ConversationLoaded { id, page, load_id, mark_read, result })).ok();
         });
     }
 
@@ -626,73 +713,110 @@ impl App {
     pub fn load_member_content(&mut self, user_id: u32, content: String, page: u32) {
         self.set_hint("Searching…");
         let generation = self.begin_search_load();
+        let session_generation = self.session_generation;
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        self.spawn_session_task(async move {
             let result = api
                 .search_member(user_id, &content, page)
                 .await
                 .map_err(|e| TaskError::of(&e));
-            tx.send(Msg::SearchDone { generation, page, result }).ok();
+            tx.send(session_msg(session_generation, Msg::SearchDone { generation, page, result })).ok();
         });
     }
 
     pub fn run_search_query(&mut self, query: SearchQuery) {
         let generation = self.begin_search_load();
+        let session_generation = self.session_generation;
         let api = self.api.clone();
         let tx = self.tx.clone();
         let page = query.page;
         self.set_hint("Searching…");
-        tokio::spawn(async move {
+        self.spawn_session_task(async move {
             let result = api
                 .search_advanced(&query)
                 .await
                 .map_err(|e| TaskError::of(&e));
-            tx.send(Msg::SearchDone { generation, page, result }).ok();
+            tx.send(session_msg(session_generation, Msg::SearchDone { generation, page, result })).ok();
         });
     }
 
     /// Fetch one page of the XFMG media catalog, whole or by category
     /// (issues #680, #697).
     pub fn load_media(&mut self, category: Option<u32>, page: u32) {
+        let load_id = self.next_load_id();
+        if let Some(gallery) = self.screens.iter_mut().rev().find_map(|s| match s {
+            Screen::MediaGallery(gallery) => Some(gallery),
+            _ => None,
+        }) {
+            gallery.load_id = load_id;
+            gallery.loading = true;
+        }
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
             let result = api
                 .media_list(category, page)
                 .await
                 .map_err(|e| TaskError::of(&e));
-            tx.send(Msg::MediaLoaded { page, result }).ok();
+            tx.send(session_msg(session_generation, Msg::MediaLoaded { page, load_id, result })).ok();
         });
     }
 
     /// The gallery's category tree (#697).
     pub fn load_media_categories(&mut self) {
+        let load_id = self.next_load_id();
+        if let Some(gallery) = self.screens.iter_mut().rev().find_map(|s| match s {
+            Screen::MediaGallery(gallery) => Some(gallery),
+            _ => None,
+        }) {
+            gallery.categories_load_id = load_id;
+        }
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
             let result = api.media_categories().await.map_err(|e| TaskError::of(&e));
-            tx.send(Msg::MediaCategoriesLoaded(result)).ok();
+            tx.send(session_msg(session_generation, Msg::MediaCategoriesLoaded { load_id, result })).ok();
         });
     }
 
     /// One resource, for the in-client page (#697).
     pub fn load_resource(&mut self, id: u32) {
+        let load_id = self.next_load_id();
+        if let Some(view) = self.screens.iter_mut().rev().find_map(|s| match s {
+            Screen::ResourceView(view) if view.id == id => Some(view),
+            _ => None,
+        }) {
+            view.load_id = load_id;
+            view.loading = true;
+        }
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
             let result = api.resource(id).await.map_err(|e| TaskError::of(&e));
-            tx.send(Msg::ResourceViewLoaded { id, result }).ok();
+            tx.send(session_msg(session_generation, Msg::ResourceViewLoaded { id, load_id, result })).ok();
         });
     }
 
     /// Fetch one page of the XFRM resource catalog (issue #680).
     pub fn load_resources(&mut self, page: u32) {
+        let load_id = self.next_load_id();
+        if let Some(resources) = self.screens.iter_mut().rev().find_map(|s| match s {
+            Screen::Resources(resources) => Some(resources),
+            _ => None,
+        }) {
+            resources.load_id = load_id;
+            resources.loading = true;
+        }
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
             let result = api.resources_list(page).await.map_err(|e| TaskError::of(&e));
-            tx.send(Msg::ResourceLoaded { page, result }).ok();
+            tx.send(session_msg(session_generation, Msg::ResourceLoaded { page, load_id, result })).ok();
         });
     }
 
@@ -725,14 +849,15 @@ impl App {
         let disk = self.images.disk();
         let tx = self.tx.clone();
         let slots = self.image_slots.clone();
-        tokio::spawn(async move {
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
             // Decoration waits its turn behind at most a couple of siblings;
             // `image_gate` then spaces the ones that get through, in a lane of
             // its own so nothing here delays an interactive call (issue #543).
             let _permit = slots.acquire_owned().await;
             let key = pending.store_key();
             let result = crate::images::load(&client, &disk, picker, &pending).await;
-            tx.send(Msg::ImageLoaded { key, result }).ok();
+            tx.send(session_msg(session_generation, Msg::ImageLoaded { key, result })).ok();
         });
     }
 
@@ -743,7 +868,7 @@ impl App {
         if url.is_empty() {
             return;
         }
-        let target = match resolve_open_url(url, &common::config::base_url()) {
+        let target = match resolve_open_url(url, self.client.base_url()) {
             Ok(target) => target,
             Err(scheme) => {
                 self.set_status(format!("Refused to open \"{scheme}:\" link."));

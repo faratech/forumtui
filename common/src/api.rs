@@ -54,6 +54,7 @@ impl WfApiClient {
     /// test really `GET /api/me`'d windowsforum.com with the operator's own
     /// bearer, and the fixture store overwrote the real `token.json`.
     pub fn with_store(store: token::Store, base_url: impl Into<String>) -> Result<Self> {
+        let base_url = config::validate_base_url(&base_url.into())?;
         // A store that fails to *parse* (hand-edited, truncated, or written
         // by a build whose `TokenSet` shape has since changed) is not a
         // reason to refuse to start: quarantine it and begin as if there
@@ -73,7 +74,7 @@ impl WfApiClient {
             http: crate::http::build()?,
             tokens: Mutex::new(tokens),
             store,
-            base: base_url.into(),
+            base: base_url,
             api_gate: Arc::new(Gate::new(config::GLOBAL_MIN_INTERVAL_MS)),
             search_gate: Arc::new(Gate::new(config::SEARCH_MIN_INTERVAL_MS)),
             write_gate: Arc::new(Gate::new(config::WRITE_COOLDOWN_MS)),
@@ -139,8 +140,15 @@ impl WfApiClient {
     }
 
     pub async fn forget_tokens(&self) -> Result<()> {
-        self.tokens.lock().await.take();
-        self.store.erase()
+        let mut guard = self.tokens.lock().await;
+        let tokens = guard.take();
+        if let Some(tokens) = tokens
+            && let Err(e) = self.store.erase_if_refresh_token(&tokens.refresh_token)
+        {
+            *guard = Some(tokens);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Snapshot the token set and end the local session in one atomic step:
@@ -158,7 +166,12 @@ impl WfApiClient {
     pub async fn take_tokens(&self) -> Result<Option<TokenSet>> {
         let mut guard = self.tokens.lock().await;
         let tokens = guard.take();
-        self.store.erase()?;
+        if let Some(snapshot) = tokens.as_ref()
+            && let Err(e) = self.store.erase_if_refresh_token(&snapshot.refresh_token)
+        {
+            *guard = tokens;
+            return Err(e);
+        }
         Ok(tokens)
     }
 
@@ -193,7 +206,9 @@ impl WfApiClient {
         }
         if existing.refresh_token.is_empty() {
             *guard = None;
-            let _ = self.store.erase();
+            // A malformed/legacy token set with no refresh grant must not
+            // erase a newer sibling session that replaced the store.
+            let _ = self.store.erase_if_refresh_token(&existing.refresh_token);
             return Err(Error::NoToken);
         }
         let refresh_token = existing.refresh_token.clone();
@@ -205,7 +220,23 @@ impl WfApiClient {
         // queued token work by the gate's spacing.
         self.api_gate.wait().await;
         let err = match oauth::refresh(&self.http, &self.base, &refresh_token).await {
-            Ok(refreshed) => return Ok(self.keep_refreshed(&mut guard, refreshed)),
+            Ok(mut refreshed) => {
+                // RFC 6749 permits a refresh response to omit
+                // `refresh_token` when the grant is not rotated. Keeping the
+                // deserializer tolerant is useful for XF and compatible OAuth
+                // servers, but persisting that empty default would turn the
+                // next access-token expiry into a needless sign-out.
+                if refreshed.refresh_token.is_empty() {
+                    refreshed.refresh_token = refresh_token.clone();
+                }
+                // Scope is also optional on a refresh response; retaining it
+                // avoids silently losing the permissions associated with the
+                // still-live grant.
+                if refreshed.scope.is_empty() {
+                    refreshed.scope = existing.scope.clone();
+                }
+                return Ok(self.keep_refreshed(&mut guard, refreshed));
+            }
             Err(e) => e,
         };
         if !matches!(&err, Error::OAuth { code, .. } if code == "invalid_grant") {
@@ -254,15 +285,7 @@ impl WfApiClient {
     /// session, and erase the store only if it still holds that very token
     /// (never a set some other code path has since written).
     fn forget_rejected(&self, guard: &mut Option<TokenSet>, rejected: &str) {
-        if self
-            .store
-            .load()
-            .ok()
-            .flatten()
-            .is_some_and(|t| t.refresh_token == rejected)
-        {
-            let _ = self.store.erase();
-        }
+        let _ = self.store.erase_if_refresh_token(rejected);
         *guard = None;
     }
 
@@ -288,6 +311,24 @@ impl WfApiClient {
         let url = format!("{}{path}", self.api_base());
         let resp = self.http.get(url).query(query).bearer_auth(&token).send().await?;
         decode(resp).await.inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate]))
+    }
+
+    /// One leg of a search is still search traffic. Keeping this separate
+    /// from get prevents the result-page request from bypassing the
+    /// expensive-search budget just because it uses GET instead of POST.
+    async fn get_search<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<T> {
+        self.search_gate.wait().await;
+        self.api_gate.wait().await;
+        let token = self.valid_token().await?;
+        let url = format!("{}{path}", self.api_base());
+        let resp = self.http.get(url).query(query).bearer_auth(&token).send().await?;
+        decode(resp)
+            .await
+            .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate, &self.search_gate]))
     }
 
     /// Flood-checked write (posts/threads/conversations): consumes the write
@@ -323,7 +364,53 @@ impl WfApiClient {
         let resp = self.http.post(url).form(form).bearer_auth(&token).send().await?;
         check_status(resp)
             .await
-            .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate, &self.write_gate]))
+            .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate]))
+    }
+
+    /// Unit response with the write gate, for mutations that do not return a
+    /// model. The gate must be re-armed only after a successful server write;
+    /// waiting before calling `post_unit` without this helper merely consumes
+    /// the old slot and leaves the next edit immediately eligible (#718).
+    async fn post_unit_write(&self, path: &str, form: &[(&str, String)]) -> Result<()> {
+        self.api_gate.wait().await;
+        self.write_gate.wait().await;
+        let token = self.valid_token().await?;
+        let url = format!("{}{path}", self.api_base());
+        let resp = self.http.post(url).form(form).bearer_auth(&token).send().await?;
+        let result = check_status(resp).await;
+        match &result {
+            Ok(()) => self
+                .write_gate
+                .penalize(Duration::from_millis(config::WRITE_COOLDOWN_MS)),
+            Err(e) => self.note_rate_limit(e, &[&self.api_gate, &self.write_gate]),
+        }
+        result
+    }
+
+    /// DELETE mutation with the same flood-control contract as a POST write.
+    /// XF accepts form parameters on soft-delete, and using one helper keeps
+    /// the success penalty and Retry-After handling identical for every
+    /// content mutation.
+    async fn delete_unit_write(&self, path: &str, form: &[(&str, String)]) -> Result<()> {
+        self.api_gate.wait().await;
+        self.write_gate.wait().await;
+        let token = self.valid_token().await?;
+        let url = format!("{}{}", self.api_base(), path);
+        let resp = self
+            .http
+            .delete(url)
+            .form(form)
+            .bearer_auth(&token)
+            .send()
+            .await?;
+        let result = check_status(resp).await;
+        match &result {
+            Ok(()) => self
+                .write_gate
+                .penalize(Duration::from_millis(config::WRITE_COOLDOWN_MS)),
+            Err(e) => self.note_rate_limit(e, &[&self.api_gate, &self.write_gate]),
+        }
+        result
     }
 
     /// A POST to one of XF's *toggle* endpoints (react, vote). Same gating as
@@ -341,7 +428,7 @@ impl WfApiClient {
         let resp = self.http.post(url).form(form).bearer_auth(&token).send().await?;
         let reply: ToggleReply = decode(resp)
             .await
-            .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate, &self.write_gate]))?;
+            .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate]))?;
         Ok(Toggle::from_action(&reply.action))
     }
 
@@ -520,7 +607,13 @@ impl WfApiClient {
         if url.starts_with(&format!("{}/", self.api_base())) {
             req = req.bearer_auth(self.valid_token().await?);
         }
-        let mut resp = req.send().await?.error_for_status()?;
+        let response = req.send().await?;
+        if !response.status().is_success() {
+            let err = check_status(response).await.expect_err("non-success response must be an error");
+            self.note_rate_limit(&err, &[&self.image_gate]);
+            return Err(err);
+        }
+        let mut resp = response;
 
         let content_type = resp
             .headers()
@@ -909,35 +1002,24 @@ impl WfApi for WfApiClient {
     ) -> Result<()> {
         // An edit is a write like any other: it goes through the write gate,
         // which is what keeps this client inside the zone's flood budget.
-        self.write_gate.wait().await;
         let mut form = vec![("message", message.to_string())];
         if let Some(key) = attachment_key {
             form.push(("attachment_key", key.to_string()));
         }
-        self.post_unit(&format!("/posts/{id}"), &form).await
+        self.post_unit_write(&format!("/posts/{id}"), &form).await
     }
 
     async fn delete_post(&self, id: u32, hard: bool) -> Result<()> {
-        self.api_gate.wait().await;
-        let token = self.valid_token().await?;
-        let url = format!("{}/posts/{id}", self.api_base());
         let form: Vec<(&str, String)> = if hard {
             vec![("hard_delete", "1".to_string())]
         } else {
             Vec::new()
         };
-        let resp = self
-            .http
-            .delete(url)
-            .form(&form)
-            .bearer_auth(&token)
-            .send()
-            .await?;
-        check_status(resp).await
+        self.delete_unit_write(&format!("/posts/{id}"), &form).await
     }
 
     async fn mark_solution(&self, id: u32) -> Result<()> {
-        self.post_unit_path(&format!("/posts/{id}/mark-solution")).await
+        self.post_unit_write(&format!("/posts/{id}/mark-solution"), &[]).await
     }
 
     async fn mark_forum_read(&self, node_id: u32) -> Result<()> {
@@ -995,11 +1077,7 @@ impl WfApi for WfApiClient {
     }
 
     async fn delete_conversation(&self, id: u32) -> Result<()> {
-        self.api_gate.wait().await;
-        let token = self.valid_token().await?;
-        let url = format!("{}/conversations/{id}", self.api_base());
-        let resp = self.http.delete(url).bearer_auth(&token).send().await?;
-        check_status(resp).await
+        self.delete_unit_write(&format!("/conversations/{id}"), &[]).await
     }
 
     async fn alerts(&self, page: u32) -> Result<AlertsReply> {
@@ -1070,7 +1148,7 @@ impl WfApi for WfApiClient {
             return Ok(SearchResultsReply::default());
         };
         let search_id = search.search_id;
-        self.get(
+        self.get_search(
             &format!("/search/{search_id}"),
             &[("page", query.page.to_string())],
         )
@@ -1146,7 +1224,7 @@ impl WfApi for WfApiClient {
             return Ok(SearchResultsReply::default());
         };
         let search_id = search.search_id;
-        self.get(
+        self.get_search(
             &format!("/search/{search_id}"),
             &[("page", page.to_string())],
         )
@@ -1396,15 +1474,17 @@ mod tests {
     #[test]
     fn write_gate_is_opened_in_every_test_that_writes_twice() {
         // The methods that `wait()` on `write_gate`, directly or through
-        // `post_form`. `delete_post` and `mark_solution` are not here: they
-        // take the api gate only.
-        const WRITE_CALLS: [&str; 6] = [
+        // `post_form`/`delete_unit_write`.
+        const WRITE_CALLS: [&str; 9] = [
             ".reply(",
             ".create_thread(",
             ".reply_conversation(",
             ".create_conversation(",
             ".edit_post(",
             ".upload_attachment(",
+            ".delete_post(",
+            ".mark_solution(",
+            ".delete_conversation(",
         ];
         // Tests whose subject *is* the spacing, so they must keep waiting.
         const WAITS_ON_PURPOSE: [&str; 1] =
@@ -1963,6 +2043,113 @@ mod tests {
         );
     }
 
+    /// `fetch_bytes` uses the image lane, but it must still parse the shared
+    /// error envelope so an image 429 extends that lane instead of surfacing
+    /// as a generic reqwest status error.
+    #[tokio::test]
+    async fn fetch_bytes_429_extends_the_image_gate_and_keeps_retry_after() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-fetch-429");
+        Mock::given(method("GET"))
+            .and(path("/thumb-429.png"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "12"))
+            .mount(&server)
+            .await;
+
+        let mut c = logged_in_client("tok-1").await;
+        c.image_gate = Arc::new(Gate::new(0));
+        let url = format!("{}/thumb-429.png", server.uri());
+        match c.fetch_bytes(&url, 1024).await.unwrap_err() {
+            Error::RateLimited { retry_after: Some(d) } => assert_eq!(d.as_secs(), 12),
+            other => panic!("wrong error: {other}"),
+        }
+        assert!(
+            c.image_gate.pending_wait() >= Duration::from_secs(11),
+            "image 429 must penalize the image gate, got {:?}",
+            c.image_gate.pending_wait()
+        );
+    }
+
+    /// An edit is a flood-checked write just like a reply. Waiting on the
+    /// write gate without re-arming it left two consecutive edits eligible at
+    /// once.
+    #[tokio::test]
+    async fn successful_edit_reanchors_the_write_gate() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-edit-gate");
+        Mock::given(method("POST"))
+            .and(path("/api/posts/7"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let mut c = logged_in_client("tok-1").await;
+        c.api_gate = Arc::new(Gate::new(0));
+        c.write_gate = Arc::new(Gate::new(0));
+        c.edit_post(7, "updated", None).await.unwrap();
+        assert!(
+            c.write_gate.pending_wait() >= Duration::from_secs(29),
+            "a successful edit must re-arm the write gate, got {:?}",
+            c.write_gate.pending_wait()
+        );
+    }
+
+    /// Deletes and solution toggles are user-visible content mutations, not
+    /// bookkeeping. They must consume and re-arm the same write lane as an
+    /// edit/reply and must honor Retry-After on a 429.
+    #[tokio::test]
+    async fn delete_and_solution_mutations_reanchor_the_write_gate() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-delete-solution-gate");
+        Mock::given(method("DELETE"))
+            .and(path("/api/posts/7"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/posts/7/mark-solution"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut c = logged_in_client("tok-1").await;
+        c.api_gate = Arc::new(Gate::new(0));
+        c.write_gate = Arc::new(Gate::new(0));
+        c.delete_post(7, false).await.unwrap();
+        assert!(
+            c.write_gate.pending_wait() >= Duration::from_secs(29),
+            "a successful delete must re-arm the write gate"
+        );
+
+        open_gates(&mut c);
+        c.mark_solution(7).await.unwrap();
+        assert!(
+            c.write_gate.pending_wait() >= Duration::from_secs(29),
+            "a successful solution toggle must re-arm the write gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_429_extends_both_mutation_gates() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-delete-429");
+        Mock::given(method("DELETE"))
+            .and(path("/api/posts/8"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "12"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut c = logged_in_client("tok-1").await;
+        c.api_gate = Arc::new(Gate::new(0));
+        c.write_gate = Arc::new(Gate::new(0));
+        assert!(matches!(c.delete_post(8, false).await, Err(Error::RateLimited { .. })));
+        assert!(c.api_gate.pending_wait() >= Duration::from_secs(11));
+        assert!(c.write_gate.pending_wait() >= Duration::from_secs(11));
+    }
+
     #[tokio::test]
     async fn search_runs_two_legs_and_returns_results() {
         let server = MockServer::start().await;
@@ -2120,6 +2307,56 @@ mod tests {
             .unwrap();
         assert_eq!(stored.access_token, "tok-2");
         assert_eq!(stored.refresh_token, "refresh-2");
+    }
+
+    /// A refresh-token response is allowed to omit `refresh_token` when the
+    /// grant is not rotated. The client must retain the old grant rather than
+    /// persisting an empty string and forcing a browser login at the next
+    /// access-token expiry.
+    #[tokio::test]
+    async fn refresh_without_a_new_refresh_token_preserves_the_existing_grant() {
+        let server = MockServer::start().await;
+        let dir = "/tmp/wftui-t-refresh-no-rotation";
+        let env = EnvGuard::hold(&server.uri(), dir);
+        let dir = env.dir.to_string_lossy().to_string();
+        Mock::given(method("POST"))
+            .and(path("/api/oauth2/token"))
+            .and(wiremock::matchers::body_string_contains("grant_type=refresh_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "tok-2",
+                "expires_in": 7200
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/me"))
+            .and(header("Authorization", "Bearer tok-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "me": {"user_id": 1, "username": "me"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = WfApiClient::new().unwrap();
+        c.set_tokens(TokenSet {
+            access_token: "expired".into(),
+            refresh_token: "refresh-1".into(),
+            expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
+            scope: "node:read".into(),
+        })
+        .await
+        .unwrap();
+        c.me().await.unwrap();
+
+        let stored = token::Store::with_path(std::path::PathBuf::from(dir).join("token.json"))
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.access_token, "tok-2");
+        assert_eq!(stored.refresh_token, "refresh-1");
+        assert_eq!(stored.scope, "node:read");
     }
 
     /// A `store.save()` failure after a successful (rotating) refresh must

@@ -16,7 +16,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::token::{restrict_permissions, tmp_sibling};
+#[cfg(unix)]
+use crate::token::restrict_permissions;
+use crate::token::tmp_sibling;
 
 /// The largest draft that is written to disk. A draft above this stays in
 /// memory for the session — the editor deliberately supports very large
@@ -136,6 +138,16 @@ pub struct Draft {
     /// resume rather than let the files vanish silently.
     #[serde(default)]
     pub remote_attachments: bool,
+    /// Edit drafts are local because XF has no edit-draft kind. Keep the
+    /// original target and seed so a restart can restore the editor with the
+    /// post's current text underneath the newer draft instead of inventing a
+    /// zero thread id or discarding the baseline.
+    #[serde(default)]
+    pub edit_thread_id: Option<u32>,
+    #[serde(default)]
+    pub edit_thread_title: Option<String>,
+    #[serde(default)]
+    pub edit_seed_body: Option<String>,
 }
 
 impl Draft {
@@ -185,6 +197,12 @@ impl Store {
     /// An unreadable one is quarantined and reported as no drafts: a corrupt
     /// convenience file must never stand between the user and the composer.
     pub fn load(&self) -> HashMap<DraftKey, Draft> {
+        if self.path.parent().is_some_and(|dir| !dir.exists()) {
+            return HashMap::new();
+        }
+        let Ok(_lock) = crate::token::lock_store(&self.path) else {
+            return HashMap::new();
+        };
         let Ok(bytes) = std::fs::read(&self.path) else {
             return HashMap::new();
         };
@@ -195,7 +213,11 @@ impl Store {
                 .filter_map(|(k, v)| Some((DraftKey::from_key(&k)?, v)))
                 .collect(),
             Err(_) => {
-                self.quarantine_corrupt();
+                // Keep the lock across the parse and rename. Otherwise a
+                // concurrent writer could replace the corrupt inode between
+                // those operations and have its valid store quarantined.
+                let dest = crate::token::sibling_with_suffix(&self.path, "corrupt");
+                let _ = std::fs::rename(&self.path, &dest);
                 HashMap::new()
             }
         }
@@ -227,6 +249,7 @@ impl Store {
             .ok_or_else(|| Error::TokenStore("draft path has no parent".into()))?;
         std::fs::create_dir_all(dir)
             .map_err(|e| Error::TokenStore(format!("cannot create {}: {e}", dir.display())))?;
+        let _lock = crate::token::lock_store(&self.path)?;
 
         let tmp = tmp_sibling(&self.path);
         {
@@ -240,8 +263,7 @@ impl Store {
             }
             let mut f = opts
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .open(&tmp)
                 .map_err(|e| Error::TokenStore(format!("cannot write {}: {e}", tmp.display())))?;
             f.write_all(&body)?;
@@ -254,6 +276,10 @@ impl Store {
     }
 
     pub fn erase(&self) -> Result<()> {
+        if self.path.parent().is_some_and(|dir| !dir.exists()) {
+            return Ok(());
+        }
+        let _lock = crate::token::lock_store(&self.path)?;
         match std::fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -261,10 +287,6 @@ impl Store {
         }
     }
 
-    fn quarantine_corrupt(&self) {
-        let dest = crate::token::sibling_with_suffix(&self.path, "corrupt");
-        let _ = std::fs::rename(&self.path, &dest);
-    }
 }
 
 #[cfg(test)]
@@ -286,6 +308,9 @@ mod tests {
             saved_at,
             remote_attachments: false,
             label: String::new(),
+            edit_thread_id: None,
+            edit_thread_title: None,
+            edit_seed_body: None,
         }
     }
 
@@ -302,6 +327,9 @@ mod tests {
                 saved_at: 1_700_000_000,
                 remote_attachments: false,
                 label: "A thread".into(),
+                edit_thread_id: None,
+                edit_thread_title: None,
+                edit_seed_body: None,
             },
         );
         store.save(&map).unwrap();

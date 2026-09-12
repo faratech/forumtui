@@ -235,18 +235,31 @@ pub fn source_of(store_key: &str) -> &str {
 /// `font` is the terminal's cell size in pixels; without it "aspect kept" is
 /// meaningless, because a cell is roughly twice as tall as it is wide.
 pub fn fit(panel_cols: u16, px: (u32, u32), font: (u16, u16)) -> (u16, u16) {
+    if panel_cols == 0 {
+        return (0, 0);
+    }
     let col_cap = ((panel_cols as u32 * WIDTH_PERCENT as u32) / 100).max(1) as u16;
     let (iw, ih) = (px.0.max(1), px.1.max(1));
-    let (fw, fh) = (font.0.max(1) as u32, font.1.max(1) as u32);
-    let max_px_w = col_cap as u32 * fw;
-    let max_px_h = MAX_ROWS as u32 * fh;
+    // Attachment metadata is remote input. Keep ratio products wide and
+    // clamp before converting back to terminal-cell integers.
+    let (fw, fh) = (u128::from(font.0.max(1)), u128::from(font.1.max(1)));
+    let iw = u128::from(iw);
+    let ih = u128::from(ih);
+    let max_px_w = u128::from(col_cap) * fw;
+    let max_px_h = u128::from(MAX_ROWS) * fh;
 
     // Which cap bites first: compare aspect ratios without dividing.
     if iw * max_px_h >= ih * max_px_w {
-        let rows = ((max_px_w * ih).div_ceil(iw).div_ceil(fh) as u16).clamp(1, MAX_ROWS);
+        let rows = (max_px_w * ih)
+            .div_ceil(iw)
+            .div_ceil(fh)
+            .clamp(1, u128::from(MAX_ROWS)) as u16;
         (col_cap, rows)
     } else {
-        let cols = ((max_px_h * iw).div_ceil(ih).div_ceil(fw) as u16).clamp(1, col_cap);
+        let cols = (max_px_h * iw)
+            .div_ceil(ih)
+            .div_ceil(fw)
+            .clamp(1, u128::from(col_cap)) as u16;
         (cols, MAX_ROWS)
     }
 }
@@ -260,17 +273,28 @@ pub fn fit(panel_cols: u16, px: (u32, u32), font: (u16, u16)) -> (u16, u16) {
 /// Never returns a box larger than asked for in either axis, so a caller can
 /// reserve exactly what it got back.
 pub fn fit_within(box_cols: u16, box_rows: u16, px: (u32, u32), font: (u16, u16)) -> (u16, u16) {
+    if box_cols == 0 || box_rows == 0 {
+        return (0, 0);
+    }
     let (cw, ch) = (box_cols.max(1), box_rows.max(1));
     let (iw, ih) = (px.0.max(1), px.1.max(1));
-    let (fw, fh) = (font.0.max(1) as u32, font.1.max(1) as u32);
-    let max_px_w = cw as u32 * fw;
-    let max_px_h = ch as u32 * fh;
+    let (fw, fh) = (u128::from(font.0.max(1)), u128::from(font.1.max(1)));
+    let iw = u128::from(iw);
+    let ih = u128::from(ih);
+    let max_px_w = u128::from(cw) * fw;
+    let max_px_h = u128::from(ch) * fh;
     // Which cap bites first: compare aspect ratios without dividing.
     if iw * max_px_h >= ih * max_px_w {
-        let rows = ((max_px_w * ih).div_ceil(iw).div_ceil(fh) as u16).clamp(1, ch);
+        let rows = (max_px_w * ih)
+            .div_ceil(iw)
+            .div_ceil(fh)
+            .clamp(1, u128::from(ch)) as u16;
         (cw, rows)
     } else {
-        let cols = ((max_px_h * iw).div_ceil(ih).div_ceil(fw) as u16).clamp(1, cw);
+        let cols = (max_px_h * iw)
+            .div_ceil(ih)
+            .div_ceil(fw)
+            .clamp(1, u128::from(cw)) as u16;
         (cols, ch)
     }
 }
@@ -959,6 +983,16 @@ mod tests {
                 assert!(cols <= cap, "{panel} {px:?} -> {cols} cols over cap {cap}");
             }
         }
+        assert_eq!(fit(0, (100, 100), (10, 20)), (0, 0));
+    }
+
+    #[test]
+    fn fit_handles_extreme_remote_dimensions_without_overflow_or_wrap() {
+        for px in [(u32::MAX, u32::MAX), (1, u32::MAX), (u32::MAX, 1)] {
+            let (cols, rows) = fit(118, px, (u16::MAX, u16::MAX));
+            assert!((1..=47).contains(&cols), "{px:?} -> {cols}x{rows}");
+            assert!((1..=MAX_ROWS).contains(&rows), "{px:?} -> {cols}x{rows}");
+        }
     }
 
     #[test]
@@ -1076,6 +1110,17 @@ mod tests {
                 cols == box_wh.0 || rows == box_wh.1,
                 "{px:?} in {box_wh:?} -> {cols}x{rows} fills neither axis"
             );
+        }
+        assert_eq!(fit_within(0, 24, (100, 100), font), (0, 0));
+        assert_eq!(fit_within(80, 0, (100, 100), font), (0, 0));
+    }
+
+    #[test]
+    fn fit_within_handles_extreme_remote_dimensions_without_overflow_or_wrap() {
+        for px in [(u32::MAX, u32::MAX), (1, u32::MAX), (u32::MAX, 1)] {
+            let (cols, rows) = fit_within(u16::MAX, u16::MAX, px, (u16::MAX, u16::MAX));
+            assert!((1..=u16::MAX).contains(&cols), "{px:?} -> {cols}x{rows}");
+            assert!((1..=u16::MAX).contains(&rows), "{px:?} -> {cols}x{rows}");
         }
     }
 

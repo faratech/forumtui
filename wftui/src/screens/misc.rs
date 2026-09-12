@@ -1934,17 +1934,19 @@ fn search_range(s: &super::SearchState) -> Option<String> {
     Some(format!("{start}\u{2013}{end} of {}", s.total))
 }
 
-/// Strip BBCode, collapse whitespace, and cap to `max_chars` — the dim
+/// Strip BBCode, collapse whitespace, and cap to `max_cells` — the dim
 /// snippet under each result's title line.
-pub(crate) fn search_snippet(message: &str, max_chars: usize) -> String {
+pub(crate) fn search_snippet(message: &str, max_cells: usize) -> String {
     // `to_plain` already collapses internal whitespace to single spaces; this
     // just trims the ends and caps the length.
     let plain = common::bbcode::to_plain(message);
     let trimmed = plain.trim();
-    if trimmed.chars().count() <= max_chars {
+    if crate::chrome::cell_width(trimmed) <= max_cells {
         trimmed.to_string()
+    } else if max_cells == 0 {
+        String::new()
     } else {
-        let cut: String = trimmed.chars().take(max_chars).collect();
+        let cut = crate::chrome::take_cells(trimmed, max_cells - 1);
         format!("{cut}\u{2026}")
     }
 }
@@ -3465,8 +3467,16 @@ mod tests {
         assert_eq!(search_snippet("", 10), "");
         let long = "word ".repeat(40);
         let snip = search_snippet(&long, 20);
-        assert_eq!(snip.chars().count(), 21, "{snip}");
+        assert_eq!(crate::chrome::cell_width(&snip), 20, "{snip}");
         assert!(snip.ends_with('\u{2026}'), "{snip}");
+    }
+
+    #[test]
+    fn search_snippet_caps_terminal_cells_without_splitting_graphemes() {
+        let warning = "\u{26a0}\u{fe0f}";
+        let snip = search_snippet(&format!("{warning}{warning} tail"), 4);
+        assert_eq!(snip, format!("{warning}…"));
+        assert!(crate::chrome::cell_width(&snip) <= 4);
     }
 
     // ---------- Reply / compose ----------

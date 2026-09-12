@@ -209,7 +209,7 @@ pub(crate) fn thread_row(
         if cw + 4 <= tw {
             spans.push(chip);
             spans.push(Span::raw(" "));
-            used = cw + 1;
+            used += cw + 1;
         }
     }
     let title = truncate(&t.title, tw.saturating_sub(used));
@@ -2357,11 +2357,10 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
             Some(url) => Action::OpenUrl(url.clone()),
             None => Action::None,
         },
-        // `w` (watch) stays advertised but inert: XenForo's REST API exposes
-        // no thread-watch endpoint (see common/src/api.rs — there is no
-        // `watch` method to call). It is a no-op rather than absent so the
-        // key bar the design specifies is the key bar members learn.
-        KeyCode::Char('w') => Action::None,
+        // XenForo's REST API exposes no thread-watch endpoint. Keep the
+        // unsupported lowercase key explicit rather than silently ignoring a
+        // command the old key contract treated as advertised.
+        KeyCode::Char('w') => Action::Notice("Thread watching is not available here.".into()),
         // `1`-`9` open the nth picture of the selected post - the same
         // numbering the caption lines print, on every tier, and now in the
         // client's own viewer rather than a browser (#693/#697). The
@@ -2887,6 +2886,25 @@ mod tests {
         };
         let line = thread_row(&t, &theme, &UNICODE, Grammar::Wide, 81);
         assert_eq!(line.width(), 81, "{}", text(&line));
+    }
+
+    /// A moderator-visible thread can carry both a state chip and a prefix;
+    /// the second chip must add to, not replace, the first chip's width.
+    #[test]
+    fn thread_row_keeps_exact_width_with_state_and_prefix_chips() {
+        let theme = Theme::truecolor();
+        let t = Thread {
+            title: "Awaiting approval thread".into(),
+            username: "moderator".into(),
+            discussion_state: "deleted".into(),
+            prefix: Some("Windows 11".into()),
+            reply_count: 4,
+            ..Default::default()
+        };
+        for inner in [60usize, 81, 120] {
+            let line = thread_row(&t, &theme, &UNICODE, Grammar::Wide, inner);
+            assert_eq!(line.width(), inner, "state + prefix at inner {inner}: {}", text(&line));
+        }
     }
 
     #[test]
@@ -5018,8 +5036,7 @@ mod tests {
         assert!(matches!(act, Action::None));
         assert_eq!(state.sel_post, 0);
 
-        // Advertised-but-inert keys must stay inert, not fall through to a verb.
-        assert!(matches!(thread_view_key(&mut state, key('w')), Action::None));
+        assert!(matches!(thread_view_key(&mut state, key('w')), Action::Notice(_)));
         assert!(matches!(thread_view_key(&mut state, key('1')), Action::None));
     }
 
@@ -5062,4 +5079,3 @@ mod tests {
         }
     }
 }
-

@@ -423,12 +423,9 @@ impl App {
             }
             Hit::Badge(tab) => self.open_inbox(tab),
             Hit::Tab(tab) => {
+                self.open_inbox(tab);
                 if let Some(Screen::Inbox(inbox)) = self.screens.last_mut() {
-                    inbox.tab = tab;
                     inbox.focus = screens::InboxPane::List;
-                }
-                if tab == screens::InboxTab::Alerts {
-                    self.mark_alerts_viewed();
                 }
             }
             Hit::PaletteRow(i) => {

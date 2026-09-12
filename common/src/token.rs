@@ -4,7 +4,9 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -76,6 +78,10 @@ impl Store {
     }
 
     pub fn load(&self) -> Result<Option<TokenSet>> {
+        if self.path.parent().is_some_and(|dir| !dir.exists()) {
+            return Ok(None);
+        }
+        let _lock = lock_store(&self.path)?;
         let bytes = match std::fs::read(&self.path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -93,6 +99,7 @@ impl Store {
             .ok_or_else(|| Error::TokenStore("token path has no parent".into()))?;
         std::fs::create_dir_all(dir)
             .map_err(|e| Error::TokenStore(format!("cannot create {}: {e}", dir.display())))?;
+        let _lock = lock_store(&self.path)?;
         let body = serde_json::to_vec_pretty(tokens)?;
 
         let tmp = tmp_sibling(&self.path);
@@ -106,8 +113,7 @@ impl Store {
             }
             let mut f = opts
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .open(&tmp)
                 .map_err(|e| Error::TokenStore(format!("cannot write {}: {e}", tmp.display())))?;
             f.write_all(&body)?;
@@ -120,6 +126,10 @@ impl Store {
     }
 
     pub fn erase(&self) -> Result<()> {
+        if self.path.parent().is_some_and(|dir| !dir.exists()) {
+            return Ok(());
+        }
+        let _lock = lock_store(&self.path)?;
         match std::fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -132,13 +142,100 @@ impl Store {
     /// was there. Best-effort: if the rename itself fails there is nothing
     /// better to do than proceed as if there were no session.
     pub fn quarantine_corrupt(&self) {
+        if self.path.parent().is_some_and(|dir| !dir.exists()) {
+            return;
+        }
+        let Ok(_lock) = lock_store(&self.path) else {
+            return;
+        };
+        // `load()` releases its lock before the caller can decide to
+        // quarantine. A sibling may have atomically installed a valid token
+        // in that interval; never move that newer grant just because the
+        // earlier read was corrupt.
+        let Ok(bytes) = std::fs::read(&self.path) else {
+            return;
+        };
+        if serde_json::from_slice::<TokenSet>(&bytes).is_ok() {
+            return;
+        }
         let dest = sibling_with_suffix(&self.path, "corrupt");
         let _ = std::fs::rename(&self.path, &dest);
     }
+
+    /// Remove the file only if it still contains `expected`. A logout or a
+    /// rejected refresh must not erase a newer grant another process wrote
+    /// after this process took its snapshot.
+    pub fn erase_if_refresh_token(&self, expected: &str) -> Result<bool> {
+        if expected.is_empty() || self.path.parent().is_some_and(|dir| !dir.exists()) {
+            return Ok(false);
+        }
+        let _lock = lock_store(&self.path)?;
+        let bytes = match std::fs::read(&self.path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let current: TokenSet = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::TokenStore(format!("{} is corrupt: {e}", self.path.display())))?;
+        if current.refresh_token != expected {
+            return Ok(false);
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// Advisory inter-process lock shared by token and draft stores. The lock is
+/// separate from the JSON file so the atomic rename never replaces the inode
+/// another process is holding. `fs2` maps this to `flock` on Unix and the
+/// corresponding mandatory Windows lock.
+pub(crate) struct StoreLock {
+    file: std::fs::File,
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+pub(crate) fn lock_store(path: &Path) -> Result<StoreLock> {
+    let lock_path = sibling_with_suffix(path, "lock");
+    #[allow(unused_mut)]
+    let mut opts = std::fs::OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)
+        .map_err(|e| Error::TokenStore(format!("cannot open {}: {e}", lock_path.display())))?;
+    #[cfg(unix)]
+    restrict_permissions(&lock_path);
+    file.lock_exclusive()
+        .map_err(|e| Error::TokenStore(format!("cannot lock {}: {e}", lock_path.display())))?;
+    Ok(StoreLock { file })
 }
 
 pub(crate) fn tmp_sibling(path: &Path) -> PathBuf {
-    sibling_with_suffix(path, "tmp")
+    // A fixed `token.json.tmp`/`drafts.json.tmp` lets two processes sharing a
+    // config directory truncate each other's in-progress JSON. The final
+    // rename is atomic, but the temporary writer was not isolated. Include a
+    // process-local sequence so concurrent writers each own a unique inode.
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let base = sibling_with_suffix(path, "tmp");
+    let name = base
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".wftui-token.tmp".into());
+    base.with_file_name(format!("{name}.{}.{}", std::process::id(), TMP_SEQ.fetch_add(1, Ordering::Relaxed)))
 }
 
 pub(crate) fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -173,6 +270,16 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_store_writes_get_distinct_temp_paths() {
+        let path = std::path::Path::new("/tmp/wftui-token-race/token.json");
+        let first = tmp_sibling(path);
+        let second = tmp_sibling(path);
+        assert_ne!(first, second, "atomic writers must not share a temp inode");
+        assert!(first.file_name().unwrap().to_string_lossy().contains(".tmp."));
+        assert!(second.file_name().unwrap().to_string_lossy().contains(".tmp."));
+    }
+
+    #[test]
     fn round_trip_and_erase() {
         let dir = std::env::temp_dir().join(format!("wftui-token-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -185,6 +292,26 @@ mod tests {
         store.erase().unwrap();
         assert!(store.load().unwrap().is_none());
         store.erase().unwrap(); // idempotent
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn conditional_erase_does_not_remove_a_newer_grant() {
+        let dir = std::env::temp_dir().join(format!("wftui-token-conditional-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::with_path(dir.join("token.json"));
+        store.save(&sample()).unwrap();
+        store
+            .save(&TokenSet {
+                refresh_token: "new-refresh".into(),
+                ..sample()
+            })
+            .unwrap();
+
+        assert!(!store.erase_if_refresh_token("rt").unwrap());
+        assert_eq!(store.load().unwrap().unwrap().refresh_token, "new-refresh");
+        assert!(store.erase_if_refresh_token("new-refresh").unwrap());
+        assert!(store.load().unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -237,6 +364,25 @@ mod tests {
         assert!(!path.exists());
         assert!(dir.join("token.json.corrupt").exists());
         assert!(store.load().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quarantine_corrupt_does_not_move_a_valid_replacement() {
+        let dir = std::env::temp_dir().join(format!("wftui-token-quarantine-valid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token.json");
+        let store = Store::with_path(path.clone());
+
+        std::fs::write(&path, b"not json at all").unwrap();
+        // Model the sibling's atomic replacement after the failed load.
+        store.save(&sample()).unwrap();
+        store.quarantine_corrupt();
+
+        assert!(path.exists(), "a valid replacement must remain in place");
+        assert!(!dir.join("token.json.corrupt").exists());
+        assert_eq!(store.load().unwrap().unwrap().refresh_token, "rt");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

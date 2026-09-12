@@ -181,18 +181,19 @@ pub fn move_end(text: &str, cursor: &mut usize) {
 /// Calculate the 2D cursor coordinate (col, row) for a multi-line string.
 pub fn cursor_coords(text: &str, cursor: usize) -> (u16, u16) {
     let chars: Vec<char> = text.chars().collect();
-    let target = cursor.min(chars.len());
+    let target = grapheme_boundary(&chars, cursor);
     let mut row = 0u16;
     let mut col = 0u16;
-    for (i, &c) in chars.iter().enumerate() {
-        if i == target {
-            break;
-        }
-        if c == '\n' {
+    let mut i = 0usize;
+    while i < target {
+        if chars[i] == '\n' {
             row += 1;
             col = 0;
+            i += 1;
         } else {
-            col += 1;
+            let end = next_cluster_end(&chars, i).min(target);
+            col = col.saturating_add(span_cells(&chars, i, end) as u16);
+            i = end;
         }
     }
     (col, row)
@@ -216,14 +217,59 @@ pub struct VisualRow {
     pub end: usize,
 }
 
+#[cfg(test)]
 fn char_cells(c: char) -> usize {
     let mut buf = [0u8; 4];
     crate::chrome::cell_width(c.encode_utf8(&mut buf))
 }
 
-/// Display width of `chars[a..b]` in cells.
+#[derive(Debug, Clone, Copy)]
+struct GraphemeRange {
+    start: usize,
+    end: usize,
+    width: usize,
+}
+
+/// Grapheme clusters with character-index ranges. The editor stores cursors
+/// as character indices for cheap mutation, but every visual operation must
+/// treat a cluster such as `⚠️` or a family emoji as one indivisible terminal
+/// unit. `ratatui`/`unicode-width` measures the complete cluster, not the
+/// individual scalar values.
+fn grapheme_ranges(chars: &[char], offset: usize) -> Vec<GraphemeRange> {
+    let text: String = chars.iter().collect();
+    let mut char_at = offset;
+    text.graphemes(true)
+        .map(|grapheme| {
+            let start = char_at;
+            char_at += grapheme.chars().count();
+            GraphemeRange {
+                start,
+                end: char_at,
+                width: crate::chrome::cell_width(grapheme),
+            }
+        })
+        .collect()
+}
+
+/// Clamp an editor cursor to a grapheme boundary. Normal key paths already
+/// maintain this invariant, but seeded text, a mouse click, or a future
+/// caller can hand the visual model an interior scalar index. Drawing a caret
+/// inside a presentation sequence would make the renderer and the editor
+/// disagree about its width.
+fn grapheme_boundary(chars: &[char], cursor: usize) -> usize {
+    let cursor = cursor.min(chars.len());
+    grapheme_ranges(chars, 0)
+        .into_iter()
+        .find(|range| cursor > range.start && cursor < range.end)
+        .map_or(cursor, |range| range.start)
+}
+
+/// Display width of `chars[a..b]` in cells. All visual ranges are grapheme
+/// aligned; measuring the complete string also keeps variation selectors and
+/// ZWJ sequences consistent with the terminal buffer's width calculation.
 fn span_cells(chars: &[char], a: usize, b: usize) -> usize {
-    chars[a..b].iter().copied().map(char_cells).sum()
+    let text: String = chars[a.min(chars.len())..b.min(chars.len())].iter().collect();
+    crate::chrome::cell_width(&text)
 }
 
 /// Greedy word wrap of `text` at `width` cells, as visual rows.
@@ -271,35 +317,51 @@ fn wrap_logical_line(
     width: usize,
     rows: &mut Vec<VisualRow>,
 ) {
+    let clusters = grapheme_ranges(&chars[start..end], start);
     let mut pos = start;
     loop {
         let mut used = 0usize;
         let mut fit = pos;
-        while fit < end {
-            let cw = char_cells(chars[fit]);
-            if used + cw > width {
+        for cluster in clusters.iter().filter(|cluster| cluster.start >= pos) {
+            if used + cluster.width > width {
                 break;
             }
-            used += cw;
-            fit += 1;
+            used += cluster.width;
+            fit = cluster.end;
         }
         if fit >= end {
             rows.push(VisualRow { start: pos, end });
             return;
         }
-        let mut brk = if chars[fit].is_whitespace() {
-            fit
+        let at_fit = clusters
+            .iter()
+            .find(|cluster| cluster.start == fit)
+            .copied();
+        let mut brk = if at_fit.is_some_and(|cluster| chars[cluster.start].is_whitespace()) {
+            at_fit.expect("cluster at the wrap boundary").end
         } else {
-            match (pos..fit).rev().find(|&i| chars[i].is_whitespace()) {
-                Some(ws) => ws + 1,
+            match clusters
+                .iter()
+                .rev()
+                .find(|cluster| cluster.start >= pos && cluster.start < fit && chars[cluster.start].is_whitespace())
+            {
+                Some(ws) => ws.end,
                 None => fit, // one unbreakable word: hard-split it
             }
         };
-        while brk < end && chars[brk].is_whitespace() {
-            brk += 1;
+        while let Some(cluster) = clusters.iter().find(|cluster| cluster.start == brk)
+            && chars[cluster.start].is_whitespace()
+        {
+            brk = cluster.end;
         }
         if brk <= pos {
-            brk = pos + 1; // the loop must always make progress
+            // A cluster wider than the pane cannot fit, but it still must be
+            // kept whole. Splitting it would make the next row start in the
+            // middle of a grapheme and reintroduce the same width bug.
+            brk = clusters
+                .iter()
+                .find(|cluster| cluster.start == pos)
+                .map_or(pos.saturating_add(1), |cluster| cluster.end);
         }
         rows.push(VisualRow { start: pos, end: brk });
         pos = brk;
@@ -494,7 +556,7 @@ impl WrapCache {
         if self.line_rows.is_empty() {
             return (0, 0);
         }
-        let cursor = cursor.min(self.chars.len());
+        let cursor = grapheme_boundary(&self.chars, cursor);
         let li = self.line_of(cursor);
         let base = self.line_starts[li];
         let rel = cursor.saturating_sub(base);
@@ -522,12 +584,13 @@ impl WrapCache {
         let mut used = 0usize;
         let mut i = r.start;
         while i < r.end {
-            let cw = char_cells(self.chars[i]);
+            let end = next_cluster_end(&self.chars, i).min(r.end);
+            let cw = span_cells(&self.chars, i, end);
             if used + cw > col {
                 break;
             }
             used += cw;
-            i += 1;
+            i = end;
         }
         i
     }
@@ -583,7 +646,7 @@ fn wrap_segment(
 
 /// The caret's `(row, col)` in `rows`, col measured in cells.
 pub fn caret_in_rows(chars: &[char], rows: &[VisualRow], cursor: usize) -> (usize, usize) {
-    let cursor = cursor.min(chars.len());
+    let cursor = grapheme_boundary(chars, cursor);
     let idx = rows.iter().rposition(|r| r.start <= cursor).unwrap_or(0);
     let Some(row) = rows.get(idx) else {
         return (0, 0);
@@ -606,7 +669,9 @@ pub fn caret_position(text: &str, width: usize, cursor: usize) -> (usize, usize)
 /// cells wide (issue #569 — the single-line sibling of `caret_in_rows`,
 /// which multi-line editors already measure this way).
 pub fn prefix_cells(text: &str, cursor: usize) -> usize {
-    text.chars().take(cursor).map(char_cells).sum()
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = grapheme_boundary(&chars, cursor);
+    span_cells(&chars, 0, cursor)
 }
 
 /// The horizontal viewport of a **single-line** field: which char the visible
@@ -624,7 +689,7 @@ pub fn prefix_cells(text: &str, cursor: usize) -> usize {
 /// whole prefix fits again.
 pub fn hwindow(text: &str, cursor: usize, width: usize) -> (usize, usize) {
     let chars: Vec<char> = text.chars().collect();
-    let cursor = cursor.min(chars.len());
+    let cursor = grapheme_boundary(&chars, cursor);
     if width == 0 {
         return (cursor, 0);
     }
@@ -637,12 +702,13 @@ pub fn hwindow(text: &str, cursor: usize, width: usize) -> (usize, usize) {
     let mut start = cursor;
     let mut used = 0usize;
     while start > 0 {
-        let w = char_cells(chars[start - 1]);
+        let previous = cluster_start_before(&chars, start);
+        let w = span_cells(&chars, previous, start);
         if used + w > budget {
             break;
         }
         used += w;
-        start -= 1;
+        start = previous;
     }
     (start, used)
 }
@@ -666,12 +732,13 @@ pub fn caret_at_cell(text: &str, width: usize, row: usize, col: usize) -> usize 
     let mut used = 0usize;
     let mut i = r.start;
     while i < r.end {
-        let cw = char_cells(chars[i]);
+        let end = next_cluster_end(&chars, i).min(r.end);
+        let cw = span_cells(&chars, i, end);
         if used + cw > col {
             break;
         }
         used += cw;
-        i += 1;
+        i = end;
     }
     i
 }
@@ -686,12 +753,13 @@ pub fn field_caret_at(text: &str, cursor: usize, room: usize, col: usize) -> usi
     let mut used = 0usize;
     let mut i = start.min(chars.len());
     while i < chars.len() {
-        let cw = char_cells(chars[i]);
+        let end = next_cluster_end(&chars, i);
+        let cw = span_cells(&chars, i, end);
         if used + cw > col {
             break;
         }
         used += cw;
-        i += 1;
+        i = end;
     }
     i
 }
@@ -723,12 +791,13 @@ pub fn move_vertical(
     let mut used = 0usize;
     let mut i = r.start;
     while i < r.end {
-        let cw = char_cells(chars[i]);
+        let end = next_cluster_end(&chars, i).min(r.end);
+        let cw = span_cells(&chars, i, end);
         if used + cw > want {
             break;
         }
         used += cw;
-        i += 1;
+        i = end;
     }
     // A CONTINUATION row (soft-wrapped — a hard-split word, or hanging
     // whitespace absorbed into the row before a break) shares its `end` with
@@ -744,7 +813,7 @@ pub fn move_vertical(
         && i > r.start
         && rows.get(target + 1).is_some_and(|next| next.start == r.end)
     {
-        i -= 1;
+        i = cluster_start_before(&chars, i);
     }
     *cursor = i;
 }
@@ -837,31 +906,32 @@ pub fn normalize_control_chars(s: &str) -> String {
     }
     let mut out = String::with_capacity(s.len());
     let mut col = 0usize;
-    for c in s.chars() {
-        match c {
-            '\n' => {
+    for grapheme in s.graphemes(true) {
+        match grapheme {
+            "\n" => {
                 out.push('\n');
                 col = 0;
             }
-            '\t' => {
+            "\t" => {
                 let next_stop = (col / 4 + 1) * 4;
                 for _ in col..next_stop {
                     out.push(' ');
                 }
                 col = next_stop;
             }
-            c if (c as u32) < 0x20 => {
-                // Drop every other C0 control character (issue #559).
-            }
-            c if c == '\u{7f}' || ('\u{80}'..='\u{9f}').contains(&c) => {
+            grapheme
+                if grapheme
+                    .chars()
+                    .any(|c| (c as u32) < 0x20 || c == '\u{7f}' || ('\u{80}'..='\u{9f}').contains(&c)) =>
+            {
                 // DEL and C1: ratatui's rendering of them is undefined (#652).
             }
-            c => {
-                out.push(c);
-                // The stop column counts terminal cells: a wide character
-                // covers two of them, and billing it one shifted every tab
-                // stop after it left (#652).
-                col += char_cells(c);
+            grapheme => {
+                out.push_str(grapheme);
+                // The stop column counts the complete grapheme's terminal
+                // cells. Billing only its first scalar shifted every tab stop
+                // after a variation sequence or ZWJ emoji (#718).
+                col += crate::chrome::cell_width(grapheme);
             }
         }
     }
@@ -1127,6 +1197,26 @@ mod tests {
                 .sum();
             assert!(w <= 9, "row is {w} cells wide");
         }
+    }
+
+    #[test]
+    fn visual_model_measures_complete_grapheme_clusters() {
+        // U+26A0 + U+FE0F is two characters but one presentation cluster;
+        // the terminal bills the complete cluster as two cells.
+        let warning = "\u{26a0}\u{fe0f}";
+        assert_eq!(crate::chrome::cell_width(warning), 2);
+        let text = format!("{warning}{warning}");
+        assert_eq!(visual_rows(&text, 2), vec![VisualRow { start: 0, end: 2 }, VisualRow { start: 2, end: 4 }]);
+        assert_eq!(caret_position(&text, 2, 2), (1, 0), "the boundary belongs to the following visual row");
+        assert_eq!(caret_position(&text, 2, 1), (0, 0), "an interior scalar clamps before the cluster");
+
+        // A ZWJ family must also stay whole when the pane is narrow.
+        let family = "👨\u{200d}👩\u{200d}👦";
+        assert_eq!(crate::chrome::cell_width(family), 2);
+        let family_text = format!("{family}{family}");
+        assert_eq!(visual_rows(&family_text, 2), vec![VisualRow { start: 0, end: 5 }, VisualRow { start: 5, end: 10 }]);
+        assert_eq!(hwindow(&text, text.chars().count(), 3), (2, 2));
+        assert_eq!(normalize_control_chars(&format!("{warning}\tx")), format!("{warning}  x"));
     }
 
     #[test]

@@ -109,11 +109,16 @@ fn shellexpand_home(path: &str) -> String {
     let Some(rest) = trimmed.strip_prefix('~') else {
         return trimmed.to_string();
     };
-    let Some(home) = std::env::var_os("HOME") else {
+    if !rest.is_empty() && !rest.starts_with('/') && !rest.starts_with('\\') {
+        return trimmed.to_string();
+    }
+    let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+    else {
         return trimmed.to_string();
     };
     let mut out = std::path::PathBuf::from(home);
-    let rest = rest.trim_start_matches('/');
+    let rest = rest.trim_start_matches(['/', '\\']);
     if !rest.is_empty() {
         out.push(rest);
     }
@@ -163,15 +168,16 @@ pub struct TaskError {
 /// this only guards the fallback case.
 const RAW_MESSAGE_CAP: usize = 80;
 
-/// Truncate `s` to at most `max` *chars* (not bytes, so a multi-byte
-/// codepoint is never split), appending `…` when it was longer.
+/// Truncate `s` to at most `max` terminal cells, cutting only on grapheme
+/// boundaries and reserving one cell for `…` when it was longer.
 fn cap_message(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if chrome::cell_width(s) <= max {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(max).collect();
-    out.push('…');
-    out
+    if max == 0 {
+        return String::new();
+    }
+    format!("{}…", chrome::take_cells(s, max - 1))
 }
 
 impl TaskError {
@@ -276,6 +282,11 @@ impl std::fmt::Display for TaskError {
 type TaskResult<T> = Result<T, TaskError>;
 
 pub enum Msg {
+    /// A result produced by work tied to one authenticated session. The app
+    /// unwraps this at the message boundary only when the generation is still
+    /// current; queued results from a session that ended are discarded before
+    /// they can mutate screens, badges, drafts, or start follow-up work.
+    Session { generation: u64, msg: Box<Msg> },
     /// The stored-session check came back. `generation` is the
     /// `App::bootstrap_generation` the check was started under: `end_session`
     /// (and so `logout`) bumps it, so a restore that was already in flight
@@ -302,7 +313,7 @@ pub enum Msg {
     LoginReady { generation: u64, url: String },
     LoginFailed { generation: u64, message: String },
     LoginComplete { generation: u64, result: Result<User, TaskError> },
-    NodesLoaded(TaskResult<Vec<Node>>),
+    NodesLoaded { load_id: u64, result: TaskResult<Vec<Node>> },
     /// A forum page came back. `node_id` is the forum that was asked for, so
     /// a reply that outraced a newer request is dropped instead of landing in
     /// whichever list happens to be on top (`Gate::wait` only spaces request
@@ -311,11 +322,17 @@ pub enum Msg {
     /// rather than replacing it, so a tall terminal is not left showing 20
     /// rows in a pane with room for 45.
     ForumLoaded { node_id: u32, page: u32, append: bool, seq: u64, result: TaskResult<ForumReply> },
-    ThreadLoaded { id: u32, page: u32, result: TaskResult<ThreadReply> },
-    ReplySent(TaskResult<Post>),
-    ThreadCreated(TaskResult<Thread>),
+    ThreadLoaded { id: u32, page: u32, load_id: u64, result: TaskResult<ThreadReply> },
+    ReplySent {
+        composer: common::drafts::DraftKey,
+        result: TaskResult<Post>,
+    },
+    ThreadCreated {
+        composer: common::drafts::DraftKey,
+        result: TaskResult<Thread>,
+    },
     MarkedRead(TaskResult<()>),
-    ConversationsLoaded { page: u32, result: TaskResult<ConversationsReply> },
+    ConversationsLoaded { page: u32, load_id: u64, result: TaskResult<ConversationsReply> },
     /// A conversation page came back. `mark_read` says whether this load was
     /// the USER opening the conversation — only then may the client tell the
     /// server it has been read. The dual-pane Inbox primes its right half with
@@ -324,6 +341,7 @@ pub enum Msg {
     ConversationLoaded {
         id: u32,
         page: u32,
+        load_id: u64,
         mark_read: bool,
         result: TaskResult<ConversationReply>,
     },
@@ -331,8 +349,11 @@ pub enum Msg {
     /// Carries no error arm on purpose: a draft sync that fails is a no-op
     /// the user cannot act on, so the failure is logged where it happens and
     /// never reaches the session boundary.
-    DraftsLoaded(Vec<common::models::RemoteDraft>),
-    ConvoReplySent(TaskResult<()>),
+    DraftsLoaded { epoch: u64, drafts: Vec<common::models::RemoteDraft> },
+    ConvoReplySent {
+        composer: common::drafts::DraftKey,
+        result: TaskResult<()>,
+    },
     ConvoCreated(TaskResult<Conversation>),
     /// The id travels with the result (issue #608) so a successful mark can
     /// flip that one row's `is_unread` locally instead of reloading page 1 of
@@ -344,23 +365,27 @@ pub enum Msg {
     /// "not found" — and so a session-ending one still reaches the boundary
     /// (issue #597).
     RecipientResolved { name: String, id: TaskResult<Option<u32>> },
-    AlertsLoaded(TaskResult<AlertsReply>),
+    AlertsLoaded { load_id: u64, result: TaskResult<AlertsReply> },
     AlertMarked(TaskResult<()>),
+    AlertsViewed { view_id: u64, result: TaskResult<()> },
     /// Media Gallery / Resource Manager catalog pages (issue #680). Replies
     /// adopt the topmost matching screen; the screens' loading guards keep
     /// one fetch in flight, so page stamping is enough identity.
-    MediaLoaded { page: u32, result: TaskResult<MediaListReply> },
-    ResourceLoaded { page: u32, result: TaskResult<ResourceListReply> },
+    MediaLoaded { page: u32, load_id: u64, result: TaskResult<MediaListReply> },
+    ResourceLoaded { page: u32, load_id: u64, result: TaskResult<ResourceListReply> },
     /// The gallery's category tree, and one resource's page (#697).
-    MediaCategoriesLoaded(TaskResult<common::models::MediaCategoriesReply>),
+    MediaCategoriesLoaded { load_id: u64, result: TaskResult<common::models::MediaCategoriesReply> },
     /// An attachment upload finished (#709): the key it went under and the
     /// file, or a message saying why not.
-    AttachmentUploaded(std::result::Result<(String, common::models::Attachment), String>),
+    AttachmentUploaded {
+        composer: common::drafts::DraftKey,
+        result: std::result::Result<(String, common::models::Attachment), String>,
+    },
     /// Post edits, deletions and solution toggles (#708).
     PostEdited { post_id: u32, result: TaskResult<()> },
     PostDeleted { post_id: u32, thread_id: u32, result: TaskResult<()> },
     SolutionMarked { post_id: u32, thread_id: u32, result: TaskResult<()> },
-    ResourceViewLoaded { id: u32, result: TaskResult<common::models::ResourceReply> },
+    ResourceViewLoaded { id: u32, load_id: u64, result: TaskResult<common::models::ResourceReply> },
     SearchDone { generation: u64, page: u32, result: TaskResult<SearchResultsReply> },
     /// A go-to palette member lookup came back. `query` is the palette query
     /// that asked, so a stale answer to an edited query is dropped.
@@ -370,7 +395,10 @@ pub enum Msg {
     /// B pushed over a slow A) is dropped instead of filling the topmost
     /// profile screen.
     ProfileLoaded { generation: u64, result: TaskResult<User> },
-    LoggedOut(Result<(), String>),
+    /// Local token snapshot is complete. Login may be started after this
+    /// point; remote revocation can continue in the background.
+    LogoutSnapshot { generation: u64, result: Result<(), String> },
+    LoggedOut { generation: u64, result: Result<(), String> },
     /// A thumbnail / avatar / the sign-in logo finished loading off-thread.
     /// Only sent by the `images` feature's loader.
     /// `key` is `images::store_key(url, cols, rows)` — decoded payloads are
@@ -385,6 +413,16 @@ pub enum Msg {
     /// baked into the post lines, so the page is re-fetched (issue #538).
     PostToggled { verb: PostVerb, result: TaskResult<Toggle> },
     Notice(String),
+}
+
+/// Wrap a message produced by work that belongs to the current authenticated
+/// session. The message pump drops the wrapper before dispatch only when its
+/// generation is still current.
+pub(super) fn session_msg(generation: u64, msg: Msg) -> Msg {
+    Msg::Session {
+        generation,
+        msg: Box::new(msg),
+    }
 }
 
 /// Which toggle a `Msg::PostToggled` is answering, so the notice can name it.
@@ -448,6 +486,10 @@ pub struct App {
     crumb_targets: Vec<usize>,
     /// Mints `ThreadListState::load_seq` (#705).
     next_list_seq: u64,
+    /// Mints identities for every screen-owned async load. A server id or
+    /// page is not enough when a screen is reopened or retargeted while the
+    /// old request is still in flight.
+    next_load_id: u64,
     pub convos_unread: u32,
     pub status: String,
     /// When the current `status` was shown as a toast (`Some`) — cleared by
@@ -491,6 +533,11 @@ pub struct App {
     /// running (and doubled by the next login's `start_pollers` call) —
     /// issue #524.
     poller_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Abort handles for session-scoped reads, draft sync/relay work, and
+    /// other background tasks that do not use the write helper. Their results
+    /// also carry `session_generation`, because an abort cannot retract a
+    /// message that already reached the channel.
+    session_handles: Vec<tokio::task::AbortHandle>,
     /// Abort handles for the in-flight *writes* (post a reply, start a
     /// thread, send/reply to a DM) spawned by `spawn_write`. A write waits
     /// on `api_gate`/`write_gate` (up to 30 s after a previous post, 180 s
@@ -501,6 +548,9 @@ pub struct App {
     /// "Reply posted." over the sign-in screen. `end_session` aborts them:
     /// a write belongs to the session that started it (issue #567).
     write_handles: Vec<tokio::task::AbortHandle>,
+    /// Changes at every login/logout or identity boundary. Every async result
+    /// created while a session is live is stamped with this value.
+    session_generation: u64,
     /// True after a transient (transport/5xx) failure to restore a stored
     /// session — cleared on a successful restore or a session-ending error.
     /// While true, `r` re-runs the session check instead of whatever the top
@@ -537,6 +587,11 @@ pub struct App {
     /// stamped on the flow's messages so a superseded flow's `LoginReady` /
     /// `LoginFailed` / `LoginComplete` is ignored (issue #547).
     login_generation: u64,
+    /// Explicit logout has taken the local token snapshot but may still be
+    /// waiting on remote revoke calls. A new login is held until the snapshot
+    /// message arrives, so it cannot write a fresh grant before the old
+    /// logout task finishes taking the store snapshot.
+    logout_pending: bool,
     /// Which `open_profile` request is the live one, stamped on the pushed
     /// `ProfileState` and its `Msg::ProfileLoaded` so a slow reply to an
     /// older profile cannot fill a newer screen (same pattern as
@@ -563,6 +618,14 @@ pub struct App {
     /// and a crash both survive.
     drafts: std::collections::HashMap<common::drafts::DraftKey, common::drafts::Draft>,
     draft_store: common::drafts::Store,
+    /// Monotonic local-draft mutation epoch. A remote list started before a
+    /// local save/delete must not resurrect its stale copy when it returns.
+    draft_epoch: u64,
+    draft_mutations: std::collections::HashMap<common::drafts::DraftKey, u64>,
+    draft_deletions: std::collections::HashMap<common::drafts::DraftKey, u64>,
+    /// Same-key relay operations share a FIFO mutex, so a delete cannot beat
+    /// the save that preceded it on the event loop.
+    draft_relay_tail: std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -760,6 +823,7 @@ pub async fn run(images: crate::images::Images) -> u8 {
     let draft_store = common::drafts::Store::new();
     let mut app = App {
         next_list_seq: 1,
+        next_load_id: 1,
         api: client.clone(),
         client,
         tx,
@@ -790,13 +854,16 @@ pub async fn run(images: crate::images::Images) -> u8 {
         last_title: String::new(),
         should_quit: false,
         poller_handles: Vec::new(),
+        session_handles: Vec::new(),
         write_handles: Vec::new(),
+        session_generation: 0,
         bootstrap_retry_needed: false,
         bootstrap_generation: 0,
         session_recovery_tried: false,
         session_recovery_pending: false,
         session_recovery_started_at: None,
         login_generation: 0,
+        logout_pending: false,
         profile_generation: 0,
         search_generation: 0,
         login_task: None,
@@ -806,6 +873,10 @@ pub async fn run(images: crate::images::Images) -> u8 {
         // must not cost the words.
         drafts: draft_store.load(),
         draft_store,
+        draft_epoch: 0,
+        draft_mutations: std::collections::HashMap::new(),
+        draft_deletions: std::collections::HashMap::new(),
+        draft_relay_tail: std::collections::HashMap::new(),
     };
     app.bootstrap().await;
     let reader = crate::event::spawn_reader();
@@ -1405,9 +1476,10 @@ impl App {
         };
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
             let user = api.find_user(&query).await.unwrap_or(None);
-            tx.send(Msg::PaletteMember { query, user }).ok();
+            tx.send(session_msg(session_generation, Msg::PaletteMember { query, user })).ok();
         });
     }
 
@@ -1416,18 +1488,24 @@ impl App {
     /// counter clears, unactioned alerts stay highlighted, and Enter/`m` on
     /// a row still marks that one read.
     ///
-    /// Only sent when there is a count to clear, so revisiting the tab does
-    /// not spend a request each time.
     fn mark_alerts_viewed(&mut self) {
-        if self.alerts_unread == 0 {
+        let view_id = self.next_load_id();
+        let Some(inbox) = self.inbox_mut() else {
+            return;
+        };
+        if inbox.alerts_viewed {
             return;
         }
+        inbox.alerts_viewed = true;
+        inbox.alerts_view_pending = true;
+        inbox.alerts_view_id = view_id;
         self.alerts_unread = 0;
         let api = self.api.clone();
-        tokio::spawn(async move {
-            // Nothing waits on this: the badge is already cleared locally,
-            // and a failure means the next poll puts the count back.
-            let _ = api.mark_alerts_viewed().await;
+        let tx = self.tx.clone();
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
+            let result = api.mark_alerts_viewed().await.map_err(|e| TaskError::of(&e));
+            tx.send(session_msg(session_generation, Msg::AlertsViewed { view_id, result })).ok();
         });
     }
 
@@ -1461,6 +1539,14 @@ impl App {
         let Some(key) = c.target.as_ref().map(|t| t.draft_key()) else {
             return;
         };
+        let (edit_thread_id, edit_thread_title, edit_seed_body) = match c.target.as_ref() {
+            Some(ComposeTarget::EditPost { thread_id, thread_title, .. }) => (
+                Some(*thread_id),
+                Some(thread_title.clone()),
+                Some(c.seed_body.clone()),
+            ),
+            _ => (None, None, None),
+        };
         let draft = common::drafts::Draft {
             title: c.title.clone(),
             body: c.body.clone(),
@@ -1469,12 +1555,19 @@ impl App {
             label: self.draft_label(c.target.as_ref()),
             // Whatever the website's copy carried, this one is now ours and
             // its files (if any) are reachable through `attachment_key`.
-            remote_attachments: false,
+            remote_attachments: c.remote_attachments,
+            edit_thread_id,
+            edit_thread_title,
+            edit_seed_body,
         };
         if draft.is_empty() {
             self.discard_draft(key);
             return;
         }
+        self.draft_epoch = self.draft_epoch.wrapping_add(1);
+        let epoch = self.draft_epoch;
+        self.draft_mutations.insert(key, epoch);
+        self.draft_deletions.remove(&key);
         let too_big = draft.too_big_to_persist();
         self.push_draft(key, &draft);
         self.drafts.insert(key, draft);
@@ -1512,6 +1605,10 @@ impl App {
     /// left empty, when the user discards it, and when the write it belongs
     /// to actually succeeds.
     fn discard_draft(&mut self, key: common::drafts::DraftKey) {
+        self.draft_epoch = self.draft_epoch.wrapping_add(1);
+        let epoch = self.draft_epoch;
+        self.draft_mutations.insert(key, epoch);
+        self.draft_deletions.insert(key, epoch);
         if self.drafts.remove(&key).is_some() {
             self.persist_drafts();
         }
@@ -1539,6 +1636,10 @@ impl App {
         if let Err(e) = self.draft_store.erase() {
             tracing::warn!("could not clear drafts: {e}");
         }
+        self.draft_epoch = self.draft_epoch.wrapping_add(1);
+        self.draft_mutations.clear();
+        self.draft_deletions.clear();
+        self.draft_relay_tail.clear();
     }
 
     /// The drafts list's rows, newest first.
@@ -1579,7 +1680,8 @@ impl App {
     /// id, not the object.
     fn resume_draft(&mut self, key: common::drafts::DraftKey) {
         use common::drafts::DraftKey;
-        let label = self.drafts.get(&key).map(|d| d.label.clone()).unwrap_or_default();
+        let draft = self.drafts.get(&key).cloned();
+        let label = draft.as_ref().map(|d| d.label.clone()).unwrap_or_default();
         match key {
             DraftKey::ThreadReply(thread_id) => {
                 self.push_screen(Screen::Compose(screens::ComposeState {
@@ -1611,14 +1713,26 @@ impl App {
                 }));
             }
             DraftKey::EditPost(post_id) => {
-                // An edit draft carries no thread id of its own. The label
-                // still names the thread, and the write is by post id.
+                let thread_id = draft.as_ref().and_then(|d| d.edit_thread_id).unwrap_or(0);
+                let thread_title = draft
+                    .as_ref()
+                    .and_then(|d| d.edit_thread_title.clone())
+                    .unwrap_or(label);
+                // Legacy edit drafts have no baseline metadata. Starting the
+                // seed at their current body is the safe fallback: ^X must
+                // never turn a resumed edit into an empty post.
+                let seed_body = draft
+                    .as_ref()
+                    .and_then(|d| d.edit_seed_body.clone())
+                    .or_else(|| draft.as_ref().map(|d| d.body.clone()))
+                    .unwrap_or_default();
                 self.push_screen(Screen::Compose(screens::ComposeState {
                     target: Some(ComposeTarget::EditPost {
                         post_id,
-                        thread_id: 0,
-                        thread_title: label,
+                        thread_id,
+                        thread_title,
                     }),
+                    body: seed_body,
                     author: self.me_name(),
                     ..Default::default()
                 }));
@@ -1667,7 +1781,7 @@ impl App {
     /// on — and blocking Esc on a network round trip to save something we
     /// already saved would be the wrong trade. `drafts.json` stays the store
     /// the composer reads; this only keeps the website in step.
-    fn push_draft(&self, key: common::drafts::DraftKey, draft: &common::drafts::Draft) {
+    fn push_draft(&mut self, key: common::drafts::DraftKey, draft: &common::drafts::Draft) {
         // `None` means XF has no draft for this kind — an edit. Local only.
         let Some(xf_key) = key.xf_key() else {
             return;
@@ -1675,7 +1789,13 @@ impl App {
         let api = self.api.clone();
         let (message, title) = (draft.body.clone(), draft.title.clone());
         let attachment_key = draft.attachment_key.clone();
-        tokio::spawn(async move {
+        let relay = self
+            .draft_relay_tail
+            .entry(xf_key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        self.spawn_session_task(async move {
+            let _guard = relay.lock().await;
             if let Err(e) = api
                 .save_draft(&xf_key, &message, &title, attachment_key.as_deref())
                 .await
@@ -1691,12 +1811,18 @@ impl App {
     /// when a post succeeds, but the REST API never touches drafts at all, so
     /// without this every post made from the TUI would leave a stale draft
     /// waiting in the browser's editor.
-    fn drop_remote_draft(&self, key: common::drafts::DraftKey) {
+    fn drop_remote_draft(&mut self, key: common::drafts::DraftKey) {
         let Some(xf_key) = key.xf_key() else {
             return;
         };
         let api = self.api.clone();
-        tokio::spawn(async move {
+        let relay = self
+            .draft_relay_tail
+            .entry(xf_key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        self.spawn_session_task(async move {
+            let _guard = relay.lock().await;
             if let Err(e) = api.delete_draft(&xf_key).await {
                 tracing::warn!("could not clear draft {xf_key} on the site: {e}");
             }
@@ -1708,13 +1834,30 @@ impl App {
     /// Runs once when a session goes live rather than when a composer opens,
     /// so opening a composer stays instant — it reads a map that is already
     /// in memory.
-    fn merge_remote_drafts(&mut self, remote: Vec<common::models::RemoteDraft>) {
+    fn merge_remote_drafts(&mut self, epoch: u64, remote: Vec<common::models::RemoteDraft>) {
         let mut changed = false;
         for r in remote {
             // A kind this build does not know is skipped, not guessed at.
             let Some(key) = common::drafts::DraftKey::from_xf_key(&r.key) else {
                 continue;
             };
+            if self
+                .draft_mutations
+                .get(&key)
+                .is_some_and(|mutation| *mutation > epoch)
+            {
+                // This list request started before a local save/delete. Its
+                // copy is stale, even when it returns after the local write.
+                continue;
+            }
+            if self
+                .draft_deletions
+                .get(&key)
+                .is_some_and(|deletion| *deletion > epoch)
+            {
+                continue;
+            }
+            self.draft_deletions.remove(&key);
             if let Some(local) = self.drafts.get(&key)
                 && local.saved_at >= r.last_update
             {
@@ -1736,6 +1879,9 @@ impl App {
                     // The relay sends no name for the target, so keep any
                     // label we already had rather than blanking the list row.
                     label: self.drafts.get(&key).map(|d| d.label.clone()).unwrap_or_default(),
+                    edit_thread_id: None,
+                    edit_thread_title: None,
+                    edit_seed_body: None,
                 },
             );
             changed = true;
@@ -1743,17 +1889,34 @@ impl App {
         if changed {
             self.persist_drafts();
         }
+        self.draft_mutations.retain(|_, mutation| *mutation > epoch);
+        self.draft_deletions.retain(|_, deletion| *deletion > epoch);
     }
 
     /// Ask the website for this account's drafts. Errors are logged and
     /// dropped: nothing about the composer depends on this call succeeding.
-    fn sync_drafts(&self) {
+    fn sync_drafts(&mut self) {
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let session_generation = self.session_generation;
+        let epoch = self.draft_epoch;
+        let relays: Vec<_> = self.draft_relay_tail.values().cloned().collect();
+        self.spawn_session_task(async move {
+            // A list taken before a same-key save/delete can be stale even if
+            // the HTTP response arrives later. Wait for all relay operations
+            // already queued at this point before asking the server.
+            let _relay_refs = relays;
+            let mut _guards = Vec::with_capacity(_relay_refs.len());
+            for relay in &_relay_refs {
+                _guards.push(relay.lock().await);
+            }
             match api.list_drafts().await {
                 Ok(drafts) => {
-                    tx.send(Msg::DraftsLoaded(drafts)).ok();
+                    tx.send(session_msg(
+                        session_generation,
+                        Msg::DraftsLoaded { epoch, drafts },
+                    ))
+                    .ok();
                 }
                 Err(e) => tracing::warn!("could not read drafts from the site: {e}"),
             }
@@ -1777,6 +1940,9 @@ impl App {
     /// clicking it returns to that screen exactly as Esc would, so its
     /// scroll position, selection and loaded pages survive.
     fn go_to_crumb(&mut self, index: usize) {
+        if self.navigation_is_blocked() {
+            return;
+        }
         // Never through the sign-in gate: it owns the screen while it is up.
         if matches!(self.screens.last(), Some(Screen::Login(_))) {
             return;
@@ -1854,7 +2020,13 @@ impl App {
             GoTarget::Inbox => self.open_inbox(screens::InboxTab::Conversations),
             GoTarget::Alerts => self.open_inbox(screens::InboxTab::Alerts),
             GoTarget::Home => {
-                self.screens.truncate(1);
+                // Every screen exit must pass through `pop_screen`: leaving a
+                // thread reports the posts that were actually seen, and
+                // leaving a composer persists its unsent draft. Directly
+                // truncating the stack loses both side effects.
+                while self.screens.len() > 1 {
+                    self.pop_screen();
+                }
                 self.status.clear();
             }
             GoTarget::Profile => {
@@ -1898,6 +2070,7 @@ impl App {
             // The files attached before Esc belong to this draft's key, and
             // without it they are attached to nothing (#709).
             c.attachment_key = draft.attachment_key.clone();
+            c.remote_attachments = draft.remote_attachments;
             c.title_cursor = c.title.chars().count();
             c.body_cursor = c.body.chars().count();
             c.resumed = true;
@@ -1922,11 +2095,23 @@ impl App {
     /// switch to that tab in place (so `c`/`a` from anywhere never stacks a
     /// second Inbox on top of the first).
     fn open_inbox(&mut self, tab: screens::InboxTab) {
-        if tab == screens::InboxTab::Alerts {
-            self.mark_alerts_viewed();
+        if self.navigation_is_blocked() {
+            return;
         }
         if let Some(Screen::Inbox(inbox)) = self.screens.last_mut() {
+            let entering_alerts = tab == screens::InboxTab::Alerts
+                && inbox.tab != screens::InboxTab::Alerts;
             inbox.tab = tab;
+            if tab != screens::InboxTab::Alerts {
+                inbox.alerts_viewed = false;
+                inbox.alerts_view_pending = false;
+            }
+            if entering_alerts {
+                // Release the mutable screen borrow before the helper walks
+                // the stack again.
+                let _ = inbox;
+                self.mark_alerts_viewed();
+            }
             return;
         }
         self.push_screen(Screen::Inbox(screens::InboxState {
@@ -1943,6 +2128,27 @@ impl App {
         }));
         self.load_conversations(1);
         self.load_alerts();
+        if tab == screens::InboxTab::Alerts {
+            self.mark_alerts_viewed();
+        }
+    }
+
+    /// Header and palette navigation must respect the same modal boundary as
+    /// Esc. A busy composer can be buried under a screen opened before the
+    /// write began; allowing a crumb click to pop that screen would then pop
+    /// the composer while its write still runs, leaving the result without an
+    /// owner and risking a post the user thought they had abandoned.
+    fn navigation_is_blocked(&mut self) -> bool {
+        let hint = self.screens.iter().rev().find_map(|screen| match screen.esc_intent() {
+            screens::EscIntent::Blocked(hint) => Some(hint),
+            _ => None,
+        });
+        if let Some(hint) = hint {
+            self.set_hint(hint);
+            true
+        } else {
+            false
+        }
     }
 
     /// The topmost Inbox screen, if any — the router other Inbox-related
@@ -1950,22 +2156,6 @@ impl App {
     fn inbox_mut(&mut self) -> Option<&mut screens::InboxState> {
         self.screens.iter_mut().rev().find_map(|s| match s {
             Screen::Inbox(inbox) => Some(inbox),
-            _ => None,
-        })
-    }
-
-    /// The `ConversationViewState` a `ConversationLoaded`/reply-sent message
-    /// belongs to: the topmost standalone `ConversationView`, or the Inbox's
-    /// inline view pane — whichever currently holds this conversation.
-    fn conversation_view_mut(&mut self, id: u32) -> Option<&mut screens::ConversationViewState> {
-        self.screens.iter_mut().rev().find_map(|s| match s {
-            Screen::ConversationView(view) if view.conversation.conversation_id == id => {
-                Some(view)
-            }
-            Screen::Inbox(inbox) => inbox
-                .view
-                .as_mut()
-                .filter(|v| v.conversation.conversation_id == id),
             _ => None,
         })
     }
@@ -2142,7 +2332,8 @@ impl App {
         let api = self.api.clone();
         let tx = self.tx.clone();
         let fallback_name = fallback_name.to_string();
-        tokio::spawn(async move {
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
             // Search hits (and any other caller that only has a username)
             // pass user_id 0; resolve it to a real id via find-name first,
             // since `GET /users/0` always 404s (issue #521).
@@ -2153,7 +2344,7 @@ impl App {
             };
             let id = resolve_profile_id(user_id, found);
             let result = api.user(id).await.map_err(|e| TaskError::of(&e));
-            tx.send(Msg::ProfileLoaded { generation, result }).ok();
+            tx.send(session_msg(session_generation, Msg::ProfileLoaded { generation, result })).ok();
         });
     }
 
@@ -2322,7 +2513,7 @@ async fn run_login_flow(
                     &http,
                     &base,
                     &code,
-                    &common::config::tui_done_url(),
+                    &format!("{base}/tui-done"),
                     &pkce.verifier,
                     &client_id,
                 )
@@ -2384,26 +2575,30 @@ fn session_error_of(msg: &Msg) -> Option<&TaskError> {
     let err = match msg {
         Msg::SessionLost(e) => e,
         Msg::Bootstrap { result: Err(e), .. }
-        | Msg::NodesLoaded(Err(e))
+        | Msg::NodesLoaded { result: Err(e), .. }
         | Msg::ForumLoaded { result: Err(e), .. }
         | Msg::ThreadLoaded { result: Err(e), .. }
-        | Msg::ReplySent(Err(e))
-        | Msg::ThreadCreated(Err(e))
+        | Msg::ReplySent { result: Err(e), .. }
+        | Msg::ThreadCreated { result: Err(e), .. }
         | Msg::MarkedRead(Err(e))
         | Msg::ConversationsLoaded { result: Err(e), .. }
         | Msg::ConversationLoaded { result: Err(e), .. }
-        | Msg::ConvoReplySent(Err(e))
+        | Msg::ConvoReplySent { result: Err(e), .. }
         | Msg::ConvoCreated(Err(e))
         | Msg::ConversationMarked(_, Err(e))
-        | Msg::AlertsLoaded(Err(e))
+        | Msg::AlertsLoaded { result: Err(e), .. }
+        | Msg::AlertsViewed { result: Err(e), .. }
         | Msg::MediaLoaded { result: Err(e), .. }
         | Msg::ResourceLoaded { result: Err(e), .. }
-        | Msg::MediaCategoriesLoaded(Err(e))
+        | Msg::MediaCategoriesLoaded { result: Err(e), .. }
         | Msg::ResourceViewLoaded { result: Err(e), .. }
         | Msg::AlertMarked(Err(e))
         | Msg::SearchDone { result: Err(e), .. }
         | Msg::ProfileLoaded { result: Err(e), .. }
         | Msg::RecipientResolved { id: Err(e), .. }
+        | Msg::PostEdited { result: Err(e), .. }
+        | Msg::PostDeleted { result: Err(e), .. }
+        | Msg::SolutionMarked { result: Err(e), .. }
         | Msg::PostToggled { result: Err(e), .. } => e,
         _ => return None,
     };
@@ -2429,26 +2624,30 @@ fn mark_retryable(msg: &mut Msg) {
     let err = match msg {
         Msg::SessionLost(e)
         | Msg::Bootstrap { result: Err(e), .. }
-        | Msg::NodesLoaded(Err(e))
+        | Msg::NodesLoaded { result: Err(e), .. }
         | Msg::ForumLoaded { result: Err(e), .. }
         | Msg::ThreadLoaded { result: Err(e), .. }
-        | Msg::ReplySent(Err(e))
-        | Msg::ThreadCreated(Err(e))
+        | Msg::ReplySent { result: Err(e), .. }
+        | Msg::ThreadCreated { result: Err(e), .. }
         | Msg::MarkedRead(Err(e))
         | Msg::ConversationsLoaded { result: Err(e), .. }
         | Msg::ConversationLoaded { result: Err(e), .. }
-        | Msg::ConvoReplySent(Err(e))
+        | Msg::ConvoReplySent { result: Err(e), .. }
         | Msg::ConvoCreated(Err(e))
         | Msg::ConversationMarked(_, Err(e))
-        | Msg::AlertsLoaded(Err(e))
+        | Msg::AlertsLoaded { result: Err(e), .. }
+        | Msg::AlertsViewed { result: Err(e), .. }
         | Msg::MediaLoaded { result: Err(e), .. }
         | Msg::ResourceLoaded { result: Err(e), .. }
-        | Msg::MediaCategoriesLoaded(Err(e))
+        | Msg::MediaCategoriesLoaded { result: Err(e), .. }
         | Msg::ResourceViewLoaded { result: Err(e), .. }
         | Msg::AlertMarked(Err(e))
         | Msg::SearchDone { result: Err(e), .. }
         | Msg::ProfileLoaded { result: Err(e), .. }
         | Msg::RecipientResolved { id: Err(e), .. }
+        | Msg::PostEdited { result: Err(e), .. }
+        | Msg::PostDeleted { result: Err(e), .. }
+        | Msg::SolutionMarked { result: Err(e), .. }
         | Msg::PostToggled { result: Err(e), .. } => e,
         _ => return,
     };
@@ -2550,6 +2749,108 @@ mod tests {
     use super::*;
     use ratatui::buffer::{Cell, CellDiffOption};
 
+    #[test]
+    fn cap_message_uses_terminal_cells_and_grapheme_boundaries() {
+        let warning = "\u{26a0}\u{fe0f}";
+        let capped = cap_message(&format!("{warning}{warning} tail"), 4);
+        assert_eq!(capped, format!("{warning}…"));
+        assert!(chrome::cell_width(&capped) <= 4);
+    }
+
+    #[test]
+    fn mutation_errors_are_included_in_the_session_boundary() {
+        let error = || TaskError {
+            message: "not logged in".into(),
+            code: None,
+            max_page: None,
+            kind: TaskErrorKind::NoToken,
+        };
+        assert!(session_error_of(&Msg::PostEdited { post_id: 1, result: Err(error()) }).is_some());
+        assert!(session_error_of(&Msg::PostDeleted {
+            post_id: 1,
+            thread_id: 2,
+            result: Err(error()),
+        })
+        .is_some());
+        assert!(session_error_of(&Msg::SolutionMarked {
+            post_id: 1,
+            thread_id: 2,
+            result: Err(error()),
+        })
+        .is_some());
+    }
+
+    #[tokio::test]
+    async fn write_results_update_the_originating_composer() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 1,
+                thread_title: "first".into(),
+            }),
+            body: "first draft".into(),
+            busy: true,
+            ..Default::default()
+        }));
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 2,
+                thread_title: "second".into(),
+            }),
+            body: "second draft".into(),
+            busy: true,
+            ..Default::default()
+        }));
+
+        app.handle_msg(Msg::ReplySent {
+            composer: common::drafts::DraftKey::ThreadReply(1),
+            result: Err(TaskError {
+                message: "first failed".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::Other,
+            }),
+        });
+        assert!(matches!(app.screens.get(1), Some(Screen::Compose(c)) if !c.busy && c.error.as_deref() == Some("first failed")));
+        assert!(matches!(app.screens.last(), Some(Screen::Compose(c)) if c.busy && c.body == "second draft"));
+
+        app.handle_msg(Msg::ReplySent {
+            composer: common::drafts::DraftKey::ThreadReply(1),
+            result: Ok(Post { post_id: 3, thread_id: 1, ..Default::default() }),
+        });
+        assert!(!app.screens.iter().any(|screen| {
+            matches!(screen, Screen::Compose(c) if matches!(c.target, Some(ComposeTarget::ThreadReply { thread_id: 1, .. })))
+        }));
+        assert!(app.screens.iter().any(|screen| {
+            matches!(screen, Screen::Compose(c) if matches!(c.target, Some(ComposeTarget::ThreadReply { thread_id: 2, .. })) && c.busy)
+        }));
+    }
+
+    #[test]
+    fn header_navigation_cannot_pop_a_busy_buried_composer() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 7,
+                thread_title: "busy".into(),
+            }),
+            body: "keep me".into(),
+            busy: true,
+            ..Default::default()
+        }));
+        app.screens.push(Screen::Search(screens::SearchState::default()));
+        let before = app.screens.len();
+
+        app.go_to_crumb(usize::MAX);
+        assert_eq!(app.screens.len(), before);
+        assert!(app.status.contains("Sending"), "status: {:?}", app.status);
+
+        app.open_inbox(screens::InboxTab::Conversations);
+        assert_eq!(app.screens.len(), before, "navigation must stay blocked while the buried write runs");
+    }
+
     /// Image cells are not text. `ratatui-image` puts a whole escape payload
     /// in one anchor cell's symbol (marked `ForcedWidth(1)`, because the
     /// payload's display width is not its byte width) and marks every cell the
@@ -2600,9 +2901,10 @@ mod tests {
         // `set_status`, `status_set_at` would stay `Some` and the message
         // would vanish `STATUS_TOAST_SECS` later.
         app.status_set_at = Some(std::time::Instant::now());
-        app.handle_msg(Msg::LoggedOut(Err(
-            "the server kept refresh token valid".into()
-        )));
+        app.handle_msg(Msg::LoggedOut {
+            generation: app.session_generation,
+            result: Err("the server kept refresh token valid".into()),
+        });
         assert!(
             app.status.contains("Logged out locally")
                 && app.status.contains("refresh token"),
@@ -2626,7 +2928,10 @@ mod tests {
 
         // A clean logout says nothing extra.
         app.status = "Logged out.".into();
-        app.handle_msg(Msg::LoggedOut(Ok(())));
+        app.handle_msg(Msg::LoggedOut {
+            generation: app.session_generation,
+            result: Ok(()),
+        });
         assert_eq!(app.status, "Logged out.");
     }
 
@@ -2686,6 +2991,7 @@ mod tests {
         app.handle_msg(Msg::ThreadLoaded {
             id: 9,
             page: 1,
+            load_id: 0,
             result: Ok(ThreadReply {
                 thread: Thread { thread_id: 9, ..Default::default() },
                 ..Default::default()
@@ -3620,6 +3926,44 @@ mod tests {
         assert!(app.status.contains("flooding"), "status was {:?}", app.status);
     }
 
+    /// A successful new conversation can be started from a profile opened
+    /// inside a thread. Unwinding that stack must still report the thread's
+    /// seen position before showing the new conversation.
+    #[tokio::test]
+    async fn creating_a_conversation_unwinds_through_screen_exit_hooks() {
+        let api = std::sync::Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 9, ..Default::default() },
+            posts: vec![Post { post_id: 1, post_date: 100, ..Default::default() }],
+            page: 1,
+            last_page: 1,
+            seen_date: 100,
+            ..Default::default()
+        }));
+        app.screens.push(Screen::Profile(screens::ProfileState::default()));
+        app.screens.push(Screen::NewConversation(screens::NewConversationState::default()));
+
+        app.handle_msg(Msg::ConvoCreated(Ok(Conversation {
+            conversation_id: 77,
+            title: "A new conversation".into(),
+            ..Default::default()
+        })));
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            api.threads_read.lock().expect("lock").as_slice(),
+            &[(9, Some(100))],
+            "unwinding the stack reports the thread before replacing it"
+        );
+        assert!(
+            matches!(app.screens.last(), Some(Screen::ConversationView(view)) if view.conversation.conversation_id == 77),
+            "the new conversation remains the active destination"
+        );
+    }
+
     /// Issue #541: a dual-pane Inbox primes its view pane with the newest
     /// conversation before the user has selected anything. That load must not
     /// mark it read on the server; the load the user actually asked for must,
@@ -3663,6 +4007,7 @@ mod tests {
         app.handle_msg(Msg::ConversationLoaded {
             id: 7,
             page: 1,
+            load_id: 0,
             mark_read: false,
             result: Ok(reply()),
         });
@@ -3681,6 +4026,7 @@ mod tests {
         app.handle_msg(Msg::ConversationLoaded {
             id: 7,
             page: 1,
+            load_id: 0,
             mark_read: true,
             result: Ok(reply()),
         });
@@ -3723,11 +4069,21 @@ mod tests {
             ..Default::default()
         }));
 
-        app.handle_msg(Msg::ConvoReplySent(Ok(())));
+        app.handle_msg(Msg::ConvoReplySent {
+            composer: common::drafts::DraftKey::ConversationReply(7),
+            result: Ok(()),
+        });
         let sent = tokio::time::timeout(std::time::Duration::from_secs(1), app.rx.recv())
             .await
             .expect("load_conversation must send a message")
             .expect("channel open");
+        let sent = match sent {
+            Msg::Session { generation, msg } => {
+                assert_eq!(generation, app.session_generation);
+                *msg
+            }
+            other => other,
+        };
         match sent {
             Msg::ConversationLoaded { id, page, mark_read, .. } => {
                 assert_eq!(id, 7);
@@ -3763,6 +4119,7 @@ mod tests {
         app.handle_msg(Msg::ConversationLoaded {
             id: 7,
             page: 3,
+            load_id: 0,
             mark_read: true,
             result: Err(TaskError {
                 message: "invalid page".into(),
@@ -3785,6 +4142,13 @@ mod tests {
             .await
             .expect("the clamp must re-request the page")
             .expect("channel open");
+        let sent = match sent {
+            Msg::Session { generation, msg } => {
+                assert_eq!(generation, app.session_generation);
+                *msg
+            }
+            other => other,
+        };
         match sent {
             Msg::ConversationLoaded { id, page, mark_read, .. } => {
                 assert_eq!(id, 7);
@@ -3987,12 +4351,15 @@ mod tests {
         // A later `NodesLoaded(Err(NoToken))` — the next sibling rotation —
         // must start a SECOND recheck rather than fall straight to
         // `end_session` with a perfectly good token set on disk.
-        app.handle_msg(Msg::NodesLoaded(Err(TaskError {
-            message: "not logged in".into(),
-            code: None,
-            max_page: None,
-            kind: TaskErrorKind::NoToken,
-        })));
+        app.handle_msg(Msg::NodesLoaded {
+            load_id: 0,
+            result: Err(TaskError {
+                message: "not logged in".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::NoToken,
+            }),
+        });
         assert!(
             app.session_recovery_pending,
             "a second recheck must have started instead of ending the session"
@@ -4208,6 +4575,7 @@ mod tests {
         app.handle_msg(Msg::ThreadLoaded {
             id: 42,
             page: 1,
+            load_id: 0,
             result: Err(TaskError {
                 message: "oauth error [invalid_grant]".into(),
                 code: Some("invalid_grant".into()),
@@ -4346,12 +4714,18 @@ mod tests {
             .await
             .unwrap();
 
-        // Let both revoke calls finish and `Msg::LoggedOut` land.
+        // The local snapshot is reported before the slower revoke calls; the
+        // final message follows once both remote revocations finish.
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), app.rx.recv())
+            .await
+            .expect("logout snapshot must report back")
+            .expect("channel open");
+        assert!(matches!(snapshot, Msg::LogoutSnapshot { .. }));
         let sent = tokio::time::timeout(Duration::from_secs(2), app.rx.recv())
             .await
             .expect("logout must report back")
             .expect("channel open");
-        assert!(matches!(sent, Msg::LoggedOut(_)), "expected LoggedOut");
+        assert!(matches!(sent, Msg::LoggedOut { .. }), "expected LoggedOut");
 
         let live = client.token_set().await.expect("the new session must survive in memory");
         assert_eq!(live.access_token, "new-access");
@@ -4361,6 +4735,31 @@ mod tests {
             .unwrap()
             .expect("the new session must survive on disk");
         assert_eq!(on_disk.refresh_token, "new-refresh");
+    }
+
+    #[tokio::test]
+    async fn login_waits_until_logout_has_taken_its_local_snapshot() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.logout();
+
+        assert!(app.logout_pending);
+        app.begin_login();
+        assert!(app.logout_pending, "a login must not race the logout snapshot");
+        assert!(app.status.contains("Signing out"));
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(1), app.rx.recv())
+            .await
+            .expect("logout snapshot must arrive")
+            .expect("channel open");
+        app.handle_msg(snapshot);
+        assert!(!app.logout_pending);
+
+        app.begin_login();
+        assert!(app.login_task.is_some(), "a new login is allowed after the snapshot");
+        if let Some(task) = app.login_task.take() {
+            task.abort();
+        }
     }
 
     /// Issue #568: while the store recheck is in flight, every other caller
@@ -4377,12 +4776,15 @@ mod tests {
         app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
 
         // A NoToken opens the recovery window.
-        app.handle_msg(Msg::NodesLoaded(Err(TaskError {
-            message: "not logged in".into(),
-            code: None,
-            max_page: None,
-            kind: TaskErrorKind::NoToken,
-        })));
+        app.handle_msg(Msg::NodesLoaded {
+            load_id: 0,
+            result: Err(TaskError {
+                message: "not logged in".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::NoToken,
+            }),
+        });
         assert!(app.session_recovery_pending, "test setup: the recheck must be in flight");
 
         // A queued caller now reports the refresh rejection that started all
@@ -4390,6 +4792,7 @@ mod tests {
         app.handle_msg(Msg::ThreadLoaded {
             id: 42,
             page: 1,
+            load_id: 0,
             result: Err(TaskError {
                 message: "oauth error [invalid_grant]".into(),
                 code: Some("invalid_grant".into()),
@@ -4425,6 +4828,7 @@ mod tests {
         app.handle_msg(Msg::ThreadLoaded {
             id: 42,
             page: 1,
+            load_id: 0,
             result: Err(TaskError {
                 message: "oauth error [invalid_grant]".into(),
                 code: Some("invalid_grant".into()),
@@ -4520,19 +4924,25 @@ mod tests {
 
         // Two `NoToken`s, back-to-back, with nothing drained from `rx` in
         // between — exactly the alerts-poller-then-convos-poller race.
-        app.handle_msg(Msg::NodesLoaded(Err(TaskError {
-            message: "not logged in".into(),
-            code: None,
-            max_page: None,
-            kind: TaskErrorKind::NoToken,
-        })));
+        app.handle_msg(Msg::NodesLoaded {
+            load_id: 0,
+            result: Err(TaskError {
+                message: "not logged in".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::NoToken,
+            }),
+        });
         assert!(app.session_recovery_pending, "test setup: the recheck must be in flight");
-        app.handle_msg(Msg::AlertsLoaded(Err(TaskError {
-            message: "not logged in".into(),
-            code: None,
-            max_page: None,
-            kind: TaskErrorKind::NoToken,
-        })));
+        app.handle_msg(Msg::AlertsLoaded {
+            load_id: 0,
+            result: Err(TaskError {
+                message: "not logged in".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::NoToken,
+            }),
+        });
 
         assert!(app.me.is_some(), "a second NoToken mid-recheck must not end the session");
         assert!(!matches!(app.screens.last(), Some(Screen::Login(_))));
@@ -4756,12 +5166,15 @@ mod tests {
 
         // The write's own `valid_token()` was the first caller to hit the
         // sibling-rotated refresh token: `NoToken`, which opens the recheck.
-        app.handle_msg(Msg::ReplySent(Err(TaskError {
-            message: "not logged in".into(),
-            code: None,
-            max_page: None,
-            kind: TaskErrorKind::NoToken,
-        })));
+        app.handle_msg(Msg::ReplySent {
+            composer: common::drafts::DraftKey::ThreadReply(42),
+            result: Err(TaskError {
+                message: "not logged in".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::NoToken,
+            }),
+        });
         assert!(app.session_recovery_pending, "test setup: the recheck must be in flight");
 
         let Some(Screen::Compose(compose)) = app.screens.last() else {
@@ -4908,12 +5321,15 @@ mod tests {
 
         // The write's own `valid_token()` was the first caller to hit the
         // sibling-rotated refresh token: `NoToken`, which opens the recheck.
-        app.handle_msg(Msg::ReplySent(Err(TaskError {
-            message: "not logged in".into(),
-            code: None,
-            max_page: None,
-            kind: TaskErrorKind::NoToken,
-        })));
+        app.handle_msg(Msg::ReplySent {
+            composer: common::drafts::DraftKey::ThreadReply(42),
+            result: Err(TaskError {
+                message: "not logged in".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::NoToken,
+            }),
+        });
         assert!(app.session_recovery_pending, "test setup: the recheck must be in flight");
 
         // Backdate the window by 16 s — longer than the OLD 15 s timeout,
@@ -5091,12 +5507,15 @@ mod tests {
             h.tree.loading = true;
         }
 
-        app.handle_msg(Msg::NodesLoaded(Err(TaskError {
-            message: "not logged in".into(),
-            code: None,
-            max_page: None,
-            kind: TaskErrorKind::NoToken,
-        })));
+        app.handle_msg(Msg::NodesLoaded {
+            load_id: 0,
+            result: Err(TaskError {
+                message: "not logged in".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::NoToken,
+            }),
+        });
 
         let Some(Screen::Home(h)) = app.screens.first() else {
             panic!("expected the retained Home screen");
@@ -5141,12 +5560,15 @@ mod tests {
         app.screens.push(screens::home_state(false));
         app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
 
-        app.handle_msg(Msg::NodesLoaded(Err(TaskError {
-            message: "not logged in".into(),
-            code: None,
-            max_page: None,
-            kind: TaskErrorKind::NoToken,
-        })));
+        app.handle_msg(Msg::NodesLoaded {
+            load_id: 0,
+            result: Err(TaskError {
+                message: "not logged in".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::NoToken,
+            }),
+        });
 
         assert!(app.me.is_some(), "the session survives until the store has been re-read");
         assert!(app.session_recovery_tried);
@@ -5171,12 +5593,15 @@ mod tests {
         // straight away instead of looping on the store.
         app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
         app.session_recovery_tried = true;
-        app.handle_msg(Msg::NodesLoaded(Err(TaskError {
-            message: "not logged in".into(),
-            code: None,
-            max_page: None,
-            kind: TaskErrorKind::NoToken,
-        })));
+        app.handle_msg(Msg::NodesLoaded {
+            load_id: 0,
+            result: Err(TaskError {
+                message: "not logged in".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::NoToken,
+            }),
+        });
         assert!(app.me.is_none());
         assert!(app.status.contains("Session expired"));
     }
@@ -5230,9 +5655,12 @@ mod tests {
             busy: true,
             ..Default::default()
         }));
-        app.handle_msg(Msg::ReplySent(Err(phrase_error(
-            "you_may_not_perform_this_action_because_discussion_is_closed",
-        ))));
+        app.handle_msg(Msg::ReplySent {
+            composer: common::drafts::DraftKey::ThreadReply(1),
+            result: Err(phrase_error(
+                "you_may_not_perform_this_action_because_discussion_is_closed",
+            )),
+        });
         assert!(app.me.is_some(), "a 403 permission refusal must not sign the user out");
         assert!(!app.poller_handles.is_empty(), "the pollers must keep running");
         match app.screens.last() {
@@ -5253,7 +5681,12 @@ mod tests {
             thread: Thread { thread_id: 42, ..Default::default() },
             ..Default::default()
         }));
-        app.handle_msg(Msg::ThreadLoaded { id: 42, page: 1, result: Err(phrase_error("no_permission")) });
+        app.handle_msg(Msg::ThreadLoaded {
+            id: 42,
+            page: 1,
+            load_id: 0,
+            result: Err(phrase_error("no_permission")),
+        });
         assert!(app.me.is_some(), "a 403 permission refusal must not sign the user out");
         assert!(!app.poller_handles.is_empty(), "the pollers must keep running");
         match app.screens.last() {
@@ -5358,6 +5791,7 @@ mod tests {
         app.handle_msg(Msg::ThreadLoaded {
             id: 42,
             page: 2,
+            load_id: 0,
             result: Ok(ThreadReply {
                 thread: Thread { thread_id: 42, ..Default::default() },
                 posts: posts(5),
@@ -5377,6 +5811,7 @@ mod tests {
         app.handle_msg(Msg::ThreadLoaded {
             id: 42,
             page: 2,
+            load_id: 0,
             result: Ok(ThreadReply {
                 thread: Thread { thread_id: 42, ..Default::default() },
                 posts: posts(5),
@@ -5518,7 +5953,10 @@ mod tests {
         assert_eq!(app.drafts.len(), 1);
 
         app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
-        app.handle_msg(Msg::ReplySent(Ok(Post { post_id: 1, thread_id: 7, ..Default::default() })));
+        app.handle_msg(Msg::ReplySent {
+            composer: common::drafts::DraftKey::ThreadReply(7),
+            result: Ok(Post { post_id: 1, thread_id: 7, ..Default::default() }),
+        });
         assert!(app.drafts.is_empty(), "a sent reply leaves no draft behind");
         assert!(
             !app.screens.iter().any(|s| matches!(s, Screen::Compose(_))),
@@ -5567,6 +6005,41 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn an_edit_draft_restart_restores_its_thread_context_and_baseline() {
+        let mut first = test_app();
+        first.screens.push(screens::home_state(false));
+        let thread = Thread { thread_id: 7, title: "A thread".into(), ..Default::default() };
+        let post = Post {
+            post_id: 500,
+            thread_id: 7,
+            message: "original post".into(),
+            ..Default::default()
+        };
+        first.execute_action(Action::StartEditPost(thread, Box::new(post)));
+        if let Some(Screen::Compose(c)) = first.screens.last_mut() {
+            c.body = "new version".into();
+        }
+        first.pop_screen();
+        let path = first.draft_store.path().to_path_buf();
+
+        let mut restarted = test_app();
+        restarted.draft_store = common::drafts::Store::with_path(path);
+        restarted.drafts = restarted.draft_store.load();
+        restarted.screens.push(screens::home_state(false));
+        restarted.resume_draft(common::drafts::DraftKey::EditPost(500));
+
+        let Some(Screen::Compose(c)) = restarted.screens.last() else {
+            panic!("expected the resumed edit composer");
+        };
+        assert_eq!(c.body, "new version");
+        assert_eq!(c.seed_body, "original post");
+        assert!(matches!(
+            c.target,
+            Some(ComposeTarget::EditPost { post_id: 500, thread_id: 7, .. })
+        ));
+    }
+
     /// #715 + #581: a draft is unsent writing by one account. Signing out
     /// must not leave it on disk for whoever signs in next — on the same
     /// machine, one restart later.
@@ -5613,6 +6086,32 @@ mod tests {
         let _ = std::fs::remove_file(app.draft_store.path());
     }
 
+    /// #3: session expiry can happen while the composer is still on screen.
+    /// That path must preserve the open editor just like Esc does; only an
+    /// explicit sign-out is allowed to clear the draft store.
+    #[tokio::test]
+    async fn an_expired_session_stashes_an_open_composer() {
+        let mut app = test_app();
+        let path = app.draft_store.path().to_path_buf();
+        let _ = std::fs::remove_file(&path);
+        app.screens.push(screens::home_state(false));
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "typed before expiry".into();
+        }
+
+        app.end_session("Session expired; log in again.");
+
+        assert_eq!(
+            app.drafts
+                .get(&common::drafts::DraftKey::ThreadReply(7))
+                .map(|d| d.body.as_str()),
+            Some("typed before expiry")
+        );
+        assert!(path.exists(), "the expired session must persist the open draft");
+        let _ = std::fs::remove_file(path);
+    }
+
     /// The whole point of writing the file: a draft must survive the process,
     /// not just the screen stack.
     // Async: the draft lifecycle now spawns relay calls (#716).
@@ -5648,7 +6147,7 @@ mod tests {
     async fn a_draft_from_the_website_is_offered_in_the_composer() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
-        app.merge_remote_drafts(vec![common::models::RemoteDraft {
+        app.merge_remote_drafts(0, vec![common::models::RemoteDraft {
             key: "thread-7".into(),
             message: "typed in the browser".into(),
             title: String::new(),
@@ -5684,15 +6183,15 @@ mod tests {
         };
 
         app.drafts.insert(key, local(5_000));
-        app.merge_remote_drafts(vec![remote(1_000)]);
+        app.merge_remote_drafts(app.draft_epoch, vec![remote(1_000)]);
         assert_eq!(app.drafts[&key].body, "local", "an older server copy must not win");
 
-        app.merge_remote_drafts(vec![remote(9_000)]);
+        app.merge_remote_drafts(app.draft_epoch, vec![remote(9_000)]);
         assert_eq!(app.drafts[&key].body, "remote", "a newer server copy must win");
 
         // Equal timestamps are the copy we pushed ourselves; keep ours.
         app.drafts.insert(key, local(9_000));
-        app.merge_remote_drafts(vec![remote(9_000)]);
+        app.merge_remote_drafts(app.draft_epoch, vec![remote(9_000)]);
         assert_eq!(app.drafts[&key].body, "local", "a tie keeps the local copy");
     }
 
@@ -5701,7 +6200,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_remote_draft_kinds_are_ignored() {
         let mut app = test_app();
-        app.merge_remote_drafts(vec![
+        app.merge_remote_drafts(0, vec![
             common::models::RemoteDraft { key: "report-1".into(), message: "x".into(), ..Default::default() },
             common::models::RemoteDraft { key: "thread-7".into(), message: "ok".into(), ..Default::default() },
         ]);
@@ -5733,7 +6232,10 @@ mod tests {
         );
 
         app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
-        app.handle_msg(Msg::ReplySent(Ok(Post { post_id: 1, thread_id: 7, ..Default::default() })));
+        app.handle_msg(Msg::ReplySent {
+            composer: common::drafts::DraftKey::ThreadReply(7),
+            result: Ok(Post { post_id: 1, thread_id: 7, ..Default::default() }),
+        });
         tokio::task::yield_now().await;
         assert_eq!(api.drafts_deleted(), vec!["thread-7".to_string()]);
     }
@@ -6111,6 +6613,7 @@ mod tests {
         App {
             crumb_targets: Vec::new(),
             next_list_seq: 1,
+            next_load_id: 1,
             api: Arc::new(RecordingApi::default()),
             client,
             tx,
@@ -6157,13 +6660,16 @@ mod tests {
             last_title: String::new(),
             should_quit: false,
             poller_handles: Vec::new(),
+            session_handles: Vec::new(),
             write_handles: Vec::new(),
+            session_generation: 0,
             bootstrap_retry_needed: false,
             bootstrap_generation: 0,
             session_recovery_tried: false,
             session_recovery_pending: false,
             session_recovery_started_at: None,
             login_generation: 0,
+            logout_pending: false,
             profile_generation: 0,
             search_generation: 0,
             login_task: None,
@@ -6172,6 +6678,10 @@ mod tests {
             // directly, and `WFTUI_MOUSE` is process-global (the env lock
             // lives in `common::config`), so it is never read here.
             hits: HitMap::new(true),
+            draft_epoch: 0,
+            draft_mutations: std::collections::HashMap::new(),
+            draft_deletions: std::collections::HashMap::new(),
+            draft_relay_tail: std::collections::HashMap::new(),
         }
     }
 
@@ -6408,7 +6918,7 @@ mod tests {
             msgs.push(m);
         }
         assert!(
-            !msgs.iter().any(|m| matches!(m, Msg::ReplySent(_))),
+            !msgs.iter().any(|m| matches!(m, Msg::ReplySent { .. })),
             "no ReplySent may land on the sign-in screen"
         );
     }
@@ -6622,14 +7132,17 @@ mod tests {
             ..Default::default()
         }));
 
-        app.handle_msg(Msg::AttachmentUploaded(Ok((
-            "key-1".to_string(),
-            common::models::Attachment {
-                attachment_id: 55,
-                filename: "shot.png".into(),
-                ..Default::default()
-            },
-        ))));
+        app.handle_msg(Msg::AttachmentUploaded {
+            composer: common::drafts::DraftKey::ThreadReply(9),
+            result: Ok((
+                "key-1".to_string(),
+                common::models::Attachment {
+                    attachment_id: 55,
+                    filename: "shot.png".into(),
+                    ..Default::default()
+                },
+            )),
+        });
         match app.screens.last() {
             Some(Screen::Compose(c)) => {
                 assert_eq!(c.body, "See: [ATTACH]55[/ATTACH]after", "inserted at the caret");
@@ -6668,9 +7181,10 @@ mod tests {
             uploading: true,
             ..Default::default()
         }));
-        app.handle_msg(Msg::AttachmentUploaded(Err(
-            "/tmp/nope.png: No such file or directory".into(),
-        )));
+        app.handle_msg(Msg::AttachmentUploaded {
+            composer: common::drafts::DraftKey::ThreadReply(9),
+            result: Err("/tmp/nope.png: No such file or directory".into()),
+        });
         match app.screens.last() {
             Some(Screen::Compose(c)) => {
                 assert_eq!(c.body, "my draft");
@@ -6680,6 +7194,56 @@ mod tests {
             }
             _ => panic!("the composer should still be open"),
         }
+    }
+
+    /// An upload may finish after the composer moved in the stack. Its result
+    /// belongs to the target that started it, not whatever composer happens to
+    /// be topmost when the channel is pumped.
+    #[test]
+    fn an_upload_result_updates_only_its_own_composer() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 9,
+                thread_title: "old".into(),
+            }),
+            body: "old body".into(),
+            body_cursor: 3,
+            uploading: true,
+            ..Default::default()
+        }));
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 10,
+                thread_title: "new".into(),
+            }),
+            body: "new body".into(),
+            ..Default::default()
+        }));
+
+        app.handle_msg(Msg::AttachmentUploaded {
+            composer: common::drafts::DraftKey::ThreadReply(9),
+            result: Ok((
+                "key-old".into(),
+                common::models::Attachment {
+                    attachment_id: 77,
+                    filename: "old.png".into(),
+                    ..Default::default()
+                },
+            )),
+        });
+
+        let Some(Screen::Compose(top)) = app.screens.last() else {
+            panic!("expected top composer");
+        };
+        assert_eq!(top.body, "new body");
+        let Some(Screen::Compose(old)) = app.screens.get(1) else {
+            panic!("expected original composer");
+        };
+        assert!(old.body.contains("[ATTACH]77[/ATTACH]"));
+        assert_eq!(old.attachment_key.as_deref(), Some("key-old"));
+        assert!(!old.uploading);
     }
 
     /// #708: editing a post sends the edit, closes the editor and reloads
@@ -6872,9 +7436,53 @@ mod tests {
         );
     }
 
+    /// Returning Home is still a stack exit: it must report a thread's seen
+    /// position and preserve any composer text instead of truncating both
+    /// screens away.
+    #[tokio::test]
+    async fn returning_home_runs_screen_exit_lifecycle_hooks() {
+        let api = std::sync::Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 9, ..Default::default() },
+            posts: vec![Post { post_id: 1, post_date: 100, ..Default::default() }],
+            page: 1,
+            last_page: 1,
+            seen_date: 100,
+            ..Default::default()
+        }));
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 9,
+                thread_title: "A thread".into(),
+            }),
+            body: "unsent reply".into(),
+            ..Default::default()
+        }));
+
+        app.go(GoTarget::Home);
+        tokio::task::yield_now().await;
+
+        assert_eq!(app.screens.len(), 1, "Home is the only remaining screen");
+        assert_eq!(
+            api.threads_read.lock().expect("lock").as_slice(),
+            &[(9, Some(100))],
+            "Home navigation reports the thread position that was seen"
+        );
+        assert_eq!(
+            app.drafts
+                .get(&common::drafts::DraftKey::ThreadReply(9))
+                .map(|draft| draft.body.as_str()),
+            Some("unsent reply"),
+            "Home navigation preserves the composer draft"
+        );
+    }
+
     /// #694: opening the Alerts tab marks them viewed — the badge clears and
-    /// XF stops counting them, which is what the web UI does. It is sent
-    /// only when there is a count to clear.
+    /// XF stops counting them, which is what the web UI does. Re-entering the
+    /// same Inbox tab does not duplicate the request.
     #[tokio::test]
     async fn showing_the_alerts_tab_marks_them_viewed_once() {
         let api = std::sync::Arc::new(RecordingApi::default());
@@ -6892,6 +7500,59 @@ mod tests {
         app.open_inbox(screens::InboxTab::Alerts);
         tokio::task::yield_now().await;
         assert_eq!(viewed(), 1, "no count, no request");
+    }
+
+    /// Keyboard and pointer tab changes must share `open_inbox`'s lifecycle:
+    /// entering Alerts acknowledges them, and leaving Alerts re-arms the
+    /// state so a later batch can restore the badge.
+    #[tokio::test]
+    async fn inbox_tab_switching_keeps_alert_view_state_in_sync() {
+        let api = std::sync::Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+        app.me = Some(User { user_id: 1, username: "Mike".into(), ..Default::default() });
+        app.screens.push(Screen::Inbox(screens::InboxState::default()));
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(
+            app.screens.last(),
+            Some(Screen::Inbox(ib)) if ib.tab == screens::InboxTab::Alerts
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(api.alerts_viewed.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(
+            app.screens.last(),
+            Some(Screen::Inbox(ib))
+                if ib.tab == screens::InboxTab::Conversations && !ib.alerts_viewed
+        ));
+
+        frame(&mut app, 120, 24);
+        let (x, y) = find_hit(&app, 120, 24, |h| h == &Hit::Tab(screens::InboxTab::Alerts))
+            .expect("the Alerts chip");
+        click(&mut app, x, y);
+        tokio::task::yield_now().await;
+        assert_eq!(api.alerts_viewed.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cold_start_alerts_are_marked_viewed_before_the_first_badge_load() {
+        let api = std::sync::Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api.clone();
+        app.alerts_unread = 0;
+        app.screens.push(screens::home_state(false));
+
+        app.open_inbox(screens::InboxTab::Alerts);
+        assert_eq!(app.alerts_unread, 0);
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            api.alerts_viewed.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "opening Alerts must acknowledge server-side alerts even before the first poll fills the badge"
+        );
     }
 
     /// #700: clicking a breadcrumb goes back to the place it names — a pop,
@@ -7325,9 +7986,14 @@ mod tests {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
         app.execute_action(Action::OpenMediaGallery);
+        let load_id = match app.screens.last() {
+            Some(Screen::MediaGallery(m)) => m.load_id,
+            _ => panic!("expected the gallery"),
+        };
 
         app.handle_msg(Msg::MediaLoaded {
             page: 1,
+            load_id,
             result: Ok(common::models::MediaListReply {
                 media: vec![common::models::MediaItem {
                     media_id: 33005,
@@ -7353,6 +8019,7 @@ mod tests {
         // Nothing is in flight now, so a late second reply must not land.
         app.handle_msg(Msg::MediaLoaded {
             page: 2,
+            load_id: 0,
             result: Ok(common::models::MediaListReply::default()),
         });
         let Some(Screen::MediaGallery(m)) = app.screens.last() else {
@@ -7360,6 +8027,102 @@ mod tests {
         };
         assert_eq!(m.items.len(), 1, "a reply nobody is waiting on must be dropped");
         assert_eq!(m.page, 1, "and it must not renumber the page either");
+    }
+
+    #[tokio::test]
+    async fn a_category_refresh_clamps_the_gallery_selection_before_enter() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.execute_action(Action::OpenMediaGallery);
+        let (load_id, category_count) = match app.screens.last_mut() {
+            Some(Screen::MediaGallery(m)) => {
+                m.categories = (1..=4)
+                    .map(|id| common::models::MediaCategory {
+                        category_id: id,
+                        title: format!("Category {id}"),
+                        ..Default::default()
+                    })
+                    .collect();
+                m.focus = screens::MediaPane::Categories;
+                m.cat_sel = 4;
+                (m.categories_load_id, m.categories.len())
+            }
+            _ => panic!("expected the gallery"),
+        };
+        assert_eq!(category_count, 4);
+
+        app.handle_msg(Msg::MediaCategoriesLoaded {
+            load_id,
+            result: Ok(common::models::MediaCategoriesReply {
+                categories: vec![common::models::MediaCategory {
+                    category_id: 9,
+                    title: "Remaining".into(),
+                    ..Default::default()
+                }],
+            }),
+        });
+
+        let Some(Screen::MediaGallery(m)) = app.screens.last() else {
+            panic!("expected the gallery");
+        };
+        assert_eq!(m.cat_sel, 1, "the last visible category row should be selected");
+        let action = app
+            .screens
+            .last_mut()
+            .expect("gallery")
+            .on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, Action::LoadMedia { category: Some(9), page: 1 }));
+    }
+
+    #[tokio::test]
+    async fn a_reopened_thread_drops_the_previous_load_even_when_the_id_matches() {
+        let mut app = test_app();
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 7, ..Default::default() },
+            loading: true,
+            ..Default::default()
+        }));
+        app.load_thread(7, 1);
+        let first = match app.screens.last() {
+            Some(Screen::ThreadView(view)) => view.load_id,
+            _ => panic!("expected the thread view"),
+        };
+        app.load_thread(7, 2);
+        let second = match app.screens.last() {
+            Some(Screen::ThreadView(view)) => view.load_id,
+            _ => panic!("expected the thread view"),
+        };
+        assert_ne!(first, second);
+
+        app.handle_msg(Msg::ThreadLoaded {
+            id: 7,
+            page: 1,
+            load_id: first,
+            result: Ok(ThreadReply {
+                posts: vec![Post { post_id: 1, ..Default::default() }],
+                ..Default::default()
+            }),
+        });
+        let Some(Screen::ThreadView(view)) = app.screens.last() else {
+            panic!("expected the thread view");
+        };
+        assert!(view.loading, "the old response must not clear the new load");
+        assert!(view.posts.is_empty());
+
+        app.handle_msg(Msg::ThreadLoaded {
+            id: 7,
+            page: 2,
+            load_id: second,
+            result: Ok(ThreadReply {
+                posts: vec![Post { post_id: 2, ..Default::default() }],
+                ..Default::default()
+            }),
+        });
+        let Some(Screen::ThreadView(view)) = app.screens.last() else {
+            panic!("expected the thread view");
+        };
+        assert!(!view.loading);
+        assert_eq!(view.posts[0].post_id, 2);
     }
 
     /// #674: the idle-skip predicate — an idle session needs no redraw,
@@ -7698,13 +8461,58 @@ mod tests {
         let mut app = test_app();
         let scratch = scratch_config_dir();
         std::fs::create_dir_all(&scratch).unwrap();
+        let path = app.client.store_path().with_file_name("login-url.txt");
+        std::fs::write(&path, b"old link").unwrap();
+        let mut permissive = std::fs::metadata(&path).unwrap().permissions();
+        permissive.set_mode(0o644);
+        std::fs::set_permissions(&path, permissive).unwrap();
         app.handle_msg(Msg::LoginReady {
             generation: app.login_generation,
             url: "https://windowsforum.com/tui-start/abc123".into(),
         });
-        let path = app.client.store_path().with_file_name("login-url.txt");
         let mode = std::fs::metadata(&path).expect("the login link is persisted").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "login-url.txt must be owner-only: {path:?}");
+    }
+
+    /// Session-scoped work can finish after logout even when its task was
+    /// aborted: the result may already be queued on the channel. The boundary
+    /// stamp must drop it before it can populate the next account's forums or
+    /// drafts.
+    #[test]
+    fn stale_session_results_are_dropped_before_dispatch() {
+        let mut app = test_app();
+        app.session_generation = 2;
+        app.screens.push(screens::home_state(true));
+
+        app.handle_msg(session_msg(
+            1,
+            Msg::NodesLoaded {
+                load_id: 0,
+                result: Ok(vec![Node {
+                    node_id: 9,
+                    title: "old account forum".into(),
+                    ..Default::default()
+                }]),
+            },
+        ));
+        app.handle_msg(session_msg(
+            1,
+            Msg::DraftsLoaded {
+                epoch: 0,
+                drafts: vec![common::models::RemoteDraft {
+                    key: "thread-9".into(),
+                    message: "private old-account draft".into(),
+                    ..Default::default()
+                }],
+            },
+        ));
+
+        let Some(Screen::Home(home)) = app.screens.first() else {
+            panic!("expected Home");
+        };
+        assert!(home.tree.nodes.is_empty(), "stale nodes must not cross the boundary");
+        assert!(home.tree.loading, "the stale result must not clear the new load");
+        assert!(app.drafts.is_empty(), "stale drafts must not cross identities");
     }
 
     /// Issue #524: a second `start_pollers` (the re-login path) must not
@@ -7766,6 +8574,22 @@ mod tests {
             app.status
         );
 
+        // Uploads are also session-bound writes; leaving the screen would
+        // let their completion land in a different composer.
+        app.screens.pop();
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 1,
+                thread_title: "A thread".into(),
+            }),
+            body: "draft".into(),
+            uploading: true,
+            ..Default::default()
+        }));
+        app.handle_key(esc());
+        assert_eq!(app.screens.len(), 2, "an uploading composer must not be popped");
+        assert!(app.status.contains("Uploading"), "upload refusal must be visible");
+
         // Idle: the composer's own Esc arm discards it.
         app.screens.pop();
         app.screens.push(composer(false));
@@ -7786,12 +8610,15 @@ mod tests {
 
         // A late failure with no composer left on the stack still surfaces.
         app.status.clear();
-        app.handle_msg(Msg::ReplySent(Err(TaskError {
-            message: "Flood control".into(),
-            code: None,
-            max_page: None,
-            kind: TaskErrorKind::Other,
-        })));
+        app.handle_msg(Msg::ReplySent {
+            composer: common::drafts::DraftKey::ThreadReply(999),
+            result: Err(TaskError {
+                message: "Flood control".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::Other,
+            }),
+        });
         assert!(
             app.status.contains("Flood control"),
             "a late Err was dropped: {:?}",

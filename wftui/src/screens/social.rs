@@ -87,7 +87,7 @@ pub fn inbox_hints(s: &InboxState) -> Hints {
 pub fn inbox_key(s: &mut InboxState, key: KeyEvent) -> Action {
     if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
         match s.focus {
-            InboxPane::List => s.tab = s.tab.other(),
+            InboxPane::List => return Action::SwitchInboxTab(s.tab.other()),
             InboxPane::View => s.focus = InboxPane::List,
         }
         return Action::None;
@@ -2255,16 +2255,23 @@ mod tests {
     fn tab_key_switches_tabs_from_the_list_and_returns_from_the_view() {
         let mut s = InboxState::default();
         assert_eq!(s.tab, InboxTab::Conversations);
-        inbox_key(&mut s, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(s.tab, InboxTab::Alerts);
-        inbox_key(&mut s, KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        assert!(matches!(
+            inbox_key(&mut s, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Action::SwitchInboxTab(InboxTab::Alerts)
+        ));
         assert_eq!(s.tab, InboxTab::Conversations);
+        s.tab = InboxTab::Alerts;
+        assert!(matches!(
+            inbox_key(&mut s, KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)),
+            Action::SwitchInboxTab(InboxTab::Conversations)
+        ));
+        assert_eq!(s.tab, InboxTab::Alerts);
 
         s.view = Some(ConversationViewState::default());
         s.focus = InboxPane::View;
         inbox_key(&mut s, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(s.focus, InboxPane::List, "Tab from the view returns to the list");
-        assert_eq!(s.tab, InboxTab::Conversations, "Tab from the view must not also flip tabs");
+        assert_eq!(s.tab, InboxTab::Alerts, "Tab from the view must not also flip tabs");
 
         s.focus = InboxPane::View;
         inbox_key(&mut s, KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));

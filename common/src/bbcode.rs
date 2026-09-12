@@ -75,6 +75,13 @@ impl Align {
 pub fn parse_color(raw: &str) -> Option<Rgb> {
     let v = raw.trim().trim_matches('"').trim_matches('\'').trim();
     if let Some(hex) = v.strip_prefix('#') {
+        // Byte length and byte slicing are only safe after proving that the
+        // value is ASCII. Malformed forum content such as "#éa" must be
+        // rejected, not allowed to index past a short Vec<char> or split a
+        // UTF-8 code point.
+        if !hex.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
         let n = |s: &str| u8::from_str_radix(s, 16).ok();
         return match hex.len() {
             3 => {
@@ -2894,6 +2901,8 @@ mod tests {
             ("rebeccapurple", Some(Rgb { r: 102, g: 51, b: 153 })),
             ("nonsense", None),
             ("#12345", None),
+            ("#éa", None),
+            ("#€€", None),
             ("transparent", None),
         ] {
             assert_eq!(parse_color(src), want, "{src:?}");

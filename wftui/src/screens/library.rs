@@ -57,7 +57,10 @@ fn page_range(page: u32, last_page: u32, total: u64, len: usize) -> Option<Strin
 /// the whole line exactly `w` cells wide (cells, never chars — CJK titles
 /// broke the naive form, issue #511/#595).
 fn catalog_line(theme: &Theme, title: &str, right_text: &str, w: usize) -> Line<'static> {
-    let right = Span::styled(right_text.to_string(), theme.dim());
+    // The metadata is untrusted too (for example, a long resource author or
+    // title).  Truncate it before reserving the title column; otherwise a
+    // narrow panel can overflow even though the left side is cell-aware.
+    let right = Span::styled(truncate(right_text, w), theme.dim());
     let right_w = right.width();
     let title_w = w.saturating_sub(right_w + 1);
     let left = Span::styled(truncate(title, title_w), theme.base());
@@ -1614,6 +1617,21 @@ mod tests {
         let theme = Theme::truecolor();
         for w in [20usize, 40, 60] {
             let line = catalog_line(&theme, &"\u{6f22}\u{5b57}".repeat(30), "kemical \u{b7} 3d", w);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(chrome::cell_width(&text), w, "width {w}");
+        }
+    }
+
+    #[test]
+    fn an_overlong_catalog_meta_run_cannot_overflow_the_panel() {
+        let theme = Theme::truecolor();
+        for w in [1usize, 4, 10, 20] {
+            let line = catalog_line(
+                &theme,
+                "short",
+                &"\u{4f5c}\u{8005}".repeat(30),
+                w,
+            );
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             assert_eq!(chrome::cell_width(&text), w, "width {w}");
         }
