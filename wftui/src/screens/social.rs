@@ -955,7 +955,7 @@ fn conversation_view_key_inner(s: &mut ConversationViewState, key: KeyEvent) -> 
             if !name.is_empty() {
                 Action::OpenProfile(uid, name)
             } else {
-                Action::None
+                Action::Notice("No conversation starter profile available.".into())
             }
         }
         KeyCode::Char('r') => Action::StartReplyConversation(s.conversation.clone()),
@@ -2443,5 +2443,21 @@ mod tests {
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
         );
         assert!(matches!(act, Action::StartReplyConversation(c) if c.conversation_id == 55));
+    }
+
+    #[test]
+    fn conversation_view_starter_profile_empty_notice() {
+        let mut state = ConversationViewState {
+            conversation: Conversation {
+                conversation_id: 1,
+                title: "Test".into(),
+                start_username: "".into(),
+                username: "".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let act = conversation_view_key(&mut state, key('P'));
+        assert!(matches!(act, Action::Notice(ref msg) if msg.contains("No conversation starter profile")));
     }
 }

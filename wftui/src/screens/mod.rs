@@ -1318,6 +1318,7 @@ impl Screen {
             Screen::NewConversation(n) if n.busy => EscIntent::Blocked(
                 "Resolving recipients\u{2026} Esc cannot cancel it \u{2014} wait for the result.",
             ),
+            Screen::ThreadView(s) if s.link_popup => EscIntent::Screen,
             Screen::Compose(_) | Screen::NewConversation(_) => EscIntent::Screen,
             Screen::Search(s) if s.input_mode => EscIntent::Screen,
             _ => EscIntent::App,
@@ -2161,6 +2162,27 @@ mod dispatch_tests {
                     // returns `Action::None` by design.
                     "o",
                 ],
+            },
+            Case {
+                name: "ThreadView (links popup)",
+                factory: || Screen::ThreadView(ThreadViewState {
+                    thread: Thread {
+                        thread_id: 1,
+                        title: "A thread".into(),
+                        view_url: Some("https://windowsforum.com/threads/1/".into()),
+                        ..Default::default()
+                    },
+                    posts: vec![Post {
+                        post_id: 9,
+                        username: "HItest".into(),
+                        message: "hello".into(),
+                        ..Default::default()
+                    }],
+                    links: vec!["https://windowsforum.com/threads/1/".into()],
+                    link_popup: true,
+                    ..Default::default()
+                }),
+                skip: &["j/k", "Esc"],
             },
             Case {
                 name: "Compose",

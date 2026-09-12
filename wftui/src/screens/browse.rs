@@ -836,7 +836,7 @@ pub fn home_key(s: &mut HomeState, key: KeyEvent) -> Action {
             if key.code == KeyCode::Char('m') {
                 return match s.tree.nodes.get(s.tree.sel) {
                     Some(n) if n.node_type == "Forum" => Action::MarkForumRead(n.node_id),
-                    _ => Action::None,
+                    _ => Action::Notice("Pick a forum first.".into()),
                 };
             }
             let act = forum_tree_key(&mut s.tree, key);
@@ -1028,10 +1028,10 @@ pub fn forum_tree_key(s: &mut ForumTreeState, key: KeyEvent) -> Action {
                 }) {
                     Action::StartNewThread(child.node_id)
                 } else {
-                    Action::None
+                    Action::Notice("Pick a forum first.".into())
                 }
             }
-            _ => Action::None,
+            _ => Action::Notice("Pick a forum first.".into()),
         },
         KeyCode::Char('q') => Action::Quit,
         _ => Action::None,
@@ -2349,8 +2349,10 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
             if !s.links.is_empty() {
                 s.sel_local = s.sel_local.min(s.links.len().saturating_sub(1));
                 s.link_popup = true;
+                Action::None
+            } else {
+                Action::Notice("No links in this thread.".into())
             }
-            Action::None
         }
         KeyCode::Char('u') => match s
             .posts
@@ -2421,7 +2423,7 @@ fn link_popup_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
     }
     s.sel_local = s.sel_local.min(s.links.len().saturating_sub(1));
     match key.code {
-        KeyCode::Esc => {
+        KeyCode::Esc | KeyCode::Char('q') => {
             s.link_popup = false;
             Action::None
         }
@@ -2450,6 +2452,13 @@ pub fn thread_view_hints(s: &ThreadViewState) -> Hints {
     // over content that never loaded — advertise the one key that works.
     if s.error.is_some() {
         return Hints::with_short(&[("R", "retry"), ("Esc", "back")], &[("R", "retry"), ("Esc", "back")], 0);
+    }
+    if s.link_popup {
+        return Hints::with_short(
+            &[("Enter", "open"), ("j/k", "move"), ("Esc", "close")],
+            &[("Enter", "open"), ("j/k", ""), ("Esc", "close")],
+            0,
+        );
     }
     // #708: the post-specific keys are advertised only where the API said
     // this reader may use them — a cap that 403s is the bug #561 fixed.
@@ -5129,5 +5138,78 @@ mod tests {
         state.posts[1].view_url = None;
         let act2 = thread_view_key(&mut state, key('u'));
         assert!(matches!(act2, Action::OpenUrl(ref url) if url == "https://windowsforum.com/threads/10/"));
+    }
+
+    #[test]
+    fn thread_view_link_popup_hints_and_empty_links_notice() {
+        let mut state = ThreadViewState {
+            thread: Thread {
+                thread_id: 1,
+                title: "Test".into(),
+                ..Default::default()
+            },
+            posts: vec![Post {
+                post_id: 1,
+                ..Default::default()
+            }],
+            links: Vec::new(),
+            link_popup: false,
+            ..Default::default()
+        };
+
+        // o with empty links gives a notice instead of a silent no-op
+        let act = thread_view_key(&mut state, key('o'));
+        assert!(matches!(act, Action::Notice(ref msg) if msg.contains("No links")));
+
+        // when popup is active, hints reflect popup controls
+        state.links.push("https://example.com".into());
+        state.link_popup = true;
+        let hints = thread_view_hints(&state);
+        let labels: Vec<&str> = hints.keys.iter().map(|(k, _)| *k).collect();
+        assert_eq!(labels, vec!["Enter", "j/k", "Esc"]);
+
+        // q closes the popup
+        let act2 = thread_view_key(&mut state, key('q'));
+        assert!(matches!(act2, Action::None));
+        assert!(!state.link_popup);
+    }
+
+    #[test]
+    fn home_and_forum_tree_notices_on_non_forum_node() {
+        let mut home = HomeState {
+            focus: Pane::Tree,
+            tree: ForumTreeState {
+                nodes: vec![
+                    Node {
+                        node_id: 1,
+                        title: "Main Category".into(),
+                        node_type: "Category".into(),
+                        ..Default::default()
+                    },
+                    Node {
+                        node_id: 2,
+                        title: "A Link Forum".into(),
+                        node_type: "LinkForum".into(),
+                        ..Default::default()
+                    },
+                ],
+                sel: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // m on Category notifies instead of silent no-op
+        let act = home_key(&mut home, key('m'));
+        assert!(matches!(act, Action::Notice(ref msg) if msg.contains("Pick a forum first")));
+
+        // m on LinkForum notifies
+        home.tree.sel = 1;
+        let act2 = home_key(&mut home, key('m'));
+        assert!(matches!(act2, Action::Notice(ref msg) if msg.contains("Pick a forum first")));
+
+        // N on LinkForum (no child forums) notifies instead of silent no-op
+        let act3 = forum_tree_key(&mut home.tree, key('N'));
+        assert!(matches!(act3, Action::Notice(ref msg) if msg.contains("Pick a forum first")));
     }
 }

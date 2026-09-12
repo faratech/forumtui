@@ -2371,7 +2371,7 @@ pub fn profile_key(s: &mut super::ProfileState, key: KeyEvent) -> Action {
                     content: "thread".into(),
                 }
             } else {
-                Action::None
+                Action::Notice("No member loaded yet.".into())
             }
         }
         KeyCode::Char('p') => {
@@ -2382,7 +2382,7 @@ pub fn profile_key(s: &mut super::ProfileState, key: KeyEvent) -> Action {
                     content: "post".into(),
                 }
             } else {
-                Action::None
+                Action::Notice("No member loaded yet.".into())
             }
         }
         KeyCode::Char('d') => {
@@ -2396,11 +2396,23 @@ pub fn profile_key(s: &mut super::ProfileState, key: KeyEvent) -> Action {
         }
         KeyCode::Char('o') => match s.user.as_ref().and_then(|u| u.view_url.clone()) {
             Some(url) => Action::OpenUrl(url),
-            None => Action::None,
+            None => {
+                if s.user.is_none() {
+                    Action::Notice("No member loaded yet.".into())
+                } else {
+                    Action::Notice("No web address for this member.".into())
+                }
+            }
         },
         KeyCode::Char('y') => match s.user.as_ref().and_then(|u| u.view_url.clone()) {
             Some(url) => Action::OscCopy(url),
-            None => Action::None,
+            None => {
+                if s.user.is_none() {
+                    Action::Notice("No member loaded yet.".into())
+                } else {
+                    Action::Notice("No web address for this member.".into())
+                }
+            }
         },
         _ => Action::None,
     }
@@ -4042,4 +4054,35 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn profile_keys_notice_when_unloaded_or_missing_url() {
+        let mut s = crate::screens::ProfileState {
+            title: "Test".into(),
+            user: None,
+            ..Default::default()
+        };
+        let key = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+
+        // All keys give notices when user is None
+        for k in ['t', 'p', 'd', 'o', 'y'] {
+            let act = profile_key(&mut s, key(k));
+            assert!(
+                matches!(act, Action::Notice(ref msg) if msg.contains("No member loaded yet")),
+                "expected notice for key {k}"
+            );
+        }
+
+        // o and y give notices when user has no view_url
+        s.user = Some(common::models::User {
+            user_id: 1,
+            username: "test".into(),
+            view_url: None,
+            ..Default::default()
+        });
+        let act_o = profile_key(&mut s, key('o'));
+        assert!(matches!(act_o, Action::Notice(ref msg) if msg.contains("No web address")));
+
+        let act_y = profile_key(&mut s, key('y'));
+        assert!(matches!(act_y, Action::Notice(ref msg) if msg.contains("No web address")));
+    }
 }
