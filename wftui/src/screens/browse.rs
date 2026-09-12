@@ -206,7 +206,7 @@ pub(crate) fn thread_row(
     {
         let chip = chrome::chip(theme, &chrome::short_prefix(prefix));
         let cw = chip.width();
-        if cw + 4 <= tw {
+        if used + cw + 4 <= tw {
             spans.push(chip);
             spans.push(Span::raw(" "));
             used += cw + 1;
@@ -595,7 +595,6 @@ pub(crate) fn post_videos(post: Option<&Post>) -> Vec<(String, &'static str)> {
     for chunk in common::bbcode::render(&post.message) {
         let url = match chunk {
             Chunk::Link(_, url, _) => url,
-            Chunk::Image { link: Some(url), .. } => url,
             _ => continue,
         };
         if let Some(site) = common::bbcode::video_site(&url)
@@ -2901,9 +2900,11 @@ mod tests {
             reply_count: 4,
             ..Default::default()
         };
-        for inner in [60usize, 81, 120] {
-            let line = thread_row(&t, &theme, &UNICODE, Grammar::Wide, inner);
-            assert_eq!(line.width(), inner, "state + prefix at inner {inner}: {}", text(&line));
+        for inner in 42usize..=120 {
+            for gram in [Grammar::Narrow, Grammar::Wide] {
+                let line = thread_row(&t, &theme, &UNICODE, gram, inner);
+                assert_eq!(line.width(), inner, "state + prefix at inner {inner}: {}", text(&line));
+            }
         }
     }
 
@@ -4047,6 +4048,20 @@ mod tests {
         assert!(found[0].0.contains("aaa"), "{found:?}");
         assert!(found[1].0.contains("bbb"), "{found:?}");
         assert!(post_videos(None).is_empty());
+    }
+
+    #[test]
+    fn linked_image_to_video_does_not_register_as_post_video_and_desync_play_rows() {
+        let post = Post {
+            post_id: 1,
+            message: "[URL=https://youtu.be/linked-img][IMG]https://example.com/pic.png[/IMG][/URL] \
+                      https://youtu.be/real-video"
+                .into(),
+            ..Default::default()
+        };
+        let found = post_videos(Some(&post));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].0.contains("real-video"), "{found:?}");
     }
 
     /// #708: edit, delete and mark-solution are offered only where the API

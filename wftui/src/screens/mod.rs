@@ -1090,7 +1090,7 @@ impl Screen {
                 }
             }
             Screen::MediaGallery(m) => {
-                if m.dual && m.cat_rect.contains(at) {
+                if m.cat_rect.contains(at) {
                     m.focus = MediaPane::Categories;
                 } else if m.items_rect.contains(at) {
                     m.focus = MediaPane::Items;

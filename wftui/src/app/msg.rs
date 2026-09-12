@@ -1285,6 +1285,10 @@ impl App {
                 Err(e) => self.set_status(format!("Mark failed: {e}")),
             },
             Msg::SearchDone { generation, page, result } => {
+                if self.status.starts_with("Searching") {
+                    self.status.clear();
+                    self.status_set_at = None;
+                }
                 // Only the screen waiting on *this* load adopts the reply —
                 // the topmost Search may belong to a newer query or member
                 // (see ForumLoaded, issue #537).

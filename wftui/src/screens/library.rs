@@ -370,9 +370,13 @@ pub fn render_media_gallery(
         // Narrow: the categories are reachable with Tab, one pane at a time.
         match s.focus {
             super::MediaPane::Categories => {
+                s.items_rect = Rect::default();
                 render_categories(s, f, area, theme, g, true, hits)
             }
-            super::MediaPane::Items => render_media_items(s, f, area, theme, g, true, hits),
+            super::MediaPane::Items => {
+                s.cat_rect = Rect::default();
+                render_media_items(s, f, area, theme, g, true, hits)
+            }
         }
         return;
     }

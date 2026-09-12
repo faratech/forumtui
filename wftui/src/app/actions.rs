@@ -507,7 +507,7 @@ impl App {
         }
         let rows = list.threads.len();
         let next = list.page.max(1) + list.pages_loaded.max(1);
-        if next > list.last_page || list.fill_budget == 0 {
+        if next > list.last_page {
             return;
         }
         // A screenful of lead, so the rows are there before the reader

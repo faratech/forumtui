@@ -156,6 +156,14 @@ impl App {
                 ib.focus = screens::InboxPane::List;
                 return;
             }
+            // Same idea for Media Gallery: Esc from the items pane returns
+            // to the categories list rather than leaving the screen entirely.
+            if let Some(Screen::MediaGallery(m)) = self.screens.last_mut()
+                && m.focus == screens::MediaPane::Items
+            {
+                m.focus = screens::MediaPane::Categories;
+                return;
+            }
             if self.pop_screen() {
                 self.status.clear();
             } else {
@@ -552,11 +560,17 @@ impl App {
             }
             Hit::Post(i) => {
                 if let Some(screen) = self.screens.last_mut() {
+                    screen.focus_pane_at(pos.0, pos.1);
                     screen.select_post(i);
                 }
                 self.screens.last().and_then(Screen::web_url)
             }
-            Hit::Pane(_) | Hit::Image(_) => self.screens.last().and_then(Screen::web_url),
+            Hit::Pane(_) | Hit::Image(_) => {
+                if let Some(screen) = self.screens.last_mut() {
+                    screen.focus_pane_at(pos.0, pos.1);
+                }
+                self.screens.last().and_then(Screen::web_url)
+            }
             _ => None,
         }
     }

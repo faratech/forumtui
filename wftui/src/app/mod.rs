@@ -9361,4 +9361,147 @@ mod tests {
         assert_eq!(h.focus, screens::Pane::Tree);
         assert!(app.selection.is_none(), "and no selection band is started");
     }
+
+    #[test]
+    fn right_click_on_inbox_view_post_focuses_view_pane_and_resolves_url() {
+        let mut app = home_app();
+        app.screens.push(Screen::Inbox(screens::InboxState {
+            focus: screens::InboxPane::List,
+            convos: screens::ConversationsState {
+                conversations: vec![Conversation {
+                    conversation_id: 1,
+                    title: "Convo 1".into(),
+                    view_url: Some("https://windowsforum.com/conversations/1/".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            view: Some(screens::ConversationViewState {
+                conversation: Conversation {
+                    conversation_id: 2,
+                    title: "Convo 2".into(),
+                    view_url: Some("https://windowsforum.com/conversations/2/".into()),
+                    ..Default::default()
+                },
+                messages: vec![ConversationMessage {
+                    message_id: 42,
+                    message: "Hello world".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        frame(&mut app, 120, 24);
+
+        let (x, y) = find_hit(&app, 120, 24, |h| matches!(h, Hit::Post(_)))
+            .expect("a post hit in view pane");
+        assert_eq!(
+            app.right_click_url((x, y)),
+            Some("https://windowsforum.com/conversations/2/".to_string())
+        );
+        let Some(Screen::Inbox(ib)) = app.screens.last() else {
+            panic!("expected Inbox");
+        };
+        assert_eq!(ib.focus, screens::InboxPane::View);
+    }
+
+    #[test]
+    fn media_gallery_narrow_mouse_focus_and_esc_routing() {
+        let mut app = home_app();
+        app.screens.push(Screen::MediaGallery(screens::MediaListState {
+            focus: screens::MediaPane::Items,
+            items: vec![common::models::MediaItem {
+                media_id: 10,
+                title: "Test Image".into(),
+                view_url: Some("https://windowsforum.com/media/10/".into()),
+                ..Default::default()
+            }],
+            categories: vec![common::models::MediaCategory {
+                category_id: 1,
+                title: "Wallpapers".into(),
+                view_url: Some("https://windowsforum.com/media/categories/1/".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+        // Esc from Items switches focus to Categories, not popping the screen
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let Some(Screen::MediaGallery(m)) = app.screens.last() else {
+            panic!("expected MediaGallery on top");
+        };
+        assert_eq!(m.focus, screens::MediaPane::Categories);
+
+        // Render narrow (< 90 cols, e.g. 80 cols) while in Categories focus
+        frame(&mut app, 80, 24);
+        let Some(Screen::MediaGallery(m)) = app.screens.last() else {
+            panic!("expected MediaGallery");
+        };
+        assert_eq!(m.items_rect, ratatui::layout::Rect::default());
+        assert_ne!(m.cat_rect, ratatui::layout::Rect::default());
+
+        // Esc from Categories pops the screen back to Home
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.screens.last(), Some(Screen::Home(_))));
+    }
+
+    #[tokio::test]
+    async fn autoload_more_fires_when_fill_budget_is_zero_and_reader_scrolls_near_bottom() {
+        let mut app = home_app();
+        if let Some(Screen::Home(h)) = app.screens.last_mut() {
+            h.list.node_id = 7;
+            h.list.page = 1;
+            h.list.pages_loaded = 1;
+            h.list.last_page = 3;
+            h.list.visible = 10;
+            h.list.fill_budget = 0; // Exhausted during initial fill
+            h.list.threads = (1..=20)
+                .map(|i| Thread {
+                    thread_id: i,
+                    title: format!("Thread {i}"),
+                    ..Default::default()
+                })
+                .collect();
+            h.list.sel = 15; // Within visible (10) of total rows (20)
+        }
+        app.autoload_more();
+        let Some(Screen::Home(h)) = app.screens.last() else {
+            panic!("expected Home");
+        };
+        assert!(
+            h.list.loading,
+            "autoload_more must trigger loading page 2 even with fill_budget == 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_clears_searching_status_hint_when_search_done_arrives() {
+        let mut app = home_app();
+        app.set_hint("Searching…");
+        assert_eq!(app.status, "Searching…");
+        assert!(app.status_set_at.is_none());
+
+        app.screens.push(Screen::Search(screens::SearchState {
+            generation: 42,
+            loading: true,
+            ..Default::default()
+        }));
+
+        app.handle_msg(Msg::SearchDone {
+            generation: 42,
+            page: 1,
+            result: Ok(common::models::SearchResultsReply {
+                results: vec![],
+                pagination: common::models::Pagination {
+                    current_page: 1,
+                    last_page: 1,
+                    per_page: 20,
+                    total: 0,
+                },
+            }),
+        });
+
+        assert_eq!(app.status, "");
+        assert!(app.status_set_at.is_none());
+    }
 }
