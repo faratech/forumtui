@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+case "$(uname -s)" in Linux) ;; *) echo "This package requires Linux." >&2; exit 1 ;; esac
+case "$(uname -m)" in
+    x86_64|amd64) arch=x86_64 ;;
+    aarch64|arm64) arch=aarch64 ;;
+    *) echo "Unsupported CPU: $(uname -m). This package supports x64 and ARM64." >&2; exit 1 ;;
+esac
+base=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$base/bin/wftui-$arch" "$@"

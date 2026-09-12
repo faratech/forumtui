@@ -611,7 +611,7 @@ pub(crate) fn post_videos(post: Option<&Post>) -> Vec<(String, &'static str)> {
 /// `None` when the API gave nothing to paint — the caller then falls back to
 /// the browser, which is all that picture ever had.
 pub(crate) fn image_open_for_post(post: &Post, img: &PostImage) -> Option<Box<super::ImageOpen>> {
-    let key = img.key.clone()?;
+    let key = img.open_url.clone().or_else(|| img.key.clone())?;
     let mut meta = post.username.clone();
     if post.post_date > 0 {
         if !meta.is_empty() {
@@ -4563,7 +4563,7 @@ mod tests {
         s.sel_post = 0;
         match thread_view_key(&mut s, KeyEvent::from(KeyCode::Enter)) {
             Action::OpenImage(open) => {
-                assert_eq!(open.key, "https://wf/thumb/1.png");
+                assert_eq!(open.key, "https://wf/full/1.png");
                 assert!(open.meta.contains("HItest") || open.meta.contains("kemical"));
             }
             _ => panic!("Enter must expand the first picture"),
@@ -4582,12 +4582,12 @@ mod tests {
         s.sel_post = 0;
 
         // #693: the digit opens the picture in the client's own viewer now.
-        // `direct_url` is still what the browser gets from there, not the
-        // thumbnail the terminal paints.
+        // Full resolution `open_url` is preferred for the viewer over the
+        // post flow's inline thumbnail.
         match thread_view_key(&mut s, key('1')) {
             Action::OpenImage(open) => {
                 assert_eq!(open.web_url.as_deref(), Some("https://wf/full/1.png"));
-                assert_eq!(open.key, "https://wf/thumb/1.png");
+                assert_eq!(open.key, "https://wf/full/1.png");
                 assert_eq!(open.px, Some((1152, 720)));
             }
             _ => panic!("1 did not open the first image"),

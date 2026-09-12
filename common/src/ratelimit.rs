@@ -17,8 +17,7 @@ struct State {
     penalty_until: Option<Instant>,
 }
 
-/// A spacing gate: every `wait()` reserves the next slot `min` after the
-/// previous one. Not a queue — concurrent callers serialise onto the slots.
+/// A spacing gate: successful dispatches are at least `min` apart.
 pub struct Gate {
     min: Duration,
     state: Mutex<State>,
@@ -35,35 +34,61 @@ impl Gate {
         }
     }
 
-    /// Reserve the next slot and sleep until it starts.
-    ///
-    /// Cancellation-safe (#623): the reservation is made under the lock and
-    /// the sleep happens outside it, so a waiter aborted mid-sleep (the
-    /// app's `abort_writes` on logout / session recovery) used to leave its
-    /// slot burned — `next_free` pushed 30 s out for a request that never
-    /// went. The slot is held open by a `Reservation` guard instead: dropped
-    /// mid-wait it rolls `next_free` back, but only while it is still the
-    /// newest reservation (a later waiter's slot legitimately builds on it).
+    /// Wait until dispatch is permitted. Waiting does not consume a future
+    /// slot, so cancellation cannot leave a hole in the schedule.
     pub async fn wait(&self) {
-        let reservation = {
-            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let now = Instant::now();
-            let mut target = s.next_free.max(now);
-            if let Some(penalty) = s.penalty_until {
-                target = target.max(penalty);
+        Self::wait_all(&[self]).await;
+    }
+
+    /// Acquire all applicable lanes together, immediately before dispatch.
+    /// Locks have a stable order; no lock or future reservation spans a sleep.
+    /// Every wake rechecks server penalties as well as competing dispatches.
+    pub async fn wait_all(gates: &[&Gate]) {
+        loop {
+            Self::wait_until_ready(gates).await;
+            if Self::try_acquire_all(gates) {
+                return;
             }
-            s.next_free = target + self.min;
-            Reservation {
-                gate: self,
-                target,
-                armed: true,
-            }
-        };
-        let now = Instant::now();
-        if reservation.target > now {
-            tokio::time::sleep_until(reservation.target).await;
         }
-        reservation.consume();
+    }
+
+    /// Wait without consuming capacity. Callers can then acquire an async
+    /// prerequisite (such as the token lock) before trying to dispatch.
+    pub async fn wait_until_ready(gates: &[&Gate]) {
+        while let Some(target) = Self::schedule(gates, false) {
+            tokio::time::sleep_until(target).await;
+        }
+    }
+
+    /// Atomically acquire every lane if all are ready now. Never blocks on an
+    /// async prerequisite or consumes a slot for a request that is not ready.
+    pub fn try_acquire_all(gates: &[&Gate]) -> bool {
+        Self::schedule(gates, true).is_none()
+    }
+
+    fn schedule(gates: &[&Gate], consume: bool) -> Option<Instant> {
+        let mut gates = gates.to_vec();
+        gates.sort_unstable_by_key(|gate| *gate as *const Gate as usize);
+        gates.dedup_by_key(|gate| *gate as *const Gate as usize);
+        let mut states: Vec<_> = gates
+            .iter()
+            .map(|gate| gate.state.lock().unwrap_or_else(|e| e.into_inner()))
+            .collect();
+        let now = Instant::now();
+        let target = states.iter().fold(now, |target, state| {
+            target
+                .max(state.next_free)
+                .max(state.penalty_until.unwrap_or(now))
+        });
+        if target > now {
+            return Some(target);
+        }
+        if consume {
+            for (gate, state) in gates.iter().zip(states.iter_mut()) {
+                state.next_free = now + gate.min;
+            }
+        }
+        None
     }
 
     /// Impose a cool-down floor starting now (Retry-After, post-write flood
@@ -101,38 +126,6 @@ impl Gate {
             target - now
         } else {
             Duration::ZERO
-        }
-    }
-}
-
-/// One waiter's live claim on a slot (#623). Dropping it without
-/// `consume()` — i.e. the future was aborted before the wait finished —
-/// rolls the slot back when it is still the gate's newest reservation.
-struct Reservation<'a> {
-    gate: &'a Gate,
-    target: Instant,
-    armed: bool,
-}
-
-impl Reservation<'_> {
-    fn consume(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for Reservation<'_> {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if let Ok(mut s) = self.gate.state.lock() {
-            let mine = match self.target.checked_add(self.gate.min) {
-                Some(end) => end,
-                None => return, // cannot have been recorded as next_free
-            };
-            if s.next_free == mine {
-                s.next_free = self.target;
-            }
         }
     }
 }
@@ -216,7 +209,11 @@ mod tests {
             g2.wait().await;
         });
         tokio::task::yield_now().await;
-        assert_eq!(gate.pending_wait(), Duration::from_secs(60), "test setup: the slot is held");
+        assert_eq!(
+            gate.pending_wait(),
+            Duration::from_secs(30),
+            "waiting consumes no future slot"
+        );
 
         waiter.abort();
         tokio::task::yield_now().await;
@@ -245,7 +242,11 @@ mod tests {
             g2.wait().await;
         });
         tokio::task::yield_now().await;
-        assert_eq!(gate.pending_wait(), Duration::from_millis(2000), "test setup");
+        assert_eq!(
+            gate.pending_wait(),
+            Duration::from_millis(1000),
+            "waiting consumes no future slot"
+        );
         // The inline wait parks at T+2s (the clock advances to it) and
         // re-anchors next_free to T+3s — 1s of spacing from now.
         gate.wait().await;
@@ -259,4 +260,63 @@ mod tests {
             "the live inline reservation must keep its spacing"
         );
     }
+    #[tokio::test(start_paused = true)]
+    async fn queued_waiters_observe_new_penalties_and_keep_spacing() {
+        let gate = std::sync::Arc::new(Gate::new(100));
+        gate.wait().await;
+        let start = Instant::now();
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let gate = gate.clone();
+            tasks.push(tokio::spawn(async move {
+                gate.wait().await;
+                Instant::now()
+            }));
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        gate.penalize(Duration::from_millis(500));
+        let mut times = Vec::new();
+        for task in tasks {
+            times.push(task.await.unwrap());
+        }
+        times.sort();
+        assert!(times[0] - start >= Duration::from_millis(520));
+        assert!(
+            times
+                .windows(2)
+                .all(|t| t[1] - t[0] >= Duration::from_millis(100))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn combined_lanes_do_not_bunch_after_a_global_penalty() {
+        let api = Gate::new(250);
+        let search = Gate::new(3000);
+        api.penalize(Duration::from_secs(10));
+        let start = Instant::now();
+        let (a, b) = tokio::join!(
+            async {
+                Gate::wait_all(&[&api, &search]).await;
+                Instant::now()
+            },
+            async {
+                Gate::wait_all(&[&search, &api]).await;
+                Instant::now()
+            },
+        );
+        assert!(a.min(b) - start >= Duration::from_secs(10));
+        assert!(a.max(b) - a.min(b) >= Duration::from_secs(3));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn waiting_without_dispatch_does_not_burn_a_write_slot() {
+        let gate = Gate::new(30_000);
+        gate.penalize(Duration::from_secs(10));
+        Gate::wait_until_ready(&[&gate]).await;
+        assert_eq!(gate.pending_wait(), Duration::ZERO);
+        let start = Instant::now();
+        gate.wait().await;
+        assert_eq!(Instant::now(), start, "refreshing the prerequisite costs no extra cooldown");
+    }
+
 }

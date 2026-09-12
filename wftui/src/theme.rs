@@ -299,7 +299,7 @@ impl Theme {
         }
         #[cfg(windows)]
         {
-            return Theme::truecolor();
+            Theme::truecolor()
         }
         #[cfg(not(windows))]
         Theme::ansi16()

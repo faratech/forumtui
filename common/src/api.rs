@@ -212,12 +212,8 @@ impl WfApiClient {
             return Err(Error::NoToken);
         }
         let refresh_token = existing.refresh_token.clone();
-        // The refresh POST is a second round-trip to the same origin and
-        // goes through the api_gate like every other request (#641): the
-        // caller consumed a slot for its own call, but this one is
-        // additional traffic the origin can see. The tokens lock is already
-        // held across the await by design, so this only ever delays
-        // queued token work by the gate's spacing.
+        // Refresh is origin traffic too. Callers acquire their own dispatch
+        // slots only AFTER this refresh and its token lock have completed.
         self.api_gate.wait().await;
         let err = match oauth::refresh(&self.http, &self.base, &refresh_token).await {
             Ok(mut refreshed) => {
@@ -239,6 +235,7 @@ impl WfApiClient {
             }
             Err(e) => e,
         };
+        self.note_rate_limit(&err, &[&self.api_gate]);
         if !matches!(&err, Error::OAuth { code, .. } if code == "invalid_grant") {
             return Err(err);
         }
@@ -305,9 +302,27 @@ impl WfApiClient {
         }
     }
 
+    /// Refresh before reserving network capacity. A long gate wait may outlive
+    /// the prepared token, so check it again without waiting behind a refresh.
+    async fn dispatch_token(&self, gates: &[&Gate]) -> Result<String> {
+        loop {
+            self.valid_token().await?;
+            Gate::wait_until_ready(gates).await;
+            // Acquire the fair async lock before committing capacity. Holding
+            // it only for this synchronous check avoids both a try_lock retry
+            // loop and blocking logout/refresh across a long gate cooldown.
+            let guard = self.tokens.lock().await;
+            let current = guard.as_ref().ok_or(Error::NoToken)?;
+            if !current.access_expired(OffsetDateTime::now_utc())
+                && Gate::try_acquire_all(gates)
+            {
+                return Ok(current.access_token.clone());
+            }
+        }
+    }
+
     async fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, String)]) -> Result<T> {
-        self.api_gate.wait().await;
-        let token = self.valid_token().await?;
+        let token = self.dispatch_token(&[&self.api_gate]).await?;
         let url = format!("{}{path}", self.api_base());
         let resp = self.http.get(url).query(query).bearer_auth(&token).send().await?;
         decode(resp).await.inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate]))
@@ -321,9 +336,7 @@ impl WfApiClient {
         path: &str,
         query: &[(&str, String)],
     ) -> Result<T> {
-        self.search_gate.wait().await;
-        self.api_gate.wait().await;
-        let token = self.valid_token().await?;
+        let token = self.dispatch_token(&[&self.api_gate, &self.search_gate]).await?;
         let url = format!("{}{path}", self.api_base());
         let resp = self.http.get(url).query(query).bearer_auth(&token).send().await?;
         decode(resp)
@@ -339,9 +352,7 @@ impl WfApiClient {
         form: &[(&str, String)],
         success_penalty: Option<Duration>,
     ) -> Result<T> {
-        self.api_gate.wait().await;
-        self.write_gate.wait().await;
-        let token = self.valid_token().await?;
+        let token = self.dispatch_token(&[&self.api_gate, &self.write_gate]).await?;
         let url = format!("{}{path}", self.api_base());
         let resp = self.http.post(url).form(form).bearer_auth(&token).send().await?;
         let out = decode(resp).await;
@@ -358,8 +369,7 @@ impl WfApiClient {
     /// Unit-style POST (mark-read and friends): bookkeeping, not a
     /// flood-checked write — global gate only.
     async fn post_unit(&self, path: &str, form: &[(&str, String)]) -> Result<()> {
-        self.api_gate.wait().await;
-        let token = self.valid_token().await?;
+        let token = self.dispatch_token(&[&self.api_gate]).await?;
         let url = format!("{}{path}", self.api_base());
         let resp = self.http.post(url).form(form).bearer_auth(&token).send().await?;
         check_status(resp)
@@ -372,9 +382,7 @@ impl WfApiClient {
     /// waiting before calling `post_unit` without this helper merely consumes
     /// the old slot and leaves the next edit immediately eligible (#718).
     async fn post_unit_write(&self, path: &str, form: &[(&str, String)]) -> Result<()> {
-        self.api_gate.wait().await;
-        self.write_gate.wait().await;
-        let token = self.valid_token().await?;
+        let token = self.dispatch_token(&[&self.api_gate, &self.write_gate]).await?;
         let url = format!("{}{path}", self.api_base());
         let resp = self.http.post(url).form(form).bearer_auth(&token).send().await?;
         let result = check_status(resp).await;
@@ -392,9 +400,7 @@ impl WfApiClient {
     /// the success penalty and Retry-After handling identical for every
     /// content mutation.
     async fn delete_unit_write(&self, path: &str, form: &[(&str, String)]) -> Result<()> {
-        self.api_gate.wait().await;
-        self.write_gate.wait().await;
-        let token = self.valid_token().await?;
+        let token = self.dispatch_token(&[&self.api_gate, &self.write_gate]).await?;
         let url = format!("{}{}", self.api_base(), path);
         let resp = self
             .http
@@ -422,8 +428,7 @@ impl WfApiClient {
             #[serde(default)]
             action: String,
         }
-        self.api_gate.wait().await;
-        let token = self.valid_token().await?;
+        let token = self.dispatch_token(&[&self.api_gate]).await?;
         let url = format!("{}{path}", self.api_base());
         let resp = self.http.post(url).form(form).bearer_auth(&token).send().await?;
         let reply: ToggleReply = decode(resp)
@@ -457,14 +462,12 @@ impl WfApiClient {
         mime: &str,
         existing_key: Option<&str>,
     ) -> Result<(String, Attachment)> {
-        self.api_gate.wait().await;
-        self.write_gate.wait().await;
-        let token = self.valid_token().await?;
 
         // One key per post: mint it on the first file, reuse it after.
         let key = match existing_key {
             Some(k) => k.to_string(),
             None => {
+                let token = self.dispatch_token(&[&self.api_gate]).await?;
                 let mut form: Vec<(&str, String)> = vec![("type", content_type.to_string())];
                 for (k, v) in context {
                     form.push((k, v.clone()));
@@ -492,7 +495,7 @@ impl WfApiClient {
             }
         };
 
-        self.api_gate.wait().await;
+        let token = self.dispatch_token(&[&self.api_gate, &self.write_gate]).await?;
         let upload_url = format!("{}/attachments/", self.api_base());
         let file_part =
             reqwest::multipart::Part::bytes(bytes).file_name(filename).mime_str(mime)?;
@@ -542,8 +545,7 @@ impl WfApiClient {
     /// `Retry-After` reaches the gates instead of dying as a plain
     /// `Error::Http` (#643).
     pub async fn attachment_data(&self, attachment_id: u32, max_bytes: usize) -> Result<Vec<u8>> {
-        self.api_gate.wait().await;
-        let token = self.valid_token().await?;
+        let token = self.dispatch_token(&[&self.api_gate]).await?;
         let url = format!("{}/attachments/{attachment_id}/data", self.api_base());
         let mut resp = self.http.get(&url).bearer_auth(&token).send().await?;
         if !resp.status().is_success() {
@@ -596,7 +598,6 @@ impl WfApiClient {
     /// which reads the whole thing first regardless of what it decides to
     /// do with it afterwards (issue #526).
     pub async fn fetch_bytes(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>> {
-        self.image_gate.wait().await;
         // Media served by the API itself (`/api/media/{id}/data`, the
         // gallery's full-size bytes) needs the bearer token; anything else is
         // a plain data-host or third-party URL and must NOT see it. The test
@@ -605,7 +606,9 @@ impl WfApiClient {
         // `[IMG]`), so a looser rule would hand the grant to whoever asked.
         let mut req = self.http.get(url);
         if url.starts_with(&format!("{}/", self.api_base())) {
-            req = req.bearer_auth(self.valid_token().await?);
+            req = req.bearer_auth(self.dispatch_token(&[&self.image_gate]).await?);
+        } else {
+            self.image_gate.wait().await;
         }
         let response = req.send().await?;
         if !response.status().is_success() {
@@ -669,7 +672,7 @@ pub(crate) async fn decode<T: DeserializeOwned>(resp: reqwest::Response) -> Resu
     serde_json::from_slice(&bytes).map_err(Error::from)
 }
 
-async fn error_from_response(resp: reqwest::Response) -> Error {
+pub(crate) async fn error_from_response(resp: reqwest::Response) -> Error {
     let status = resp.status().as_u16();
     if status == 429 {
         // A hostile or broken origin can send an arbitrarily large
@@ -979,8 +982,7 @@ impl WfApi for WfApiClient {
     }
 
     async fn delete_draft(&self, xf_key: &str) -> Result<()> {
-        self.api_gate.wait().await;
-        let token = self.valid_token().await?;
+        let token = self.dispatch_token(&[&self.api_gate]).await?;
         let url = format!("{}/wf-tui-drafts", self.api_base());
         let resp = self
             .http
@@ -1099,7 +1101,6 @@ impl WfApi for WfApiClient {
     }
 
     async fn search_advanced(&self, query: &SearchQuery) -> Result<SearchResultsReply> {
-        self.search_gate.wait().await;
         #[derive(serde::Deserialize)]
         struct SearchInfo {
             #[serde(default)]
@@ -1110,8 +1111,7 @@ impl WfApi for WfApiClient {
             #[serde(default)]
             search: Option<SearchInfo>,
         }
-        self.api_gate.wait().await;
-        let token = self.valid_token().await?;
+        let token = self.dispatch_token(&[&self.api_gate, &self.search_gate]).await?;
         let url = format!("{}/search", self.api_base());
         let mut form: Vec<(&str, String)> = Vec::new();
         if !query.keywords.trim().is_empty() {
@@ -1191,7 +1191,6 @@ impl WfApi for WfApiClient {
         content: &str,
         page: u32,
     ) -> Result<SearchResultsReply> {
-        self.search_gate.wait().await;
         #[derive(serde::Deserialize)]
         struct SearchInfo {
             #[serde(default)]
@@ -1202,8 +1201,7 @@ impl WfApi for WfApiClient {
             #[serde(default)]
             search: Option<SearchInfo>,
         }
-        self.api_gate.wait().await;
-        let token = self.valid_token().await?;
+        let token = self.dispatch_token(&[&self.api_gate, &self.search_gate]).await?;
         let url = format!("{}/search/member", self.api_base());
         let mut form: Vec<(&str, String)> = vec![("user_id", user_id.to_string())];
         if !content.is_empty() && content != "all" {
@@ -3154,4 +3152,69 @@ mod tests {
         assert_eq!(c.vote_post(101, "up").await.unwrap(), Toggle::Removed);
         assert_eq!(c.vote_post(102, "up").await.unwrap(), Toggle::Inserted);
     }
+    #[tokio::test]
+    async fn concurrent_reads_remain_spaced_after_slow_refresh() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-spaced-refresh");
+        Mock::given(method("POST")).and(path("/api/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(800))
+                .set_body_json(serde_json::json!({"access_token":"fresh","refresh_token":"next","expires_in":3600})))
+            .expect(1).mount(&server).await;
+        let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = arrivals.clone();
+        Mock::given(method("GET")).and(path("/api/resources"))
+            .respond_with(move |_: &wiremock::Request| {
+                observed.lock().unwrap().push(std::time::Instant::now());
+                ResponseTemplate::new(200).set_body_raw(include_str!("testdata/resources_page.json"), "application/json")
+            }).expect(4).mount(&server).await;
+        let client = logged_in_client("expired").await;
+        client.tokens.lock().await.as_mut().unwrap().expires_at = 0;
+        let results = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(client.resources_list(1), client.resources_list(1), client.resources_list(1), client.resources_list(1))
+        }).await.expect("concurrent dispatches must make progress");
+        results.0.unwrap(); results.1.unwrap(); results.2.unwrap(); results.3.unwrap();
+        let arrivals = arrivals.lock().unwrap();
+        assert_eq!(arrivals.len(), 4);
+        assert!(arrivals.windows(2).all(|pair| pair[1] - pair[0] >= Duration::from_millis(220)), "requests bunched after refresh");
+    }
+
+    #[tokio::test]
+    async fn refresh_rate_limit_preserves_retry_after_and_delays_waiting_refreshes() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-refresh-retry");
+        Mock::given(method("POST")).and(path("/api/oauth2/token"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "5")
+                .set_body_json(serde_json::json!({"error":"temporarily_unavailable"})))
+            .expect(1).mount(&server).await;
+        let client = logged_in_client("expired").await;
+        client.tokens.lock().await.as_mut().unwrap().expires_at = 0;
+        assert!(matches!(client.valid_token().await, Err(Error::RateLimited { retry_after: Some(delay) }) if delay == Duration::from_secs(5)));
+        assert!(client.api_gate.pending_wait() >= Duration::from_secs(4));
+        assert!(tokio::time::timeout(Duration::from_millis(350), client.valid_token()).await.is_err());
+        assert!(client.has_tokens().await, "a rate limit must keep the session");
+    }
+
+    #[tokio::test]
+    async fn expiry_during_a_write_cooldown_refreshes_without_consuming_an_extra_slot() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-expiring-write-token");
+        Mock::given(method("POST")).and(path("/api/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"access_token":"fresh","refresh_token":"next","expires_in":3600})))
+            .expect(1).mount(&server).await;
+        let client = logged_in_client("old").await;
+        client.write_gate.penalize(Duration::from_millis(150));
+        let expire_while_waiting = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            client.tokens.lock().await.as_mut().unwrap().expires_at = 0;
+        };
+        let gates = [&*client.api_gate, &*client.write_gate];
+        let (result, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(2), client.dispatch_token(&gates)),
+            expire_while_waiting,
+        );
+        assert_eq!(result.expect("an unsent request must not add another 30-second cooldown").unwrap(), "fresh");
+        assert!(client.write_gate.pending_wait() >= Duration::from_secs(29));
+    }
+
 }

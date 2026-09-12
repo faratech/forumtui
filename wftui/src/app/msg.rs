@@ -178,6 +178,7 @@ impl App {
                 match result {
                     Ok(user) => {
                         self.begin_session();
+                        self.select_draft_owner(user.user_id);
                         self.me = Some(user);
                         if self.screens.len() > 1
                             && matches!(self.screens.last(), Some(Screen::Login(_)))
@@ -313,6 +314,7 @@ impl App {
                     self.clear_all_drafts();
                 }
                 let username = user.username.clone();
+                self.select_draft_owner(user.user_id);
                 self.me = Some(user);
                 if identity_changed {
                     self.set_hint(format!(

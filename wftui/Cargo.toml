@@ -54,6 +54,11 @@ image = { version = "0.25", default-features = false, optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# The Windows graphics probe waits on console input itself, with a deadline;
+# unlike the library's stdio probe it cannot leave a blocked reader behind.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_System_Threading"] }
+
 [dev-dependencies]
 # Test-only `WfApi` fakes: the trait is declared with `#[async_trait]`, so an
 # implementation outside `common` needs the same macro. Keeps handler tests

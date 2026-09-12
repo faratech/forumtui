@@ -7,6 +7,21 @@ use super::*;
 
 impl App {
     pub(super) fn execute_action(&mut self, action: Action) {
+        let submission = match &action {
+            Action::SubmitReply { thread_id, .. } => Some(common::drafts::DraftKey::ThreadReply(*thread_id)),
+            Action::SubmitThread { node_id, .. } => Some(common::drafts::DraftKey::NewThread(*node_id)),
+            Action::SubmitEdit { post_id, .. } => Some(common::drafts::DraftKey::EditPost(*post_id)),
+            _ => None,
+        };
+        if let Some(key) = submission
+            && let Some(Screen::Compose(c)) = self.screens.iter_mut().rev().find(|s| {
+                matches!(s, Screen::Compose(c) if c.target.as_ref().is_some_and(|t| t.draft_key() == key) && c.uploading)
+            })
+        {
+            c.busy = false;
+            self.set_status("Still uploading — one moment.");
+            return;
+        }
         match action {
             Action::None => {}
             Action::Notice(msg) => self.set_status(msg),
@@ -854,9 +869,9 @@ impl App {
             // Decoration waits its turn behind at most a couple of siblings;
             // `image_gate` then spaces the ones that get through, in a lane of
             // its own so nothing here delays an interactive call (issue #543).
-            let _permit = slots.acquire_owned().await;
+            let Ok(permit) = slots.acquire_owned().await else { return; };
             let key = pending.store_key();
-            let result = crate::images::load(&client, &disk, picker, &pending).await;
+            let result = crate::images::load(&client, &disk, picker, &pending, permit).await;
             tx.send(session_msg(session_generation, Msg::ImageLoaded { key, result })).ok();
         });
     }

@@ -39,7 +39,7 @@ fn main() -> std::process::ExitCode {
     // It also runs before raw mode and the alternate screen: the query drives
     // termios itself, which is the ordering ratatui-image's own binary uses.
     // …and before either, snapshot the terminal's line discipline, so the exit
-    // state cannot be poisoned by the query's leaked reader thread (#532).
+    // state always returns to the original terminal settings on exit.
     tty::snapshot();
     let images = images::Images::detect();
     // Undo anything the query left behind BEFORE crossterm's first

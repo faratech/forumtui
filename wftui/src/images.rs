@@ -12,8 +12,8 @@
 //! | 5 | text | `▣ name · W×H` placeholder + "press N" hint |
 //!
 //! **Hard rule 1** (never put escape bytes in span content) is kept by never
-//! writing an escape sequence in this module. The only thing that emits one is
-//! `ratatui-image`'s own widget, and it does so through ratatui's sanctioned
+//! writing an image escape sequence in this module. Only `ratatui-image`'s
+//! own widget emits them, and it does so through ratatui's sanctioned
 //! diff-option path: the whole payload goes into exactly one anchor `Cell`'s
 //! symbol (marked `CellDiffOption::ForcedWidth(1)`) and every other cell of
 //! the image rect is marked `CellDiffOption::Skip`, so the frame diff can
@@ -26,7 +26,7 @@
 //! **Hard rule 3**: the terminal capability query reads stdin directly, so it
 //! runs in `main.rs` before `event::spawn_reader` exists. See `Images::detect`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -35,12 +35,21 @@ use ratatui::layout::Rect;
 
 use common::models::{Attachment, User};
 
+#[cfg(all(feature = "images", any(windows, test)))]
+mod windows;
+
+#[cfg(all(feature = "images", unix))]
+pub(crate) mod unix;
+
 #[cfg(feature = "images")]
 use ratatui::widgets::Widget;
 
 /// The sign-in logo is embedded, not fetched: it must render before there is
 /// a session (or even a network). `Request::key` carries this sentinel instead
 /// of a URL.
+pub const LOAD_CONCURRENCY: usize = 3;
+pub const QUEUE_CAP: usize = 64;
+
 pub const LOGO_KEY: &str = "wftui:logo";
 
 #[cfg(feature = "images")]
@@ -592,6 +601,8 @@ pub enum DetectPlan {
     Forced(Tier),
     /// Ask the terminal: writes capability escapes and READS STDIN.
     Query,
+    /// Use a bounded native console probe, before the input reader starts.
+    WindowsQuery,
     /// No query: half-blocks with the fallback font size.
     Fallback,
 }
@@ -656,13 +667,10 @@ where
 ///
 /// * an explicit `WFTUI_GRAPHICS` wins over everything — that is the escape
 ///   hatch for slow SSH links, which answer the DSR *after* the timeout;
-/// * Windows never queries. `ratatui-image`'s own source documents ConPTY as
-///   a terminal that does not reliably deliver the reply, so the query there
-///   is a guaranteed 2 s stall plus a leaked reader that eats the user's first
-///   keystrokes and re-enables `ENABLE_PROCESSED_INPUT` behind the TUI.
-///   Instead, environment variables (like `WT_SESSION` for Windows Terminal,
-///   which natively supports Sixel, or `TERM_PROGRAM` for WezTerm / Ghostty /
-///   VS Code) identify high-resolution graphics capabilities without touching stdin;
+/// * Windows uses our bounded native console probe, never the library's
+///   stdio reader. Environment alone is insufficient: launching an EXE from
+///   Explorer attaches Windows Terminal AFTER the process starts, without
+///   `WT_SESSION` or `WT_PROFILE_ID` (microsoft/terminal#13006);
 /// * a non-terminal stdin (pipe, `< /dev/null`) can never answer either.
 pub fn detect_plan<F>(var: F, windows: bool, stdin_is_tty: bool) -> DetectPlan
 where
@@ -687,11 +695,7 @@ where
         return DetectPlan::Fallback;
     }
     if windows {
-        if let Some(tier) = env_graphics_tier(&var) {
-            DetectPlan::Forced(tier)
-        } else {
-            DetectPlan::Fallback
-        }
+        DetectPlan::WindowsQuery
     } else {
         DetectPlan::Query
     }
@@ -735,6 +739,7 @@ pub fn tier_of(p: ratatui_image::picker::ProtocolType) -> Tier {
 /// the in-flight/failed sets that keep a missing thumbnail from becoming a
 /// fetch storm, and the disk cache.
 pub struct Images {
+    startup_input: Vec<u8>,
     policy: Policy,
     #[cfg(feature = "images")]
     picker: Option<ratatui_image::picker::Picker>,
@@ -742,6 +747,7 @@ pub struct Images {
     #[cfg_attr(not(feature = "images"), allow(dead_code))]
     cache: Lru<Decoded>,
     inflight: HashSet<String>,
+    queued: VecDeque<Pending>,
     failed: HashSet<String>,
     /// Source pixel size per image key, learned when a load finishes. Grows
     /// only; captions read it for their `W×H` segment.
@@ -759,11 +765,13 @@ impl Images {
     /// Tier 5: no query, no decoding, placeholders everywhere.
     pub fn text_only() -> Self {
         Images {
+            startup_input: Vec::new(),
             policy: Policy::default(),
             #[cfg(feature = "images")]
             picker: None,
             cache: Lru::new(LRU_CAP),
             inflight: HashSet::new(),
+            queued: VecDeque::new(),
             failed: HashSet::new(),
             sizes: Sizes::new(),
             disk: DiskCache::new(),
@@ -800,9 +808,9 @@ impl Images {
     /// runs before raw mode and the alternate screen (it manages termios
     /// itself, and this is the ordering `ratatui-image`'s own binary uses).
     ///
-    /// `detect_plan` decides whether the query runs at all: never on Windows,
-    /// never without a terminal on stdin, never when `WFTUI_GRAPHICS` names a
-    /// tier. `main.rs` brackets this call with `tty::snapshot()` /
+    /// `detect_plan` skips queries without a terminal or when `WFTUI_GRAPHICS`
+    /// names a tier. Windows uses a separate native probe with no helper thread.
+    /// `main.rs` brackets this call with `tty::snapshot()` /
     /// `tty::restore()` so even the query path cannot poison the exit state.
     #[cfg(feature = "images")]
     pub fn detect() -> Self {
@@ -830,12 +838,23 @@ impl Images {
                 tracing::debug!("skipping the graphics capability query; half-blocks fallback");
                 ratatui_image::picker::Picker::halfblocks()
             }
-            DetectPlan::Query => match ratatui_image::picker::Picker::from_query_stdio() {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("graphics capability query failed ({e}); staying on text tier");
-                    return me;
+            DetectPlan::WindowsQuery => {
+                #[cfg(windows)]
+                {
+                    windows::detect(env_graphics_tier(&|k| std::env::var(k).ok()))
                 }
+                #[cfg(not(windows))]
+                unreachable!("WindowsQuery is only selected on Windows")
+            }
+            DetectPlan::Query => {
+                #[cfg(unix)]
+                {
+                    let (picker, input) = unix::detect();
+                    me.startup_input = input;
+                    picker
+                }
+                #[cfg(not(unix))]
+                unreachable!("Unix query is only selected on Unix")
             },
         };
         let tier = tier_of(picker.protocol_type());
@@ -850,6 +869,10 @@ impl Images {
     #[cfg(not(feature = "images"))]
     pub fn detect() -> Self {
         Self::text_only()
+    }
+
+    pub fn take_startup_input(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.startup_input)
     }
 
     pub fn policy(&self) -> Policy {
@@ -878,10 +901,14 @@ impl Images {
     #[cfg_attr(not(feature = "images"), allow(unused_variables))]
     pub fn paint(&mut self, f: &mut Frame, reqs: &[Request]) -> Vec<Pending> {
         let mut pending: Vec<Pending> = Vec::new();
+        self.queued.clear();
         if !self.policy.inline() {
             return pending;
         }
-        for req in reqs {
+        let mut visible: Vec<_> = reqs.iter().collect();
+        visible.sort_by_key(|req| !req.full);
+        let mut seen = HashSet::new();
+        for req in visible {
             if req.rect.width == 0 || req.rect.height == 0 {
                 continue;
             }
@@ -893,17 +920,43 @@ impl Images {
                 ratatui_image::Image::new(proto).render(req.rect, f.buffer_mut());
                 continue;
             }
-            if self.failed.contains(&sk) || !self.inflight.insert(sk) {
+            if self.failed.contains(&sk) || self.inflight.contains(&sk) || !seen.insert(sk) {
                 continue;
             }
-            pending.push(Pending {
-                key: req.key.clone(),
-                cols: req.rect.width,
-                rows: req.rect.height,
-                full: req.full,
-            });
+            if self.queued.len() < QUEUE_CAP {
+                self.queued.push_back(Pending {
+                    key: req.key.clone(),
+                    cols: req.rect.width,
+                    rows: req.rect.height,
+                    full: req.full,
+                });
+            }
         }
+        // Only spawn actual workers. The next frame replaces the queue
+        // with current demand, so scrolling never leaves obsolete tasks.
+        let mut deferred = VecDeque::new();
+        while self.inflight.len() < LOAD_CONCURRENCY {
+            let Some(request) = self.queued.pop_front() else { break; };
+            if self.inflight.iter().any(|key| source_of(key) == request.key) {
+                deferred.push_back(request);
+                continue;
+            }
+            self.inflight.insert(request.store_key());
+            pending.push(request);
+        }
+        deferred.append(&mut self.queued);
+        self.queued = deferred;
         pending
+    }
+
+    /// Session generation is also the identity of all active image requests.
+    /// The app discards old completions before they can reach this store.
+    pub fn reset_session(&mut self) {
+        self.inflight.clear();
+        self.queued.clear();
+        self.failed.clear();
+        self.cache = Lru::new(LRU_CAP);
+        self.sizes.clear();
     }
 
     /// A background load finished (or failed). A failure is remembered so a
@@ -969,6 +1022,7 @@ pub async fn load(
     disk: &DiskCache,
     picker: ratatui_image::picker::Picker,
     pending: &Pending,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<Loaded, String> {
     let bytes = if pending.key == LOGO_KEY {
         LOGO_BYTES.to_vec()
@@ -986,7 +1040,10 @@ pub async fn load(
         fetched
     };
     let (cols, rows) = (pending.cols, pending.rows);
-    tokio::task::spawn_blocking(move || decode(&picker, &bytes, cols, rows))
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        decode(&picker, &bytes, cols, rows)
+    })
         .await
         .map_err(|e| e.to_string())?
 }
@@ -1280,11 +1337,11 @@ mod tests {
     #[test]
     fn the_stdio_query_only_runs_on_a_unix_terminal_with_no_override() {
         let none = |_: &str| None;
-        // The one case that may touch stdin.
+        // The one case that uses the library's stdio query.
         assert_eq!(detect_plan(none, false, true), DetectPlan::Query);
-        // Windows never queries (ConPTY does not answer; the leaked reader
-        // then eats keystrokes and re-enables ENABLE_PROCESSED_INPUT).
-        assert_eq!(detect_plan(none, true, true), DetectPlan::Fallback);
+        // Windows uses a timed native probe, never the library
+        // stdio query that can leak a blocked reader.
+        assert_eq!(detect_plan(none, true, true), DetectPlan::WindowsQuery);
         // Neither does a piped/redirected stdin.
         assert_eq!(detect_plan(none, false, false), DetectPlan::Fallback);
         assert_eq!(detect_plan(none, true, false), DetectPlan::Fallback);
@@ -1298,7 +1355,7 @@ mod tests {
         // Auto and garbage both fall through to automatic detection.
         assert_eq!(detect_plan(g("auto"), false, true), DetectPlan::Query);
         assert_eq!(detect_plan(g("chafa"), false, true), DetectPlan::Query);
-        assert_eq!(detect_plan(g("chafa"), true, true), DetectPlan::Fallback);
+        assert_eq!(detect_plan(g("chafa"), true, true), DetectPlan::WindowsQuery);
 
         // The existing off switches still win over an override that asks for
         // pixels.
@@ -1311,36 +1368,46 @@ mod tests {
     }
 
     #[test]
-    fn windows_detects_graphics_tier_from_terminal_environment() {
+    fn windows_keeps_environment_hints_but_probes_the_actual_console() {
         let wt = |k: &str| (k == "WT_SESSION").then(|| "{guid}".to_string());
-        assert_eq!(detect_plan(wt, true, true), DetectPlan::Forced(Tier::Sixel));
+        assert_eq!(env_graphics_tier(&wt), Some(Tier::Sixel));
+        assert_eq!(detect_plan(wt, true, true), DetectPlan::WindowsQuery);
 
         let wt_prof = |k: &str| (k == "WT_PROFILE_ID").then(|| "{guid}".to_string());
-        assert_eq!(detect_plan(wt_prof, true, true), DetectPlan::Forced(Tier::Sixel));
+        assert_eq!(env_graphics_tier(&wt_prof), Some(Tier::Sixel));
+        assert_eq!(detect_plan(wt_prof, true, true), DetectPlan::WindowsQuery);
 
         let wez = |k: &str| (k == "TERM_PROGRAM").then(|| "WezTerm".to_string());
-        assert_eq!(detect_plan(wez, true, true), DetectPlan::Forced(Tier::Iterm2));
+        assert_eq!(env_graphics_tier(&wez), Some(Tier::Iterm2));
+        assert_eq!(detect_plan(wez, true, true), DetectPlan::WindowsQuery);
 
         let wez_exe = |k: &str| (k == "WEZTERM_EXECUTABLE").then(|| "wezterm.exe".to_string());
-        assert_eq!(detect_plan(wez_exe, true, true), DetectPlan::Forced(Tier::Iterm2));
+        assert_eq!(env_graphics_tier(&wez_exe), Some(Tier::Iterm2));
+        assert_eq!(detect_plan(wez_exe, true, true), DetectPlan::WindowsQuery);
 
         let ghostty = |k: &str| (k == "TERM_PROGRAM").then(|| "ghostty".to_string());
-        assert_eq!(detect_plan(ghostty, true, true), DetectPlan::Forced(Tier::Kitty));
+        assert_eq!(env_graphics_tier(&ghostty), Some(Tier::Kitty));
+        assert_eq!(detect_plan(ghostty, true, true), DetectPlan::WindowsQuery);
 
         let vscode = |k: &str| (k == "TERM_PROGRAM").then(|| "vscode".to_string());
-        assert_eq!(detect_plan(vscode, true, true), DetectPlan::Forced(Tier::Sixel));
+        assert_eq!(env_graphics_tier(&vscode), Some(Tier::Sixel));
+        assert_eq!(detect_plan(vscode, true, true), DetectPlan::WindowsQuery);
 
         let mintty = |k: &str| (k == "TERM_PROGRAM").then(|| "mintty".to_string());
-        assert_eq!(detect_plan(mintty, true, true), DetectPlan::Forced(Tier::Sixel));
+        assert_eq!(env_graphics_tier(&mintty), Some(Tier::Sixel));
+        assert_eq!(detect_plan(mintty, true, true), DetectPlan::WindowsQuery);
 
         let kitty = |k: &str| (k == "KITTY_WINDOW_ID").then(|| "1".to_string());
-        assert_eq!(detect_plan(kitty, true, true), DetectPlan::Forced(Tier::Kitty));
+        assert_eq!(env_graphics_tier(&kitty), Some(Tier::Kitty));
+        assert_eq!(detect_plan(kitty, true, true), DetectPlan::WindowsQuery);
 
         let term_sixel = |k: &str| (k == "TERM").then(|| "xterm-sixel".to_string());
-        assert_eq!(detect_plan(term_sixel, true, true), DetectPlan::Forced(Tier::Sixel));
+        assert_eq!(env_graphics_tier(&term_sixel), Some(Tier::Sixel));
+        assert_eq!(detect_plan(term_sixel, true, true), DetectPlan::WindowsQuery);
 
         let iterm = |k: &str| (k == "LC_TERMINAL").then(|| "iTerm2".to_string());
-        assert_eq!(detect_plan(iterm, true, true), DetectPlan::Forced(Tier::Iterm2));
+        assert_eq!(env_graphics_tier(&iterm), Some(Tier::Iterm2));
+        assert_eq!(detect_plan(iterm, true, true), DetectPlan::WindowsQuery);
 
         // When stdin is not a tty, always fallback
         assert_eq!(detect_plan(wt, true, false), DetectPlan::Fallback);
@@ -1713,4 +1780,104 @@ mod tests {
         assert_ne!(store_key("u", 10, 4), store_key("u", 11, 4));
         assert_eq!(store_key("u", 10, 4), "10x4|u");
     }
+    #[cfg(feature = "images")]
+    #[test]
+    fn image_queue_tracks_visible_work_and_deduplicates_source_downloads() {
+        let mut images = Images::text_only();
+        images.policy = Policy { tier: Tier::Halfblocks, font: (10, 20) };
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let requests: Vec<_> = (0..100).map(|id| Request {
+            key: format!("http://127.0.0.1:9/{id}.png"), rect: Rect::new(0, 0, 8, 4), full: false,
+        }).collect();
+        let mut first = Vec::new();
+        terminal.draw(|frame| first = images.paint(frame, &requests)).unwrap();
+        assert_eq!(first.len(), LOAD_CONCURRENCY);
+        assert!(images.queued.len() <= QUEUE_CAP);
+        let viewer = Request { key: "http://127.0.0.1:9/current.png".into(), rect: Rect::new(0, 0, 80, 24), full: true };
+        terminal.draw(|frame| { assert!(images.paint(frame, std::slice::from_ref(&viewer)).is_empty()); }).unwrap();
+        assert_eq!(images.queued.len(), 1, "obsolete queued work is gone");
+        images.on_loaded(first[0].store_key(), Err("done".into()));
+        let mut current = Vec::new();
+        terminal.draw(|frame| current = images.paint(frame, std::slice::from_ref(&viewer))).unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].key, viewer.key, "the current viewer gets the next freed slot");
+
+        images.reset_session();
+        let sizes = [viewer.clone(), Request { rect: Rect::new(0, 0, 40, 12), ..viewer }];
+        terminal.draw(|frame| current = images.paint(frame, &sizes)).unwrap();
+        assert_eq!(current.len(), 1, "two sizes share one source download at a time");
+        assert_eq!(images.queued.len(), 1);
+        images.reset_session();
+        terminal.draw(|frame| current = images.paint(frame, &sizes)).unwrap();
+        assert_eq!(current.len(), 1, "cancelled images are requestable in the next session");
+    }
+
+    #[cfg(feature = "images")]
+    #[tokio::test]
+    async fn delayed_image_loads_give_the_current_viewer_the_next_slot_and_share_bytes() {
+        use std::sync::Arc;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let server = MockServer::start().await;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(20, 20).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        Mock::given(method("GET")).respond_with(move |request: &wiremock::Request| {
+            observed.lock().unwrap().push(request.url.path().to_owned());
+            ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(100))
+                .set_body_raw(png.get_ref().clone(), "image/png")
+        }).mount(&server).await;
+        let dir = std::env::temp_dir().join(format!("wftui-delayed-images-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut client = common::api::WfApiClient::with_store(
+            common::token::Store::with_path(dir.join("token.json")), server.uri()
+        ).unwrap();
+        client.image_gate = Arc::new(common::ratelimit::Gate::new(0));
+        let client = Arc::new(client);
+        let disk = DiskCache::with_dir(dir.join("images"), DISK_CAP_BYTES);
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        let slots = Arc::new(tokio::sync::Semaphore::new(LOAD_CONCURRENCY));
+        let mut images = Images::text_only_at(dir.join("images"));
+        images.policy = Policy { tier: Tier::Halfblocks, font: (10, 20) };
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut jobs = tokio::task::JoinSet::new();
+        let start = |pending: Vec<Pending>, jobs: &mut tokio::task::JoinSet<(String, Result<Loaded, String>)>| {
+            for pending in pending {
+                let (client, disk, picker, slots) = (client.clone(), disk.clone(), picker.clone(), slots.clone());
+                jobs.spawn(async move {
+                    let permit = slots.acquire_owned().await.unwrap();
+                    let result = load(&client, &disk, picker, &pending, permit).await;
+                    (pending.store_key(), result)
+                });
+            }
+        };
+        let old: Vec<_> = (0..100).map(|id| Request { key: format!("{}/{id}.png", server.uri()), rect: Rect::new(0, 0, 8, 4), full: false }).collect();
+        terminal.draw(|frame| start(images.paint(frame, &old), &mut jobs)).unwrap();
+        assert_eq!(jobs.len(), LOAD_CONCURRENCY);
+        let current = Request { key: format!("{}/current.png", server.uri()), rect: Rect::new(0, 0, 80, 24), full: true };
+        terminal.draw(|frame| start(images.paint(frame, std::slice::from_ref(&current)), &mut jobs)).unwrap();
+        let (key, result) = jobs.join_next().await.unwrap().unwrap();
+        assert!(result.is_ok()); images.on_loaded(key, result);
+        terminal.draw(|frame| start(images.paint(frame, std::slice::from_ref(&current)), &mut jobs)).unwrap();
+        while let Some(result) = jobs.join_next().await {
+            let (key, result) = result.unwrap(); assert!(result.is_ok()); images.on_loaded(key, result);
+        }
+        let fetched = requests.lock().unwrap().clone();
+        assert_eq!(fetched.len(), 4, "none of the obsolete queued requests should reach HTTP");
+        assert!(fetched.contains(&"/current.png".to_owned()));
+
+        images.reset_session();
+        let mut shared = Request { key: format!("{}/shared.png", server.uri()), rect: Rect::new(0, 0, 8, 4), full: false };
+        terminal.draw(|frame| start(images.paint(frame, std::slice::from_ref(&shared)), &mut jobs)).unwrap();
+        shared.rect = Rect::new(0, 0, 40, 20);
+        terminal.draw(|frame| start(images.paint(frame, std::slice::from_ref(&shared)), &mut jobs)).unwrap();
+        assert_eq!(jobs.len(), 1);
+        let (key, result) = jobs.join_next().await.unwrap().unwrap(); images.on_loaded(key, result);
+        terminal.draw(|frame| start(images.paint(frame, std::slice::from_ref(&shared)), &mut jobs)).unwrap();
+        let (key, result) = jobs.join_next().await.unwrap().unwrap(); assert!(result.is_ok()); images.on_loaded(key, result);
+        assert_eq!(requests.lock().unwrap().iter().filter(|path| *path == "/shared.png").count(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
 }

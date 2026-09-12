@@ -626,7 +626,21 @@ windows-msvc objects). reqwest 0.13's plain `rustls` feature would pull
 aws-lc-rs (a vendored C tree needing NASM), so `common/` takes
 `rustls-no-provider` and installs ring itself in `http::build` — don't "simplify"
 that back. `unix`-only crates (`libc` for `tty.rs`) are cfg-gated. The graphics
-capability query is skipped on Windows (ConPTY never answers it reliably).
+library's stdio capability query is skipped on Windows: its timeout can leave
+a blocked reader behind. `images/windows.rs` instead probes DA1 and cell size
+with `WaitForSingleObject` + one `ReadConsoleInputW` record at a time, under a
+500 ms deadline, before `event::spawn_reader`. A guard restores both console
+modes and requeues non-query input on every exit path. Do not replace this with
+environment-only detection: Explorer launches attach Windows Terminal after
+the EXE starts, so `WT_SESSION` / `WT_PROFILE_ID` are absent (#13006 in
+microsoft/terminal). The actual DA1 reply selects Sixel even in that case;
+legacy consoles keep half-blocks. `WFTUI_GRAPHICS` still bypasses all probing.
+
+Native console smoke tests (in Windows Terminal, with `WT_SESSION` and
+`WT_PROFILE_ID` unset and `WFTUI_CONFIG_DIR` pointed to a scratch directory):
+`cargo test -p wftui native_console_probe -- --ignored --nocapture --test-threads=1`.
+These check Sixel detection, measured cell size, queued-key preservation,
+timeout, and exact console-mode restoration without contacting the site.
 
 ## Inline graphics (cargo feature `images`, default on)
 
@@ -684,3 +698,35 @@ an image past either returns `Err` and falls back to the placeholder.
   not its updates, reviews or versions (`XFRM:ResourceUpdates`,
   `ResourceReviews`, `ResourceVersions`). All of those endpoints exist.
 - There is no @mention completion.
+
+
+## Production readiness corrections (2026-09)
+
+- Draft store version 2 binds entries to the verified origin and user ID. Only
+  successful login/bootstrap selects the owner; expiry retains it. Per-key
+  transactions merge under the file lock. An ownership tombstone rejects stale
+  writes after sign-out. Pre-release unowned drafts are discarded on upgrade, as
+  requested by the operator; a future version is never silently deleted.
+- Every ordinary event-loop exit calls `shutdown`: open supported composers save
+  locally before runtime teardown, with at most two seconds for final read marks.
+  Session expiry also saves locally, without creating new relay/read tasks after
+  cancellation. Busy composers keep pasted input in the clipboard; upload and
+  submit are mutually exclusive, while ordinary typing remains available during
+  uploads. File prompts own bracketed paste and clipboard shortcuts.
+- Request dispatch acquires all applicable throttle lanes together after token
+  refresh. Waiting consumes no future slot and rechecks new penalties. OAuth 429
+  responses preserve Retry-After and remain retryable instead of ending a session.
+- Unix graphics probing uses a two-second absolute deadline on the startup thread
+  and restores termios before returning. There is no detached stdin worker. Keys
+  read during probing are handed to the sole event reader. Windows keeps its
+  native timed console probe.
+- Image work follows current visible demand: at most 64 queued requests and three
+  active workers, with duplicate source sizes serialized through the disk cache.
+  Session transitions clear transient image state; session-stamped completions
+  cannot affect a newer request. The worker permit stays alive through actual
+  blocking encoding, even if its async wrapper is cancelled.
+- Editor wrapping advances cluster indices instead of rescanning whole lines.
+  Cached per-line grapheme boundaries and cumulative cell widths serve caret
+  placement and hit testing. The optional release benchmark is
+  `cargo test -p wftui --release benchmark_large_composer_frames -- --ignored --nocapture`
+  (set a scratch `WFTUI_CONFIG_DIR` first, like every test).

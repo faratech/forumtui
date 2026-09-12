@@ -193,6 +193,12 @@ impl App {
             return;
         }
         self.clipboard = text.clone();
+        if matches!(self.screens.last(), Some(Screen::Compose(c)) if c.busy)
+            || matches!(self.screens.last(), Some(Screen::NewConversation(c)) if c.busy)
+        {
+            self.set_status("Submission in progress; pasted text kept in the clipboard.");
+            return;
+        }
         // The palette owns the keyboard while it is up, so it owns pastes too.
         if let Some(palette) = self.palette.as_mut() {
             let sanitized = crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], " "));
@@ -203,7 +209,10 @@ impl App {
         if let Some(screen) = self.screens.last_mut() {
             match screen {
                 Screen::Compose(cs) => {
-                    if cs.title_field {
+                    if let Some(path) = cs.file_prompt.as_mut() {
+                        let sanitized = crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], " "));
+                        crate::editor::insert_str(path, &mut cs.file_prompt_cursor, &sanitized);
+                    } else if cs.title_field {
                         let sanitized =
                             crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], " "));
                         crate::editor::insert_str(&mut cs.title, &mut cs.title_cursor, &sanitized);

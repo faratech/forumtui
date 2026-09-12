@@ -318,53 +318,37 @@ fn wrap_logical_line(
     rows: &mut Vec<VisualRow>,
 ) {
     let clusters = grapheme_ranges(&chars[start..end], start);
-    let mut pos = start;
-    loop {
-        let mut used = 0usize;
-        let mut fit = pos;
-        for cluster in clusters.iter().filter(|cluster| cluster.start >= pos) {
-            if used + cluster.width > width {
-                break;
+    let mut first = 0;
+    while first < clusters.len() {
+        let mut fit = first;
+        let mut used = 0;
+        let mut whitespace = None;
+        while fit < clusters.len() && used + clusters[fit].width <= width {
+            used += clusters[fit].width;
+            if chars[clusters[fit].start].is_whitespace() {
+                whitespace = Some(fit + 1);
             }
-            used += cluster.width;
-            fit = cluster.end;
+            fit += 1;
         }
-        if fit >= end {
-            rows.push(VisualRow { start: pos, end });
+        if fit == clusters.len() {
+            rows.push(VisualRow { start: clusters[first].start, end });
             return;
         }
-        let at_fit = clusters
-            .iter()
-            .find(|cluster| cluster.start == fit)
-            .copied();
-        let mut brk = if at_fit.is_some_and(|cluster| chars[cluster.start].is_whitespace()) {
-            at_fit.expect("cluster at the wrap boundary").end
+        let mut next = if chars[clusters[fit].start].is_whitespace() {
+            fit + 1
         } else {
-            match clusters
-                .iter()
-                .rev()
-                .find(|cluster| cluster.start >= pos && cluster.start < fit && chars[cluster.start].is_whitespace())
-            {
-                Some(ws) => ws.end,
-                None => fit, // one unbreakable word: hard-split it
-            }
+            whitespace.unwrap_or(fit)
         };
-        while let Some(cluster) = clusters.iter().find(|cluster| cluster.start == brk)
-            && chars[cluster.start].is_whitespace()
-        {
-            brk = cluster.end;
+        while next < clusters.len() && chars[clusters[next].start].is_whitespace() {
+            next += 1;
         }
-        if brk <= pos {
-            // A cluster wider than the pane cannot fit, but it still must be
-            // kept whole. Splitting it would make the next row start in the
-            // middle of a grapheme and reintroduce the same width bug.
-            brk = clusters
-                .iter()
-                .find(|cluster| cluster.start == pos)
-                .map_or(pos.saturating_add(1), |cluster| cluster.end);
-        }
-        rows.push(VisualRow { start: pos, end: brk });
-        pos = brk;
+        // Even a cluster wider than the pane must remain whole.
+        next = next.max(first + 1);
+        rows.push(VisualRow { start: clusters[first].start, end: clusters[next - 1].end });
+        first = next;
+    }
+    if clusters.is_empty() {
+        rows.push(VisualRow { start, end });
     }
 }
 
@@ -390,12 +374,44 @@ pub struct WrapCache {
     /// Rows per logical line, offsets *relative* to that line's start — so
     /// an edit shifts `line_starts`, not every row in the tail.
     line_rows: Vec<Vec<VisualRow>>,
+    line_metrics: Vec<LineMetrics>,
     /// Rows before each logical line, plus the total (`lines + 1` entries).
     row_prefix: Vec<usize>,
     /// Rows the last `sync` actually re-wrapped. One assignment per sync,
     /// and it is what pins the cache's whole reason to exist
     /// (`a_keystroke_rewraps_one_logical_line_not_the_whole_draft`).
     rewrapped: usize,
+}
+
+/// Grapheme boundaries and cumulative cell widths, relative to one line.
+/// Rebuilt only for changed lines; cursor movement does not segment text.
+#[derive(Default)]
+struct LineMetrics {
+    clusters: Vec<GraphemeRange>,
+    cells: Vec<usize>,
+}
+
+impl LineMetrics {
+    fn new(chars: &[char]) -> Self {
+        let clusters = grapheme_ranges(chars, 0);
+        let mut cells = vec![0];
+        for cluster in &clusters {
+            cells.push(cells.last().copied().unwrap_or(0) + cluster.width);
+        }
+        Self { clusters, cells }
+    }
+
+    fn boundary(&self, cursor: usize) -> (usize, usize) {
+        let index = self.clusters.partition_point(|c| c.end <= cursor);
+        (index, self.clusters.get(index).map_or(cursor, |c| c.start))
+    }
+}
+
+fn segment_metrics(chars: &[char], starts: &[usize], end: usize) -> Vec<LineMetrics> {
+    starts.iter().enumerate().map(|(i, &start)| {
+        let end = starts.get(i + 1).map_or(end, |next| next.saturating_sub(1));
+        LineMetrics::new(&chars[start..end])
+    }).collect()
 }
 
 impl WrapCache {
@@ -468,6 +484,7 @@ impl WrapCache {
         let delta = new_end as isize - old_end as isize;
         let replaced = starts.len();
         self.rewrapped = rows.iter().map(Vec::len).sum();
+        self.line_metrics.splice(first..=last, segment_metrics(&self.chars, &starts, end));
         self.line_starts.splice(first..=last, starts);
         self.line_rows.splice(first..=last, rows);
         // Everything after the replaced span keeps its wrap; only its
@@ -480,6 +497,7 @@ impl WrapCache {
 
     fn rebuild(&mut self) {
         let (starts, rows) = wrap_segment(&self.chars, 0, self.chars.len(), self.width);
+        self.line_metrics = segment_metrics(&self.chars, &starts, self.chars.len());
         self.line_starts = starts;
         self.line_rows = rows;
         self.line_starts.push(self.chars.len());
@@ -556,10 +574,11 @@ impl WrapCache {
         if self.line_rows.is_empty() {
             return (0, 0);
         }
-        let cursor = grapheme_boundary(&self.chars, cursor);
+        let cursor = cursor.min(self.chars.len());
         let li = self.line_of(cursor);
         let base = self.line_starts[li];
-        let rel = cursor.saturating_sub(base);
+        let metrics = &self.line_metrics[li];
+        let (cluster, rel) = metrics.boundary(cursor.saturating_sub(base));
         let rows = &self.line_rows[li];
         let ri = rows
             .partition_point(|r| r.start <= rel)
@@ -568,7 +587,7 @@ impl WrapCache {
         let row = rows[ri];
         (
             self.row_prefix[li] + ri,
-            span_cells(&self.chars, base + row.start, cursor.min(base + row.end)),
+            metrics.cells[cluster] - metrics.cells[metrics.boundary(row.start).0],
         )
     }
 
@@ -581,18 +600,16 @@ impl WrapCache {
         else {
             return 0;
         };
-        let mut used = 0usize;
-        let mut i = r.start;
-        while i < r.end {
-            let end = next_cluster_end(&self.chars, i).min(r.end);
-            let cw = span_cells(&self.chars, i, end);
-            if used + cw > col {
-                break;
-            }
-            used += cw;
-            i = end;
-        }
-        i
+        let li = self.line_of(r.start);
+        let base = self.line_starts[li];
+        let metrics = &self.line_metrics[li];
+        let first = metrics.boundary(r.start - base).0;
+        let last = metrics.boundary(r.end - base).0;
+        let target = metrics.cells[first].saturating_add(col);
+        let index = metrics.cells[first..=last].partition_point(|&cell| cell <= target)
+            .saturating_sub(1) + first;
+        base + metrics.clusters.get(index).map_or(r.end - base, |c| c.start)
+
     }
 
     /// Move the caret `delta` visual rows, keeping the desired column — the

@@ -25,7 +25,7 @@ use crate::theme::Theme;
 /// How many image loads may be in flight at once (issue #543). Small on
 /// purpose: decoration is never what the user is waiting for, and `draw`
 /// spawns one task per visible image slot the moment a thread opens.
-const IMAGE_LOAD_CONCURRENCY: usize = 3;
+const IMAGE_LOAD_CONCURRENCY: usize = crate::images::LOAD_CONCURRENCY;
 
 /// How long a status *toast* (`App::set_status`) stays on the status row
 /// before the event loop clears it (DESIGN.md: "Toasts (success/error)
@@ -624,6 +624,7 @@ pub struct App {
     /// and a crash both survive.
     drafts: std::collections::HashMap<common::drafts::DraftKey, common::drafts::Draft>,
     draft_store: common::drafts::Store,
+    draft_owner: Option<common::drafts::Owner>,
     /// Monotonic local-draft mutation epoch. A remote list started before a
     /// local save/delete must not resurrect its stale copy when it returns.
     draft_epoch: u64,
@@ -878,7 +879,8 @@ pub async fn run(images: crate::images::Images) -> u8 {
         hits: HitMap::new(common::config::mouse_enabled()),
         // Drafts left by the previous run (#715): an Esc or a crash mid-post
         // must not cost the words.
-        drafts: draft_store.load(),
+        drafts: std::collections::HashMap::new(),
+        draft_owner: None,
         draft_store,
         draft_epoch: 0,
         draft_mutations: std::collections::HashMap::new(),
@@ -886,8 +888,9 @@ pub async fn run(images: crate::images::Images) -> u8 {
         draft_relay_tail: std::collections::HashMap::new(),
     };
     app.bootstrap().await;
-    let reader = crate::event::spawn_reader();
+    let reader = crate::event::spawn_reader_with_prefix(app.images.take_startup_input());
     let outcome = app.event_loop(&mut terminal, reader).await;
+    app.shutdown().await;
     drop(_guard);
     outcome
 }
@@ -1012,7 +1015,10 @@ impl App {
             }
             let gate_pending = self.client.write_gate.pending_wait();
             if dirty || gate_pending != last_drawn_gate || self.needs_continuous_redraw() {
-                let _ = terminal.draw(|f| self.draw(f));
+                if let Err(error) = terminal.draw(|f| self.draw(f)) {
+                    tracing::warn!("terminal draw failed: {error}");
+                    return 3;
+                }
                 last_drawn_gate = gate_pending;
                 dirty = false;
             }
@@ -1519,11 +1525,15 @@ impl App {
     /// The one way a screen leaves the stack. Whatever it owes on the way
     /// out is settled here (#694), so no exit path can forget it.
     fn pop_screen(&mut self) -> bool {
+        self.pop_screen_with_relay(true)
+    }
+
+    fn pop_screen_with_relay(&mut self, relay: bool) -> bool {
         if self.screens.len() <= 1 {
             return false;
         }
         let gone = self.screens.pop();
-        if let Some(Screen::ThreadView(view)) = &gone {
+        if relay && let Some(Screen::ThreadView(view)) = &gone {
             self.report_read(view);
         }
         // Esc used to destroy an unsent post outright (#715). Keep it instead
@@ -1532,7 +1542,7 @@ impl App {
         // opens. The successful-send paths do not come through here: they
         // `screens.remove(idx)` and clear the draft explicitly.
         if let Some(Screen::Compose(c)) = &gone {
-            self.stash_draft(c);
+            self.stash_draft(c, relay);
         }
         true
     }
@@ -1542,7 +1552,7 @@ impl App {
     /// An empty composer *removes* any stored draft rather than storing a
     /// blank one, so opening a reply, thinking better of it and pressing Esc
     /// does not leave an empty draft to be resumed later.
-    fn stash_draft(&mut self, c: &screens::ComposeState) {
+    fn stash_draft(&mut self, c: &screens::ComposeState, relay: bool) {
         let Some(key) = c.target.as_ref().map(|t| t.draft_key()) else {
             return;
         };
@@ -1568,7 +1578,7 @@ impl App {
             edit_seed_body,
         };
         if draft.is_empty() {
-            self.discard_draft(key);
+            self.discard_draft_local(key, relay);
             return;
         }
         self.draft_epoch = self.draft_epoch.wrapping_add(1);
@@ -1576,15 +1586,17 @@ impl App {
         self.draft_mutations.insert(key, epoch);
         self.draft_deletions.remove(&key);
         let too_big = draft.too_big_to_persist();
-        self.push_draft(key, &draft);
+        if relay { self.push_draft(key, &draft); }
         self.drafts.insert(key, draft);
-        self.persist_drafts();
+        let saved = self.persist_draft(key);
         if too_big {
             // Honest about the limit rather than promising a recovery that a
             // restart will not deliver.
             self.set_status("Draft kept for this session — too large to save to disk.");
-        } else {
+        } else if saved {
             self.set_status("Draft saved. Open this composer again to resume it.");
+        } else {
+            self.set_status("Draft kept for this session; could not save it to disk.");
         }
     }
 
@@ -1612,17 +1624,20 @@ impl App {
     /// left empty, when the user discards it, and when the write it belongs
     /// to actually succeeds.
     fn discard_draft(&mut self, key: common::drafts::DraftKey) {
+        self.discard_draft_local(key, true);
+    }
+
+    fn discard_draft_local(&mut self, key: common::drafts::DraftKey, relay: bool) {
         self.draft_epoch = self.draft_epoch.wrapping_add(1);
         let epoch = self.draft_epoch;
         self.draft_mutations.insert(key, epoch);
         self.draft_deletions.insert(key, epoch);
-        if self.drafts.remove(&key).is_some() {
-            self.persist_drafts();
-        }
+        self.drafts.remove(&key);
+        self.persist_draft(key);
         // Unconditionally, not only when a local copy existed: the draft may
         // have been written in the browser and never resumed here, and the
         // point of a discard is that it is gone from both.
-        self.drop_remote_draft(key);
+        if relay { self.drop_remote_draft(key); }
     }
 
     /// Forget every draft, in memory and on disk. For the two moments where
@@ -1640,7 +1655,8 @@ impl App {
         if !self.drafts.is_empty() {
             self.drafts.clear();
         }
-        if let Err(e) = self.draft_store.erase() {
+        if let Some(owner) = self.draft_owner.take()
+            && let Err(e) = self.draft_store.erase(&owner) {
             tracing::warn!("could not clear drafts: {e}");
         }
         self.draft_epoch = self.draft_epoch.wrapping_add(1);
@@ -1842,7 +1858,6 @@ impl App {
     /// so opening a composer stays instant — it reads a map that is already
     /// in memory.
     fn merge_remote_drafts(&mut self, epoch: u64, remote: Vec<common::models::RemoteDraft>) {
-        let mut changed = false;
         for r in remote {
             // A kind this build does not know is skipped, not guessed at.
             let Some(key) = common::drafts::DraftKey::from_xf_key(&r.key) else {
@@ -1891,10 +1906,7 @@ impl App {
                     edit_seed_body: None,
                 },
             );
-            changed = true;
-        }
-        if changed {
-            self.persist_drafts();
+            self.persist_draft(key);
         }
         self.draft_mutations.retain(|_, mutation| *mutation > epoch);
         self.draft_deletions.retain(|_, deletion| *deletion > epoch);
@@ -1930,12 +1942,34 @@ impl App {
         });
     }
 
-    /// Write the store, best effort. A draft is a convenience: failing to
-    /// save one is worth a line in the log, never an error that interrupts
-    /// the user mid-post.
-    fn persist_drafts(&self) {
-        if let Err(e) = self.draft_store.save(&self.drafts) {
-            tracing::warn!("could not save drafts: {e}");
+    fn select_draft_owner(&mut self, user_id: u32) {
+        let owner = common::drafts::Owner::new(self.client.base_url(), user_id);
+        let selected = self.draft_store.activate(&owner);
+        if self.draft_owner.as_ref() == Some(&owner) {
+            if let Err(error) = selected { tracing::warn!("could not select account drafts: {error}"); }
+            return;
+        }
+        self.drafts.clear();
+        self.draft_mutations.clear();
+        self.draft_deletions.clear();
+        self.draft_relay_tail.clear();
+        self.draft_epoch = self.draft_epoch.wrapping_add(1);
+        match selected {
+            Ok(drafts) => self.drafts = drafts,
+            Err(e) => tracing::warn!("could not select account drafts: {e}"),
+        }
+        self.draft_owner = Some(owner);
+    }
+
+    /// Persist one explicit mutation, never a stale whole-file snapshot.
+    fn persist_draft(&self, key: common::drafts::DraftKey) -> bool {
+        let Some(owner) = &self.draft_owner else { return false; };
+        match self.draft_store.apply(owner, &[(key, self.drafts.get(&key).cloned())]) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("could not save draft: {e}");
+                false
+            }
         }
     }
 
@@ -6033,7 +6067,7 @@ mod tests {
 
         let mut restarted = test_app();
         restarted.draft_store = common::drafts::Store::with_path(path);
-        restarted.drafts = restarted.draft_store.load();
+        restarted.drafts = restarted.draft_store.load(restarted.draft_owner.as_ref().unwrap());
         restarted.screens.push(screens::home_state(false));
         restarted.resume_draft(common::drafts::DraftKey::EditPost(500));
 
@@ -6067,7 +6101,7 @@ mod tests {
 
         app.clear_all_drafts();
         assert!(app.drafts.is_empty(), "nothing left in memory");
-        assert!(!path.exists(), "and nothing left on disk for the next account");
+        assert!(common::drafts::Store::with_path(path).load(&common::drafts::Owner::new("http://127.0.0.1:9", 7)).is_empty(), "nothing available to the old owner");
     }
 
     /// A session that merely *expires* is the same person coming back, so
@@ -6138,7 +6172,7 @@ mod tests {
         // A second app reading the same store is what a restart looks like.
         let mut next = test_app();
         next.draft_store = common::drafts::Store::with_path(path.clone());
-        next.drafts = next.draft_store.load();
+        next.drafts = next.draft_store.load(next.draft_owner.as_ref().unwrap());
         next.screens.push(screens::home_state(false));
         next.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
         match next.screens.last() {
@@ -6641,6 +6675,7 @@ mod tests {
                 scratch_config_dir().join("cache").join("img"),
             ),
             drafts: std::collections::HashMap::new(),
+            draft_owner: Some(common::drafts::Owner::new("http://127.0.0.1:9", 7)),
             // Scratch dir, never the operator's own (#565) — asserted by
             // `guard_no_test_touches_the_real_config_dir_or_the_live_site`.
             //
@@ -9504,4 +9539,149 @@ mod tests {
         assert_eq!(app.status, "");
         assert!(app.status_set_at.is_none());
     }
+    #[tokio::test]
+    async fn shutdown_saves_active_new_and_resumed_drafts_without_esc() {
+        for target in [
+            ComposeTarget::ThreadReply { thread_id: 7, thread_title: "thread".into() },
+            ComposeTarget::NewThread { node_id: 7 },
+            ComposeTarget::EditPost { post_id: 7, thread_id: 9, thread_title: "edit".into() },
+            ComposeTarget::ConversationReply { conversation_id: 7, conversation_title: "DM".into(), participants: "user".into() },
+        ] {
+            for resumed in [false, true] {
+                let mut app = test_app();
+                let owner = app.draft_owner.clone().unwrap();
+                let key = target.draft_key();
+                app.screens.push(screens::home_state(false));
+                if resumed {
+                    app.drafts.insert(key, common::drafts::Draft { body: "previous version".into(), ..Default::default() });
+                    assert!(app.persist_draft(key));
+                }
+                app.screens.push(Screen::Compose(screens::ComposeState {
+                    target: Some(target.clone()), body: "latest unsent words".into(), resumed,
+                    ..Default::default()
+                }));
+                app.shutdown().await;
+                assert_eq!(app.draft_store.load(&owner)[&key].body, "latest unsent words");
+                assert!(app.session_handles.is_empty(), "shutdown must not create relay tasks");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn expiry_preserves_only_the_verified_draft_owner_on_relogin_and_restart() {
+        for same_account in [true, false] {
+            let mut app = test_app();
+            app.select_draft_owner(7);
+            app.me = Some(User { user_id: 7, ..Default::default() });
+            let owner = app.draft_owner.clone().unwrap();
+            let path = app.draft_store.path().to_owned();
+            app.screens.push(screens::home_state(false));
+            app.screens.push(Screen::Compose(screens::ComposeState {
+                target: Some(ComposeTarget::ThreadReply { thread_id: 1, thread_title: "thread".into() }),
+                body: "account seven's words".into(), ..Default::default()
+            }));
+            app.end_session("expired");
+            assert!(app.session_handles.is_empty(), "no tasks may be spawned after cancellation");
+            assert_eq!(app.draft_store.load(&owner).len(), 1);
+            let id = if same_account { 7 } else { 8 };
+            app.handle_msg(Msg::LoginComplete { generation: app.login_generation, result: Ok(User { user_id: id, ..Default::default() }) });
+            assert_eq!(app.drafts.len(), usize::from(same_account));
+            app.stop_pollers(); app.abort_session_tasks();
+            let mut restarted = test_app();
+            restarted.draft_owner = None;
+            restarted.draft_store = common::drafts::Store::with_path(path);
+            restarted.select_draft_owner(9);
+            assert!(restarted.drafts.is_empty(), "a replaced token cannot expose another account's drafts");
+        }
+    }
+
+    #[tokio::test]
+    async fn paste_during_submission_preserves_clipboard_without_changing_payload() {
+        for success in [false, true] {
+            let mut app = test_app();
+            app.screens.push(screens::home_state(false));
+            let target = ComposeTarget::ThreadReply { thread_id: 7, thread_title: "thread".into() };
+            app.screens.push(Screen::Compose(screens::ComposeState {
+                target: Some(target), body: "submitted".into(), busy: true, ..Default::default()
+            }));
+            app.handle_paste("not submitted".into());
+            assert_eq!(app.clipboard, "not submitted");
+            assert!(matches!(app.screens.last(), Some(Screen::Compose(c)) if c.body == "submitted"));
+            let result = if success { Ok(Post { post_id: 9, thread_id: 7, ..Default::default() }) }
+                else { Err(TaskError::of(&common::error::Error::FetchRejected("failed".into()))) };
+            app.handle_msg(Msg::ReplySent { composer: common::drafts::DraftKey::ThreadReply(7), result });
+            if !success { assert!(matches!(app.screens.last(), Some(Screen::Compose(c)) if c.body == "submitted")); }
+            assert_eq!(app.clipboard, "not submitted");
+        }
+        let mut app = test_app();
+        app.screens.push(Screen::NewConversation(screens::NewConversationState { body: "submitted DM".into(), busy: true, ..Default::default() }));
+        app.handle_paste("clipboard DM".into());
+        assert!(matches!(app.screens.last(), Some(Screen::NewConversation(c)) if c.body == "submitted DM"));
+        assert_eq!(app.clipboard, "clipboard DM");
+    }
+
+    #[tokio::test]
+    async fn attachment_prompt_owns_paste_and_submission_waits_for_upload() {
+        fn composer_action(state: &mut screens::ComposeState, key: KeyEvent) -> Action {
+            let mut screen = Screen::Compose(std::mem::take(state));
+            let action = screen.on_key(key);
+            let Screen::Compose(next) = screen else { unreachable!() };
+            *state = next;
+            action
+        }
+        for target in [
+            ComposeTarget::ThreadReply { thread_id: 7, thread_title: "thread".into() },
+            ComposeTarget::NewThread { node_id: 7 },
+            ComposeTarget::EditPost { post_id: 7, thread_id: 9, thread_title: "edit".into() },
+        ] {
+            for has_previous in [false, true] {
+                let mut app = test_app();
+                app.screens.push(Screen::Compose(screens::ComposeState {
+                    target: Some(target.clone()), title: "title".into(), body: "body".into(),
+                    file_prompt: Some(String::new()), title_field: matches!(target, ComposeTarget::NewThread { .. }),
+                    attachment_key: has_previous.then(|| "existing-key".to_owned()),
+                    ..Default::default()
+                }));
+                app.clipboard = "C:/Pictures/Zoë image.png".into();
+                app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+                let Some(Screen::Compose(c)) = app.screens.last_mut() else { panic!("composer"); };
+                assert_eq!(c.file_prompt.as_deref(), Some("C:/Pictures/Zoë image.png"));
+                assert_eq!(c.body, "body"); assert_eq!(c.title, "title");
+                assert!(matches!(composer_action(c, KeyEvent::from(KeyCode::Enter)), Action::UploadAttachment { path, .. } if path == "C:/Pictures/Zoë image.png"));
+                c.uploading = true;
+                assert!(matches!(composer_action(c, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)), Action::Notice(_)));
+                assert!(!c.busy);
+                let action = match target {
+                    ComposeTarget::ThreadReply { thread_id, .. } => Action::SubmitReply { thread_id, message: "body".into() },
+                    ComposeTarget::NewThread { node_id } => Action::SubmitThread { node_id, title: "title".into(), message: "body".into() },
+                    ComposeTarget::EditPost { post_id, .. } => Action::SubmitEdit { post_id, message: "body".into() },
+                    _ => unreachable!(),
+                };
+                app.execute_action(action);
+                assert!(app.write_handles.is_empty(), "direct actions must honor the upload interlock");
+                app.handle_msg(Msg::AttachmentUploaded { composer: target.draft_key(), result: Ok(("completed-key".into(), common::models::Attachment { attachment_id: 99, ..Default::default() })) });
+                let Some(Screen::Compose(c)) = app.screens.last_mut() else { panic!("composer"); };
+                assert_eq!(c.attachment_key.as_deref(), Some("completed-key"));
+                assert!(c.body.contains("[ATTACH]99[/ATTACH]"));
+                assert!(!matches!(composer_action(c, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)), Action::Notice(_) | Action::None));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode composer frame benchmark"]
+    fn benchmark_large_composer_frames() {
+        let mut app = test_app();
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply { thread_id: 7, thread_title: "benchmark".into() }),
+            body: "a log line with details to read.\n".repeat(70_000),
+            ..Default::default()
+        }));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..20 { terminal.draw(|frame| app.draw(frame)).unwrap(); }
+        println!("warmed 70k-line composer frame: {:?}", start.elapsed() / 20);
+    }
+
 }

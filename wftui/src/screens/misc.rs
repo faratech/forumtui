@@ -413,6 +413,11 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
     // #709: the file prompt owns the keyboard while it is up — a terminal
     // has no file picker, so the path is typed here.
     if let Some(path) = s.file_prompt.clone() {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('y' | 'v'))
+        {
+            return Action::PasteClipboard;
+        }
         match key.code {
             KeyCode::Esc => {
                 s.file_prompt = None;
@@ -468,6 +473,9 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('s') => {
+                if s.uploading {
+                    return Action::Notice("Still uploading — one moment.".into());
+                }
                 match target {
                     ComposeTarget::ThreadReply { thread_id, .. } => {
                         if s.body.trim().is_empty() {

@@ -377,6 +377,9 @@ async fn token_request(
     let url = format!("{base}{}", config::OAUTH_TOKEN_PATH);
     let resp = client.post(url).form(form).send().await?;
     let status = resp.status().as_u16();
+    if status == 429 {
+        return Err(crate::api::error_from_response(resp).await);
+    }
     let body = resp.bytes().await?;
     #[derive(Deserialize)]
     struct TokenResp {

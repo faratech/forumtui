@@ -3904,6 +3904,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-segmentation",
+ "windows-sys 0.61.2",
  "wiremock",
 ]
 

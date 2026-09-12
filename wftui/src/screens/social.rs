@@ -840,9 +840,7 @@ impl ConversationViewState {
             };
             let mut sink: Vec<Line<'static>> = Vec::new();
             let mut links = Vec::new();
-            // Hidden spoilers in DMs stay hidden: the reveal key lives on
-            // the thread view (#621).
-            push_bbcode(&mut sink, &mut links, &msg.message, theme, false);
+            push_bbcode(&mut sink, &mut links, &msg.message, theme, self.reveal_spoilers);
             for logical in sink {
                 for wrapped in wrap_line(&logical.spans, body_w) {
                     let mut spans = vec![
@@ -1998,57 +1996,35 @@ mod tests {
     #[test]
     fn x_reveals_spoiler_bodies_in_a_conversation() {
         let theme = Theme::truecolor();
-        let mut s = crate::screens::ConversationViewState {
-            conversation: crate::screens::Conversation {
-                conversation_id: 3,
-                title: "A DM".into(),
-                ..Default::default()
-            },
-            messages: vec![crate::screens::ConversationMessage {
-                message_id: 1,
-                user_id: 7,
-                username: "kemical".into(),
-                message: "before [ISPOILER]dm secret[/ISPOILER] after".into(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-
-        // Hidden by default: the spoiler run paints black-on-black...
-        let mut sink = Vec::new();
-        let mut links = Vec::new();
-        push_bbcode(&mut sink, &mut links, &s.messages[0].message, &theme, s.reveal_spoilers);
-        let hidden = sink.iter().any(|l| {
-            l.spans.iter().any(|sp| {
-                sp.style.fg == Some(ratatui::style::Color::Black)
-                    && sp.style.bg == Some(ratatui::style::Color::Black)
-                    && sp.content.contains("secret")
-            })
-        });
-        assert!(hidden, "the spoiler body must be hidden by default");
-
-        // ...and `x` reveals it (flag flips, line cache invalidated).
-        conversation_view_key(&mut s, key('x'));
-        assert!(s.reveal_spoilers);
-        assert!(s.built.is_none(), "the flip must force a rebuild");
-        sink.clear();
-        links.clear();
-        push_bbcode(&mut sink, &mut links, &s.messages[0].message, &theme, s.reveal_spoilers);
-        let revealed = sink.iter().any(|l| {
-            l.spans.iter().any(|sp| {
-                sp.content.contains("secret")
-                    && sp.style.fg != Some(ratatui::style::Color::Black)
-            })
-        });
-        assert!(revealed, "the spoiler body must be readable after x");
-
-        // And `x` also works from the Inbox's inline view pane
-        let mut inbox = sample_inbox_state();
-        inbox.focus = InboxPane::View;
-        inbox.view = Some(s);
-        inbox_key(&mut inbox, key('x'));
-        assert!(!inbox.view.as_ref().unwrap().reveal_spoilers);
-        assert!(inbox.view.as_ref().unwrap().built.is_none());
+        for inline in [false, true] {
+            let view = crate::screens::ConversationViewState {
+                conversation: crate::screens::Conversation { conversation_id: 3, title: "A DM".into(), ..Default::default() },
+                messages: vec![crate::screens::ConversationMessage {
+                    message_id: 1, user_id: 7, username: "kemical".into(),
+                    message: "before [ISPOILER]dm secret[/ISPOILER] after".into(), ..Default::default()
+                }], ..Default::default()
+            };
+            let mut screen = if inline {
+                let mut inbox = sample_inbox_state();
+                inbox.focus = InboxPane::View;
+                inbox.view = Some(view);
+                crate::screens::Screen::Inbox(inbox)
+            } else { crate::screens::Screen::ConversationView(view) };
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+            for revealed in [false, true] {
+                if revealed { screen.on_key(key('x')); }
+                terminal.draw(|frame| {
+                    screen.render(frame, frame.area(), &theme, &crate::glyph::UNICODE, &mut HitMap::default());
+                }).unwrap();
+                let buffer = terminal.backend().buffer();
+                let hidden = buffer.content.iter().any(|cell| {
+                    cell.fg == ratatui::style::Color::Black && cell.bg == ratatui::style::Color::Black && cell.symbol() != " "
+                });
+                assert_eq!(hidden, !revealed, "inline={inline}, revealed={revealed}");
+                let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                assert!(text.contains("dm secret"));
+            }
+        }
     }
 
     #[test]

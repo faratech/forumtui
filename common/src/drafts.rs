@@ -163,6 +163,34 @@ impl Draft {
     }
 }
 
+/// Draft ownership is established only after the API verifies the account.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Owner {
+    pub origin: String,
+    pub user_id: u32,
+}
+
+impl Owner {
+    pub fn new(origin: &str, user_id: u32) -> Self {
+        Self { origin: origin.trim_end_matches('/').to_owned(), user_id }
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct StoredDrafts {
+    version: u32,
+    owner: Option<Owner>,
+    drafts: HashMap<String, Draft>,
+}
+
+impl StoredDrafts {
+    fn entries(&self) -> HashMap<DraftKey, Draft> {
+        self.drafts.iter().filter_map(|(key, value)| {
+            Some((DraftKey::from_key(key)?, value.clone()))
+        }).collect()
+    }
+}
+
 pub struct Store {
     path: std::path::PathBuf,
 }
@@ -192,99 +220,119 @@ impl Store {
         &self.path
     }
 
-    /// Load every draft. A missing store is simply no drafts.
-    ///
-    /// An unreadable one is quarantined and reported as no drafts: a corrupt
-    /// convenience file must never stand between the user and the composer.
-    pub fn load(&self) -> HashMap<DraftKey, Draft> {
-        if self.path.parent().is_some_and(|dir| !dir.exists()) {
-            return HashMap::new();
-        }
-        let Ok(_lock) = crate::token::lock_store(&self.path) else {
-            return HashMap::new();
+    fn ensure_parent(&self) -> Result<()> {
+        let parent = self.path.parent().ok_or_else(|| Error::TokenStore("draft path has no parent".into()))?;
+        std::fs::create_dir_all(parent)?;
+        Ok(())
+    }
+
+    fn read_locked(&self) -> Result<StoredDrafts> {
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(StoredDrafts::default()),
+            Err(e) => return Err(e.into()),
         };
-        let Ok(bytes) = std::fs::read(&self.path) else {
-            return HashMap::new();
-        };
-        let parsed: std::result::Result<HashMap<String, Draft>, _> = serde_json::from_slice(&bytes);
-        match parsed {
-            Ok(raw) => raw
-                .into_iter()
-                .filter_map(|(k, v)| Some((DraftKey::from_key(&k)?, v)))
-                .collect(),
-            Err(_) => {
-                // Keep the lock across the parse and rename. Otherwise a
-                // concurrent writer could replace the corrupt inode between
-                // those operations and have its valid store quarantined.
-                let dest = crate::token::sibling_with_suffix(&self.path, "corrupt");
-                let _ = std::fs::rename(&self.path, &dest);
-                HashMap::new()
+        match serde_json::from_slice::<StoredDrafts>(&bytes) {
+            Ok(stored) if stored.version == 2 => Ok(stored),
+            _ => {
+                // Pre-release unowned drafts are deliberately discarded on
+                // upgrade. Keep genuinely corrupt data available for diagnosis.
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if value.get("version").is_some() {
+                        return Err(Error::TokenStore("unsupported draft store format".into()));
+                    }
+                    std::fs::remove_file(&self.path)?;
+                } else {
+                    let dest = crate::token::sibling_with_suffix(&self.path, "corrupt");
+                    std::fs::rename(&self.path, dest)?;
+                }
+                Ok(StoredDrafts::default())
             }
         }
     }
 
-    /// Replace the store with `drafts`.
-    ///
-    /// Oversized drafts are skipped, not truncated — half a post silently
-    /// restored would be worse than none — and the newest `MAX_DRAFTS`
-    /// survive.
-    pub fn save(&self, drafts: &HashMap<DraftKey, Draft>) -> Result<()> {
-        let mut keep: Vec<(&DraftKey, &Draft)> = drafts
-            .iter()
-            .filter(|(_, d)| !d.is_empty() && !d.too_big_to_persist())
-            .collect();
-        keep.sort_by_key(|(_, d)| std::cmp::Reverse(d.saved_at));
-        keep.truncate(MAX_DRAFTS);
-
-        if keep.is_empty() {
-            return self.erase();
-        }
-        let body: HashMap<String, &Draft> =
-            keep.into_iter().map(|(k, d)| (k.as_key(), d)).collect();
-        let body = serde_json::to_vec_pretty(&body)?;
-
-        let dir = self
-            .path
-            .parent()
-            .ok_or_else(|| Error::TokenStore("draft path has no parent".into()))?;
-        std::fs::create_dir_all(dir)
-            .map_err(|e| Error::TokenStore(format!("cannot create {}: {e}", dir.display())))?;
+    /// Select the verified account. Replacing an owner clears its drafts in
+    /// the same transaction, so a sibling with the old owner cannot write back.
+    pub fn activate(&self, owner: &Owner) -> Result<HashMap<DraftKey, Draft>> {
+        self.ensure_parent()?;
         let _lock = crate::token::lock_store(&self.path)?;
+        let mut stored = self.read_locked()?;
+        if stored.owner.as_ref() != Some(owner) {
+            stored = StoredDrafts { version: 2, owner: Some(owner.clone()), drafts: HashMap::new() };
+            self.write_locked(&stored)?;
+        }
+        Ok(stored.entries())
+    }
 
+    pub fn load(&self, owner: &Owner) -> HashMap<DraftKey, Draft> {
+        let Ok(_lock) = crate::token::lock_store(&self.path) else { return HashMap::new() };
+        match self.read_locked() {
+            Ok(stored) if stored.owner.as_ref() == Some(owner) => stored.entries(),
+            _ => HashMap::new(),
+        }
+    }
+
+    /// Apply only explicit mutations against the freshest snapshot under the
+    /// lock. Untouched keys and deletions from another instance survive.
+    pub fn apply(&self, owner: &Owner, changes: &[(DraftKey, Option<Draft>)]) -> Result<()> {
+        self.ensure_parent()?;
+        let _lock = crate::token::lock_store(&self.path)?;
+        let mut stored = self.read_locked()?;
+        if stored.version == 0 {
+            stored.version = 2;
+            stored.owner = Some(owner.clone());
+        }
+        if stored.owner.as_ref() != Some(owner) {
+            return Err(Error::TokenStore("draft account changed; refusing a stale save".into()));
+        }
+        for (key, draft) in changes {
+            match draft {
+                Some(draft) if !draft.is_empty() && !draft.too_big_to_persist() => {
+                    stored.drafts.insert(key.as_key(), draft.clone());
+                }
+                _ => { stored.drafts.remove(&key.as_key()); }
+            }
+        }
+        let mut keys: Vec<_> = stored.drafts.iter().map(|(key, draft)| (key.clone(), draft.saved_at)).collect();
+        keys.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (key, _) in keys.into_iter().skip(MAX_DRAFTS) { stored.drafts.remove(&key); }
+        self.write_locked(&stored)
+    }
+
+    /// Leave an empty ownership tombstone on sign-out. A stale instance must
+    /// not recreate private drafts after this owner was explicitly cleared.
+    pub fn erase(&self, owner: &Owner) -> Result<()> {
+        self.ensure_parent()?;
+        let _lock = crate::token::lock_store(&self.path)?;
+        let stored = self.read_locked()?;
+        if stored.owner.as_ref() == Some(owner) {
+            self.write_locked(&StoredDrafts { version: 2, ..Default::default() })?;
+        }
+        Ok(())
+    }
+
+    fn write_locked(&self, stored: &StoredDrafts) -> Result<()> {
+        let body = serde_json::to_vec_pretty(stored)?;
         let tmp = tmp_sibling(&self.path);
-        {
+        let result = (|| {
             use std::io::Write;
-            #[allow(unused_mut)]
             let mut opts = std::fs::OpenOptions::new();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
                 opts.mode(0o600);
             }
-            let mut f = opts
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-                .map_err(|e| Error::TokenStore(format!("cannot write {}: {e}", tmp.display())))?;
+            let mut f = opts.write(true).create_new(true).open(&tmp)?;
             f.write_all(&body)?;
-            f.sync_all().ok();
-        }
-        #[cfg(unix)]
-        restrict_permissions(&tmp);
-        std::fs::rename(&tmp, &self.path)
-            .map_err(|e| Error::TokenStore(format!("cannot finalize {}: {e}", self.path.display())))
-    }
-
-    pub fn erase(&self) -> Result<()> {
-        if self.path.parent().is_some_and(|dir| !dir.exists()) {
-            return Ok(());
-        }
-        let _lock = crate::token::lock_store(&self.path)?;
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+            f.sync_all()?;
+            drop(f);
+            #[cfg(unix)]
+            restrict_permissions(&tmp);
+            std::fs::rename(&tmp, &self.path)?;
+            Ok(())
+        })();
+        if result.is_err() { let _ = std::fs::remove_file(&tmp); }
+        result
     }
 
 }
@@ -299,6 +347,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("drafts.json")
     }
+
+    fn owner() -> Owner { Owner::new("http://127.0.0.1:9", 7) }
 
     fn draft(body: &str, saved_at: i64) -> Draft {
         Draft {
@@ -332,8 +382,8 @@ mod tests {
                 edit_seed_body: None,
             },
         );
-        store.save(&map).unwrap();
-        assert_eq!(store.load(), map, "a draft must survive the round trip byte for byte");
+        store.apply(&owner(), &map.iter().map(|(k, v)| (*k, Some(v.clone()))).collect::<Vec<_>>()).unwrap();
+        assert_eq!(store.load(&owner()), map, "a draft must survive the round trip byte for byte");
     }
 
     /// Every key kind must survive, or a resumed conversation reply would
@@ -356,8 +406,8 @@ mod tests {
             .enumerate()
             .map(|(i, k)| (*k, draft(&format!("body {i}"), 1)))
             .collect();
-        store.save(&map).unwrap();
-        assert_eq!(store.load(), map);
+        store.apply(&owner(), &map.iter().map(|(k, v)| (*k, Some(v.clone()))).collect::<Vec<_>>()).unwrap();
+        assert_eq!(store.load(&owner()), map);
     }
 
     #[test]
@@ -365,9 +415,9 @@ mod tests {
         let store = Store::with_path(scratch("empty"));
         let mut map = HashMap::new();
         map.insert(DraftKey::ThreadReply(1), draft("   \n  ", 1));
-        store.save(&map).unwrap();
-        assert!(store.load().is_empty(), "whitespace is not a draft");
-        assert!(!store.path().exists(), "and it must not leave an empty file behind");
+        store.apply(&owner(), &map.iter().map(|(k, v)| (*k, Some(v.clone()))).collect::<Vec<_>>()).unwrap();
+        assert!(store.load(&owner()).is_empty(), "whitespace is not a draft");
+        assert!(store.load(&owner()).is_empty(), "only ownership metadata remains");
     }
 
     /// The editor supports very large pastes; `drafts.json` should not have
@@ -379,8 +429,8 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(DraftKey::ThreadReply(1), draft(&"x".repeat(MAX_DRAFT_BYTES + 1), 2));
         map.insert(DraftKey::ThreadReply(2), draft("small", 1));
-        store.save(&map).unwrap();
-        let back = store.load();
+        store.apply(&owner(), &map.iter().map(|(k, v)| (*k, Some(v.clone()))).collect::<Vec<_>>()).unwrap();
+        let back = store.load(&owner());
         assert!(!back.contains_key(&DraftKey::ThreadReply(1)), "oversized draft skipped");
         assert_eq!(back[&DraftKey::ThreadReply(2)].body, "small", "the small one still saves");
     }
@@ -391,8 +441,8 @@ mod tests {
         let map: HashMap<DraftKey, Draft> = (0..MAX_DRAFTS as u32 + 10)
             .map(|i| (DraftKey::ThreadReply(i), draft("b", i as i64)))
             .collect();
-        store.save(&map).unwrap();
-        let back = store.load();
+        store.apply(&owner(), &map.iter().map(|(k, v)| (*k, Some(v.clone()))).collect::<Vec<_>>()).unwrap();
+        let back = store.load(&owner());
         assert_eq!(back.len(), MAX_DRAFTS);
         assert!(back.contains_key(&DraftKey::ThreadReply(MAX_DRAFTS as u32 + 9)), "newest kept");
         assert!(!back.contains_key(&DraftKey::ThreadReply(0)), "oldest evicted");
@@ -407,7 +457,7 @@ mod tests {
         let path = scratch("corrupt");
         let store = Store::with_path(path.clone());
         std::fs::write(&path, b"{not json").unwrap();
-        assert!(store.load().is_empty());
+        assert!(store.load(&owner()).is_empty());
         assert!(!path.exists(), "the corrupt file is moved out of the way");
         assert!(
             path.with_file_name("drafts.json.corrupt").exists(),
@@ -416,8 +466,8 @@ mod tests {
         // The next save must then work rather than fight the old file.
         let mut map = HashMap::new();
         map.insert(DraftKey::NewThread(3), draft("after", 1));
-        store.save(&map).unwrap();
-        assert_eq!(store.load(), map);
+        store.apply(&owner(), &map.iter().map(|(k, v)| (*k, Some(v.clone()))).collect::<Vec<_>>()).unwrap();
+        assert_eq!(store.load(&owner()), map);
     }
 
     /// A store written by a newer build must not brick an older one: an
@@ -428,10 +478,10 @@ mod tests {
         let store = Store::with_path(path.clone());
         std::fs::write(
             &path,
-            br#"{"profile:9":{"body":"future"},"thread:1":{"body":"now"}}"#,
+            br#"{"version":2,"owner":{"origin":"http://127.0.0.1:9","user_id":7},"drafts":{"profile:9":{"body":"future"},"thread:1":{"body":"now"}}}"#,
         )
         .unwrap();
-        let back = store.load();
+        let back = store.load(&owner());
         assert_eq!(back.len(), 1);
         assert_eq!(back[&DraftKey::ThreadReply(1)].body, "now");
     }
@@ -495,7 +545,7 @@ mod tests {
         let store = Store::with_path(scratch("perms"));
         let mut map = HashMap::new();
         map.insert(DraftKey::ThreadReply(1), draft("private words", 1));
-        store.save(&map).unwrap();
+        store.apply(&owner(), &map.iter().map(|(k, v)| (*k, Some(v.clone()))).collect::<Vec<_>>()).unwrap();
         let mode = std::fs::metadata(store.path()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "an unsent post is private");
     }
@@ -518,4 +568,57 @@ mod tests {
         );
         assert!(path.starts_with("/tmp/wftui-drafts-guard"), "got {path:?}");
     }
+    #[test]
+    fn concurrent_stores_merge_explicit_edits_without_resurrecting_deletions() {
+        let path = scratch("concurrent");
+        let a = Store::with_path(path.clone());
+        let b = Store::with_path(path);
+        let owner = owner();
+        a.activate(&owner).unwrap();
+        let first = DraftKey::EditPost(1);
+        let second = DraftKey::EditPost(2);
+        a.apply(&owner, &[(first, Some(draft("one", 1)))]).unwrap();
+        b.apply(&owner, &[(second, Some(draft("two", 2)))]).unwrap();
+        assert_eq!(a.load(&owner).len(), 2);
+        a.apply(&owner, &[(first, None)]).unwrap();
+        b.apply(&owner, &[(second, Some(draft("new two", 3)))]).unwrap();
+        let read = a.load(&owner);
+        assert!(!read.contains_key(&first));
+        assert_eq!(read[&second].body, "new two");
+    }
+
+    #[test]
+    fn account_and_origin_changes_reject_old_writers_and_logout_leaves_no_drafts() {
+        let store = Store::with_path(scratch("owners"));
+        let a = owner();
+        let b = Owner::new(&a.origin, 8);
+        let other_origin = Owner::new("http://127.0.0.1:10", 8);
+        let change = [(DraftKey::EditPost(1), Some(draft("private", 1)))];
+        store.activate(&a).unwrap();
+        store.apply(&a, &change).unwrap();
+        assert_eq!(store.activate(&a).unwrap().len(), 1);
+        assert!(store.activate(&b).unwrap().is_empty());
+        assert!(store.load(&a).is_empty());
+        assert!(store.apply(&a, &change).is_err());
+        store.apply(&b, &change).unwrap();
+        assert!(store.activate(&other_origin).unwrap().is_empty());
+        assert!(store.apply(&b, &change).is_err());
+        store.apply(&other_origin, &change).unwrap();
+        store.erase(&other_origin).unwrap();
+        assert!(store.load(&other_origin).is_empty());
+        assert!(store.apply(&other_origin, &change).is_err());
+    }
+
+    #[test]
+    fn upgrade_discards_unowned_drafts_but_does_not_destroy_a_future_store() {
+        let path = scratch("migration");
+        let store = Store::with_path(path.clone());
+        std::fs::write(&path, r#"{"thread:1":{"body":"legacy"}}"#).unwrap();
+        assert!(store.activate(&owner()).unwrap().is_empty());
+        let future = r#"{"version":3,"owner":null,"drafts":{}}"#;
+        std::fs::write(&path, future).unwrap();
+        assert!(store.activate(&owner()).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), future);
+    }
+
 }

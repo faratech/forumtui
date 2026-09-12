@@ -12,8 +12,8 @@
 //! of anything the leaked thread did or did not do.
 //!
 //! Unix only, and cfg-gated to nothing on Windows so the Windows build stays
-//! clean (there is no termios there; the same class of damage is avoided by
-//! not running the query at all — see `images::detect_plan`).
+//! clean (there is no termios there; the native probe in `images/windows.rs`
+//! restores its own console modes and never leaves a reader thread behind).
 
 /// Capture the current terminal attributes. Call once, as early as possible,
 /// and before `images::detect()`. A second call is a no-op.

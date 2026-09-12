@@ -27,6 +27,30 @@ impl App {
     pub(super) fn begin_session(&mut self) {
         self.abort_session_tasks();
         self.session_generation = self.session_generation.wrapping_add(1);
+        self.images.reset_session();
+    }
+
+    /// All ordinary exits save locally before the runtime and terminal go away.
+    /// Remote bookkeeping is bounded; draft durability never depends on it.
+    pub(super) async fn shutdown(&mut self) {
+        self.stop_pollers();
+        self.abort_session_tasks();
+        self.abort_writes();
+        if let Some(task) = self.login_task.take() { task.abort(); }
+        let read: Vec<_> = self.screens.iter().filter_map(|screen| {
+            match screen {
+                Screen::ThreadView(view) if view.seen_date > view.reported_date && view.seen_date > 0 =>
+                    Some((view.thread.thread_id, view.seen_date)),
+                _ => None,
+            }
+        }).collect();
+        while self.screens.len() > 1 { self.pop_screen_with_relay(false); }
+        if self.me.is_some() {
+            let api = self.api.clone();
+            let _ = tokio::time::timeout(Duration::from_secs(2), async move {
+                for (id, seen) in read { let _ = api.mark_thread_read(id, Some(seen)).await; }
+            }).await;
+        }
     }
 
     pub(super) async fn bootstrap(&mut self) {
@@ -223,6 +247,7 @@ impl App {
         // Anything already in flight belongs to the session being ended.
         self.bootstrap_generation = self.bootstrap_generation.wrapping_add(1);
         self.session_generation = self.session_generation.wrapping_add(1);
+        self.images.reset_session();
         self.me = None;
         self.alerts_unread = 0;
         self.convos_unread = 0;
@@ -251,12 +276,11 @@ impl App {
         // whichever one is already there is enough; only push a new one
         // when none survived.
         // Expiry is recoverable state for the same user. Unwind active
-        // screens through the normal lifecycle path so an open composer is
-        // stashed instead of silently discarded (#3), and a thread gets a
-        // last best-effort read-position report. Explicit logout clears the
-        // resulting local drafts immediately after this teardown.
+        // screens through local-only cleanup so an open composer is stashed
+        // without spawning new work after cancellation. Explicit logout
+        // clears the resulting local drafts immediately after this teardown.
         while self.screens.len() > 1 && !matches!(self.screens.last(), Some(Screen::Login(_))) {
-            self.pop_screen();
+            self.pop_screen_with_relay(false);
         }
         if !matches!(self.screens.last(), Some(Screen::Login(_))) {
             self.screens.push(screens::login_state());
