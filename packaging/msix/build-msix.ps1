@@ -6,9 +6,7 @@
 .DESCRIPTION
   Windows-only — needs the Rust MSVC toolchain, the Windows SDK (for
   makeappx.exe; the sign kit locates signtool.exe itself), and the signing
-  kit at -SignKitRoot (defaults to C:\code\sign, i.e. what's checked in at
-  /root/.sign on the build server — copy that directory here first, with
-  .env.codesigning's client secret filled in, before running this).
+  bundled kit in packaging/msix/signing (override with -SignKitRoot only for a compatible kit). Authentication comes from GitHub Secrets or process environment variables.
 
   Per architecture: `cargo build --release --target <triple>`, stage the
   exe + Assets\, render AppxManifest.template.xml, `makeappx pack`, then
@@ -26,7 +24,7 @@
   Just the x64 package, unsigned — for a local sideload smoke test.
 
 .EXAMPLE
-  .\build-msix.ps1 -SignKitRoot 'C:\code\sign' -OutDir 'C:\code\sign\dist'
+  .\build-msix.ps1 -OutDir '.\dist'
 #>
 
 [CmdletBinding()]
@@ -38,7 +36,7 @@ param(
     # x.y.z — the 4th (build) component is always appended as .0.
     [string]$Version,
 
-    [string]$SignKitRoot = "C:\code\sign",
+    [string]$SignKitRoot = (Join-Path $PSScriptRoot "signing"),
 
     [string]$OutDir = "C:\code\sign\dist",
 
@@ -158,6 +156,10 @@ foreach ($arch in $Architectures) {
     New-Item -ItemType Directory -Force -Path (Join-Path $stage "Assets") | Out-Null
 
     Copy-Item $exe (Join-Path $stage "wftui.exe") -Force
+    if (-not $SkipSign) {
+        & $signScript (Join-Path $stage 'wftui.exe') -Description 'WindowsForum TUI'
+        if ($LASTEXITCODE -ne 0) { throw "Dual signing failed for $arch executable" }
+    }
     Copy-Item (Join-Path $AssetsDir "*.png") (Join-Path $stage "Assets") -Force
 
     $manifest = Get-Content $ManifestTemplate -Raw

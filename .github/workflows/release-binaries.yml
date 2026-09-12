@@ -90,7 +90,12 @@ jobs:
           if ($env:GITHUB_REF -like 'refs/tags/v*') {
             $VERSION = $env:GITHUB_REF.Substring('refs/tags/v'.Length)
           } else {
-            $VERSION = "dev-$(git rev-parse --short HEAD)"
+            # MSIX requires numeric version components, including on dry runs.
+            $manifest = Get-Content 'wftui/Cargo.toml' -Raw
+            if ($manifest -notmatch '(?m)^version\s*=\s*"(\d+\.\d+\.\d+)"') {
+              throw 'Could not read a numeric package version from wftui/Cargo.toml'
+            }
+            $VERSION = $Matches[1]
           }
           $MSIX_VERSION = "$VERSION.0"
           echo "version=$VERSION" >> $env:GITHUB_OUTPUT
@@ -110,10 +115,10 @@ jobs:
           key: release-windows
 
       - name: Restore Trusted Signing dlib
-        run: packaging/msix/install-dlib.ps1
+        run: packaging/msix/signing/install-dlib.ps1
         shell: pwsh
 
-      - name: Build and sign MSIX packages
+      - name: Dual-sign executables and sign MSIX packages
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
