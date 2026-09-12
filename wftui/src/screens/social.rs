@@ -35,11 +35,17 @@ pub fn inbox_hints(s: &InboxState) -> Hints {
     // while the keys that DO work (`n/N` next/prev message, `p/P` profile,
     // `[/]` page) went unadvertised.
     if s.focus == InboxPane::View && s.view.is_some() {
+        let x_label = if s.view.as_ref().is_some_and(|v| v.reveal_spoilers) {
+            "hide"
+        } else {
+            "reveal"
+        };
         return Hints::with_short(
             &[
                 ("r", "reply"),
                 ("j/k", "scroll"),
                 ("n/N", "msg"),
+                ("x", x_label),
                 ("p/P", "profile"),
                 ("[/]", "page"),
                 ("Tab/Esc", "list"),
@@ -48,6 +54,7 @@ pub fn inbox_hints(s: &InboxState) -> Hints {
                 ("r", "reply"),
                 ("j/k", ""),
                 ("n/N", "msg"),
+                ("x", x_label),
                 ("p/P", "profile"),
                 ("[/]", "page"),
                 ("Tab/Esc", "list"),
@@ -859,13 +866,6 @@ pub fn conversation_view_key(s: &mut ConversationViewState, key: KeyEvent) -> Ac
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => {
             Action::PopScreen
         }
-        // Issue #669: `x` reveals (or re-hides) [SPOILER] bodies. `built`
-        // keys on the flag, so the next render rebuilds the message lines.
-        KeyCode::Char('x') => {
-            s.reveal_spoilers = !s.reveal_spoilers;
-            s.built = None;
-            Action::None
-        }
         _ => conversation_view_key_inner(s, key),
     }
 }
@@ -877,6 +877,13 @@ pub fn conversation_view_key(s: &mut ConversationViewState, key: KeyEvent) -> Ac
 /// list), so callers handle those themselves before delegating here.
 fn conversation_view_key_inner(s: &mut ConversationViewState, key: KeyEvent) -> Action {
     match key.code {
+        // Issue #669: `x` reveals (or re-hides) [SPOILER] bodies. `built`
+        // keys on the flag, so the next render rebuilds the message lines.
+        KeyCode::Char('x') => {
+            s.reveal_spoilers = !s.reveal_spoilers;
+            s.built = None;
+            Action::None
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             s.scroll = s.scroll.saturating_sub(1);
             Action::None
@@ -2034,6 +2041,14 @@ mod tests {
             })
         });
         assert!(revealed, "the spoiler body must be readable after x");
+
+        // And `x` also works from the Inbox's inline view pane
+        let mut inbox = sample_inbox_state();
+        inbox.focus = InboxPane::View;
+        inbox.view = Some(s);
+        inbox_key(&mut inbox, key('x'));
+        assert!(!inbox.view.as_ref().unwrap().reveal_spoilers);
+        assert!(inbox.view.as_ref().unwrap().built.is_none());
     }
 
     #[test]

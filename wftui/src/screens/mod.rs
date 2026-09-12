@@ -2382,7 +2382,7 @@ mod dispatch_tests {
                     }),
                     ..Default::default()
                 }),
-                skip: &["Tab", "Esc"],
+                skip: &["Tab", "Esc", "x"],
             },
             Case {
                 // The Alerts tab: Enter/m mark read, `n` starts a message,

@@ -2352,8 +2352,13 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
             }
             Action::None
         }
-        KeyCode::Char('u') => match &s.thread.view_url {
-            Some(url) => Action::OpenUrl(url.clone()),
+        KeyCode::Char('u') => match s
+            .posts
+            .get(s.sel_post)
+            .and_then(|p| p.view_url.clone())
+            .or_else(|| s.thread.view_url.clone())
+        {
+            Some(url) => Action::OpenUrl(url),
             None => Action::None,
         },
         // XenForo's REST API exposes no thread-watch endpoint. Keep the
@@ -5092,5 +5097,37 @@ mod tests {
             let l = thread_summary_line(&state, &theme, g, width);
             assert!(l.width() <= width, "width {width}: {}", text(&l));
         }
+    }
+
+    #[test]
+    fn thread_view_u_key_opens_selected_post_url() {
+        let mut state = ThreadViewState {
+            thread: Thread {
+                thread_id: 10,
+                view_url: Some("https://windowsforum.com/threads/10/".into()),
+                ..Default::default()
+            },
+            posts: vec![
+                Post {
+                    post_id: 101,
+                    view_url: Some("https://windowsforum.com/posts/101/".into()),
+                    ..Default::default()
+                },
+                Post {
+                    post_id: 102,
+                    view_url: Some("https://windowsforum.com/posts/102/".into()),
+                    ..Default::default()
+                },
+            ],
+            sel_post: 1,
+            ..Default::default()
+        };
+        let act = thread_view_key(&mut state, key('u'));
+        assert!(matches!(act, Action::OpenUrl(ref url) if url == "https://windowsforum.com/posts/102/"));
+
+        // Fallback to thread view_url when post view_url is missing
+        state.posts[1].view_url = None;
+        let act2 = thread_view_key(&mut state, key('u'));
+        assert!(matches!(act2, Action::OpenUrl(ref url) if url == "https://windowsforum.com/threads/10/"));
     }
 }
