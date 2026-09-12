@@ -102,6 +102,11 @@ const FILL_PAGE_BUDGET: u8 = 3;
 /// server is worse than saying so first.
 const MAX_UPLOAD_BYTES: u64 = 24 * 1024 * 1024;
 
+/// The system browser opener is injected so handler tests can exercise the
+/// real URL-routing path without launching a host browser. This matters on
+/// WSL, where `xdg-open` can open the Windows browser as a test side effect.
+type BrowserOpener = fn(&str) -> common::error::Result<()>;
+
 /// `~` in a typed path means what the shell means by it — the prompt is
 /// where a path is typed, and a terminal user types `~/shot.png`.
 fn shellexpand_home(path: &str) -> String {
@@ -465,6 +470,7 @@ impl PostVerb {
 pub struct App {
     pub api: Arc<dyn WfApi>,
     pub client: Arc<WfApiClient>,
+    browser_opener: BrowserOpener,
     pub tx: mpsc::UnboundedSender<Msg>,
     rx: mpsc::UnboundedReceiver<Msg>,
     pub theme: Theme,
@@ -826,6 +832,7 @@ pub async fn run(images: crate::images::Images) -> u8 {
         next_load_id: 1,
         api: client.clone(),
         client,
+        browser_opener: common::oauth::open_browser,
         tx,
         rx,
         theme: Theme::detect(),
@@ -2488,6 +2495,7 @@ async fn run_login_flow(
     tx: &mpsc::UnboundedSender<Msg>,
     client: Arc<WfApiClient>,
     generation: u64,
+    browser_opener: BrowserOpener,
 ) -> Result<(), String> {
     let client_id = common::config::oauth_client_id().map_err(|e| e.to_string())?;
     let http = common::http::build().map_err(|e| e.to_string())?;
@@ -2503,7 +2511,7 @@ async fn run_login_flow(
         .await
         .map_err(|e| e.to_string())?;
     tx.send(Msg::LoginReady { generation, url: link.url.clone() }).ok();
-    let _ = common::oauth::open_browser(&link.url);
+    let _ = browser_opener(&link.url);
 
     for _ in 0..300 {
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -6607,6 +6615,14 @@ mod tests {
     /// Gives every `test_app()` its own draft store; see the comment there.
     static TEST_DRAFT_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+    /// Handler tests may route links through `App::open_url`, but they must
+    /// never hand a test URL to `xdg-open` (which can launch the host browser
+    /// from WSL). Production keeps the real opener in `run`; tests inject
+    /// this no-op instead.
+    fn test_browser_opener(_: &str) -> common::error::Result<()> {
+        Ok(())
+    }
+
     fn test_app() -> App {
         let client = offline_client();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -6616,6 +6632,7 @@ mod tests {
             next_load_id: 1,
             api: Arc::new(RecordingApi::default()),
             client,
+            browser_opener: test_browser_opener,
             tx,
             rx,
             theme: Theme::detect(),

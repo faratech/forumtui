@@ -879,6 +879,6 @@ impl App {
         // URL is now in the user's local clipboard.
         self.copy_text(&target);
         self.set_status(format!("Opening {target} (also copied to clipboard)"));
-        let _ = common::oauth::open_browser(&target);
+        let _ = (self.browser_opener)(&target);
     }
 }

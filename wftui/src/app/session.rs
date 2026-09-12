@@ -433,8 +433,9 @@ impl App {
         }
         let tx = self.tx.clone();
         let client = self.client.clone();
+        let browser_opener = self.browser_opener;
         let handle = tokio::spawn(async move {
-            if let Err(message) = run_login_flow(&tx, client, generation).await {
+            if let Err(message) = run_login_flow(&tx, client, generation, browser_opener).await {
                 tx.send(Msg::LoginFailed { generation, message }).ok();
             }
         });
