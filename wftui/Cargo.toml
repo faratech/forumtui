@@ -4,20 +4,24 @@ version = "0.0.1"
 edition = "2024"
 rust-version = "1.98"
 publish = false
-description = "WindowsForum.com terminal UI client (Linux + Windows)"
+description = "WindowsForum Terminal: a terminal client for windowsforum.com (Linux + Windows)"
 
 [[bin]]
 name = "wftui"
 path = "src/main.rs"
 
 [features]
-default = ["images"]
+default = ["images", "builtin-windowsforum"]
+# The WindowsForum Terminal edition (see common/Cargo.toml). Off, the same
+# binary is "Terminal for XenForo": no compiled-in site, no embedded logo,
+# a Setup screen on first run.
+builtin-windowsforum = ["common/builtin-windowsforum"]
 # Inline graphics (DESIGN.md tiers 1-4). Optional so the binary can be built
 # without an image decoder at all; the text tier (5) is always compiled.
 images = ["dep:ratatui-image", "dep:image"]
 
 [dependencies]
-common = { path = "../common" }
+common = { path = "../common", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "signal"] }
 ratatui = "0.30"
 crossterm = "0.29"

@@ -70,7 +70,7 @@ impl App {
         // The key after `g` resolves the chord or cancels it; either way it is
         // consumed, so a mistyped chord never fires a stray command.
         if self.prefix.armed() {
-            if let PrefixEvent::Go(target) = self.prefix.resolve(k) {
+            if let PrefixEvent::Go(target) = self.prefix.resolve(k, &self.site.quick) {
                 self.go(target);
             }
             return;
@@ -208,6 +208,20 @@ impl App {
         }
         if let Some(screen) = self.screens.last_mut() {
             match screen {
+                // The Setup screen: whichever field has the caret.
+                Screen::Setup(ss) => {
+                    let sanitized = crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], ""));
+                    let (field, cursor) = ss.text_mut(ss.field);
+                    crate::editor::insert_str(field, cursor, &sanitized);
+                    self.set_status(format!("Pasted {} characters", text.chars().count()));
+                }
+                // The sign-in paste field: a redirect URL is exactly what a
+                // bracketed paste or `^Y` carries here.
+                Screen::Login(ls) if matches!(ls.stage, screens::LoginStage::Pasting { .. }) => {
+                    let sanitized = crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], ""));
+                    crate::editor::insert_str(&mut ls.paste, &mut ls.paste_cursor, &sanitized);
+                    self.set_status("Pasted — press Enter to submit");
+                }
                 Screen::Compose(cs) => {
                     if let Some(path) = cs.file_prompt.as_mut() {
                         let sanitized = crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], " "));
@@ -599,7 +613,7 @@ impl App {
         if self.prefix.armed() {
             // Same path a stray key takes: armed -> cancelled, silently.
             self.prefix
-                .resolve(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                .resolve(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &[]);
             return;
         }
         if let Some(Screen::ThreadView(v)) = self.screens.last_mut() {

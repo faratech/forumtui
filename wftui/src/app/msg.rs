@@ -112,7 +112,7 @@ impl App {
             }
         }
         match msg {
-            Msg::LoginReady { generation, url } => {
+            Msg::LoginReady { generation, url, mode } => {
                 if generation != self.login_generation {
                     return; // a flow the user already restarted (issue #547)
                 }
@@ -147,11 +147,19 @@ impl App {
                     permissions.set_mode(0o600);
                     let _ = std::fs::set_permissions(&path, permissions);
                 }
-                self.set_hint("Login link → clipboard + login-url.txt");
+                self.set_hint(match mode {
+                    common::site::LoginMode::Paste => "Login link → clipboard + login-url.txt · paste the address the browser lands on",
+                    _ => "Login link → clipboard + login-url.txt",
+                });
                 if let Some(Screen::Login(ls)) = self.screens.last_mut() {
                     ls.busy = false;
                     ls.url = url;
-                    ls.stage = crate::screens::LoginStage::Waiting;
+                    // Paste mode opens the field straight away: there is
+                    // nothing else for the reader to do here.
+                    ls.stage = match mode {
+                        common::site::LoginMode::Paste => crate::screens::LoginStage::Pasting { mode },
+                        _ => crate::screens::LoginStage::Waiting { mode },
+                    };
                 }
             }
             Msg::LoginFailed { generation, message } => {
@@ -162,12 +170,16 @@ impl App {
                 if let Some(Screen::Login(ls)) = self.screens.last_mut() {
                     ls.busy = false;
                     ls.error = Some(message);
-                    if matches!(
-                        ls.stage,
-                        crate::screens::LoginStage::Waiting
-                    ) {
-                        ls.stage = crate::screens::LoginStage::Idle;
-                    }
+                    ls.stage = crate::screens::LoginStage::Idle;
+                }
+                self.login_paste_tx = None;
+            }
+            Msg::LoginNotice { generation, message } => {
+                if generation != self.login_generation {
+                    return;
+                }
+                if let Some(Screen::Login(ls)) = self.screens.last_mut() {
+                    ls.error = Some(message);
                 }
             }
             Msg::LoginComplete { generation, result } => {
@@ -245,6 +257,15 @@ impl App {
                     Err(e) => {
                         self.set_status(format!("{}: {}", verb.failure(), e.message));
                     }
+                }
+            }
+            Msg::UpdateChecked { generation, forced, result } => {
+                self.handle_update_checked(generation, forced, result);
+            }
+            Msg::DraftRelayAbsent => {
+                if !self.drafts_relay_absent {
+                    tracing::info!("this site has no draft relay; drafts stay local");
+                    self.drafts_relay_absent = true;
                 }
             }
             Msg::Notice(n) => {

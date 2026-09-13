@@ -20,7 +20,9 @@ packaging/linux/build-tarball.sh --no-images  # the no-default-features build
 
 Runs entirely on this box: `cargo build --release -p wftui` for the host's
 native target, then stages the binary + a short README into
-`dist/wftui-<version>-linux-<arch>.tar.gz` next to a `.sha256`. No
+`dist/wftui-<version>-linux-<arch>.tar.gz` next to a `.sha256`, and (for the
+default build only) the bare binary `dist/wftui-<version>-linux-<arch>` that
+a running wftui downloads to update itself. No
 cross-compilation — this always builds for whatever target the machine
 running the script is (same as `bin/wftui`, which is built the same way and
 committed separately).
@@ -73,6 +75,8 @@ Produces, in `C:\code\sign\dist\` by default:
 - `wftui-<version>-arm64.msix`
 - `wftui-<version>.msixbundle` (all three architectures, one installer —
   what you'd hand to `Add-AppxPackage` or winget)
+- `wftui-<version>-windows-{x64,x86,arm64}.exe` — the bare dual-signed
+  executables, what a running wftui downloads to update itself
 - `wftui-<version>.SHA256SUMS.txt`
 
 Each `.msix` is signed and verified (`signtool sign` + `signtool verify /pa`)

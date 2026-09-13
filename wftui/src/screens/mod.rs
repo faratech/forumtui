@@ -7,17 +7,21 @@
 pub(crate) mod browse;
 mod library;
 mod misc;
+pub mod setup;
 mod social;
 
 /// Quick-node ids and the resolver that turns one into an `Action` (a category
 /// opens its first forum, a link-forum opens its URL). The go-to palette and
 /// the `g` which-key both navigate through these.
-pub(crate) use browse::{NEWS_NODE, SECURITY_NODE, TUTORIALS_NODE, open_node_action};
+pub(crate) use browse::{QUICK_DIGITS, open_node_action};
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
 
+use std::sync::Arc;
+
 use common::models::*;
+use common::site::{LoginMode, SiteConfig};
 
 use crate::chrome::{self, Hints};
 use crate::glyph::Glyphs;
@@ -26,11 +30,26 @@ use crate::theme::Theme;
 
 // ---------- state structs ----------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginStage {
     Idle,
-    /// Short link issued; the TUI is polling for the authorization code.
-    Waiting,
+    /// A link is on screen and the flow is waiting for the code: the relay
+    /// poll (`TuiLink`), the loopback listener (`Loopback`), or the user's
+    /// paste (`Paste`). Never `Auto` — that is resolved before the link.
+    Waiting { mode: LoginMode },
+    /// The paste field is open: the keyboard belongs to it until Enter or
+    /// Esc. `mode` is the flow underneath, so Esc knows where to go back.
+    Pasting { mode: LoginMode },
+}
+
+impl LoginStage {
+    /// The mode a live stage is running, if any.
+    pub fn mode(&self) -> Option<LoginMode> {
+        match self {
+            LoginStage::Idle => None,
+            LoginStage::Waiting { mode } | LoginStage::Pasting { mode } => Some(*mode),
+        }
+    }
 }
 
 pub struct LoginState {
@@ -45,6 +64,22 @@ pub struct LoginState {
     pub images: crate::images::Policy,
     /// The logo rect the last frame reserved, in absolute screen coordinates.
     pub image_requests: Vec<crate::images::Request>,
+    /// The site being signed in to (brand, login mode); stamped by
+    /// `Screen::set_site`.
+    pub site: Arc<SiteConfig>,
+    /// Whether there is a logo picture at all (`Images::has_logo`), stamped
+    /// by the app before every frame; without one the block mark stays on
+    /// every tier.
+    pub has_logo: bool,
+    /// The paste field (`p`): the redirected URL, or the bare code, typed or
+    /// pasted; `paste_cursor` in chars like the composer's file prompt.
+    pub paste: String,
+    pub paste_cursor: usize,
+    /// `m` cycles this over the site's configured mode for the next flow.
+    pub mode_override: Option<LoginMode>,
+    /// Which panel line carries the paste field, stamped by the renderer so
+    /// the caret lands on it.
+    pub paste_line: Option<usize>,
 }
 
 impl Default for LoginState {
@@ -57,7 +92,20 @@ impl Default for LoginState {
             error: None,
             images: crate::images::Policy::default(),
             image_requests: Vec::new(),
+            site: Arc::default(),
+            has_logo: true,
+            paste: String::new(),
+            paste_cursor: 0,
+            mode_override: None,
+            paste_line: None,
         }
+    }
+}
+
+impl LoginState {
+    /// The mode the next flow will run: the override, else the site's.
+    pub fn login_mode(&self) -> LoginMode {
+        self.mode_override.unwrap_or(self.site.login)
     }
 }
 
@@ -74,6 +122,8 @@ pub fn search_state() -> Screen {
 
 #[derive(Default)]
 pub struct ForumTreeState {
+    /// Quick destinations and prefix rules come from here.
+    pub site: Arc<SiteConfig>,
     pub nodes: Vec<Node>,
     pub sel: usize,
     /// First rendered row of the Forums panel, kept so the selection stays
@@ -87,6 +137,7 @@ pub struct ForumTreeState {
 
 #[derive(Default)]
 pub struct ThreadListState {
+    pub site: Arc<SiteConfig>,
     pub node_id: u32,
     pub title: String,
     pub threads: Vec<Thread>,
@@ -140,6 +191,9 @@ impl ThreadListState {
 
 #[derive(Default)]
 pub struct ThreadViewState {
+    /// Origin for `[POST]`/`[THREAD]` links, bot ids for the `AI` chip,
+    /// prefix rules; stamped by `Screen::set_site`.
+    pub site: Arc<SiteConfig>,
     /// Identity of the current thread load. The thread id alone cannot
     /// distinguish a reopened view from an older request still in flight.
     pub load_id: u64,
@@ -288,6 +342,8 @@ impl ComposeTarget {
 
 #[derive(Default)]
 pub struct ComposeState {
+    /// Origin for the preview's site links.
+    pub site: Arc<SiteConfig>,
     pub target: Option<ComposeTarget>,
     pub title: String,
     pub body: String,
@@ -394,6 +450,8 @@ pub struct ConversationsState {
 
 #[derive(Default)]
 pub struct ConversationViewState {
+    /// Origin for the messages' site links.
+    pub site: Arc<SiteConfig>,
     /// Identity of the current conversation load, independent of its id.
     pub load_id: u64,
     pub conversation: Conversation,
@@ -522,6 +580,9 @@ pub struct InboxState {
 
 #[derive(Default)]
 pub struct SearchState {
+    /// Which add-ons the site has decides which content types the `t`
+    /// cycler offers.
+    pub site: Arc<SiteConfig>,
     pub query: String,
     pub query_cursor: usize,
     pub author: String,
@@ -670,6 +731,8 @@ pub struct DraftsState {
 /// same BBCode the site renders.
 #[derive(Default)]
 pub struct ResourceViewState {
+    /// Origin for the description's site links.
+    pub site: Arc<SiteConfig>,
     pub id: u32,
     /// Identity of the current resource request.
     pub load_id: u64,
@@ -761,6 +824,8 @@ pub struct ProfileState {
 #[allow(clippy::large_enum_variant)]
 pub enum Screen {
     Login(LoginState),
+    /// First run of the generic edition: no site yet (`screens/setup.rs`).
+    Setup(setup::SetupState),
     Home(HomeState),
     /// The standalone Forums screen. Home now owns the tree, so nothing
     /// constructs this today; it is kept whole (render, keys, hints) as the
@@ -895,6 +960,15 @@ pub enum Action {
     SubmitConvoReply { id: u32, message: String },
     ResolveRecipients(Vec<String>, String, String),
     LoginBegin,
+    /// The Setup screen's submit: the forum the generic edition should
+    /// connect to. The app validates, writes `config.json`, adopts the
+    /// site and starts sign-in — or hands the errors back to the screen.
+    SetupSite { origin: String, client_id: String, name: String },
+    /// The paste field's Enter: the redirected URL or the bare code.
+    LoginPaste(String),
+    /// `m` on the sign-in screen: next login mode (auto → tuilink →
+    /// loopback → paste), restarting a flow that is already running.
+    LoginCycleMode,
     OpenUrl(String),
     OscCopy(String),
     /// A screen-level refusal that still needs to say something — unlike
@@ -921,6 +995,7 @@ impl Screen {
     ) {
         match self {
             Screen::Login(s) => misc::render_login(s, f, area, theme, g, hits),
+            Screen::Setup(s) => setup::render_setup(s, f, area, theme, g, hits),
             Screen::Home(s) => browse::render_home(s, f, area, theme, g, hits),
             Screen::ForumTree(s) => browse::render_forum_tree(s, f, area, theme, g, hits),
             Screen::ThreadList(s) => browse::render_thread_list(s, f, area, theme, g, hits),
@@ -947,6 +1022,47 @@ impl Screen {
     /// screens that draw images care; a change invalidates the thread view's
     /// wrapped lines, because inline images reserve rows the text tier does
     /// not (`width = 0` is the renderer's "rebuild me" signal).
+    /// Stamp the process's site onto whichever states read it (brand, quick
+    /// nodes, origin for links, add-on flags). Called from `push_screen`
+    /// and once per frame like `set_image_policy`, so a state built with
+    /// `Default` (the built-in site) is corrected before it draws.
+    pub fn set_site(&mut self, site: &Arc<SiteConfig>) {
+        let same = |s: &Arc<SiteConfig>| Arc::ptr_eq(s, site);
+        match self {
+            Screen::Login(s) if !same(&s.site) => s.site = site.clone(),
+            Screen::Home(h) => {
+                if !same(&h.tree.site) {
+                    h.tree.site = site.clone();
+                }
+                if !same(&h.list.site) {
+                    h.list.site = site.clone();
+                }
+            }
+            Screen::ForumTree(s) if !same(&s.site) => s.site = site.clone(),
+            Screen::ThreadList(s) if !same(&s.site) => s.site = site.clone(),
+            Screen::ThreadView(s) if !same(&s.site) => {
+                s.site = site.clone();
+                // Links carry the origin, so the laid-out lines are stale.
+                s.width = 0;
+            }
+            Screen::Compose(s) if !same(&s.site) => s.site = site.clone(),
+            Screen::Search(s) if !same(&s.site) => s.site = site.clone(),
+            Screen::ConversationView(s) if !same(&s.site) => s.site = site.clone(),
+            Screen::Inbox(s) => {
+                if let Some(v) = &mut s.view
+                    && !same(&v.site)
+                {
+                    v.site = site.clone();
+                }
+            }
+            Screen::ResourceView(s) if !same(&s.site) => {
+                s.site = site.clone();
+                s.width = 0;
+            }
+            _ => {}
+        }
+    }
+
     pub fn set_image_policy(&mut self, policy: crate::images::Policy, sizes: &crate::images::Sizes) {
         match self {
             Screen::ThreadView(s) => {
@@ -999,8 +1115,9 @@ impl Screen {
     pub fn hints(&self) -> Hints {
         match self {
             Screen::Login(s) => misc::login_hints(s),
+            Screen::Setup(s) => setup::setup_hints(s),
             Screen::Home(s) => browse::home_hints(s),
-            Screen::ForumTree(_) => browse::forum_tree_hints(),
+            Screen::ForumTree(s) => browse::forum_tree_hints(&s.site),
             Screen::ThreadList(s) => browse::thread_list_hints(s.node_id),
             Screen::ThreadView(s) => browse::thread_view_hints(s),
             Screen::Compose(s) => misc::compose_hints(s),
@@ -1022,6 +1139,7 @@ impl Screen {
     pub fn crumb(&self) -> String {
         match self {
             Screen::Login(_) => "Login".into(),
+            Screen::Setup(_) => "Setup".into(),
             Screen::Home(_) => "Forums".into(),
             Screen::ForumTree(_) => "Forums".into(),
             Screen::ThreadList(s) => browse::thread_list_crumb(s),
@@ -1047,6 +1165,7 @@ impl Screen {
     pub fn on_key(&mut self, key: ratatui::crossterm::event::KeyEvent) -> Action {
         match self {
             Screen::Login(s) => misc::login_key(s, key),
+            Screen::Setup(s) => setup::setup_key(s, key),
             Screen::Home(s) => browse::home_key(s, key),
             Screen::ForumTree(s) => browse::forum_tree_key(s, key),
             Screen::ThreadList(s) => browse::thread_list_key(s, key),
@@ -1217,7 +1336,8 @@ impl Screen {
             Screen::ImageView(v) => v.loading,
             // The Login Waiting stage animates its "waiting for approval"
             // spinner too — but only while a flow is live.
-            Screen::Login(l) => l.busy || matches!(l.stage, LoginStage::Waiting),
+            Screen::Login(l) => l.busy || matches!(l.stage, LoginStage::Waiting { .. }),
+            Screen::Setup(_) => false,
             Screen::Compose(_) | Screen::NewConversation(_) => false,
         }
     }
@@ -1302,6 +1422,9 @@ impl Screen {
             // The sign-in screen is a gate, not a place: Esc must not pop it
             // onto a session-less Home stuck loading forever (issue #556).
             Screen::Login(_) => EscIntent::Blocked("Sign in first, or press q to quit."),
+            // The fields own Esc: it quits, since nothing is behind this
+            // screen yet (`setup_key`).
+            Screen::Setup(_) => EscIntent::Screen,
             Screen::Compose(c) if c.busy || c.uploading => EscIntent::Blocked(
                 if c.uploading {
                     "Uploading\u{2026} Esc cannot cancel it \u{2014} wait for the result."
@@ -1328,6 +1451,8 @@ impl Screen {
     pub fn input_capture(&self) -> bool {
         match self {
             Screen::ThreadView(s) => s.link_popup,
+            Screen::Login(s) => matches!(s.stage, LoginStage::Pasting { .. }),
+            Screen::Setup(_) => true,
             _ => false,
         }
     }
@@ -1435,6 +1560,7 @@ impl Screen {
     pub fn keys_group(&self) -> &'static str {
         match self {
             Screen::Login(_) => "SIGNING IN",
+            Screen::Setup(_) => "SETUP",
             Screen::Home(_) | Screen::ForumTree(_) | Screen::ThreadList(_) => "THIS LIST",
             Screen::ThreadView(_) => "THIS THREAD",
             Screen::Compose(_) | Screen::NewConversation(_) => "THIS DRAFT",
@@ -1453,6 +1579,7 @@ impl Screen {
     pub fn title(&self) -> &str {
         match self {
             Screen::Login(_) => "Login",
+            Screen::Setup(_) => "Setup",
             Screen::Home(_) => "Forums",
             Screen::ForumTree(_) => "Forums",
             Screen::ThreadList(s) => &s.title,
@@ -2017,7 +2144,8 @@ mod dispatch_tests {
     /// `social::tab_key_switches_tabs_from_the_list_and_returns_from_the_view`).
     fn key_for_label(label: &str) -> Option<KeyEvent> {
         match label {
-            "j/k" | "h/l" | "n/N" | "[/]" | "[ ]" | "1/2/3" | "1-9" | "Tab" => None,
+            "j/k" | "h/l" | "n/N" | "[/]" | "[ ]" | "1/2" | "1/2/3" | "Tab" => None,
+            _ if label.starts_with("1-") => None,
             "Enter" => Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             "Esc" => Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             _ if label.len() == 2 && label.starts_with('^') => Some(KeyEvent::new(
@@ -2067,7 +2195,7 @@ mod dispatch_tests {
 
         fn login_waiting() -> Screen {
             let login = LoginState {
-                stage: LoginStage::Waiting,
+                stage: LoginStage::Waiting { mode: LoginMode::TuiLink },
                 url: "https://windowsforum.com/tui-start/abc123".into(),
                 ..Default::default()
             };
@@ -2345,6 +2473,44 @@ mod dispatch_tests {
                 name: "Login (Idle)",
                 factory: || Screen::Login(LoginState::default()),
                 skip: &[],
+            },
+            Case {
+                // A stock site: the loopback listener is up and `p` opens
+                // the paste field — screen state, no `Action`.
+                name: "Login (Waiting, loopback)",
+                factory: || Screen::Login(LoginState {
+                    stage: LoginStage::Waiting { mode: LoginMode::Loopback },
+                    url: "http://127.0.0.1:1/oauth2/authorize?x=y".into(),
+                    ..Default::default()
+                }),
+                skip: &["p"],
+            },
+            Case {
+                // The generic edition's first run: Enter on the last field
+                // (and ^S anywhere) submits, Tab is a field switch, Esc
+                // quits, ^Y pastes.
+                name: "Setup",
+                factory: || Screen::Setup(setup::SetupState {
+                    origin: "https://forum.example.com".into(),
+                    client_id: "abc".into(),
+                    name: "Example".into(),
+                    field: 2,
+                    ..Default::default()
+                }),
+                skip: &["Tab"],
+            },
+            Case {
+                // The paste field owns the keyboard: Enter submits what was
+                // pasted, Esc closes the field (screen state).
+                name: "Login (Pasting)",
+                factory: || Screen::Login(LoginState {
+                    stage: LoginStage::Pasting { mode: LoginMode::Paste },
+                    url: "http://127.0.0.1:1/oauth2/authorize?x=y".into(),
+                    paste: "http://127.0.0.1/callback?code=abc&state=st".into(),
+                    paste_cursor: 0,
+                    ..Default::default()
+                }),
+                skip: &["Esc"],
             },
             Case {
                 // #715: a composer that opened onto a recovered draft

@@ -33,7 +33,10 @@ pub const PALETTE_WIDTH: u16 = 60;
 pub const PALETTE_ROWS: usize = 8;
 /// Which-key panel size.
 const WHICH_KEY_WIDTH: u16 = 52;
-const WHICH_KEY_HEIGHT: u16 = 6;
+/// The built-in site's panel height (13 cells → 5 rows + border); other
+/// sites reflow to their own cell count (`render_which_key`).
+#[cfg(test)]
+const WHICH_KEY_HEIGHT: u16 = 7;
 /// Keys card size (`Help.dc.html`: 96 × 16).
 const KEYS_CARD_WIDTH: u16 = 96;
 /// DESIGN.md specifies 96 x 16; the card grew by the three rows the mouse
@@ -152,6 +155,9 @@ pub enum Target {
     /// Unsent composer drafts (#716) — the palette twin of `g d`.
     Drafts,
     Search,
+    /// Check for a newer release, or act on one already found (#722) — the
+    /// palette twin of `g u`.
+    Update,
     SignOut,
     Quit,
     Member(u32, String),
@@ -278,6 +284,12 @@ impl Palette {
             self.sel = i;
             self.clamp_scroll();
         }
+    }
+
+    /// Every row's title, unfiltered — what a test asserts the palette offers.
+    #[cfg(test)]
+    pub fn titles(&self) -> Vec<String> {
+        self.items.iter().map(|i| i.title.clone()).collect()
     }
 
     pub fn selected(&self) -> Option<&Item> {
@@ -573,9 +585,9 @@ fn highlight(theme: &Theme, title: &str, positions: &[usize], max: usize) -> Vec
 /// Where a `g <key>` chord goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoTarget {
-    News,
-    Security,
-    Tutorials,
+    /// The site's n-th quick destination (`site.quick[n]`): the `g <letter>`
+    /// chords a forum declares for itself.
+    Quick(usize),
     Latest,
     Inbox,
     Alerts,
@@ -586,6 +598,8 @@ pub enum GoTarget {
     Home,
     Profile,
     Top,
+    /// Check for a newer release now (#722).
+    Update,
 }
 
 /// The `g` prefix state machine. `arm()` shows the which-key panel; the next
@@ -615,8 +629,10 @@ impl Prefix {
         self.armed = true;
     }
 
-    /// Feed the key that follows `g`. Always disarms.
-    pub fn resolve(&mut self, k: KeyEvent) -> PrefixEvent {
+    /// Feed the key that follows `g`. Always disarms. `quick` is the site's
+    /// own chord list; its letters are validated at startup never to collide
+    /// with the fixed ones below.
+    pub fn resolve(&mut self, k: KeyEvent, quick: &[common::site::QuickNode]) -> PrefixEvent {
         if !self.armed {
             return PrefixEvent::NotArmed;
         }
@@ -624,10 +640,12 @@ impl Prefix {
         if !k.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
             return PrefixEvent::Cancelled;
         }
+        if let KeyCode::Char(c) = k.code
+            && let Some(i) = quick.iter().position(|q| q.key == c)
+        {
+            return PrefixEvent::Go(GoTarget::Quick(i));
+        }
         match k.code {
-            KeyCode::Char('n') => PrefixEvent::Go(GoTarget::News),
-            KeyCode::Char('s') => PrefixEvent::Go(GoTarget::Security),
-            KeyCode::Char('t') => PrefixEvent::Go(GoTarget::Tutorials),
             KeyCode::Char('l') => PrefixEvent::Go(GoTarget::Latest),
             KeyCode::Char('i') => PrefixEvent::Go(GoTarget::Inbox),
             KeyCode::Char('a') => PrefixEvent::Go(GoTarget::Alerts),
@@ -637,23 +655,92 @@ impl Prefix {
             KeyCode::Char('h') => PrefixEvent::Go(GoTarget::Home),
             KeyCode::Char('p') => PrefixEvent::Go(GoTarget::Profile),
             KeyCode::Char('g') => PrefixEvent::Go(GoTarget::Top),
+            KeyCode::Char('u') => PrefixEvent::Go(GoTarget::Update),
             _ => PrefixEvent::Cancelled,
         }
     }
 }
 
-/// The rows of the which-key panel, in the order the design shows them.
-const WHICH_KEY: [[(&str, &str); 3]; 4] = [
-    [("n", "news"), ("s", "security"), ("t", "tutorials")],
-    [("l", "latest"), ("i", "inbox"), ("a", "alerts")],
-    [("m", "media"), ("r", "resources"), ("d", "drafts")],
-    [("h", "home"), ("p", "profile"), ("g", "top")],
-];
+/// One lowercase letter as a `&'static str`, for the key caps and `Hit::Key`
+/// (both are `'static`): a site's chord letters are validated to `a-z`, so
+/// every one of them is in this table and nothing is ever leaked.
+pub fn static_letter(c: char) -> &'static str {
+    const LETTERS: [&str; 26] = [
+        "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r",
+        "s", "t", "u", "v", "w", "x", "y", "z",
+    ];
+    match c {
+        'a'..='z' => LETTERS[(c as u8 - b'a') as usize],
+        _ => "?",
+    }
+}
+
+/// The cells of the which-key panel, in the order the design shows them:
+/// the site's own quick chords first, then the fixed destinations, with
+/// `media` and `resources` only when the site has those add-ons. Laid out
+/// three per row by [`render_which_key`].
+pub fn which_key_cells(site: &common::site::SiteConfig) -> Vec<(&'static str, String)> {
+    let mut cells: Vec<(&'static str, String)> = site
+        .quick
+        .iter()
+        .map(|q| (static_letter(q.key), which_key_label(&q.label, &site.prefix_strip)))
+        .collect();
+    cells.push(("l", "latest".into()));
+    cells.push(("i", "inbox".into()));
+    cells.push(("a", "alerts".into()));
+    if site.features.xfmg {
+        cells.push(("m", "media".into()));
+    }
+    if site.features.xfrm {
+        cells.push(("r", "resources".into()));
+    }
+    for (k, label) in [("d", "drafts"), ("h", "home"), ("p", "profile"), ("g", "top"), ("u", "update")] {
+        cells.push((k, label.into()));
+    }
+    cells
+}
+
+/// A quick destination's label as the panel shows it: lowercase, without
+/// the site's stripped words ("Windows News" → "news"), and cut to its first
+/// word when it still would not fit beside its cap in a 15-cell column
+/// ("Security Alerts" → "security"). The palette row keeps the full label.
+fn which_key_label(label: &str, strip: &[String]) -> String {
+    let mut l = label.trim().to_string();
+    for word in strip {
+        if let Some(rest) = l.strip_prefix(word.as_str())
+            && !rest.trim().is_empty()
+        {
+            l = rest.trim().to_string();
+        }
+    }
+    let l = l.to_lowercase();
+    // 15 cells: a 3-cell cap, a space, and the label.
+    if chrome::cell_width(&l) > 11 {
+        l.split_whitespace().next().unwrap_or(&l).to_string()
+    } else {
+        l
+    }
+}
+
+/// Rows of the panel for `cells`: three per row, the last padded.
+fn which_key_rows(cells: &[(&'static str, String)]) -> Vec<Vec<(&'static str, String)>> {
+    cells.chunks(3).map(|c| c.to_vec()).collect()
+}
 
 /// Draw the `g …` panel bottom-right of the body, one row above the key bar.
-pub fn render_which_key(f: &mut Frame, body: Rect, theme: &Theme, g: &Glyphs, hits: &mut HitMap) {
+pub fn render_which_key(
+    f: &mut Frame,
+    body: Rect,
+    theme: &Theme,
+    g: &Glyphs,
+    cells: &[(&'static str, String)],
+    hits: &mut HitMap,
+) {
+    let rows = which_key_rows(cells);
     let width = WHICH_KEY_WIDTH.min(body.width);
-    let height = WHICH_KEY_HEIGHT.min(body.height);
+    // Two border rows plus one per row of cells; for the built-in site that
+    // is `WHICH_KEY_HEIGHT`, the DESIGN.md panel.
+    let height = (rows.len() as u16 + 2).min(body.height);
     let x = body
         .x
         .max(body.x + body.width.saturating_sub(width + 2));
@@ -676,18 +763,13 @@ pub fn render_which_key(f: &mut Frame, body: Rect, theme: &Theme, g: &Glyphs, hi
     }
     let w = inner.width as usize;
     let stride = 15usize;
-    let lines: Vec<Line<'static>> = WHICH_KEY
+    let lines: Vec<Line<'static>> = rows
         .iter()
         .enumerate()
         .map(|(r, row)| {
             let mut spans = vec![Span::raw(" ")];
-            for &(key, label) in row {
+            for (key, label) in row {
                 let start: usize = spans.iter().map(Span::width).sum();
-                if key.is_empty() {
-                    // Grid filler (11 targets in 12 slots): padding only.
-                    spans.push(Span::raw(" ".repeat(stride)));
-                    continue;
-                }
                 // The whole `cap label` cell is the target, not the two-cell
                 // cap: the chord's key is pressed through `handle_key`, so an
                 // armed `g` resolves exactly as it does from the keyboard.
@@ -695,6 +777,7 @@ pub fn render_which_key(f: &mut Frame, body: Rect, theme: &Theme, g: &Glyphs, hi
                     Rect::new(inner.x + start as u16, inner.y + r as u16, stride as u16, 1),
                     Hit::Key(key),
                 );
+                let key: &str = key;
                 spans.push(chrome::keycap(theme, key, false));
                 spans.push(Span::styled(format!(" {label}"), theme.dim()));
                 let used: usize = spans.iter().map(Span::width).sum();
@@ -1144,25 +1227,32 @@ mod tests {
 
     #[test]
     fn prefix_machine_arms_resolves_and_cancels() {
+        let quick = common::site::SiteConfig::windowsforum().quick;
         let mut p = Prefix::default();
         assert!(!p.armed());
         assert_eq!(
-            p.resolve(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            p.resolve(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &quick),
             PrefixEvent::NotArmed
         );
 
         p.arm();
         assert!(p.armed());
         assert_eq!(
-            p.resolve(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
-            PrefixEvent::Go(GoTarget::News)
+            p.resolve(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &quick),
+            PrefixEvent::Go(GoTarget::Quick(0))
         );
         assert!(!p.armed(), "resolving always disarms");
 
         p.arm();
         assert_eq!(
-            p.resolve(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)),
+            p.resolve(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &quick),
             PrefixEvent::Go(GoTarget::Top)
+        );
+
+        p.arm();
+        assert_eq!(
+            p.resolve(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE), &quick),
+            PrefixEvent::Go(GoTarget::Update)
         );
 
         // Esc, an unknown key and a modified key all cancel silently.
@@ -1172,7 +1262,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
         ] {
             p.arm();
-            assert_eq!(p.resolve(key), PrefixEvent::Cancelled);
+            assert_eq!(p.resolve(key, &quick), PrefixEvent::Cancelled);
             assert!(!p.armed());
         }
     }
@@ -1278,11 +1368,11 @@ mod tests {
             assert!(text.contains("@WindowsForum AI"), "member row missing");
 
             let shot_which = shot(w, h, |f, body| {
-                render_which_key(f, body, &theme, &UNICODE, &mut crate::hit::HitMap::default())
+                render_which_key(f, body, &theme, &UNICODE, &which_key_cells(&common::site::SiteConfig::windowsforum()), &mut crate::hit::HitMap::default())
             });
             assert_boxed_in_body(&shot_which, w, h, "g \u{2026}", "Esc cancel");
             let text = shot_which.join("\n");
-            for word in ["news", "security", "tutorials", "inbox", "alerts", "top"] {
+            for word in ["news", "security", "tutorials", "inbox", "alerts", "top", "update"] {
                 assert!(text.contains(word), "which-key is missing {word}:\n{text}");
             }
 
@@ -1376,6 +1466,43 @@ mod tests {
         assert_eq!(accents, " r ", "only the primary cap is accented: {accents:?}");
     }
 
+    /// Every cap the which-key panel shows must resolve: a chord the panel
+    /// teaches and the prefix machine cancels is the silent no-op the key
+    /// contract forbids.
+    #[test]
+    fn every_which_key_cell_resolves_to_a_go_target() {
+        let site = common::site::SiteConfig::windowsforum();
+        let cells = which_key_cells(&site);
+        assert_eq!(which_key_rows(&cells).len() as u16 + 2, WHICH_KEY_HEIGHT, "the built-in panel is the DESIGN.md one");
+        for (key, label) in &cells {
+            let mut p = Prefix::default();
+            p.arm();
+            let c = key.chars().next().unwrap();
+            assert!(
+                matches!(p.resolve(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &site.quick), PrefixEvent::Go(_)),
+                "g {key} ({label}) is advertised but does not resolve"
+            );
+        }
+        // The built-in chords resolve to the site's quick list, in order.
+        let mut p = Prefix::default();
+        p.arm();
+        assert_eq!(p.resolve(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &site.quick), PrefixEvent::Go(GoTarget::Quick(1)));
+        // A site with no add-ons and no quick nodes: the fixed rows only.
+        assert_eq!(
+            cells.iter().take(3).map(|(k, l)| format!("{k} {l}")).collect::<Vec<_>>(),
+            ["n news", "s security", "t tutorials"],
+            "the built-in panel reads as it always did"
+        );
+        let plain = common::site::SiteConfig::blank("plain");
+        let cells = which_key_cells(&plain);
+        assert_eq!(cells.iter().map(|(k, _)| *k).collect::<Vec<_>>(), ["l", "i", "a", "d", "h", "p", "g", "u"]);
+        let mut p = Prefix::default();
+        p.arm();
+        assert_eq!(p.resolve(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &plain.quick), PrefixEvent::Cancelled);
+        assert_eq!(static_letter('q'), "q");
+        assert_eq!(static_letter('Q'), "?");
+    }
+
     #[test]
     fn overlays_render_inside_the_body_at_every_size() {
         for (w, h) in [(120u16, 36u16), (80, 24), (60, 18), (40, 10), (20, 5)] {
@@ -1389,7 +1516,7 @@ mod tests {
                         let body = Rect::new(0, 1, w, h.saturating_sub(3).max(1));
                         dim_body(f, body, &theme);
                         p.render(f, body, &theme, g, &mut crate::hit::HitMap::default());
-                        render_which_key(f, body, &theme, g, &mut crate::hit::HitMap::default());
+                        render_which_key(f, body, &theme, g, &which_key_cells(&common::site::SiteConfig::windowsforum()), &mut crate::hit::HitMap::default());
                         render_keys_card(f, body, &theme, g, "THIS THREAD", &hints, &mut crate::hit::HitMap::default());
                     })
                     .expect("render");

@@ -47,20 +47,22 @@ pub const OAUTH_AUTHORIZE_PATH: &str = "/oauth2/authorize";
 pub const OAUTH_TOKEN_PATH: &str = "/api/oauth2/token";
 pub const OAUTH_REVOKE_PATH: &str = "/api/oauth2/revoke";
 
-/// Loopback redirect the TUI listens on during the OAuth handshake. The
-/// matching redirect URIs must be registered on the OAuth client row.
+/// Loopback port the client tries first for the OAuth redirect. XenForo
+/// matches loopback-IP redirect URIs without regard to port (RFC 8252
+/// §7.3), so a registered `http://127.0.0.1/callback` accepts this port and
+/// the ephemeral one `oauth::bind_loopback` falls back to; an admin who
+/// registered the exact `:9420` form on a stricter server still works.
 pub const LOOPBACK_PORT: u16 = 9420;
-pub const REDIRECT_URIS: [&str; 2] = [
-    "http://127.0.0.1:9420/callback",
-    "http://localhost:9420/callback",
-];
 
-/// Public OAuth client id (PKCE, no secret). Registered by
-/// `/web/ops/wftui_oauth_client.php` on 2026-09-05 ("WindowsForum TUI",
-/// client_type=public, loopback redirect 127.0.0.1:9420). Public clients
-/// carry no secret, so this id is safe to embed.
+/// Public OAuth client id (PKCE, no secret) of the built-in site.
+/// Registered by `/web/ops/wftui_oauth_client.php` on 2026-09-05
+/// ("WindowsForum TUI", client_type=public). Public clients carry no secret,
+/// so this id is safe to embed. Any other site's id comes from
+/// `config.json` (`site::SiteConfig::oauth_client_id`).
 pub const DEFAULT_OAUTH_CLIENT_ID: &str = "6014883021104153";
 
+/// The built-in site's client id, or the `WFTUI_OAUTH_CLIENT_ID` override.
+/// `site::resolve` applies the same override on top of any site.
 pub fn oauth_client_id() -> Result<String, Error> {
     let id = std::env::var("WFTUI_OAUTH_CLIENT_ID")
         .ok()
@@ -68,36 +70,13 @@ pub fn oauth_client_id() -> Result<String, Error> {
         .unwrap_or_else(|| DEFAULT_OAUTH_CLIENT_ID.to_string());
     if id.trim().is_empty() {
         return Err(Error::Config(
-            "no OAuth client id: set WFTUI_OAUTH_CLIENT_ID (public PKCE client \
-             registered on windowsforum.com)"
+            "no OAuth client id: set WFTUI_OAUTH_CLIENT_ID (a public PKCE client \
+             registered on the forum)"
                 .into(),
         ));
     }
     Ok(id)
 }
-
-/// Scopes requested during authorization. Keep in sync with the client row's
-/// allowed scope list; requesting a scope the client lacks fails the handshake.
-pub const SCOPES: [&str; 14] = [
-    "node:read",
-    "thread:read",
-    "thread:write",
-    "user:read",
-    "conversation:read",
-    "conversation:write",
-    "alert:read",
-    "search:read",
-    "search:write",
-    "attachment:read",
-    "attachment:write",
-    "profile_post:read",
-    // XFMG / XFRM (#680, #695): the catalog screens and the search type
-    // cycler's Media/Resources modes 403 with `missing_scope` without these.
-    // An API *key* bypasses scopes entirely, which is why probing the
-    // endpoints with one did not catch it.
-    "media:read",
-    "resource:read",
-];
 
 /// Minimum spacing between any two API calls (politeness budget; the zone's
 /// flood ceiling is shared with every other visitor).
@@ -128,25 +107,28 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Attachment uploads bypass the default total timeout.
 pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// A release binary is ~8 MiB; a slow link needs longer than a page fetch.
+pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Ceiling for one attachment download (`attachment_data`): XF caps uploads
 /// well below this, so anything larger is a mistake or an attack. Enforced
 /// at `Content-Length` and again on the streamed body, like `fetch_bytes`.
 pub const MAX_ATTACHMENT_BYTES: usize = 32 * 1024 * 1024;
 
+/// The UA for the built-in site: `wftui/<ver> (+https://windowsforum.com)`.
+/// Hard rule 6 — Cloudflare's bot rule on windowsforum.com is keyed to it.
 pub fn user_agent() -> String {
     format!("wftui/{} (+{})", env!("CARGO_PKG_VERSION"), BASE_URL)
 }
 
-pub fn api_base() -> String {
-    format!("{}/api", base_url())
+/// The UA for any other site: same prefix, the client's own project URL.
+/// Still distinctive, never another forum's address.
+pub fn user_agent_for_project() -> String {
+    format!("wftui/{} (+{})", env!("CARGO_PKG_VERSION"), crate::site::PROJECT_URL)
 }
 
-/// Site-relayed OAuth redirect (WindowsForum\TuiLink addon). The authorize
-/// request uses this as redirect_uri; /tui-done captures the code server-side
-/// and the TUI polls for it — no copy-paste, works over SSH and on phones.
-pub fn tui_done_url() -> String {
-    format!("{}/tui-done", base_url())
+pub fn api_base() -> String {
+    format!("{}/api", base_url())
 }
 
 /// Whether the client captures the mouse at all (`WFTUI_MOUSE`).
@@ -175,6 +157,33 @@ fn config_root() -> PathBuf {
     default_config_root()
 }
 
+/// The config dir itself (`WFTUI_CONFIG_DIR`, else the platform default):
+/// where `config.json` lives and what a relative logo path resolves against.
+pub fn config_dir() -> PathBuf {
+    config_root()
+}
+
+/// Where one site's own files live. The built-in site keeps the flat layout
+/// every existing install already has (`<config dir>/token.json`), so
+/// nobody is signed out by an upgrade; any other site gets
+/// `<config dir>/sites/<name>/`. `update/`, `cache/` and the log stay
+/// shared — none of them is about a site.
+pub fn site_root(name: &str) -> PathBuf {
+    if name == crate::site::BUILTIN_NAME {
+        config_root()
+    } else {
+        config_root().join("sites").join(name)
+    }
+}
+
+pub fn token_path_for(name: &str) -> PathBuf {
+    site_root(name).join("token.json")
+}
+
+pub fn drafts_path_for(name: &str) -> PathBuf {
+    site_root(name).join("drafts.json")
+}
+
 /// The config dir used when `WFTUI_CONFIG_DIR` is unset — i.e. the machine
 /// owner's real one. Exposed so both crates' test suites can assert that
 /// nothing they build ever resolves to it (issue #565: the suite used to read
@@ -198,6 +207,37 @@ pub fn drafts_path() -> PathBuf {
 
 pub fn log_path() -> PathBuf {
     config_root().join("wftui.log")
+}
+
+/// Where a downloaded update is staged until the next start applies it
+/// (`update::apply_pending_update`). Under the config dir like everything
+/// else the client writes, so `WFTUI_CONFIG_DIR` moves it and a test can
+/// never reach the operator's own.
+pub fn update_root() -> PathBuf {
+    config_root().join("update")
+}
+
+/// The release feed (`WFTUI_UPDATE_URL`): a URL answering with GitHub's
+/// `releases/latest` JSON shape. The default is the client's own repository.
+pub fn update_feed_url() -> String {
+    std::env::var("WFTUI_UPDATE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| crate::update::DEFAULT_FEED_URL.to_string())
+}
+
+/// `WFTUI_NO_UPDATE=1` turns the self-updater off entirely: no feed check,
+/// no download, and nothing applied at start. For a checkout's `bin/wftui`,
+/// a distro package, or anyone who would rather update by hand.
+pub fn updates_disabled() -> bool {
+    match std::env::var("WFTUI_NO_UPDATE") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+        Err(_) => false,
+    }
 }
 
 /// Serialized env access for tests (base URL override is process-global).
@@ -239,10 +279,15 @@ mod tests {
         let ua = user_agent();
         assert!(ua.starts_with("wftui/"));
         assert!(ua.contains("windowsforum.com"));
+        let project = user_agent_for_project();
+        assert!(project.starts_with("wftui/"));
+        assert!(project.contains("github.com/faratech/wftui") && !project.contains("windowsforum"));
         // Cloudflare's bot rules block bare library UAs (reqwest/hyper/...);
         // ours must never degrade to one of those signatures.
-        for banned in ["reqwest", "hyper", "python", "okhttp", "axios", "go-http"] {
-            assert!(!ua.to_ascii_lowercase().contains(banned), "{ua}");
+        for ua in [ua, project] {
+            for banned in ["reqwest", "hyper", "python", "okhttp", "axios", "go-http"] {
+                assert!(!ua.to_ascii_lowercase().contains(banned), "{ua}");
+            }
         }
     }
 
@@ -252,6 +297,7 @@ mod tests {
     /// its scope.
     #[test]
     fn scopes_cover_every_endpoint_family_the_client_calls() {
+        let scopes = crate::site::SiteConfig::windowsforum().effective_scopes();
         for needed in [
             "node:read",
             "thread:read",
@@ -262,16 +308,35 @@ mod tests {
             "media:read",
             "resource:read",
         ] {
-            assert!(SCOPES.contains(&needed), "missing scope: {needed}");
+            assert!(scopes.iter().any(|s| s == needed), "missing scope: {needed}");
         }
     }
 
     #[test]
     fn scopes_are_read_write_pairs() {
-        for scope in SCOPES {
+        for scope in crate::site::BASE_SCOPES {
             let (head, tail) = scope.split_once(':').expect("scope shape");
             assert!(matches!(tail, "read" | "write"), "{scope}");
             assert!(!head.is_empty());
+        }
+    }
+
+    /// The built-in site's files stay where every install already has them;
+    /// another site's live in their own directory, and both hang off the
+    /// same config dir so `WFTUI_CONFIG_DIR` moves everything together.
+    #[test]
+    fn site_roots_keep_the_builtin_flat_and_nest_the_rest() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("WFTUI_CONFIG_DIR").ok();
+        unsafe { std::env::set_var("WFTUI_CONFIG_DIR", "/tmp/wftui-t-roots") };
+        assert_eq!(token_path_for("windowsforum"), token_path());
+        assert_eq!(drafts_path_for("windowsforum"), drafts_path());
+        assert_eq!(token_path_for("other"), PathBuf::from("/tmp/wftui-t-roots/sites/other/token.json"));
+        assert_eq!(drafts_path_for("other"), PathBuf::from("/tmp/wftui-t-roots/sites/other/drafts.json"));
+        assert_eq!(crate::site::config_path(), PathBuf::from("/tmp/wftui-t-roots/config.json"));
+        match saved {
+            Some(v) => unsafe { std::env::set_var("WFTUI_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("WFTUI_CONFIG_DIR") },
         }
     }
 
@@ -292,6 +357,34 @@ mod tests {
             assert!(mouse_enabled(), "WFTUI_MOUSE={on:?} must leave it on");
         }
         unsafe { std::env::remove_var("WFTUI_MOUSE") };
+    }
+
+    /// The updater's two knobs: `WFTUI_UPDATE_URL` replaces the feed (a
+    /// test or a staging build points it at a local file server) and
+    /// `WFTUI_NO_UPDATE=1` switches the whole thing off. Unset is the
+    /// GitHub feed, enabled.
+    #[test]
+    fn update_env_overrides_read_the_feed_url_and_the_opt_out() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("WFTUI_UPDATE_URL") };
+        unsafe { std::env::remove_var("WFTUI_NO_UPDATE") };
+        assert_eq!(update_feed_url(), crate::update::DEFAULT_FEED_URL);
+        assert!(!updates_disabled());
+        unsafe { std::env::set_var("WFTUI_UPDATE_URL", " http://127.0.0.1:1/latest.json ") };
+        assert_eq!(update_feed_url(), "http://127.0.0.1:1/latest.json");
+        unsafe { std::env::set_var("WFTUI_UPDATE_URL", "   ") };
+        assert_eq!(update_feed_url(), crate::update::DEFAULT_FEED_URL, "blank means default");
+        for on in ["1", "true", "YES", " on "] {
+            unsafe { std::env::set_var("WFTUI_NO_UPDATE", on) };
+            assert!(updates_disabled(), "WFTUI_NO_UPDATE={on:?} must disable updates");
+        }
+        for off in ["0", "", "no"] {
+            unsafe { std::env::set_var("WFTUI_NO_UPDATE", off) };
+            assert!(!updates_disabled(), "WFTUI_NO_UPDATE={off:?} must leave them on");
+        }
+        unsafe { std::env::remove_var("WFTUI_UPDATE_URL") };
+        unsafe { std::env::remove_var("WFTUI_NO_UPDATE") };
+        assert!(update_root().ends_with("update"));
     }
 
     #[test]

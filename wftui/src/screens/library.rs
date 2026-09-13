@@ -577,7 +577,7 @@ pub fn rebuild_resource_lines(s: &mut super::ResourceViewState, theme: &Theme, g
             theme.dim(),
         )));
     } else {
-        let chunks = bbcode::render(&r.description);
+        let chunks = bbcode::render_at(&r.description, &s.site.origin);
         for (logical, align) in
             chunk_lines_aligned(&chunks, &mut s.links, theme, true, RuleWidth::of(width, g))
         {

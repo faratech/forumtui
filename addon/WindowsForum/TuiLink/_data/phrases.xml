@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<phrases>
+  <phrase title="wf_tuilink.authorized" version_id="1010170" version_string="1.1.1"><![CDATA[Authorized! You can close this tab - the terminal client will finish signing in on its own.]]></phrase>
+  <phrase title="wf_tuilink.expired" version_id="1010170" version_string="1.1.1"><![CDATA[This login link has expired or was already used. Start again from your terminal.]]></phrase>
+  <phrase title="wf_tuilink.unavailable" version_id="1010170" version_string="1.1.1"><![CDATA[The terminal client login is not configured. Ask the site administrator to create a public OAuth client and name it in Options → TuiLink.]]></phrase>
+  <phrase title="wf_tuilink.denied" version_id="1010170" version_string="1.1.1"><![CDATA[Authorization was not granted. Back in your terminal, start the login again.]]></phrase>
+  <phrase title="wf_tuilink.invalid_state" version_id="1010170" version_string="1.1.1"><![CDATA[Invalid login state value.]]></phrase>
+  <phrase title="wf_tuilink.invalid_challenge" version_id="1010170" version_string="1.1.1"><![CDATA[Invalid PKCE challenge value.]]></phrase>
+  <phrase title="wf_tuilink.invalid_id" version_id="1010170" version_string="1.1.1"><![CDATA[Invalid login id.]]></phrase>
+  <phrase title="wf_tuilink.invalid_draft_key" version_id="1010170" version_string="1.1.1"><![CDATA[Invalid draft key.]]></phrase>
+  <phrase title="wf_tuilink.draft_takes_no_attachments" version_id="1010170" version_string="1.1.1"><![CDATA[This kind of draft does not carry attachments.]]></phrase>
+  <phrase title="option.wfTuiLinkClientId" version_id="1010170" version_string="1.1.1"><![CDATA[OAuth client ID]]></phrase>
+  <phrase title="option_explain.wfTuiLinkClientId" version_id="1010170" version_string="1.1.1"><![CDATA[The client ID of the <b>public</b> OAuth client the terminal client (wftui) signs in through: Setup → Service providers → OAuth clients. Its redirect URIs must include <code>{boardUrl}/tui-done</code> and <code>http://127.0.0.1/callback</code>. Leave empty to use the client titled "WindowsForum TUI".]]></phrase>
+  <phrase title="option_group.wfTuiLink" version_id="1010170" version_string="1.1.1"><![CDATA[TuiLink (terminal client)]]></phrase>
+  <phrase title="option_group_description.wfTuiLink" version_id="1010170" version_string="1.1.1"><![CDATA[Sign-in relay and draft sync for the wftui terminal client.]]></phrase>
+</phrases>

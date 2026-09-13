@@ -16,6 +16,7 @@ use super::{
     browse::{chunk_lines, truncate, wrap_spans},
     link_style, solo_panel, Action, ComposeTarget, LoginStage,
 };
+use common::site::LoginMode;
 use crate::chrome::{self, Hints};
 use crate::glyph::Glyphs;
 use crate::hit::{Hit, HitMap};
@@ -35,6 +36,49 @@ pub fn login_key(s: &mut super::LoginState, key: KeyEvent) -> Action {
             Action::None
         };
     }
+    // The paste field owns the keyboard while it is open (the composer's
+    // file prompt, #709, is the precedent): letters are text, not commands.
+    if let LoginStage::Pasting { mode } = s.stage.clone() {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('y' | 'v'))
+        {
+            return Action::PasteClipboard;
+        }
+        let mut chars: Vec<char> = s.paste.chars().collect();
+        match key.code {
+            KeyCode::Esc => {
+                s.stage = LoginStage::Waiting { mode };
+                return Action::None;
+            }
+            KeyCode::Enter => {
+                let text = s.paste.trim().to_string();
+                if text.is_empty() {
+                    return Action::Notice(
+                        "Paste the address the browser landed on (or the code) first.".into(),
+                    );
+                }
+                return Action::LoginPaste(text);
+            }
+            KeyCode::Backspace => {
+                if s.paste_cursor > 0 && s.paste_cursor <= chars.len() {
+                    chars.remove(s.paste_cursor - 1);
+                    s.paste_cursor -= 1;
+                }
+            }
+            KeyCode::Left => s.paste_cursor = s.paste_cursor.saturating_sub(1),
+            KeyCode::Right => s.paste_cursor = (s.paste_cursor + 1).min(chars.len()),
+            KeyCode::Home => s.paste_cursor = 0,
+            KeyCode::End => s.paste_cursor = chars.len(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let at = s.paste_cursor.min(chars.len());
+                chars.insert(at, c);
+                s.paste_cursor = at + 1;
+            }
+            _ => {}
+        }
+        s.paste = chars.into_iter().collect();
+        return Action::None;
+    }
     match (&s.stage, key.code) {
         // The key bar advertises "restart login" on the whole screen, so Enter
         // has to restart from `Waiting` too: a denied approval, a failed
@@ -42,13 +86,23 @@ pub fn login_key(s: &mut super::LoginState, key: KeyEvent) -> Action {
         // full 10-minute TTL with no other way out (issue #547). `begin_login`
         // aborts the superseded flow.
         (_, KeyCode::Enter) => Action::LoginBegin,
-        (LoginStage::Waiting, KeyCode::Char('c')) => Action::OscCopy(s.url.clone()),
-        (LoginStage::Waiting, KeyCode::Char('o')) => Action::OpenUrl(s.url.clone()),
+        (_, KeyCode::Char('m')) => Action::LoginCycleMode,
+        (LoginStage::Waiting { .. }, KeyCode::Char('c')) => Action::OscCopy(s.url.clone()),
+        (LoginStage::Waiting { .. }, KeyCode::Char('o')) => Action::OpenUrl(s.url.clone()),
+        // `p` opens the paste field for the two modes where the code comes
+        // back through the user; the relay hands it over by itself.
+        (LoginStage::Waiting { mode: LoginMode::Loopback | LoginMode::Paste }, KeyCode::Char('p')) => {
+            s.stage = LoginStage::Pasting { mode: s.stage.mode().unwrap_or(LoginMode::Paste) };
+            Action::None
+        }
+        (LoginStage::Waiting { .. }, KeyCode::Char('p')) => Action::Notice(
+            "This sign-in uses the site's relay \u{2014} press m to switch to loopback or paste mode.".into(),
+        ),
         // Idle is a real resting state (`end_session` lands here, so does
         // every poll/exchange failure) with no link yet to copy or open —
         // say so instead of silently ignoring the keys the bar just
         // advertised for `Waiting` (issue #605).
-        (LoginStage::Idle, KeyCode::Char('c') | KeyCode::Char('o')) => {
+        (LoginStage::Idle, KeyCode::Char('c') | KeyCode::Char('o') | KeyCode::Char('p')) => {
             Action::Notice("No link yet \u{2014} press Enter to begin sign-in".into())
         }
         // Advertised on the key bar (issue #561); a login task in flight, if
@@ -59,21 +113,50 @@ pub fn login_key(s: &mut super::LoginState, key: KeyEvent) -> Action {
     }
 }
 
+/// `m mode: auto` — the cap shows the mode the next flow will run.
+fn mode_hint(s: &super::LoginState) -> (&'static str, &'static str) {
+    (
+        "m",
+        match s.login_mode() {
+            LoginMode::Auto => "mode: auto",
+            LoginMode::TuiLink => "mode: relay",
+            LoginMode::Loopback => "mode: loopback",
+            LoginMode::Paste => "mode: paste",
+        },
+    )
+}
+
 pub fn login_hints(s: &super::LoginState) -> Hints {
     // Busy: the flow owns the screen and every key but q is inert —
     // advertise only what works (#658; the never-a-silent-no-op rule).
     if s.busy {
         return Hints::new(&[("q", "quit")], 0);
     }
-    match s.stage {
-        LoginStage::Idle => Hints::new(&[("Enter", "begin sign-in"), ("q", "quit")], 0),
-        LoginStage::Waiting => Hints::new(
+    match &s.stage {
+        LoginStage::Idle => Hints::new(&[("Enter", "begin sign-in"), mode_hint(s), ("q", "quit")], 0),
+        LoginStage::Waiting { mode: LoginMode::Loopback | LoginMode::Paste } => Hints::new(
+            &[
+                ("p", "paste code"),
+                ("c", "copy link"),
+                ("o", "open here"),
+                ("Enter", "restart login"),
+                mode_hint(s),
+                ("q", "quit"),
+            ],
+            0,
+        ),
+        LoginStage::Waiting { .. } => Hints::new(
             &[
                 ("c", "copy link"),
                 ("o", "open here"),
                 ("Enter", "restart login"),
+                mode_hint(s),
                 ("q", "quit"),
             ],
+            0,
+        ),
+        LoginStage::Pasting { .. } => Hints::new(
+            &[("Enter", "submit"), ("Esc", "cancel"), ("^Y", "paste clipboard")],
             0,
         ),
     }
@@ -89,6 +172,19 @@ const MARK_PAD: usize = 4;
 const TEXT_COL: usize = 21;
 const STEP_NUM_COL: usize = 3;
 const STEP_BODY_COL: usize = 6;
+/// The paste field's label (loopback and paste modes).
+const PASTE_LABEL: &str = "Paste: ";
+
+/// The visible slice of the paste field and the caret's cell within it: a
+/// redirect URL is longer than the panel, so the field scrolls to keep the
+/// caret in view (`editor::hwindow`, the single-line rule the file prompt
+/// and the palette use).
+fn paste_window(text: &str, cursor: usize) -> (String, usize) {
+    let width = (LOGIN_PANEL_WIDTH as usize).saturating_sub(2 + STEP_BODY_COL + PASTE_LABEL.len() + 1);
+    let (start, caret) = crate::editor::hwindow(text, cursor, width);
+    let tail: String = text.chars().skip(start).collect();
+    (chrome::take_cells(&tail, width).to_string(), caret)
+}
 
 /// The mark as a white speech-bubble chip, echoing `wf-logo.png`: rounded
 /// top-left/top-right/bottom-left corners (quarter-block glyphs `▗ ▖ ▝`) and a
@@ -105,7 +201,10 @@ const STEP_BODY_COL: usize = 6;
 /// with `login_text_rows`'s 6 slots. ASCII has no half-block glyphs to fake
 /// rounding, so it falls back to a single plain `[ WF ]` chip on row 2 instead
 /// of a multi-row shape.
-fn login_mark_rows(theme: &Theme, g: &Glyphs) -> Vec<Vec<Span<'static>>> {
+///
+/// `mark` is the site's 1-4 letter mark; the bubble is 2 + mark + 3 cells
+/// wide inside its border, so it grows with the mark (7 inside for `WF`).
+fn login_mark_rows(theme: &Theme, g: &Glyphs, mark: &str) -> Vec<Vec<Span<'static>>> {
     let pad = || Span::raw(" ".repeat(MARK_PAD));
     let blank = || vec![pad()];
     let wf = Style::new()
@@ -116,56 +215,78 @@ fn login_mark_rows(theme: &Theme, g: &Glyphs) -> Vec<Vec<Span<'static>>> {
         let chip = vec![
             pad(),
             Span::styled("[", theme.faint()),
-            Span::styled(" WF ", wf),
+            Span::styled(format!(" {mark} "), wf),
             Span::styled("]", theme.faint()),
         ];
         return vec![blank(), blank(), chip, blank(), blank(), blank()];
     }
+    let inside = 2 + mark.len() + 3;
     let white = Style::new().fg(theme.chrome_fg);
     let fill = Style::new().bg(theme.chrome_fg);
     let top = vec![
         pad(),
-        Span::styled("\u{2597}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2596}", white),
+        Span::styled(format!("\u{2597}{}\u{2596}", "\u{2584}".repeat(inside)), white),
     ];
     let label = vec![
         pad(),
         Span::styled("\u{2588}", white),
         Span::styled("  ", fill),
-        Span::styled("WF", wf),
+        Span::styled(mark.to_string(), wf),
         Span::styled("   ", fill),
         Span::styled("\u{2588}", white),
     ];
     let card = vec![
         pad(),
         Span::styled("\u{2588}", white),
-        Span::styled(" ".repeat(7), fill),
+        Span::styled(" ".repeat(inside), fill),
         Span::styled("\u{2588}", white),
     ];
     let bottom = vec![
         pad(),
         // The last glyph is a full block, not a rounded quarter-block: the
         // one corner that stays square, matching wf-logo.png exactly.
-        Span::styled("\u{259D}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2588}", white),
+        Span::styled(format!("\u{259D}{}\u{2588}", "\u{2580}".repeat(inside)), white),
     ];
     vec![blank(), top, label, card, bottom, blank()]
 }
 
+/// The wordmark: the site's bold prefix, then the rest (`Windows` + `Forum`).
+fn brand_name_spans(theme: &Theme, brand: &common::site::Brand) -> Vec<Span<'static>> {
+    let (bold, rest) = brand.split();
+    let mut spans = Vec::new();
+    if !bold.is_empty() {
+        spans.push(Span::styled(bold.to_string(), theme.base().add_modifier(Modifier::BOLD)));
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), theme.base()));
+    }
+    spans
+}
+
 /// The brand copy beside the mark box, one entry per `login_mark_rows` slot;
 /// `None` rows (the box's own top/bottom border) carry no text.
-fn login_text_rows(theme: &Theme) -> Vec<Option<Vec<Span<'static>>>> {
+/// The last line of the brand copy, per stage: the relay flow needs no
+/// typing at all; the loopback and paste flows have a field for the
+/// address the browser lands on.
+fn login_typing_hint(stage: &LoginStage) -> &'static str {
+    match stage {
+        LoginStage::Idle | LoginStage::Waiting { mode: LoginMode::TuiLink } => "Nothing to type here.",
+        LoginStage::Waiting { .. } => "Or press p to paste the address.",
+        LoginStage::Pasting { .. } => "Paste the address, then Enter.",
+    }
+}
+
+fn login_text_rows(theme: &Theme, brand: &common::site::Brand, stage: &LoginStage) -> Vec<Option<Vec<Span<'static>>>> {
     vec![
         None,
-        Some(vec![
-            Span::styled("Windows", theme.base().add_modifier(Modifier::BOLD)),
-            Span::styled("Forum", theme.base()),
-        ]),
+        Some(brand_name_spans(theme, brand)),
         Some(vec![Span::styled("for your terminal", theme.dim())]),
         None,
         Some(vec![Span::styled(
             "Sign in with your browser.",
             theme.base(),
         )]),
-        Some(vec![Span::styled("Nothing to type here.", theme.dim())]),
+        Some(vec![Span::styled(login_typing_hint(stage), theme.dim())]),
     ]
 }
 
@@ -173,15 +294,12 @@ fn login_text_rows(theme: &Theme) -> Vec<Option<Vec<Span<'static>>>> {
 /// logo's columns (the app paints `assets/wf-logo.png` over them) with the
 /// same copy beside them, at the same `TEXT_COL` as the block-mark version so
 /// nothing else on the screen moves.
-fn login_logo_lines(theme: &Theme) -> Vec<Line<'static>> {
+fn login_logo_lines(theme: &Theme, brand: &common::site::Brand, stage: &LoginStage) -> Vec<Line<'static>> {
     let mut rows: Vec<Option<Vec<Span<'static>>>> = vec![None; images::LOGO_ROWS as usize];
-    rows[1] = Some(vec![
-        Span::styled("Windows", theme.base().add_modifier(Modifier::BOLD)),
-        Span::styled("Forum", theme.base()),
-    ]);
+    rows[1] = Some(brand_name_spans(theme, brand));
     rows[2] = Some(vec![Span::styled("for your terminal", theme.dim())]);
     rows[4] = Some(vec![Span::styled("Sign in with your browser.", theme.base())]);
-    rows[5] = Some(vec![Span::styled("Nothing to type here.", theme.dim())]);
+    rows[5] = Some(vec![Span::styled(login_typing_hint(stage), theme.dim())]);
     rows.into_iter()
         .map(|text| {
             let mut spans = vec![Span::raw(" ".repeat(TEXT_COL))];
@@ -193,13 +311,13 @@ fn login_logo_lines(theme: &Theme) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn login_brand_lines(theme: &Theme, g: &Glyphs) -> Vec<Line<'static>> {
-    // "[ WF ]" (6) in ASCII; the 9-cell bubble chip in Unicode.
-    let box_w = if g.ascii { 6 } else { 9 };
+fn login_brand_lines(theme: &Theme, g: &Glyphs, brand: &common::site::Brand, stage: &LoginStage) -> Vec<Line<'static>> {
+    // "[ WF ]" (mark + 4) in ASCII; the bubble chip (mark + 7) in Unicode.
+    let box_w = if g.ascii { brand.mark.len() + 4 } else { brand.mark.len() + 7 };
     let gap = TEXT_COL.saturating_sub(MARK_PAD + box_w);
-    login_mark_rows(theme, g)
+    login_mark_rows(theme, g, &brand.mark)
         .into_iter()
-        .zip(login_text_rows(theme))
+        .zip(login_text_rows(theme, brand, stage))
         .map(|(mut spans, text)| {
             if let Some(t) = text {
                 spans.push(Span::raw(" ".repeat(gap)));
@@ -230,11 +348,11 @@ pub fn render_login(
     // Tiers 1-3 replace the block mark with the real logo; tiers 4 (half-
     // blocks) and 5 (text) keep the mark, which is already drawn out of block
     // glyphs and reads better than a 16x7 half-block rendering would.
-    let logo = s.images.pixels();
+    let logo = s.images.pixels() && s.has_logo;
     let mut lines = if logo {
-        login_logo_lines(theme)
+        login_logo_lines(theme, &s.site.brand, &s.stage)
     } else {
-        login_brand_lines(theme, g)
+        login_brand_lines(theme, g, &s.site.brand, &s.stage)
     };
 
     match &s.stage {
@@ -246,11 +364,15 @@ pub fn render_login(
                 Span::raw(" begin sign-in"),
             ]));
         }
-        LoginStage::Waiting => {
+        LoginStage::Waiting { mode } | LoginStage::Pasting { mode } => {
+            let mode = *mode;
             lines.push(login_step_line(
                 theme,
                 "1",
-                "Open this link on any device \u{2014} phone is fine",
+                match mode {
+                    LoginMode::Loopback => "Open this link in a browser on this machine",
+                    _ => "Open this link on any device \u{2014} phone is fine",
+                },
             ));
 
             let vbar = if g.ascii { "|" } else { "\u{2502}" };
@@ -296,8 +418,9 @@ pub fn render_login(
             ]));
             let copied_text = format!(
                 "copied to your clipboard \u{b7} also in {}/login-url.txt",
-                std::path::Path::new(&common::config::token_path())
-                    .parent()
+                // The site's own directory (`config::site_root`): where
+                // `App` writes the file, beside that site's token store.
+                Some(common::config::site_root(&s.site.name))
                     .map(|p| p.display().to_string())
                     .unwrap_or_default()
             );
@@ -314,15 +437,52 @@ pub fn render_login(
                 "2",
                 "Approve access on the site (your usual 2FA applies)",
             ));
-            lines.push(login_step_line(theme, "3", "This window finishes on its own"));
-            lines.push(Line::from(vec![
-                Span::raw(" ".repeat(STEP_BODY_COL)),
-                Span::styled(
-                    format!("{} ", chrome::spinner(g, chrome::spinner_tick())),
-                    Style::new().fg(theme.accent),
-                ),
-                Span::styled("waiting for approval\u{2026}", theme.dim()),
-            ]));
+            match mode {
+                LoginMode::Paste => {
+                    lines.push(login_step_line(
+                        theme,
+                        "3",
+                        "The browser lands on a 127.0.0.1 address that will not load:",
+                    ));
+                    lines.push(login_step_line(theme, " ", "paste that address (or just the code) here"));
+                }
+                LoginMode::Loopback => {
+                    lines.push(login_step_line(theme, "3", "The browser comes back here on its own"));
+                    lines.push(login_step_line(
+                        theme,
+                        " ",
+                        "browser elsewhere? press p and paste the address it lands on",
+                    ));
+                }
+                _ => {
+                    lines.push(login_step_line(theme, "3", "This window finishes on its own"));
+                }
+            }
+            if let LoginStage::Pasting { .. } = &s.stage {
+                // The field row: measured here so the caret lands on it.
+                s.paste_line = Some(lines.len());
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(STEP_BODY_COL)),
+                    Span::styled(PASTE_LABEL, theme.dim()),
+                    Span::styled(paste_window(&s.paste, s.paste_cursor).0, theme.base()),
+                ]));
+            } else {
+                s.paste_line = None;
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(STEP_BODY_COL)),
+                    Span::styled(
+                        format!("{} ", chrome::spinner(g, chrome::spinner_tick())),
+                        Style::new().fg(theme.accent),
+                    ),
+                    Span::styled(
+                        match mode {
+                            LoginMode::Paste => "waiting for the pasted address\u{2026}",
+                            _ => "waiting for approval\u{2026}",
+                        },
+                        theme.dim(),
+                    ),
+                ]));
+            }
         }
     }
     if s.busy {
@@ -337,10 +497,20 @@ pub fn render_login(
 
     let height = (lines.len() as u16 + 2).min(area.height);
     let panel_area = super::centered_box(area, LOGIN_PANEL_WIDTH, height);
-    let block = solo_panel(theme, g, "Sign in to WindowsForum", None, None);
+    let block = solo_panel(theme, g, &format!("Sign in to {}", s.site.brand.name), None, None);
     let inner = block.inner(panel_area);
     f.render_widget(block, panel_area);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    if let Some(line) = s.paste_line
+        && (line as u16) < inner.height
+    {
+        let (_, caret) = paste_window(&s.paste, s.paste_cursor);
+        let x = STEP_BODY_COL + PASTE_LABEL.len() + caret;
+        f.set_cursor_position((
+            inner.x + (x as u16).min(inner.width.saturating_sub(1)),
+            inner.y + line as u16,
+        ));
+    }
 
     // The sign-in link is a link (#701): clicking it opens the browser, the
     // same thing Enter's flow does, so a reader on a machine with a browser
@@ -1242,8 +1412,10 @@ fn resolve_image(r: &bbcode::ImageRef, attachments: &[Attachment]) -> Option<Pre
 /// Reserving the rows here (rather than drawing over whatever follows) is
 /// what keeps the text after an image from ending up underneath it — the same
 /// contract `ThreadViewState::rebuild_lines` keeps for post attachments.
+#[allow(clippy::too_many_arguments)]
 fn build_preview(
     body: &str,
+    origin: &str,
     attachments: &[Attachment],
     theme: &Theme,
     g: &Glyphs,
@@ -1252,7 +1424,7 @@ fn build_preview(
     sizes: &images::Sizes,
 ) -> (Vec<Line<'static>>, Vec<images::Slot>) {
     let w = width.max(1);
-    let chunks = bbcode::render(body);
+    let chunks = bbcode::render_at(body, origin);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut slots: Vec<images::Slot> = Vec::new();
     let mut links: Vec<String> = Vec::new();
@@ -1352,6 +1524,7 @@ fn draw_preview_panel(
         s.preview_cache.note_body(&s.body);
         let (lines, slots) = build_preview(
             &s.body,
+            &s.site.origin,
             &s.attachments,
             theme,
             g,
@@ -1687,7 +1860,7 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
                         page: 1,
                     };
                 }
-                s.content_type = (s.content_type + 1) % 5;
+                s.content_type = next_content_type(s.content_type, &s.site);
                 let q = s.query.trim().to_string();
                 let a = s.author.trim().to_string();
                 if !q.is_empty() || !a.is_empty() {
@@ -1907,6 +2080,29 @@ pub fn search_hints(s: &super::SearchState) -> Hints {
 /// The `search_type` the wire API expects for each chip position
 /// (#673): 0 = all types, 1 = threads, 2 = posts, 3 = Media Gallery
 /// items (`xfmg_media`), 4 = Resource Manager entries (`resource`).
+/// The chip positions a site offers: the stock three always, Media only
+/// with XFMG, Resources only with XFRM — a type the server has no searcher
+/// for is not a mode, it is a 403 waiting to happen (#673).
+pub(crate) fn content_types(site: &common::site::SiteConfig) -> Vec<u8> {
+    let mut types = vec![0, 1, 2];
+    if site.features.xfmg {
+        types.push(3);
+    }
+    if site.features.xfrm {
+        types.push(4);
+    }
+    types
+}
+
+/// The `t` cycler: the next offered type after `ct`, wrapping.
+pub(crate) fn next_content_type(ct: u8, site: &common::site::SiteConfig) -> u8 {
+    let types = content_types(site);
+    match types.iter().position(|t| *t == ct) {
+        Some(i) => types[(i + 1) % types.len()],
+        None => types[0],
+    }
+}
+
 pub(crate) fn content_type_param(ct: u8) -> Option<&'static str> {
     match ct {
         1 => Some("thread"),
@@ -2154,8 +2350,10 @@ fn search_chip_hint(s: &super::SearchState) -> &'static str {
 /// chip in accent_bg (`chrome::chip_active`), the mode hint dim on the right.
 fn render_chip_row(s: &super::SearchState, f: &mut Frame, area: Rect, theme: &Theme) {
     let mut spans = Vec::new();
-    for (i, label) in ["All", "Threads", "Posts", "Media", "Resources"].into_iter().enumerate() {
-        spans.push(if s.content_type == i as u8 {
+    let labels = ["All", "Threads", "Posts", "Media", "Resources"];
+    for i in content_types(&s.site) {
+        let label = labels[i as usize];
+        spans.push(if s.content_type == i {
             chrome::chip_active(theme, label)
         } else {
             chrome::chip(theme, label)
@@ -3284,6 +3482,21 @@ mod tests {
             matches!(&act, Action::RunSearchQuery(q) if q.content_type.is_none()),
             "chip 5 wraps back to all types"
         );
+
+        // A site without either add-on: the cycler and the chip row stop at
+        // Posts, so no mode can 403 with `missing_scope`.
+        let plain = std::sync::Arc::new(common::site::SiteConfig::blank("plain"));
+        assert_eq!(content_types(&plain), vec![0, 1, 2]);
+        let mut s = crate::screens::SearchState { query: "edge".into(), site: plain, ..Default::default() };
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            s.loading = false;
+            match search_key(&mut s, t) {
+                Action::RunSearchQuery(q) => seen.push(q.content_type),
+                _ => panic!("the cycler must re-run the search"),
+            }
+        }
+        assert_eq!(seen, vec![Some("thread".into()), Some("post".into()), None]);
     }
 
     /// Issue #548: a Search screen opened from a profile (`t`/`p`) is showing
@@ -3850,7 +4063,7 @@ mod tests {
         let act = login_key(&mut s, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
         assert!(matches!(act, Action::Notice(_)), "o in Idle must notice, not silently no-op");
 
-        let waiting = crate::screens::LoginState { stage: LoginStage::Waiting, ..Default::default() };
+        let waiting = crate::screens::LoginState { stage: LoginStage::Waiting { mode: LoginMode::TuiLink }, ..Default::default() };
         let hints = login_hints(&waiting);
         assert!(hints.keys.iter().any(|(cap, _)| *cap == "c"), "Waiting must still advertise c");
         assert!(hints.keys.iter().any(|(cap, _)| *cap == "o"), "Waiting must still advertise o");
@@ -3861,7 +4074,7 @@ mod tests {
         let theme = Theme::truecolor();
         for (w, h) in [(120u16, 36u16), (80, 24)] {
             let mut s = crate::screens::LoginState {
-                stage: LoginStage::Waiting,
+                stage: LoginStage::Waiting { mode: LoginMode::TuiLink },
                 url: "https://windowsforum.com/tui-start/k7Qx2p".into(),
                 ..Default::default()
             };
@@ -3888,7 +4101,7 @@ mod tests {
             crate::images::Tier::Iterm2,
         ] {
             let mut s = crate::screens::LoginState {
-                stage: LoginStage::Waiting,
+                stage: LoginStage::Waiting { mode: LoginMode::TuiLink },
                 url: "https://windowsforum.com/tui-start/k7Qx2p".into(),
                 images: crate::images::Policy { tier, font: (10, 20) },
                 ..Default::default()
@@ -3912,7 +4125,7 @@ mod tests {
         // Tier 4 (half-blocks) and tier 5 (text) keep the crafted mark.
         for tier in [crate::images::Tier::Halfblocks, crate::images::Tier::Text] {
             let mut s = crate::screens::LoginState {
-                stage: LoginStage::Waiting,
+                stage: LoginStage::Waiting { mode: LoginMode::TuiLink },
                 url: "https://windowsforum.com/tui-start/k7Qx2p".into(),
                 images: crate::images::Policy { tier, font: (10, 20) },
                 ..Default::default()
@@ -3981,7 +4194,7 @@ mod tests {
         let theme = Theme::truecolor();
         let mut hits = HitMap::default();
         let mut s = super::super::LoginState {
-            stage: super::super::LoginStage::Waiting,
+            stage: super::super::LoginStage::Waiting { mode: LoginMode::TuiLink },
             url: "https://windowsforum.com/tui-start/abc123".into(),
             ..Default::default()
         };

@@ -281,6 +281,32 @@ impl Theme {
         Theme::mono()
     }
 
+    /// `detect()` plus a site's own header colour: the three chrome roles
+    /// are re-derived from it at the detected tier (exact on TrueColor,
+    /// nearest cube entry on 256, nearest basic on 16), and left alone on
+    /// mono, where `NO_COLOR` means what it says. `None` is the default
+    /// blue every other role was tuned against.
+    pub fn detect_with(chrome_bg: Option<common::bbcode::Rgb>) -> Self {
+        let theme = Self::detect();
+        match chrome_bg {
+            Some(rgb) => theme.with_chrome_bg(rgb),
+            None => theme,
+        }
+    }
+
+    /// The header band in `rgb`, with `chrome_dim` mixed 72 % towards white
+    /// so meta text on the band keeps the contrast the default pair has,
+    /// and `chrome_fg` white. A no-op on mono.
+    pub fn with_chrome_bg(mut self, rgb: common::bbcode::Rgb) -> Self {
+        let mix = |c: u8| ((c as u16 * 28 + 255 * 72) / 100) as u8;
+        let dim = common::bbcode::Rgb { r: mix(rgb.r), g: mix(rgb.g), b: mix(rgb.b) };
+        if let (Some(bg), Some(dim)) = (quantize(self.tier, rgb), quantize(self.tier, dim)) {
+            self.chrome_bg = bg;
+            self.chrome_dim = dim;
+        }
+        self
+    }
+
     pub fn detect() -> Self {
         if std::env::var_os("NO_COLOR").is_some() {
             return Theme::mono();
@@ -515,6 +541,25 @@ mod tests {
             time::Date::from_calendar_date(y, m, d).expect("date"),
             time::Time::from_hms(12, 0, 0).expect("time"),
         )
+    }
+
+    /// A site's header colour lands on every tier at that tier's fidelity,
+    /// `chrome_dim` follows it towards white, and mono stays untouched.
+    #[test]
+    fn detect_with_quantises_chrome_bg_per_tier_and_keeps_mono_reset() {
+        let green = common::bbcode::Rgb { r: 0x3A, g: 0x7D, b: 0x44 };
+        let t = Theme::truecolor().with_chrome_bg(green);
+        assert_eq!(t.chrome_bg, Color::Rgb(0x3A, 0x7D, 0x44));
+        assert_eq!(t.chrome_fg, Color::Rgb(0xFF, 0xFF, 0xFF));
+        let Color::Rgb(r, g, b) = t.chrome_dim else { panic!("{:?}", t.chrome_dim) };
+        assert!(r > 0x3A && g > 0x7D && b > 0x44, "dim is lighter than the band: {r:x}{g:x}{b:x}");
+        assert!(matches!(Theme::ansi256().with_chrome_bg(green).chrome_bg, Color::Indexed(_)));
+        assert!(!matches!(Theme::ansi16().with_chrome_bg(green).chrome_bg, Color::Rgb(..) | Color::Indexed(_)));
+        let mono = Theme::mono().with_chrome_bg(green);
+        assert_eq!(mono.chrome_bg, Theme::mono().chrome_bg);
+        assert_eq!(mono.chrome_dim, Theme::mono().chrome_dim);
+        // The default blue is what every other role was tuned against.
+        assert_eq!(Theme::truecolor().with_chrome_bg(common::bbcode::Rgb { r: 0x0F, g: 0x6C, b: 0xBD }).chrome_bg, Theme::truecolor().chrome_bg);
     }
 
     #[test]

@@ -19,6 +19,25 @@ pub struct TokenSet {
     /// Unix seconds; the API issues 2h access / 90d refresh tokens.
     pub expires_at: i64,
     pub scope: String,
+    /// The site and OAuth client this grant belongs to, stamped by
+    /// `WfApiClient::set_tokens`. Empty on a store written before sites
+    /// were configurable — accepted as the built-in site's and back-filled
+    /// on the next save. A client for a *different* origin or client id
+    /// must never send this bearer (`WfApiClient::with_store` quarantines
+    /// such a store instead of using it).
+    #[serde(default)]
+    pub origin: String,
+    #[serde(default)]
+    pub client_id: String,
+}
+
+impl TokenSet {
+    /// True when this grant may be used by a client for `origin` /
+    /// `client_id`: a match, or a legacy store that never recorded either.
+    pub fn belongs_to(&self, origin: &str, client_id: &str) -> bool {
+        (self.origin.is_empty() || self.origin == origin)
+            && (self.client_id.is_empty() || self.client_id == client_id)
+    }
 }
 
 // Deliberately manual: the derived Debug printed both live secrets, and one
@@ -34,6 +53,8 @@ impl std::fmt::Debug for TokenSet {
             )
             .field("expires_at", &self.expires_at)
             .field("scope", &self.scope)
+            .field("origin", &self.origin)
+            .field("client_id", &self.client_id)
             .finish()
     }
 }
@@ -162,6 +183,30 @@ impl Store {
         let _ = std::fs::rename(&self.path, &dest);
     }
 
+    /// Move a store that parses but belongs to another site or client aside
+    /// as `token.json.<suffix>`, so this process starts with no session and
+    /// the grant is kept for inspection rather than deleted or — worse —
+    /// sent to the wrong origin. Only moves it if it still fails
+    /// `belongs_to` under the lock: a sibling may have replaced it.
+    pub fn quarantine_as(&self, suffix: &str, origin: &str, client_id: &str) {
+        if self.path.parent().is_some_and(|dir| !dir.exists()) {
+            return;
+        }
+        let Ok(_lock) = lock_store(&self.path) else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&self.path) else {
+            return;
+        };
+        if let Ok(t) = serde_json::from_slice::<TokenSet>(&bytes)
+            && t.belongs_to(origin, client_id)
+        {
+            return;
+        }
+        let dest = sibling_with_suffix(&self.path, suffix);
+        let _ = std::fs::rename(&self.path, &dest);
+    }
+
     /// Remove the file only if it still contains `expected`. A logout or a
     /// rejected refresh must not erase a newer grant another process wrote
     /// after this process took its snapshot.
@@ -224,6 +269,35 @@ pub(crate) fn lock_store(path: &Path) -> Result<StoreLock> {
     Ok(StoreLock { file })
 }
 
+/// `lock_store` without the wait: `Ok(None)` when another process holds the
+/// lock. The update pass at start uses it so a sibling instance mid-download
+/// can never stall this one's boot.
+pub(crate) fn try_lock_store(path: &Path) -> Result<Option<StoreLock>> {
+    let lock_path = sibling_with_suffix(path, "lock");
+    #[allow(unused_mut)]
+    let mut opts = std::fs::OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)
+        .map_err(|e| Error::TokenStore(format!("cannot open {}: {e}", lock_path.display())))?;
+    #[cfg(unix)]
+    restrict_permissions(&lock_path);
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(StoreLock { file })),
+        // `lock_contended_error` is EWOULDBLOCK on Unix and
+        // ERROR_LOCK_VIOLATION on Windows; only the OS code is comparable.
+        Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => Ok(None),
+        Err(e) => Err(Error::TokenStore(format!("cannot lock {}: {e}", lock_path.display()))),
+    }
+}
+
 pub(crate) fn tmp_sibling(path: &Path) -> PathBuf {
     // A fixed `token.json.tmp`/`drafts.json.tmp` lets two processes sharing a
     // config directory truncate each other's in-progress JSON. The final
@@ -261,7 +335,7 @@ mod tests {
     use super::*;
 
     fn sample() -> TokenSet {
-        TokenSet {
+        TokenSet { origin: String::new(), client_id: String::new(),
             access_token: "at".into(),
             refresh_token: "rt".into(),
             expires_at: 1_800_000_000,
@@ -302,7 +376,7 @@ mod tests {
         let store = Store::with_path(dir.join("token.json"));
         store.save(&sample()).unwrap();
         store
-            .save(&TokenSet {
+            .save(&TokenSet { origin: String::new(), client_id: String::new(),
                 refresh_token: "new-refresh".into(),
                 ..sample()
             })

@@ -722,7 +722,18 @@ fn emit_list_marker(out: &mut Vec<Chunk>, stack: &mut [Frame], style: Style) {
     out.push(Chunk::Text(marker, st));
 }
 
+/// Render for the built-in site: `[POST]`/`[THREAD]`/`[GALLERY]` links
+/// point at windowsforum.com. Screens render through [`render_at`] with the
+/// session's origin; this is the fixed form the golden tests read.
 pub fn render(src: &str) -> Vec<Chunk> {
+    render_at(src, crate::config::BASE_URL)
+}
+
+/// Render with the links that name the site itself (`[POST=id]`,
+/// `[THREAD=id]`, `[GALLERY=media, id]`) built on `origin`, so a post on
+/// another forum links to that forum.
+pub fn render_at(src: &str, origin: &str) -> Vec<Chunk> {
+    let origin = origin.trim_end_matches('/');
     let mut out: Vec<Chunk> = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
     // Incremental style mirror of `stack` (#622): O(1) push/pop instead of
@@ -1009,7 +1020,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                     "post" => {
                         let id = value.as_deref().map(strip_quotes).unwrap_or("");
                         let url = if !id.is_empty() {
-                            format!("https://windowsforum.com/posts/{id}/")
+                            format!("{origin}/posts/{id}/")
                         } else {
                             String::new()
                         };
@@ -1021,7 +1032,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                     "thread" => {
                         let id = value.as_deref().map(strip_quotes).unwrap_or("");
                         let url = if !id.is_empty() {
-                            format!("https://windowsforum.com/threads/{id}/")
+                            format!("{origin}/threads/{id}/")
                         } else {
                             String::new()
                         };
@@ -1090,7 +1101,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
                                 .map(str::trim)
                                 .filter(|id| !id.is_empty());
                             let url =
-                                id.map(|id| format!("https://windowsforum.com/media/{id}/"));
+                                id.map(|id| format!("{origin}/media/{id}/"));
                             if let Some(url) = url {
                                 let caption = inner.trim();
                                 let label = if caption.is_empty() {
@@ -2049,6 +2060,28 @@ mod tests {
     /// media item's page, with a placeholder label when there is no
     /// caption — and degrade to literal text without a close tag, like
     /// every other framed tag.
+    /// A post on another forum links to that forum: the three tags whose
+    /// href is the site itself build it on the origin the screen passes.
+    #[test]
+    fn render_at_uses_the_given_origin_for_post_thread_and_media_links() {
+        let chunks = render_at(
+            "[POST=5]p[/POST] [THREAD=7]t[/THREAD] [GALLERY=media, 9]g[/GALLERY]",
+            "https://forum.example/",
+        );
+        let urls: Vec<&str> = chunks
+            .iter()
+            .filter_map(|c| match c {
+                Chunk::Link(_, url, _) => Some(url.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            urls,
+            ["https://forum.example/posts/5/", "https://forum.example/threads/7/", "https://forum.example/media/9/"]
+        );
+        assert!(!format!("{chunks:?}").contains("windowsforum"), "{chunks:?}");
+    }
+
     #[test]
     fn gallery_embed_links_the_media_item() {
         let captioned = render(

@@ -315,8 +315,13 @@ pub enum Msg {
     /// a message from a superseded flow (the user pressed Enter again after a
     /// denied approval) is dropped instead of overwriting the live one —
     /// issue #547.
-    LoginReady { generation: u64, url: String },
+    /// A link is ready and `mode` says which flow is behind it (never
+    /// `Auto`: the relay probe has already happened by now).
+    LoginReady { generation: u64, url: String, mode: common::site::LoginMode },
     LoginFailed { generation: u64, message: String },
+    /// A flow that is still running has something to say — a rejected
+    /// paste, say. Shown as the screen's error line; nothing else changes.
+    LoginNotice { generation: u64, message: String },
     LoginComplete { generation: u64, result: Result<User, TaskError> },
     NodesLoaded { load_id: u64, result: TaskResult<Vec<Node>> },
     /// A forum page came back. `node_id` is the forum that was asked for, so
@@ -417,7 +422,26 @@ pub enum Msg {
     /// insert-vs-delete is what decides the wording, and the ♡/▲ footer is
     /// baked into the post lines, so the page is re-fetched (issue #538).
     PostToggled { verb: PostVerb, result: TaskResult<Toggle> },
+    /// The self-update check answered (#722). Not session work: it carries
+    /// its own `generation` (`App::update_generation`) and is never wrapped
+    /// in `Session`, so a sign-out mid-check does not lose it.
+    UpdateChecked {
+        generation: u64,
+        forced: bool,
+        result: Result<common::update::Outcome, String>,
+    },
+    /// A draft-relay call answered 404: this site has no TuiLink draft
+    /// endpoint, so the mirror stops asking (drafts stay local).
+    DraftRelayAbsent,
     Notice(String),
+}
+
+/// A draft-relay error that means "no such route": stock XenForo answers an
+/// unknown API route with its envelope and HTTP 404 (`Error::Api`), and
+/// `TaskError` keeps the status. Anything else — a 403, a 5xx, a dropped
+/// connection — says nothing about whether the add-on is installed.
+fn relay_route_missing(e: &common::error::Error) -> bool {
+    matches!(e, common::error::Error::Api { status: 404, .. })
 }
 
 /// Wrap a message produced by work that belongs to the current authenticated
@@ -612,6 +636,28 @@ pub struct App {
     /// client is still polling stops that poll loop instead of leaving two
     /// flows racing for the same screen.
     login_task: Option<tokio::task::AbortHandle>,
+    /// The live login flow's paste channel: what `Action::LoginPaste` sends
+    /// on, and what the loopback/paste flows wait on beside their listener.
+    login_paste_tx: Option<mpsc::UnboundedSender<String>>,
+    /// Self-update (#722): the resolved feed/paths/platform, what the reader
+    /// has been told, which check is the live one, and its abort handle —
+    /// the login flow's shape, because like a login it belongs to no session.
+    /// The forum this process talks to (`common::site`): brand, quick
+    /// destinations, add-on flags, login mode. Fixed for the process; the
+    /// screens get a copy through `Screen::set_site`.
+    site: Arc<common::site::SiteConfig>,
+    /// Where the Setup screen writes the site it collects
+    /// (`site::config_path()`; a scratch file under test).
+    config_path: std::path::PathBuf,
+    /// Whether `/api/wf-tui-drafts` exists on this site. `features.drafts_relay`
+    /// pins it; `None` there means the first 404 flips this off for the
+    /// session (`Msg::DraftRelayAbsent`), so a stock forum costs one log
+    /// line, not one per keystroke-save.
+    drafts_relay_absent: bool,
+    update_cfg: common::update::UpdateConfig,
+    update: update::UpdateState,
+    update_generation: u64,
+    update_task: Option<tokio::task::AbortHandle>,
     /// The body zone of the last frame (between the header band and the key
     /// bar). The wheel scrolls what is inside it and nothing else (#549).
     body_rect: ratatui::layout::Rect,
@@ -780,13 +826,25 @@ mod terminal_guard_tests {
     }
 }
 
-pub async fn run(images: crate::images::Images) -> u8 {
+/// `just_applied` is the version `update::apply_pending_update` swapped in
+/// before the terminal was touched: this process is still the old image, so
+/// it shows the restart chip and skips its own check.
+///
+/// `needs_setup` is the generic edition's first run: `site` is the
+/// placeholder and the Setup screen comes up instead of sign-in.
+pub async fn run(
+    images: crate::images::Images,
+    update_cfg: common::update::UpdateConfig,
+    just_applied: Option<String>,
+    site: Arc<common::site::SiteConfig>,
+    needs_setup: bool,
+) -> u8 {
     // Every fallible step that can be done on the normal screen happens
     // BEFORE `TerminalGuard::new()` enters the alternate screen. Once the
     // guard exists, an `eprintln!` here would land on the alt screen and be
     // erased the instant `_guard` drops and issues `LeaveAlternateScreen` —
     // the same tty, so the message never reaches the user (issue #546).
-    let client = match WfApiClient::new() {
+    let client = match WfApiClient::for_site(&site) {
         Ok(c) => Arc::new(c),
         Err(e) => {
             eprintln!("client init failed: {e}");
@@ -827,7 +885,8 @@ pub async fn run(images: crate::images::Images) -> u8 {
         tokio::spawn(forward_signals(tx));
     }
 
-    let draft_store = common::drafts::Store::new();
+    let draft_store = common::drafts::Store::for_site(&site.name);
+    let theme = Theme::detect_with(site.brand.chrome_bg);
     let mut app = App {
         next_list_seq: 1,
         next_load_id: 1,
@@ -836,7 +895,7 @@ pub async fn run(images: crate::images::Images) -> u8 {
         browser_opener: common::oauth::open_browser,
         tx,
         rx,
-        theme: Theme::detect(),
+        theme,
         glyphs: glyph::detect(),
         images,
         image_slots: Arc::new(tokio::sync::Semaphore::new(IMAGE_LOAD_CONCURRENCY)),
@@ -875,6 +934,17 @@ pub async fn run(images: crate::images::Images) -> u8 {
         profile_generation: 0,
         search_generation: 0,
         login_task: None,
+        login_paste_tx: None,
+        site,
+        config_path: common::site::config_path(),
+        drafts_relay_absent: false,
+        update_cfg,
+        update: match just_applied {
+            Some(version) => update::UpdateState::JustApplied { version },
+            None => update::UpdateState::Idle,
+        },
+        update_generation: 0,
+        update_task: None,
         body_rect: ratatui::layout::Rect::default(),
         hits: HitMap::new(common::config::mouse_enabled()),
         // Drafts left by the previous run (#715): an Esc or a crash mid-post
@@ -887,7 +957,12 @@ pub async fn run(images: crate::images::Images) -> u8 {
         draft_deletions: std::collections::HashMap::new(),
         draft_relay_tail: std::collections::HashMap::new(),
     };
-    app.bootstrap().await;
+    if needs_setup {
+        app.push_screen(Screen::Setup(screens::setup::SetupState::default()));
+    } else {
+        app.bootstrap().await;
+    }
+    app.schedule_startup_update_check();
     let reader = crate::event::spawn_reader_with_prefix(app.images.take_startup_input());
     let outcome = app.event_loop(&mut terminal, reader).await;
     app.shutdown().await;
@@ -934,6 +1009,7 @@ mod actions;
 mod input;
 mod msg;
 mod session;
+mod update;
 
 impl App {
     /// Show a status *toast* — a one-off success/failure notice ("Reply
@@ -1155,13 +1231,13 @@ impl App {
         self.crumb_targets = crumb_targets;
         let me_name = self.me.as_ref().map(|u| u.username.as_str());
         let (header, badges, crumb_hits) = chrome::header_line_hits(
-            &self.theme,
-            &self.glyphs,
+            &chrome::Chrome::new(&self.theme, &self.glyphs, &self.site.brand),
             &crumbs,
             me_name,
             self.convos_unread,
             self.alerts_unread,
             None,
+            self.update_chip().as_deref(),
             top.width,
         );
         f.render_widget(Paragraph::new(header), top);
@@ -1184,7 +1260,11 @@ impl App {
         if let Screen::ThreadView(v) = screen {
             v.has_draft = draft_here;
         }
+        screen.set_site(&self.site);
         screen.set_image_policy(policy, self.images.sizes());
+        if let Screen::Login(l) = screen {
+            l.has_logo = self.images.has_logo();
+        }
         let screen_title = screen.title().to_string();
         screen.render(f, body, &self.theme, &self.glyphs, &mut self.hits);
         // Hints are read AFTER render (#656): the renderers stamp layout
@@ -1239,7 +1319,8 @@ impl App {
             status_left = Palette::status().to_string();
         }
         if self.prefix.armed() {
-            overlay::render_which_key(f, body, &self.theme, &self.glyphs, &mut self.hits);
+            let cells = overlay::which_key_cells(&self.site);
+            overlay::render_which_key(f, body, &self.theme, &self.glyphs, &cells, &mut self.hits);
         }
         if self.show_help {
             overlay::render_keys_card(
@@ -1432,29 +1513,32 @@ impl App {
             "L",
             Target::Latest,
         ));
-        for (id, title, key) in [
-            (screens::NEWS_NODE, "Windows News", "1"),
-            (screens::SECURITY_NODE, "Security Alerts", "2"),
-            (screens::TUTORIALS_NODE, "Windows Tutorials", "3"),
-        ] {
+        // The site's own quick destinations, under the digits Home gives them.
+        for (q, key) in self.site.quick.iter().zip(screens::QUICK_DIGITS) {
             items.push(Item::action(
-                title.to_string(),
+                q.label.clone(),
                 key,
-                Target::QuickNode(id, title.to_string()),
+                Target::QuickNode(q.node_id, q.label.clone()),
             ));
         }
         items.push(Item::action("Inbox".to_string(), "c", Target::Inbox));
         items.push(Item::action("Alerts".to_string(), "a", Target::Alerts));
-        items.push(Item::action(
-            "Media Gallery".to_string(),
-            "gm",
-            Target::MediaGallery,
-        ));
-        items.push(Item::action(
-            "Resources".to_string(),
-            "gr",
-            Target::Resources,
-        ));
+        // Add-on catalogs only where the site has the add-on: a row that
+        // can only 404 is worse than no row.
+        if self.site.features.xfmg {
+            items.push(Item::action(
+                "Media Gallery".to_string(),
+                "gm",
+                Target::MediaGallery,
+            ));
+        }
+        if self.site.features.xfrm {
+            items.push(Item::action(
+                "Resources".to_string(),
+                "gr",
+                Target::Resources,
+            ));
+        }
         // Named with a count, because the whole point is that a draft you
         // forgot about is otherwise invisible (#716).
         if !self.drafts.is_empty() {
@@ -1465,6 +1549,7 @@ impl App {
             ));
         }
         items.push(Item::action("Search".to_string(), "/", Target::Search));
+        items.push(self.update_palette_item());
         items.push(Item::action("Sign out".to_string(), "^L", Target::SignOut));
         items.push(Item::action("Quit".to_string(), "q", Target::Quit));
         if let Some(tree) = self.tree() {
@@ -1809,7 +1894,11 @@ impl App {
         let Some(xf_key) = key.xf_key() else {
             return;
         };
+        if !self.draft_relay_enabled() {
+            return;
+        }
         let api = self.api.clone();
+        let tx = self.tx.clone();
         let (message, title) = (draft.body.clone(), draft.title.clone());
         let attachment_key = draft.attachment_key.clone();
         let relay = self
@@ -1824,8 +1913,17 @@ impl App {
                 .await
             {
                 tracing::warn!("could not sync draft {xf_key} to the site: {e}");
+                if relay_route_missing(&e) {
+                    tx.send(Msg::DraftRelayAbsent).ok();
+                }
             }
         });
+    }
+
+    /// Whether draft mirroring to the site is on: the site says it has the
+    /// relay (or has not said), and no call has yet found it missing.
+    fn draft_relay_enabled(&self) -> bool {
+        self.site.features.drafts_relay != Some(false) && !self.drafts_relay_absent
     }
 
     /// Forget a draft on the website too.
@@ -1838,7 +1936,11 @@ impl App {
         let Some(xf_key) = key.xf_key() else {
             return;
         };
+        if !self.draft_relay_enabled() {
+            return;
+        }
         let api = self.api.clone();
+        let tx = self.tx.clone();
         let relay = self
             .draft_relay_tail
             .entry(xf_key.clone())
@@ -1848,6 +1950,9 @@ impl App {
             let _guard = relay.lock().await;
             if let Err(e) = api.delete_draft(&xf_key).await {
                 tracing::warn!("could not clear draft {xf_key} on the site: {e}");
+                if relay_route_missing(&e) {
+                    tx.send(Msg::DraftRelayAbsent).ok();
+                }
             }
         });
     }
@@ -1915,6 +2020,9 @@ impl App {
     /// Ask the website for this account's drafts. Errors are logged and
     /// dropped: nothing about the composer depends on this call succeeding.
     fn sync_drafts(&mut self) {
+        if !self.draft_relay_enabled() {
+            return;
+        }
         let api = self.api.clone();
         let tx = self.tx.clone();
         let session_generation = self.session_generation;
@@ -1937,7 +2045,12 @@ impl App {
                     ))
                     .ok();
                 }
-                Err(e) => tracing::warn!("could not read drafts from the site: {e}"),
+                Err(e) => {
+                    tracing::warn!("could not read drafts from the site: {e}");
+                    if relay_route_missing(&e) {
+                        tx.send(Msg::DraftRelayAbsent).ok();
+                    }
+                }
             }
         });
     }
@@ -2029,6 +2142,7 @@ impl App {
             T::Resources => self.execute_action(Action::OpenResources),
             T::Drafts => self.execute_action(Action::OpenDrafts),
             T::Search => self.push_screen(screens::search_state()),
+            T::Update => self.check_for_updates_now(),
             T::SignOut => self.logout(),
             T::Quit => self.should_quit = true,
             T::Member(user_id, name) => self.open_profile(user_id, &name),
@@ -2049,12 +2163,20 @@ impl App {
     /// Run a `g <key>` chord.
     fn go(&mut self, target: GoTarget) {
         match target {
-            GoTarget::News => self.open_quick_node(screens::NEWS_NODE, "Windows News"),
-            GoTarget::Security => self.open_quick_node(screens::SECURITY_NODE, "Security Alerts"),
-            GoTarget::Tutorials => {
-                self.open_quick_node(screens::TUTORIALS_NODE, "Windows Tutorials")
+            GoTarget::Quick(i) => {
+                if let Some(q) = self.site.quick.get(i).cloned() {
+                    self.open_quick_node(q.node_id, &q.label);
+                }
             }
             GoTarget::Latest => self.execute_action(Action::OpenLatestThreads),
+            // The chord letters are fixed, so on a site without the add-on
+            // they still resolve — to a notice, never a silent no-op.
+            GoTarget::Media if !self.site.features.xfmg => {
+                self.set_status("The Media Gallery is not enabled for this site.");
+            }
+            GoTarget::Resources if !self.site.features.xfrm => {
+                self.set_status("Resources are not enabled for this site.");
+            }
             GoTarget::Media => self.execute_action(Action::OpenMediaGallery),
             GoTarget::Resources => self.execute_action(Action::OpenResources),
             GoTarget::Drafts => self.execute_action(Action::OpenDrafts),
@@ -2081,10 +2203,12 @@ impl App {
                     screen.goto_top();
                 }
             }
+            GoTarget::Update => self.check_for_updates_now(),
         }
     }
 
     pub fn push_screen(&mut self, mut screen: Screen) {
+        screen.set_site(&self.site);
         // Restore here rather than at each opener (#715): all four composers
         // — reply, quote-reply, edit, new thread, conversation reply — reach
         // the stack through this one call, so a fifth cannot forget to.
@@ -2522,56 +2646,142 @@ fn capture_active(app: &App) -> bool {
     app.screens.last().map(|s| s.input_capture()).unwrap_or(false)
 }
 
-/// The whole login flow: register a short link, show it, poll for the
-/// authorization code relayed by /tui-done, exchange it. Poll errors are
-/// transient and retried; only expiry/timeout fail the flow.
+/// The whole login flow, in the mode the site (or `m`) asked for:
+///
+/// - `TuiLink`: register a short link with the site's relay, show it, poll
+///   for the code `/tui-done` captured, exchange it. Poll errors are
+///   transient and retried; only expiry/denial/timeout fail the flow.
+/// - `Loopback`: bind 127.0.0.1, point the browser at `/oauth2/authorize`
+///   with that redirect, and take the code from whichever comes first —
+///   the browser's redirect or a paste (`p`).
+/// - `Paste`: the same authorize URL with a portless loopback redirect the
+///   browser cannot load; the user pastes the address it landed on.
+///
+/// `Auto` tries them in that order: a relay route that is missing (404)
+/// falls through to loopback, a loopback bind that is refused falls through
+/// to paste. Any other failure is reported — a transport error says nothing
+/// about which modes the site supports.
 async fn run_login_flow(
     tx: &mpsc::UnboundedSender<Msg>,
     client: Arc<WfApiClient>,
     generation: u64,
     browser_opener: BrowserOpener,
+    site: Arc<common::site::SiteConfig>,
+    mode: common::site::LoginMode,
+    mut paste_rx: mpsc::UnboundedReceiver<String>,
 ) -> Result<(), String> {
-    let client_id = common::config::oauth_client_id().map_err(|e| e.to_string())?;
-    let http = common::http::build().map_err(|e| e.to_string())?;
+    use common::site::LoginMode;
+    const LOGIN_TIMEOUT: Duration = Duration::from_secs(600);
+
+    let client_id = client.client_id().to_string();
+    let http = common::http::build_with_ua(&site.user_agent()).map_err(|e| e.to_string())?;
     let pkce = common::oauth::generate_pkce();
     let state = common::oauth::generate_state();
+    let scopes = site.effective_scopes();
 
     // The origin comes from the client, not `config::base_url()`: the flow
     // must talk to the same site the session will be stored for, and a test
     // that ever polls this task can only reach the client's harmless base
     // (issue #565).
     let base = client.base_url().to_string();
-    let link = common::oauth::register_link(&http, &base, &state, &pkce.challenge)
+
+    // ---- 1. the relay
+    let mut mode = mode;
+    if matches!(mode, LoginMode::Auto | LoginMode::TuiLink) && site.features.tuilink != Some(false) {
+        match common::oauth::register_link(&http, &base, &state, &pkce.challenge).await {
+            Ok(link) => {
+                tx.send(Msg::LoginReady { generation, url: link.url.clone(), mode: LoginMode::TuiLink }).ok();
+                let _ = browser_opener(&link.url);
+                for _ in 0..300 {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    match common::oauth::poll_link(&http, &base, &link.id).await {
+                        Ok(common::oauth::PollStatus::Authorized(code)) => {
+                            let tokens = common::oauth::exchange_code(
+                                &http,
+                                &base,
+                                &code,
+                                &format!("{base}/tui-done"),
+                                &pkce.verifier,
+                                &client_id,
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?;
+                            finish_login(tx, client, tokens, generation).await;
+                            return Ok(());
+                        }
+                        Ok(common::oauth::PollStatus::Expired) => {
+                            return Err("login link expired — press Enter to start again".into());
+                        }
+                        Ok(common::oauth::PollStatus::Denied) => {
+                            return Err("authorization was denied — press Enter to start again".into());
+                        }
+                        Ok(common::oauth::PollStatus::Waiting) => {}
+                        Err(e) => tracing::warn!("login poll error (retrying): {e}"),
+                    }
+                }
+                return Err(
+                    "timed out waiting for approval — press Enter to start again, or m to switch \
+                     to loopback if the site's OAuth client lacks the /tui-done redirect"
+                        .into(),
+                );
+            }
+            Err(e) if mode == LoginMode::Auto && common::oauth::is_route_missing(&e) => {
+                tracing::info!("no TuiLink relay on {base}; falling back to loopback");
+                mode = LoginMode::Loopback;
+            }
+            Err(e) if mode == LoginMode::TuiLink && common::oauth::is_route_missing(&e) => {
+                return Err("this site has no TuiLink relay — press m for loopback or paste mode".into());
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    } else if mode == LoginMode::Auto {
+        mode = LoginMode::Loopback;
+    }
+
+    // ---- 2. loopback, else 3. paste
+    let (listener, redirect_uri, mode) = match mode {
+        LoginMode::Loopback | LoginMode::Auto => match common::oauth::bind_loopback().await {
+            Ok((l, uri)) => (Some(l), uri, LoginMode::Loopback),
+            Err(e) if mode == LoginMode::Auto => {
+                tracing::info!("cannot bind a loopback listener ({e}); falling back to paste");
+                (None, common::oauth::PASTE_REDIRECT_URI.to_string(), LoginMode::Paste)
+            }
+            Err(e) => return Err(format!("{e} — press m for paste mode")),
+        },
+        _ => (None, common::oauth::PASTE_REDIRECT_URI.to_string(), LoginMode::Paste),
+    };
+    let url = common::oauth::authorize_url(&base, &pkce, &state, &redirect_uri, &client_id, &scopes);
+    tx.send(Msg::LoginReady { generation, url: url.clone(), mode }).ok();
+    let _ = browser_opener(&url);
+
+    // A paste is accepted in both modes; a bad one is reported and the flow
+    // keeps waiting rather than making the reader start over.
+    let pasted = async {
+        while let Some(text) = paste_rx.recv().await {
+            match common::oauth::code_from_pasted(&text, &state) {
+                Ok(code) => return Ok(code),
+                Err(e) => {
+                    tx.send(Msg::LoginNotice { generation, message: format!("{e} — try again") }).ok();
+                }
+            }
+        }
+        Err(common::error::Error::Handshake("the sign-in screen went away".into()))
+    };
+    let code = match listener {
+        Some(listener) => tokio::select! {
+            r = common::oauth::wait_for_redirect(listener, &state, LOGIN_TIMEOUT) => r,
+            r = pasted => r,
+        },
+        None => tokio::time::timeout(LOGIN_TIMEOUT, pasted)
+            .await
+            .unwrap_or_else(|_| Err(common::error::Error::Handshake("timed out waiting for the pasted address".into()))),
+    }
+    .map_err(|e| format!("{e} — press Enter to start again"))?;
+    let tokens = common::oauth::exchange_code(&http, &base, &code, &redirect_uri, &pkce.verifier, &client_id)
         .await
         .map_err(|e| e.to_string())?;
-    tx.send(Msg::LoginReady { generation, url: link.url.clone() }).ok();
-    let _ = browser_opener(&link.url);
-
-    for _ in 0..300 {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        match common::oauth::poll_link(&http, &base, &link.id).await {
-            Ok(common::oauth::PollStatus::Authorized(code)) => {
-                let tokens = common::oauth::exchange_code(
-                    &http,
-                    &base,
-                    &code,
-                    &format!("{base}/tui-done"),
-                    &pkce.verifier,
-                    &client_id,
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                finish_login(tx, client, tokens, generation).await;
-                return Ok(());
-            }
-            Ok(common::oauth::PollStatus::Expired) => {
-                return Err("login link expired — press Enter to start again".into());
-            }
-            Ok(common::oauth::PollStatus::Waiting) => {}
-            Err(e) => tracing::warn!("login poll error (retrying): {e}"),
-        }
-    }
-    Err("timed out waiting for approval — press Enter to start again".into())
+    finish_login(tx, client, tokens, generation).await;
+    Ok(())
 }
 
 /// Exchange completion shared by browser and paste paths: persist tokens,
@@ -4723,9 +4933,9 @@ mod tests {
         let store_path = scratch_config_dir().join("token-race-574.json");
         let _ = std::fs::remove_file(&store_path);
         let store = common::token::Store::with_path(store_path.clone());
-        let client = Arc::new(WfApiClient::with_store(store, server.uri()).expect("client init"));
+        let client = Arc::new(WfApiClient::with_store(store, server.uri(), "test-client").expect("client init"));
         client
-            .set_tokens(common::token::TokenSet {
+            .set_tokens(common::token::TokenSet { origin: String::new(), client_id: String::new(),
                 access_token: "old-access".into(),
                 refresh_token: "old-refresh".into(),
                 expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -4747,7 +4957,7 @@ mod tests {
 
         // A sign-in lands here — exactly what `finish_login` does.
         client
-            .set_tokens(common::token::TokenSet {
+            .set_tokens(common::token::TokenSet { origin: String::new(), client_id: String::new(),
                 access_token: "new-access".into(),
                 refresh_token: "new-refresh".into(),
                 expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -4931,9 +5141,9 @@ mod tests {
         let store_path = scratch_config_dir().join("token-580.json");
         let _ = std::fs::remove_file(&store_path);
         let store = common::token::Store::with_path(store_path.clone());
-        let client = Arc::new(WfApiClient::with_store(store, OFFLINE_BASE).expect("client init"));
+        let client = Arc::new(WfApiClient::with_store(store, OFFLINE_BASE, "test-client").expect("client init"));
         client
-            .set_tokens(common::token::TokenSet {
+            .set_tokens(common::token::TokenSet { origin: String::new(), client_id: String::new(),
                 access_token: "old-access".into(),
                 refresh_token: "old-refresh".into(),
                 expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -4945,7 +5155,7 @@ mod tests {
         // process's knowledge — written straight to the store, bypassing
         // `client`, exactly like a second `wftui` sharing the config dir.
         common::token::Store::with_path(store_path)
-            .save(&common::token::TokenSet {
+            .save(&common::token::TokenSet { origin: String::new(), client_id: String::new(),
                 access_token: "sibling-access".into(),
                 refresh_token: "sibling-refresh".into(),
                 expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -5028,9 +5238,9 @@ mod tests {
         let store_path = scratch_config_dir().join("token-587-pollers.json");
         let _ = std::fs::remove_file(&store_path);
         let store = common::token::Store::with_path(store_path.clone());
-        let client = Arc::new(WfApiClient::with_store(store, OFFLINE_BASE).expect("client init"));
+        let client = Arc::new(WfApiClient::with_store(store, OFFLINE_BASE, "test-client").expect("client init"));
         client
-            .set_tokens(common::token::TokenSet {
+            .set_tokens(common::token::TokenSet { origin: String::new(), client_id: String::new(),
                 access_token: "old-access".into(),
                 refresh_token: "old-refresh".into(),
                 expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -5041,7 +5251,7 @@ mod tests {
         // A sibling instance rotated the refresh token on disk without this
         // process's knowledge.
         common::token::Store::with_path(store_path)
-            .save(&common::token::TokenSet {
+            .save(&common::token::TokenSet { origin: String::new(), client_id: String::new(),
                 access_token: "sibling-access".into(),
                 refresh_token: "sibling-refresh".into(),
                 expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -5115,9 +5325,9 @@ mod tests {
         let store_path = scratch_config_dir().join("token-587-oauth-poller.json");
         let _ = std::fs::remove_file(&store_path);
         let store = common::token::Store::with_path(store_path.clone());
-        let client = Arc::new(WfApiClient::with_store(store, OFFLINE_BASE).expect("client init"));
+        let client = Arc::new(WfApiClient::with_store(store, OFFLINE_BASE, "test-client").expect("client init"));
         client
-            .set_tokens(common::token::TokenSet {
+            .set_tokens(common::token::TokenSet { origin: String::new(), client_id: String::new(),
                 access_token: "old-access".into(),
                 refresh_token: "old-refresh".into(),
                 expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -5126,7 +5336,7 @@ mod tests {
             .await
             .unwrap();
         common::token::Store::with_path(store_path)
-            .save(&common::token::TokenSet {
+            .save(&common::token::TokenSet { origin: String::new(), client_id: String::new(),
                 access_token: "sibling-access".into(),
                 refresh_token: "sibling-refresh".into(),
                 expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -5883,7 +6093,7 @@ mod tests {
     /// or erase the machine owner's `token.json`) and an unreachable origin.
     fn offline_client() -> Arc<WfApiClient> {
         let store = common::token::Store::with_path(scratch_config_dir().join("token.json"));
-        let client = WfApiClient::with_store(store, OFFLINE_BASE).expect("client init");
+        let client = WfApiClient::with_store(store, OFFLINE_BASE, "test-client").expect("client init");
         // Checked on every single `test_app()`, not just in the guard test:
         // if someone ever swaps this back to `WfApiClient::new()`, every
         // test in the crate fails loudly instead of quietly reading (and
@@ -6604,6 +6814,30 @@ mod tests {
         let drafts = app.draft_store.path();
         assert!(drafts.starts_with(&scratch), "draft store escaped the scratch dir: {drafts:?}");
         assert!(!drafts.starts_with(&real), "draft store resolved the real config dir: {drafts:?}");
+        // #722: a staged update is the fourth, and the "binary" a test would
+        // swap must be a scratch file — never this test runner.
+        let update_root = &app.update_cfg.root;
+        assert!(update_root.starts_with(&scratch), "update root escaped the scratch dir: {update_root:?}");
+        assert!(!update_root.starts_with(&real), "update root resolved the real config dir: {update_root:?}");
+        let exe = app.update_cfg.exe.as_ref().expect("test exe");
+        assert!(exe.starts_with(&scratch), "the update target is not a scratch file: {exe:?}");
+        assert!(!app.update_cfg.feed_url.contains("github.com"), "a test must never ask the real feed");
+        // The Setup screen's file is this app's own scratch file.
+        assert!(app.config_path.starts_with(&scratch), "{:?}", app.config_path);
+        // Per-site files (the generalised client): every site's store, and
+        // the config file itself, resolve under the scratch dir too.
+        // These resolve from `WFTUI_CONFIG_DIR` (the suite's scratch, set by
+        // the harness) rather than from this app's own paths, so the one
+        // thing to prove is that they are not the operator's.
+        for path in [
+            common::config::token_path_for("other-site"),
+            common::config::drafts_path_for("other-site"),
+            common::site::config_path(),
+        ] {
+            assert!(!path.starts_with(&real), "resolved the real config dir: {path:?}");
+        }
+        assert_eq!(app.site.origin, "https://windowsforum.com", "the built-in site's origin is only a label here");
+        assert_eq!(app.client.base_url(), OFFLINE_BASE, "…the client itself is pinned offline");
 
         // 3. The origin is unreachable, and the API seam is a stub, not the
         //    network client (`me()` answers without a request).
@@ -6624,7 +6858,7 @@ mod tests {
         );
         assert!(
             poisoned
-                .save(&common::token::TokenSet {
+                .save(&common::token::TokenSet { origin: String::new(), client_id: String::new(),
                     access_token: "guard".into(),
                     refresh_token: "guard".into(),
                     expires_at: 0,
@@ -6725,6 +6959,26 @@ mod tests {
             profile_generation: 0,
             search_generation: 0,
             login_task: None,
+            login_paste_tx: None,
+            // The built-in site, exactly as shipped: every existing test
+            // was written against it.
+            site: Arc::new(common::site::SiteConfig::windowsforum()),
+            config_path: scratch_config_dir().join(format!(
+                "config-{}.json",
+                TEST_DRAFT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            )),
+            drafts_relay_absent: false,
+            // Scratch root, unreachable feed, and a scratch "binary" that is
+            // not under any cargo target dir (#722).
+            update_cfg: common::update::UpdateConfig::for_test(
+                scratch_config_dir().join("update"),
+                format!("{OFFLINE_BASE}/latest"),
+                scratch_config_dir().join("bin").join("wftui"),
+                env!("CARGO_PKG_VERSION"),
+            ),
+            update: update::UpdateState::Idle,
+            update_generation: 0,
+            update_task: None,
             body_rect: ratatui::layout::Rect::default(),
             // Tests build the map enabled: every hit-map test drives it
             // directly, and `WFTUI_MOUSE` is process-global (the env lock
@@ -6794,12 +7048,13 @@ mod tests {
     #[test]
     fn no_direct_status_writes_bypass_set_status_or_set_hint() {
         let src = format!(
-            "{}{}{}{}{}",
+            "{}{}{}{}{}{}",
             include_str!("mod.rs"),
             include_str!("actions.rs"),
             include_str!("input.rs"),
             include_str!("msg.rs"),
             include_str!("session.rs"),
+            include_str!("update.rs"),
         );
         let direct_writes: Vec<&str> = src
             .lines()
@@ -6843,7 +7098,7 @@ mod tests {
     /// disagree.
     #[test]
     fn every_app_module_is_covered_by_the_source_scans() {
-        const SCANNED: [&str; 5] = ["mod.rs", "actions.rs", "input.rs", "msg.rs", "session.rs"];
+        const SCANNED: [&str; 6] = ["mod.rs", "actions.rs", "input.rs", "msg.rs", "session.rs", "update.rs"];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("app");
         let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
             .expect("app module dir")
@@ -6872,7 +7127,7 @@ mod tests {
         let mut app = test_app();
         app.screens.push(screens::login_state());
         if let Some(Screen::Login(ls)) = app.screens.last_mut() {
-            ls.stage = screens::LoginStage::Waiting;
+            ls.stage = screens::LoginStage::Waiting { mode: common::site::LoginMode::TuiLink };
             ls.url = "https://windowsforum.com/tui-start/abc123".into();
         }
         assert!(app.me.is_none());
@@ -7068,6 +7323,791 @@ mod tests {
         let view = inbox.view.as_ref().expect("the view survives");
         assert_eq!(view.page, 7, "the in-flight load was not replaced");
         assert!(view.loading);
+    }
+
+
+    // ---------------------------------------------------------------- setup
+
+    /// The generic edition's first run: a bad answer stays on the Setup
+    /// screen with the reason under the fields; a good one is written to
+    /// `config.json`, becomes the process's site, and sign-in starts.
+    #[tokio::test]
+    async fn setup_screen_validates_and_writes_config_then_starts_login() {
+        let mut app = test_app();
+        let path = app.config_path.clone();
+        let _ = std::fs::remove_file(&path);
+        let dir = path.parent().unwrap().to_path_buf();
+        app.site = Arc::new(common::site::SiteConfig::placeholder());
+        app.push_screen(Screen::Setup(screens::setup::SetupState::default()));
+        let text = frame_text(&mut app, 120, 30);
+        assert!(text.contains("Set up") && text.contains("Terminal") && text.contains("Forum address"), "{text}");
+
+        // Refused: no client id. The screen keeps the fields and says why.
+        app.execute_action(Action::SetupSite { origin: "https://forum.example.com".into(), client_id: "".into(), name: "Example".into() });
+        let Some(Screen::Setup(s)) = app.screens.last() else { panic!("stays on Setup") };
+        assert!(s.errors.iter().any(|e| e.contains("oauth_client_id")), "{:?}", s.errors);
+        assert!(!path.exists(), "nothing is written for a refused site");
+
+        // Accepted: config.json gains the site as default, the app is now
+        // that site, and the login flow is running for it.
+        app.execute_action(Action::SetupSite { origin: "http://127.0.0.1:1/".into(), client_id: "test-client".into(), name: "Example Forum".into() });
+        assert!(!app.screens.iter().any(|s| matches!(s, Screen::Setup(_))), "Setup is gone");
+        assert!(matches!(app.screens.last(), Some(Screen::Login(_))), "sign-in is up");
+        assert_eq!(app.site.name, "127-0-0-1");
+        assert_eq!(app.site.origin, "http://127.0.0.1:1");
+        assert_eq!(app.site.brand.name, "Example Forum");
+        assert_eq!(app.site.brand.mark, "EX");
+        assert_eq!(app.client.base_url(), "http://127.0.0.1:1");
+        assert_eq!(app.client.client_id(), "test-client");
+        assert!(app.client.store_path().ends_with("sites/127-0-0-1/token.json"), "{:?}", app.client.store_path());
+        assert!(app.login_task.is_some(), "begin_login ran for the new site");
+        let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["default_site"], "127-0-0-1");
+        assert_eq!(written["sites"][0]["origin"], "http://127.0.0.1:1");
+        assert_eq!(written["sites"][0]["oauth_client_id"], "test-client");
+        // And the loader agrees with what was written.
+        let cfg = common::site::Config::load(&path).unwrap();
+        let again = common::site::resolve(&cfg, None, &dir).unwrap();
+        assert_eq!(again.brand.name, "Example Forum");
+        let Some(Screen::Login(ls)) = app.screens.last() else { panic!() };
+        assert!(Arc::ptr_eq(&ls.site, &app.site), "the pushed login screen carries the new site");
+
+        // Re-saving the same site replaces its entry rather than duplicating it.
+        let mut site = (*app.site).clone();
+        site.brand.name = "Renamed".into();
+        common::site::save_site(&path, &site).unwrap();
+        let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["sites"].as_array().unwrap().len(), 1);
+        assert_eq!(written["sites"][0]["brand"]["name"], "Renamed");
+
+        app.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Typing and pasting land in the active field; the Setup screen never
+    /// lets a letter fall through to a global key.
+    #[tokio::test]
+    async fn setup_fields_capture_typing_and_paste() {
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "x".into(), ..Default::default() });
+        app.push_screen(Screen::Setup(screens::setup::SetupState::default()));
+        for c in "https://f.example".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.clipboard = "cid-1".into();
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        app.handle_paste("23\n".into());
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert!(!app.prefix.armed(), "g is a letter in a field");
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.should_quit, "q is a letter in a field");
+        let Some(Screen::Setup(s)) = app.screens.last() else { panic!() };
+        assert_eq!(s.origin, "https://f.example");
+        assert_eq!(s.client_id, "cid-123gq");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.should_quit, "Esc quits: nothing is behind Setup");
+    }
+
+    // --------------------------------------------------------- site gating
+
+    fn site_without_addons() -> Arc<common::site::SiteConfig> {
+        let mut site = common::site::SiteConfig::blank("plain");
+        site.origin = "http://127.0.0.1:1".into();
+        site.oauth_client_id = "test-client".into();
+        Arc::new(site)
+    }
+
+    /// `g m` / `g r` are fixed chords, so on a site without the add-on they
+    /// must still answer — with a notice, never a silent no-op or a 404.
+    #[tokio::test]
+    async fn go_media_on_a_site_without_xfmg_notices() {
+        let mut app = test_app();
+        app.site = site_without_addons();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.screens.push(screens::home_state(false));
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(matches!(app.screens.last(), Some(Screen::Home(_))), "no gallery screen was pushed");
+        assert!(app.status.contains("Media Gallery is not enabled"), "{}", app.status);
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(app.status.contains("Resources are not enabled"), "{}", app.status);
+        // A site chord the plain site does not declare cancels silently.
+        app.status.clear();
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(app.status.is_empty() && matches!(app.screens.last(), Some(Screen::Home(_))));
+    }
+
+    #[tokio::test]
+    async fn palette_hides_media_and_resources_when_features_off() {
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.screens.push(screens::home_state(false));
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        let titles = app.palette.as_ref().unwrap().titles();
+        for t in ["Windows News", "Security Alerts", "Windows Tutorials", "Media Gallery", "Resources"] {
+            assert!(titles.iter().any(|x| x == t), "built-in palette lacks {t}: {titles:?}");
+        }
+        app.palette = None;
+        app.site = site_without_addons();
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        let titles = app.palette.as_ref().unwrap().titles();
+        for t in ["Windows News", "Media Gallery", "Resources"] {
+            assert!(!titles.iter().any(|x| x == t), "a plain site must not offer {t}: {titles:?}");
+        }
+        assert!(titles.iter().any(|x| x == "Latest posts") && titles.iter().any(|x| x == "Check for updates"));
+    }
+
+    /// The which-key panel reflows to the site: no quick row at all, or
+    /// nine quick chords over three rows — and fits an 80×24 body either way.
+    #[test]
+    fn which_key_fits_with_zero_and_nine_quick_nodes_at_80x24() {
+        let mut nine = common::site::SiteConfig::blank("nine");
+        nine.quick = "bcefjknoq"
+            .chars()
+            .enumerate()
+            .map(|(i, key)| common::site::QuickNode { key, label: format!("Forum {i}"), node_id: i as u32 + 1 })
+            .collect();
+        for (site, rows) in [(common::site::SiteConfig::blank("zero"), 3), (nine, 6)] {
+            let cells = overlay::which_key_cells(&site);
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            let theme = Theme::truecolor();
+            term.draw(|f| {
+                let body = ratatui::layout::Rect::new(0, 1, 80, 21);
+                overlay::render_which_key(f, body, &theme, &glyph::UNICODE, &cells, &mut HitMap::default());
+            })
+            .unwrap();
+            let buf = term.backend().buffer().clone();
+            let text: Vec<String> = (0..24)
+                .map(|y| (0..80).map(|x| buf[(x, y)].symbol().to_string()).collect())
+                .collect();
+            let drawn = text.iter().filter(|l| l.contains('\u{2502}') || l.contains('\u{256D}') || l.contains('\u{2570}')).count();
+            assert_eq!(drawn, rows + 2, "{} cells → {rows} rows plus the border:\n{}", cells.len(), text.join("\n"));
+            for (key, _) in &cells {
+                assert!(text.iter().any(|l| l.contains(&format!(" {key} "))), "cap {key} missing");
+            }
+        }
+    }
+
+    /// Home's digits are the site's quick list: a digit past the end is not
+    /// advertised and does nothing, a digit inside it opens that forum.
+    #[tokio::test]
+    async fn quick_digit_beyond_the_list_is_not_advertised() {
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        let mut one = common::site::SiteConfig::blank("one");
+        one.origin = "http://127.0.0.1:1".into();
+        one.oauth_client_id = "test-client".into();
+        one.quick = vec![common::site::QuickNode { key: 'n', label: "News".into(), node_id: 12 }];
+        app.site = Arc::new(one);
+        // Through `push_screen`, which stamps the site — a bare `Vec::push`
+        // would leave the tree on the built-in list until the first frame.
+        app.push_screen(screens::home_state(false));
+        let hints = app.screens.last().unwrap().hints();
+        assert!(!hints.keys.iter().any(|(k, _)| k.starts_with('1')), "Home never advertised digits: {:?}", hints.keys);
+        let tree = Screen::ForumTree(screens::ForumTreeState { site: app.site.clone(), ..Default::default() });
+        let caps: Vec<&str> = tree.hints().keys.iter().map(|(k, _)| *k).collect();
+        assert!(caps.contains(&"1") && !caps.contains(&"1/2/3"), "{caps:?}");
+        let builtin = Screen::ForumTree(screens::ForumTreeState::default());
+        let caps: Vec<&str> = builtin.hints().keys.iter().map(|(k, _)| *k).collect();
+        assert!(caps.contains(&"1/2/3"), "{caps:?}");
+        let zero = screens::ForumTreeState { site: site_without_addons(), ..Default::default() };
+        let caps: Vec<&str> = Screen::ForumTree(zero).hints().keys.iter().map(|(k, _)| *k).collect();
+        assert!(!caps.iter().any(|k| k.starts_with('1')), "{caps:?}");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert!(matches!(app.screens.last(), Some(Screen::Home(_))), "digit 2 has no forum on this site");
+        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert!(
+            matches!(app.screens.last(), Some(Screen::ThreadList(l)) if l.node_id == 12 && l.title == "News"),
+            "digit 1 opens the site's first quick forum"
+        );
+        // And the Home tree draws the QUICK block from the same list.
+        app.screens.truncate(1);
+        let text = frame_text(&mut app, 120, 30);
+        assert!(text.contains(" 1  News") && !text.contains("Windows News"), "{text}");
+    }
+
+    /// The first 404 from the draft relay turns the mirror off for the
+    /// session: later saves and deletes spawn nothing, and `drafts.json`
+    /// keeps working. A site that pins `drafts_relay: false` never asks.
+    #[tokio::test]
+    async fn draft_relay_404_stops_further_relay_calls() {
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        assert!(app.draft_relay_enabled());
+        app.handle_msg(Msg::DraftRelayAbsent);
+        assert!(!app.draft_relay_enabled());
+        let before = app.session_handles.len();
+        app.push_draft(
+            common::drafts::DraftKey::ThreadReply(5),
+            &common::drafts::Draft { body: "words".into(), ..Default::default() },
+        );
+        app.drop_remote_draft(common::drafts::DraftKey::ThreadReply(5));
+        app.sync_drafts();
+        assert_eq!(app.session_handles.len(), before, "no relay task after a 404");
+
+        let mut pinned = test_app();
+        let mut site = common::site::SiteConfig::windowsforum();
+        site.features.drafts_relay = Some(false);
+        pinned.site = Arc::new(site);
+        assert!(!pinned.draft_relay_enabled());
+        assert!(relay_route_missing(&common::error::Error::Api {
+            code: "route_not_found".into(),
+            message: "".into(),
+            status: 404,
+            max_page: None
+        }));
+        assert!(!relay_route_missing(&common::error::Error::NoToken));
+    }
+
+    // ----------------------------------------------------------- login modes
+
+    /// What a login flow said, in order — `Msg` is neither `Clone` nor
+    /// `Debug`, so the drain records the parts a test asserts on.
+    #[derive(Debug, PartialEq)]
+    enum LoginEvent {
+        Ready(common::site::LoginMode, String),
+        Notice(String),
+        Failed(String),
+        Complete(bool),
+    }
+
+    /// Feed every message the flow sends through `handle_msg` until it
+    /// settles (`LoginFailed` / `LoginComplete`) or `deadline` passes.
+    async fn drain_login(app: &mut App, deadline: Duration) -> Vec<LoginEvent> {
+        let mut events = Vec::new();
+        let until = tokio::time::Instant::now() + deadline;
+        loop {
+            let msg = match tokio::time::timeout_at(until, app.rx.recv()).await {
+                Ok(Some(m)) => m,
+                _ => break,
+            };
+            let done = match &msg {
+                Msg::LoginReady { url, mode, .. } => {
+                    events.push(LoginEvent::Ready(*mode, url.clone()));
+                    false
+                }
+                Msg::LoginNotice { message, .. } => {
+                    events.push(LoginEvent::Notice(message.clone()));
+                    false
+                }
+                Msg::LoginFailed { message, .. } => {
+                    events.push(LoginEvent::Failed(message.clone()));
+                    true
+                }
+                Msg::LoginComplete { result, .. } => {
+                    events.push(LoginEvent::Complete(result.is_ok()));
+                    true
+                }
+                _ => false,
+            };
+            app.handle_msg(msg);
+            if done {
+                break;
+            }
+        }
+        events
+    }
+
+    /// The `state` an authorize URL carries.
+    fn state_of(url: &str) -> String {
+        url.split('?')
+            .nth(1)
+            .unwrap_or("")
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("state="))
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// A "browser" for the loopback test: it reads the redirect URI and the
+    /// state out of the authorize URL and, from another thread, lands on the
+    /// redirect with a code — what a real browser does after approval.
+    fn redirecting_browser(url: &str) -> common::error::Result<()> {
+        let redirect = url
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("redirect_uri="))
+            .unwrap_or("")
+            .replace("%3A", ":")
+            .replace("%2F", "/");
+        let state = state_of(url);
+        let Some(host_port) = redirect.strip_prefix("http://").and_then(|r| r.split('/').next()) else {
+            return Ok(());
+        };
+        let host_port = host_port.to_string();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            if let Ok(mut s) = std::net::TcpStream::connect(&host_port) {
+                let _ = write!(s, "GET /callback?code=thecode&state={state} HTTP/1.1\r\nHost: x\r\n\r\n");
+                let _ = s.flush();
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        Ok(())
+    }
+
+    /// A mock forum with a working token endpoint and `/me`, whose relay
+    /// answers as `mount_register` says.
+    async fn oauth_server() -> wiremock::MockServer {
+        use wiremock::matchers::{body_string_contains, method, path};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .and(path("/api/oauth2/token"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .and(body_string_contains("code=thecode"))
+            .and(body_string_contains("client_id=test-client"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "tok-1", "refresh_token": "refresh-1",
+                "expires_in": 7200, "token_type": "bearer", "scope": "test"
+            })))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(method("GET"))
+            .and(path("/api/me"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"me": {"user_id": 7, "username": "kemical"}}),
+            ))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// What stock XenForo answers for a route no add-on provides.
+    async fn mount_register(server: &wiremock::MockServer, status: u16) {
+        use wiremock::matchers::{method, path};
+        wiremock::Mock::given(method("POST"))
+            .and(path("/api/wf-tuilink/register"))
+            .respond_with(wiremock::ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                "errors": [{"code": "route_not_found", "message": "Route not found"}]
+            })))
+            .mount(server)
+            .await;
+    }
+
+    fn app_for(server: &wiremock::MockServer, mode: Option<common::site::LoginMode>) -> App {
+        let mut app = test_app();
+        let store = common::token::Store::with_path(
+            scratch_config_dir().join(format!("login-{}.json", TEST_DRAFT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst))),
+        );
+        app.client = Arc::new(WfApiClient::with_store(store, server.uri(), "test-client").expect("client"));
+        app.browser_opener = redirecting_browser;
+        app.screens.push(screens::home_state(false));
+        app.screens.push(screens::login_state());
+        if let Some(Screen::Login(ls)) = app.screens.last_mut() {
+            ls.mode_override = mode;
+        }
+        app
+    }
+
+    /// A stock forum (no TuiLink): `Auto` probes the relay, gets XenForo's
+    /// 404, and falls back to the loopback listener — where the browser's
+    /// redirect completes the login without the reader touching anything.
+    #[tokio::test]
+    async fn login_relay_404_falls_back_to_loopback_and_completes() {
+        let server = oauth_server().await;
+        mount_register(&server, 404).await;
+        let mut app = app_for(&server, None);
+        app.begin_login();
+        let events = drain_login(&mut app, Duration::from_secs(15)).await;
+        let Some(LoginEvent::Ready(mode, url)) = events.first() else {
+            panic!("{events:?}");
+        };
+        assert_eq!(*mode, common::site::LoginMode::Loopback);
+        assert!(url.starts_with(&format!("{}/oauth2/authorize?", server.uri())), "{url}");
+        assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A"), "{url}");
+        assert!(url.contains("client_id=test-client"), "{url}");
+        assert!(url.contains("code_challenge_method=S256"), "{url}");
+        assert!(url.contains("media%3Aread"), "the built-in site's scopes: {url}");
+        assert_eq!(events.last(), Some(&LoginEvent::Complete(true)), "{events:?}");
+        assert_eq!(app.me.as_ref().map(|u| u.username.as_str()), Some("kemical"));
+        let stored = app.client.store_path();
+        let tokens = common::token::Store::with_path(stored.to_path_buf()).load().unwrap().unwrap();
+        assert_eq!(tokens.origin, server.uri());
+        assert_eq!(tokens.client_id, "test-client");
+        app.shutdown().await;
+    }
+
+    /// Paste mode never listens: the browser lands on a portless loopback
+    /// address that cannot load, and whatever the reader pastes back — a
+    /// bad state first, then the right address — is checked before the code
+    /// is exchanged.
+    #[tokio::test]
+    async fn login_paste_mode_exchanges_a_pasted_url() {
+        let server = oauth_server().await;
+        mount_register(&server, 404).await;
+        let mut app = app_for(&server, Some(common::site::LoginMode::Paste));
+        app.browser_opener = test_browser_opener;
+        app.begin_login();
+        // Only the link comes back on its own; nothing else happens until a paste.
+        let msg = tokio::time::timeout(Duration::from_secs(10), app.rx.recv()).await.unwrap().unwrap();
+        let (url, mode) = match &msg {
+            Msg::LoginReady { url, mode, .. } => (url.clone(), *mode),
+            _ => panic!("expected the link first"),
+        };
+        app.handle_msg(msg);
+        assert_eq!(mode, common::site::LoginMode::Paste);
+        assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"), "{url}");
+        let Some(Screen::Login(ls)) = app.screens.last() else { panic!() };
+        assert_eq!(ls.stage, screens::LoginStage::Pasting { mode: common::site::LoginMode::Paste });
+        assert!(app.login_paste_tx.is_some());
+
+        app.execute_action(Action::LoginPaste("http://127.0.0.1/callback?code=x&state=wrong".into()));
+        let events = drain_login(&mut app, Duration::from_secs(2)).await;
+        assert!(matches!(events.as_slice(), [LoginEvent::Notice(m)] if m.contains("state mismatch")), "{events:?}");
+        let Some(Screen::Login(ls)) = app.screens.last() else { panic!() };
+        assert!(ls.error.as_deref().is_some_and(|e| e.contains("try again")));
+        assert!(matches!(ls.stage, screens::LoginStage::Pasting { .. }), "a bad paste keeps the field open");
+
+        let state = state_of(&url);
+        app.execute_action(Action::LoginPaste(format!("http://127.0.0.1/callback?code=thecode&state={state}")));
+        let events = drain_login(&mut app, Duration::from_secs(10)).await;
+        assert_eq!(events.last(), Some(&LoginEvent::Complete(true)), "{events:?}");
+        assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(7));
+        app.shutdown().await;
+    }
+
+    /// Only a *missing route* means "no relay". An explicit relay mode
+    /// reports it instead of silently changing mode, and a 500 — the add-on
+    /// may be there and broken — never falls through at all.
+    #[tokio::test]
+    async fn login_explicit_tuilink_and_transport_errors_do_not_fall_back() {
+        let server = oauth_server().await;
+        mount_register(&server, 404).await;
+        let mut app = app_for(&server, Some(common::site::LoginMode::TuiLink));
+        app.begin_login();
+        let events = drain_login(&mut app, Duration::from_secs(10)).await;
+        assert!(matches!(events.as_slice(), [LoginEvent::Failed(m)] if m.contains("no TuiLink relay")), "{events:?}");
+        let Some(Screen::Login(ls)) = app.screens.last() else { panic!() };
+        assert!(!ls.busy && ls.stage == screens::LoginStage::Idle);
+
+        let broken = oauth_server().await;
+        mount_register(&broken, 500).await;
+        let mut app = app_for(&broken, None);
+        app.begin_login();
+        let events = drain_login(&mut app, Duration::from_secs(10)).await;
+        assert!(matches!(events.as_slice(), [LoginEvent::Failed(_)]), "a 500 is not a missing relay: {events:?}");
+    }
+
+    /// The generalised relay reports a refused approval as `denied`; the
+    /// flow ends with a message instead of polling until the link expires.
+    #[tokio::test]
+    async fn login_poll_denied_fails_the_login() {
+        use wiremock::matchers::{method, path};
+        let server = oauth_server().await;
+        wiremock::Mock::given(method("POST"))
+            .and(path("/api/wf-tuilink/register"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "id": "abc123", "url": format!("{}/tui-start/abc123", server.uri()), "ttl": 600
+            })))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(method("POST"))
+            .and(path("/api/wf-tuilink/poll"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "status": "denied"
+            })))
+            .mount(&server)
+            .await;
+        let mut app = app_for(&server, None);
+        app.browser_opener = test_browser_opener;
+        app.begin_login();
+        let events = drain_login(&mut app, Duration::from_secs(15)).await;
+        assert!(
+            matches!(events.as_slice(), [LoginEvent::Ready(common::site::LoginMode::TuiLink, _), LoginEvent::Failed(m)] if m.contains("denied")),
+            "{events:?}"
+        );
+    }
+
+    /// While the paste field is open, letters are text: `q` does not quit,
+    /// `m` does not change mode, `^Y` and a bracketed paste land in the
+    /// field, Esc closes it, and `m` from the waiting state restarts the
+    /// flow in the next mode.
+    #[tokio::test]
+    async fn paste_field_owns_the_keyboard_and_clipboard() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::Login(screens::LoginState {
+            stage: screens::LoginStage::Waiting { mode: common::site::LoginMode::Loopback },
+            url: "http://127.0.0.1:1/oauth2/authorize?state=s".into(),
+            ..Default::default()
+        }));
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        let Some(Screen::Login(ls)) = app.screens.last() else { panic!() };
+        assert_eq!(ls.stage, screens::LoginStage::Pasting { mode: common::site::LoginMode::Loopback });
+        for c in "qm".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(!app.should_quit, "q is a letter in the field");
+        app.clipboard = "?code=c".into();
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        app.handle_paste("&state=s\n".into());
+        let Some(Screen::Login(ls)) = app.screens.last() else { panic!() };
+        assert_eq!(ls.paste, "qm?code=c&state=s");
+        assert!(ls.mode_override.is_none(), "m typed into the field is not the mode key");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let Some(Screen::Login(ls)) = app.screens.last() else { panic!() };
+        assert_eq!(ls.stage, screens::LoginStage::Waiting { mode: common::site::LoginMode::Loopback });
+        assert!(matches!(app.screens.last(), Some(Screen::Login(_))), "Esc never leaves the gate");
+
+        // Enter in the field with nothing pasted says so; with text it is
+        // handed to the flow — or, with no flow, reported.
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        if let Some(Screen::Login(ls)) = app.screens.last_mut() {
+            ls.paste.clear();
+            ls.paste_cursor = 0;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.status.contains("Paste the address"), "{}", app.status);
+        app.handle_paste("abc".into());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.status.contains("No sign-in in progress"), "{}", app.status);
+
+        // `m` while waiting cycles the mode and restarts.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let before = app.login_generation;
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(app.status.starts_with("Login mode: tuilink"), "{}", app.status);
+        assert_eq!(app.login_generation, before + 1, "a running flow restarts in the new mode");
+        app.shutdown().await;
+    }
+
+    // ----------------------------------------------------------- self-update
+
+    /// The updater compares the feed against the *binary's* version, while
+    /// the UA (hard rule 6) carries `common`'s. The packaging scripts read
+    /// `wftui/Cargo.toml`; a bump of one crate without the other would ship
+    /// a release that reports itself under two numbers.
+    #[test]
+    fn common_and_wftui_versions_are_in_lockstep() {
+        let ua = common::config::user_agent();
+        assert!(
+            ua.starts_with(&format!("wftui/{} ", env!("CARGO_PKG_VERSION"))),
+            "common ({ua}) and wftui ({}) versions differ — bump both Cargo.toml files",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+
+    fn frame_text(app: &mut App, w: u16, h: u16) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
+        term.draw(|f| app.draw(f)).expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>() + "\n")
+            .collect()
+    }
+
+    /// A staged update (#722) shows in three places: the header chip, the
+    /// status hint, and the palette row — and the row's wording says what
+    /// pressing it does. Pressing it needs no second check.
+    #[tokio::test]
+    async fn update_checked_staged_sets_the_chip_and_the_palette_row() {
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.screens.push(screens::home_state(false));
+        assert!(app.update_chip().is_none());
+
+        app.update_generation = 1;
+        app.handle_msg(Msg::UpdateChecked {
+            generation: 1,
+            forced: false,
+            result: Ok(common::update::Outcome::Staged {
+                version: "9.9.9".into(),
+                path: app.update_cfg.root.join("pending-x").join("wftui"),
+            }),
+        });
+        assert_eq!(app.update, update::UpdateState::Staged { version: "9.9.9".into() });
+        assert_eq!(app.update_chip().as_deref(), Some("update v9.9.9 ready"));
+        assert!(app.status.contains("restart"), "{}", app.status);
+        assert!(app.status_set_at.is_none(), "a staged update is a persistent hint, not a toast");
+        let text = frame_text(&mut app, 120, 30);
+        assert!(text.lines().next().unwrap().contains("update v9.9.9 ready"), "{text}");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        for c in "update".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let row = app.palette.as_ref().and_then(|p| p.selected()).map(|i| i.title.clone());
+        assert_eq!(row.as_deref(), Some("Update v9.9.9 ready, restart to apply"));
+        app.status.clear();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.status.contains("restart wftui to apply"), "{}", app.status);
+        assert_eq!(app.update_generation, 1, "a staged update is not re-checked");
+        assert!(app.update_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_update_generation_is_dropped() {
+        let mut app = test_app();
+        app.update_generation = 5;
+        app.handle_msg(Msg::UpdateChecked {
+            generation: 4,
+            forced: true,
+            result: Ok(common::update::Outcome::Staged { version: "9.9.9".into(), path: std::path::PathBuf::new() }),
+        });
+        assert_eq!(app.update, update::UpdateState::Idle, "a superseded check must not speak");
+        assert!(app.status.is_empty());
+        assert!(app.update_chip().is_none());
+    }
+
+    /// The check belongs to no session: a sign-out mid-check keeps the task
+    /// and its generation, and only `shutdown` aborts it.
+    #[tokio::test]
+    async fn update_check_task_survives_end_session() {
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.screens.push(screens::home_state(false));
+        app.check_for_updates_now();
+        assert_eq!(app.update, update::UpdateState::Checking);
+        assert!(app.update_task.is_some());
+        let generation = app.update_generation;
+
+        app.end_session("Session expired; log in again.");
+        assert!(app.update_task.is_some(), "end_session must not abort the update check");
+        assert_eq!(app.update_generation, generation);
+        assert_eq!(app.update, update::UpdateState::Checking);
+
+        // The feed is unreachable, so the answer is a failure — delivered
+        // and shown even though the session that started it is gone.
+        let msg = tokio::time::timeout(Duration::from_secs(10), app.rx.recv()).await.expect("answer").expect("msg");
+        assert!(matches!(msg, Msg::UpdateChecked { generation: g, forced: true, result: Err(_) } if g == generation));
+        app.handle_msg(msg);
+        assert!(matches!(app.update, update::UpdateState::Failed(_)));
+        assert!(app.status.starts_with("Update check failed:"), "{}", app.status);
+
+        app.check_for_updates_now();
+        app.shutdown().await;
+        assert!(app.update_task.is_none(), "shutdown aborts the check");
+    }
+
+    /// `g u` and the palette row both run the manual check, which is one
+    /// live task at a time and says so while it runs.
+    #[tokio::test]
+    async fn g_u_chord_and_palette_row_trigger_a_forced_check() {
+        let mut app = test_app();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.screens.push(screens::home_state(false));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert_eq!(app.update, update::UpdateState::Checking);
+        assert_eq!(app.update_generation, 1);
+        assert_eq!(app.status, "Checking for updates…");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert_eq!(app.update_generation, 1, "a second press does not start a second check");
+        assert_eq!(app.status, "Already checking for updates…");
+
+        app.update = update::UpdateState::UpToDate;
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        for c in "check for updates".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let row = app.palette.as_ref().and_then(|p| p.selected()).map(|i| i.title.clone());
+        assert_eq!(row.as_deref(), Some("Check for updates"));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.update_generation, 2, "the palette row runs the same check");
+        assert_eq!(app.update, update::UpdateState::Checking);
+
+        // A manual answer of "nothing new" is a toast; the automatic one is silent.
+        app.handle_msg(Msg::UpdateChecked {
+            generation: 2,
+            forced: true,
+            result: Ok(common::update::Outcome::UpToDate { latest: "0.0.1".into() }),
+        });
+        assert!(app.status.contains("is up to date"), "{}", app.status);
+        assert!(app.status_set_at.is_some(), "a toast");
+        app.update_generation = 3;
+        app.status.clear();
+        app.handle_msg(Msg::UpdateChecked {
+            generation: 3,
+            forced: false,
+            result: Ok(common::update::Outcome::UpToDate { latest: "0.0.1".into() }),
+        });
+        assert!(app.status.is_empty(), "the automatic check is quiet when there is nothing to do");
+        app.shutdown().await;
+    }
+
+    /// The session that applied an update still runs the old image: it
+    /// wears the restart chip, never re-checks (it would re-download what it
+    /// just installed), and `g u` says restart rather than checking.
+    #[tokio::test]
+    async fn just_applied_session_skips_the_auto_check_and_shows_the_restart_chip() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(screens::login_state());
+        app.update = update::UpdateState::JustApplied { version: "9.9.9".into() };
+        app.schedule_startup_update_check();
+        assert!(app.update_task.is_none());
+        assert_eq!(app.update_generation, 0);
+        assert_eq!(app.update_chip().as_deref(), Some("v9.9.9 applied, restart"));
+        let text = frame_text(&mut app, 120, 30);
+        assert!(text.lines().next().unwrap().contains("v9.9.9 applied, restart"), "signed out or not: {text}");
+
+        app.check_for_updates_now();
+        assert!(app.update_task.is_none());
+        assert!(app.status.contains("restart wftui to run it"), "{}", app.status);
+
+        // The ordinary start does schedule one (delayed) check.
+        let mut fresh = test_app();
+        fresh.schedule_startup_update_check();
+        assert!(fresh.update_task.is_some());
+        assert_eq!(fresh.update_generation, 1);
+        fresh.shutdown().await;
+
+        // And `WFTUI_NO_UPDATE` turns both surfaces off.
+        let mut off = test_app();
+        off.update_cfg.disabled = true;
+        off.schedule_startup_update_check();
+        assert!(off.update_task.is_none());
+        off.check_for_updates_now();
+        assert!(off.update_task.is_none());
+        assert!(off.status.contains("disabled"), "{}", off.status);
+    }
+
+    /// A read-only install dir (a `/usr/local/bin` the reader does not own)
+    /// still gets the download; the hint carries the install-then-rename
+    /// line, and an MSIX install is pointed at the release page instead.
+    #[tokio::test]
+    async fn manual_install_state_hints_the_install_then_rename_command() {
+        let mut app = test_app();
+        app.update_generation = 1;
+        let command = "sudo install -m755 '/cfg/update/pending-1/wftui' '/usr/local/bin/wftui.new' && sudo mv -f '/usr/local/bin/wftui.new' '/usr/local/bin/wftui'";
+        app.handle_msg(Msg::UpdateChecked {
+            generation: 1,
+            forced: false,
+            result: Ok(common::update::Outcome::ManualInstall {
+                version: "9.9.9".into(),
+                staged: std::path::PathBuf::from("/cfg/update/pending-1/wftui"),
+                command: command.into(),
+            }),
+        });
+        assert_eq!(app.status, format!("Update v9.9.9 downloaded; install it with: {command}"));
+        assert_eq!(app.update_chip().as_deref(), Some("update v9.9.9 (manual)"));
+        app.status.clear();
+        app.check_for_updates_now();
+        assert!(app.status.contains(command), "g u repeats the command rather than re-checking");
+        assert_eq!(app.update_generation, 1);
+
+        let mut msix = test_app();
+        msix.update_generation = 1;
+        msix.handle_msg(Msg::UpdateChecked {
+            generation: 1,
+            forced: true,
+            result: Ok(common::update::Outcome::Available {
+                version: "9.9.9".into(),
+                html_url: "http://127.0.0.1:9/releases/tag/v9.9.9".into(),
+                why: common::update::Refusal::Msix,
+            }),
+        });
+        assert!(msix.status.contains("release page"), "{}", msix.status);
+        assert_eq!(msix.update_chip().as_deref(), Some("update v9.9.9"));
+        msix.check_for_updates_now();
+        assert!(msix.status.starts_with("Opening http://127.0.0.1:9/releases/tag/v9.9.9"), "{}", msix.status);
+        assert_eq!(msix.clipboard, "http://127.0.0.1:9/releases/tag/v9.9.9", "the URL is on the clipboard for remote sessions");
     }
 
     /// #680: both navigation surfaces reach the new catalogs — `g m` / `g r`
@@ -8318,7 +9358,7 @@ mod tests {
         let mut app = test_app();
         app.screens.push(screens::login_state());
         if let Some(Screen::Login(ls)) = app.screens.last_mut() {
-            ls.stage = screens::LoginStage::Waiting;
+            ls.stage = screens::LoginStage::Waiting { mode: common::site::LoginMode::TuiLink };
             ls.url = "https://windowsforum.com/tui-start/abc123".into();
         }
         app.status = "Login link \u{2192} clipboard + login-url.txt".into();
@@ -8330,7 +9370,7 @@ mod tests {
         match app.screens.last() {
             Some(Screen::Login(ls)) => {
                 assert!(
-                    matches!(ls.stage, screens::LoginStage::Waiting),
+                    matches!(ls.stage, screens::LoginStage::Waiting { .. }),
                     "the stage must survive"
                 );
                 assert_eq!(
@@ -8428,7 +9468,7 @@ mod tests {
         let mut app = test_app();
         app.screens.push(screens::login_state());
         if let Some(Screen::Login(ls)) = app.screens.last_mut() {
-            ls.stage = screens::LoginStage::Waiting;
+            ls.stage = screens::LoginStage::Waiting { mode: common::site::LoginMode::TuiLink };
             ls.url = "https://windowsforum.com/tui-start/old".into();
         }
 
@@ -8474,6 +9514,7 @@ mod tests {
         app.handle_msg(Msg::LoginReady {
             generation: before,
             url: "https://windowsforum.com/tui-start/stale".into(),
+            mode: common::site::LoginMode::TuiLink,
         });
         app.handle_msg(Msg::LoginFailed {
             generation: before,
@@ -8521,6 +9562,7 @@ mod tests {
         app.handle_msg(Msg::LoginReady {
             generation: app.login_generation,
             url: "https://windowsforum.com/tui-start/abc123".into(),
+            mode: common::site::LoginMode::TuiLink,
         });
         let mode = std::fs::metadata(&path).expect("the login link is persisted").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "login-url.txt must be owner-only: {path:?}");

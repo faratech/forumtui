@@ -370,6 +370,39 @@ impl App {
                 }
             }
             Action::LoginBegin => self.begin_login(),
+            Action::SetupSite { origin, client_id, name } => self.setup_site(&origin, &client_id, &name),
+            Action::LoginPaste(text) => match &self.login_paste_tx {
+                Some(tx) if tx.send(text).is_ok() => {
+                    if let Some(Screen::Login(ls)) = self.screens.last_mut() {
+                        ls.error = None;
+                    }
+                    self.set_hint("Checking the pasted address…");
+                }
+                _ => self.set_status("No sign-in in progress — press Enter to begin."),
+            },
+            Action::LoginCycleMode => {
+                let (next, restart) = match self.screens.last_mut() {
+                    Some(Screen::Login(ls)) => {
+                        let next = ls.login_mode().next();
+                        ls.mode_override = Some(next);
+                        (next, !matches!(ls.stage, screens::LoginStage::Idle))
+                    }
+                    _ => return,
+                };
+                self.set_hint(format!(
+                    "Login mode: {} — {}",
+                    next.as_str(),
+                    match next {
+                        common::site::LoginMode::Auto => "the site's relay if it has one, else a browser on this machine, else paste",
+                        common::site::LoginMode::TuiLink => "the site's short-link relay (any device)",
+                        common::site::LoginMode::Loopback => "a browser on this machine returns the code by itself",
+                        common::site::LoginMode::Paste => "paste the address the browser lands on",
+                    }
+                ));
+                if restart {
+                    self.begin_login();
+                }
+            }
             Action::PasteClipboard => {
                 let mut text = self.clipboard.clone();
                 if text.is_empty()
@@ -865,13 +898,14 @@ impl App {
         let tx = self.tx.clone();
         let slots = self.image_slots.clone();
         let session_generation = self.session_generation;
+        let logo = self.images.logo();
         self.spawn_session_task(async move {
             // Decoration waits its turn behind at most a couple of siblings;
             // `image_gate` then spaces the ones that get through, in a lane of
             // its own so nothing here delays an interactive call (issue #543).
             let Ok(permit) = slots.acquire_owned().await else { return; };
             let key = pending.store_key();
-            let result = crate::images::load(&client, &disk, picker, &pending, permit).await;
+            let result = crate::images::load(&client, &disk, picker, &pending, permit, logo).await;
             tx.send(session_msg(session_generation, Msg::ImageLoaded { key, result })).ok();
         });
     }

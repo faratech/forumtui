@@ -65,12 +65,38 @@ pub enum GateState {
 }
 
 const ELLIPSIS: &str = "\u{2026}"; // …
-/// The header mark: a white bubble chip, echoing the rounded speech-bubble
-/// logo (`wf-logo.png`) without the four-color glyph inside it — bare
-/// red/green/blue/yellow quadrants read as the Microsoft Windows logo with no
-/// other context around them, which is a trademark problem out of context.
-/// Pure letters, so ASCII and Unicode share the same chip.
-const MARK_CHIP: &str = " WF ";
+/// Everything the header needs to draw the site's identity: the palette,
+/// the glyph set, and the brand (`site::Brand` — mark, wordmark, bold
+/// prefix). One context rather than three more parameters on functions
+/// that already take nine.
+#[derive(Clone, Copy)]
+pub struct Chrome<'a> {
+    pub theme: &'a Theme,
+    pub glyphs: &'a Glyphs,
+    pub brand: &'a common::site::Brand,
+}
+
+impl<'a> Chrome<'a> {
+    pub fn new(theme: &'a Theme, glyphs: &'a Glyphs, brand: &'a common::site::Brand) -> Self {
+        Chrome { theme, glyphs, brand }
+    }
+
+    /// The built-in site's brand — what every test was written against.
+    pub fn builtin(theme: &'a Theme, glyphs: &'a Glyphs) -> Self {
+        static WF: std::sync::LazyLock<common::site::Brand> =
+            std::sync::LazyLock::new(|| common::site::SiteConfig::windowsforum().brand);
+        Chrome { theme, glyphs, brand: &WF }
+    }
+}
+
+/// The header mark is a white bubble chip with the site's 1-4 letter mark
+/// in it (` WF `), echoing a rounded speech-bubble logo without any glyph
+/// inside — bare red/green/blue/yellow quadrants read as the Microsoft
+/// Windows logo out of context, a trademark problem. Pure letters, so ASCII
+/// and Unicode share the same chip.
+pub fn mark_chip(brand: &common::site::Brand) -> String {
+    format!(" {} ", brand.mark)
+}
 /// Cells the countdown bar occupies.
 const GATE_BAR_CELLS: usize = 10;
 
@@ -141,18 +167,29 @@ pub fn spinner_tick() -> usize {
 /// squeezed), `"Windows Server"` → `"Server"` (the word "Windows" carries no
 /// information on a Windows forum). Anything else is passed through, capped at
 /// 8 cells so the title column keeps its width.
-pub fn short_prefix(prefix: &str) -> String {
+///
+/// `strip` is the site's `prefix_strip` list (`["Windows "]` on the built-in
+/// site): a prefix starting with one of those words loses it. The `Win11`
+/// contraction is specific to the word "Windows".
+pub fn short_prefix(prefix: &str, strip: &[String]) -> String {
     let p = prefix.trim();
-    let out = match p.strip_prefix("Windows ").map(str::trim) {
-        Some("") => "Windows".to_string(),
-        // "Windows 11 24H2" -> "Win11": the release number is the chip; the
-        // build/update qualifier does not fit and is in the title anyway.
-        Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => {
-            format!("Win{}", rest.split_whitespace().next().unwrap_or(rest))
+    let mut out = p.to_string();
+    for word in strip {
+        if let Some(rest) = p.strip_prefix(word.as_str()) {
+            let rest = rest.trim();
+            out = match rest {
+                "" => word.trim().to_string(),
+                // "Windows 11 24H2" -> "Win11": the release number is the
+                // chip; the build/update qualifier does not fit and is in
+                // the title anyway.
+                r if word.trim() == "Windows" && r.starts_with(|c: char| c.is_ascii_digit()) => {
+                    format!("Win{}", r.split_whitespace().next().unwrap_or(r))
+                }
+                r => r.to_string(),
+            };
+            break;
         }
-        Some(rest) => rest.to_string(),
-        None => p.to_string(),
-    };
+    }
     truncate(&out, 8)
 }
 
@@ -167,19 +204,21 @@ pub fn short_prefix(prefix: &str) -> String {
 ///
 /// `online` is not in the DESIGN.md signature because no API surface supplies
 /// it yet; it is here so the first rung of the ladder is real code rather than
-/// a comment, and `app.rs` passes `None` today.
+/// a comment, and `app.rs` passes `None` today. `update` is the self-update
+/// chip (`update v0.0.2 ready`), a badge because it is something waiting for
+/// the reader; it shares the online count's rung of the ladder.
 #[allow(clippy::too_many_arguments)]
 pub fn header_line(
-    theme: &Theme,
-    g: &Glyphs,
+    cx: &Chrome<'_>,
     crumbs: &[String],
     user: Option<&str>,
     inbox: u32,
     alerts: u32,
     online: Option<u32>,
+    update: Option<&str>,
     width: u16,
 ) -> Line<'static> {
-    header_line_hits(theme, g, crumbs, user, inbox, alerts, online, width).0
+    header_line_hits(cx, crumbs, user, inbox, alerts, online, update, width).0
 }
 
 /// Where a header badge was drawn: `Inbox 2` / `Alerts 5` including their
@@ -207,17 +246,18 @@ pub struct CrumbHit {
 /// about where the overflow ladder left them.
 #[allow(clippy::too_many_arguments)]
 pub fn header_line_hits(
-    theme: &Theme,
-    g: &Glyphs,
+    cx: &Chrome<'_>,
     crumbs: &[String],
     user: Option<&str>,
     inbox: u32,
     alerts: u32,
     online: Option<u32>,
+    update: Option<&str>,
     width: u16,
 ) -> (Line<'static>, Vec<BadgeHit>, Vec<CrumbHit>) {
+    let (theme, g) = (cx.theme, cx.glyphs);
     let w = width as usize;
-    let brand = brand_spans(theme);
+    let brand = brand_spans(cx);
     let brand_w = spans_width(&brand);
     // One leading space before the mark, one minimum gap before the right side.
     const LEAD: usize = 1;
@@ -227,7 +267,7 @@ pub fn header_line_hits(
         LEAD + brand_w + crumbs_width(g, &texts) + right_w + GAP
     };
 
-    let (mut right, mut marks) = right_spans(theme, user, inbox, alerts, online);
+    let (mut right, mut marks) = right_spans(theme, user, inbox, alerts, online, update);
     // Each crumb keeps the index it had in the caller's path, so a click on
     // a drawn crumb still means the place the caller named — the rungs below
     // drop and rewrite crumbs, and a positional index would then point at
@@ -238,9 +278,11 @@ pub fn header_line_hits(
         .map(|(i, c)| (c.clone(), Some(i)))
         .collect();
 
-    // Rung 1: the online count is the least load-bearing thing on the row.
-    if needed(&crumbs, spans_width(&right)) > w && online.is_some() {
-        (right, marks) = right_spans(theme, user, inbox, alerts, None);
+    // Rung 1: the online count and the update chip are the least
+    // load-bearing things on the row (the chip comes back on a wider frame,
+    // and the palette row and `g u` say the same thing).
+    if needed(&crumbs, spans_width(&right)) > w && (online.is_some() || update.is_some()) {
+        (right, marks) = right_spans(theme, user, inbox, alerts, None, None);
     }
     // Rung 2: the path's middle is inferable; its ends are not.
     if needed(&crumbs, spans_width(&right)) > w && crumbs.len() > 2 {
@@ -335,20 +377,25 @@ pub fn header_line_hits(
     (Line::from(clip_spans(spans, w)), badges, crumb_hits)
 }
 
-fn brand_spans(theme: &Theme) -> Vec<Span<'static>> {
-    let mut spans = mark_spans(theme);
-    spans.push(Span::styled(" ", theme.chrome()));
-    spans.push(Span::styled("Windows", theme.chrome_bold()));
-    spans.push(Span::styled("Forum", theme.chrome()));
+fn brand_spans(cx: &Chrome<'_>) -> Vec<Span<'static>> {
+    let mut spans = mark_spans(cx.theme, cx.brand);
+    spans.push(Span::styled(" ", cx.theme.chrome()));
+    let (bold, rest) = cx.brand.split();
+    if !bold.is_empty() {
+        spans.push(Span::styled(bold.to_string(), cx.theme.chrome_bold()));
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), cx.theme.chrome()));
+    }
     spans
 }
 
-/// The mark: one `MARK_CHIP` cell, background chrome_fg (white) foreground
-/// chrome_bg (brand blue), bold — the same chip in both glyph sets, since it
-/// is letters rather than block-drawing characters.
-fn mark_spans(theme: &Theme) -> Vec<Span<'static>> {
+/// The mark: one [`mark_chip`] cell, background chrome_fg (white) foreground
+/// chrome_bg (the brand colour), bold — the same chip in both glyph sets,
+/// since it is letters rather than block-drawing characters.
+fn mark_spans(theme: &Theme, brand: &common::site::Brand) -> Vec<Span<'static>> {
     vec![Span::styled(
-        MARK_CHIP,
+        mark_chip(brand),
         Style::new()
             .fg(theme.chrome_bg)
             .bg(theme.chrome_fg)
@@ -365,6 +412,7 @@ fn right_spans(
     inbox: u32,
     alerts: u32,
     online: Option<u32>,
+    update: Option<&str>,
 ) -> (Vec<Span<'static>>, Vec<(usize, usize, crate::screens::InboxTab)>) {
     use crate::screens::InboxTab;
     let mut spans = Vec::new();
@@ -395,6 +443,13 @@ fn right_spans(
             format!("   {} online", thousands(n)),
             theme.chrome_dim(),
         ));
+    }
+    // A staged update is something waiting for the reader, so it wears the
+    // badge colour like an unread count — and it is drawn signed in or not,
+    // since the sign-in screen is where a stale build is most often sitting.
+    if let Some(chip) = update {
+        spans.push(Span::styled("   ", theme.chrome()));
+        spans.push(Span::styled(format!(" {chip} "), theme.badge()));
     }
     spans.push(Span::styled(" ", theme.chrome()));
     (spans, marks)
@@ -754,7 +809,7 @@ mod tests {
         let t = Theme::truecolor();
         let c = crumbs(&["Forums", "Windows Help and Support", "How do I control MS edge?"]);
         for w in [40u16, 60, 80, 100, 120, 200] {
-            let line = header_line(&t, &UNICODE, &c, Some("Mike"), 2, 5, Some(1384), w);
+            let line = header_line(&Chrome::builtin(&t, &UNICODE), &c, Some("Mike"), 2, 5, Some(1384), None, w);
             assert_eq!(
                 line.width(),
                 w as usize,
@@ -771,7 +826,7 @@ mod tests {
         let t = Theme::truecolor();
         let c = crumbs(&["视频编辑软件推荐帮助教程升级指南", "第二个论坛版块名称"]);
         for w in [40u16, 60, 80, 100, 120, 200] {
-            let line = header_line(&t, &UNICODE, &c, Some("Mike"), 2, 5, Some(1384), w);
+            let line = header_line(&Chrome::builtin(&t, &UNICODE), &c, Some("Mike"), 2, 5, Some(1384), None, w);
             assert_eq!(
                 line.width(),
                 w as usize,
@@ -793,7 +848,7 @@ mod tests {
             "Mica\u{2122}\u{FE0F} App: The Beauty of Doing Nothing in Windows 11",
         ]);
         for w in 40u16..=200 {
-            let line = header_line(&t, &UNICODE, &c, Some("Mike"), 2, 5, Some(1384), w);
+            let line = header_line(&Chrome::builtin(&t, &UNICODE), &c, Some("Mike"), 2, 5, Some(1384), None, w);
             assert_eq!(
                 line.width(),
                 w as usize,
@@ -802,7 +857,7 @@ mod tests {
             );
         }
         // The right-hand side survives: badges are still on the row.
-        let line = header_line(&t, &UNICODE, &c, Some("Mike"), 2, 5, None, 100);
+        let line = header_line(&Chrome::builtin(&t, &UNICODE), &c, Some("Mike"), 2, 5, None, None, 100);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("Mike"), "{text}");
     }
@@ -832,27 +887,27 @@ mod tests {
         let c = crumbs(&["Forums", "Windows Help and Support", "How do I control MS edge update schedule?"]);
 
         // Wide: everything fits, so the online count survives.
-        let wide = header_line(&t, &UNICODE, &c, Some("Mike"), 2, 5, Some(1384), 200);
+        let wide = header_line(&Chrome::builtin(&t, &UNICODE), &c, Some("Mike"), 2, 5, Some(1384), None, 200);
         let wide_text: String = wide.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(wide_text.contains("1,384 online"), "{wide_text}");
         assert!(wide_text.contains("Windows Help and Support"));
         assert!(!wide_text.contains(ELLIPSIS));
 
         // Rung 1: online goes first, the path is untouched.
-        let mid = header_line(&t, &UNICODE, &c, Some("Mike"), 2, 5, Some(1384), 130);
+        let mid = header_line(&Chrome::builtin(&t, &UNICODE), &c, Some("Mike"), 2, 5, Some(1384), None, 130);
         let mid_text: String = mid.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!mid_text.contains("online"), "{mid_text}");
         assert!(mid_text.contains("Windows Help and Support"), "{mid_text}");
 
         // Rung 2: the middle crumb becomes an ellipsis, the ends survive.
-        let narrow = header_line(&t, &UNICODE, &c, Some("Mike"), 2, 5, Some(1384), 110);
+        let narrow = header_line(&Chrome::builtin(&t, &UNICODE), &c, Some("Mike"), 2, 5, Some(1384), None, 110);
         let narrow_text: String = narrow.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!narrow_text.contains("Windows Help and Support"), "{narrow_text}");
         assert!(narrow_text.contains("Forums"), "{narrow_text}");
         assert!(narrow_text.contains(ELLIPSIS), "{narrow_text}");
 
         // Rung 3: the last crumb is clipped, and the row still fits exactly.
-        let tiny = header_line(&t, &UNICODE, &c, Some("Mike"), 2, 5, Some(1384), 80);
+        let tiny = header_line(&Chrome::builtin(&t, &UNICODE), &c, Some("Mike"), 2, 5, Some(1384), None, 80);
         assert_eq!(tiny.width(), 80);
         let tiny_text: String = tiny.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
@@ -874,7 +929,7 @@ mod tests {
         let t = Theme::truecolor();
         let c = crumbs(&["Forums", "Windows Help and Support"]);
         for w in [1u16, 2, 3, 8, 16, 24] {
-            let line = header_line(&t, &UNICODE, &c, Some("Mike"), 2, 5, Some(1384), w);
+            let line = header_line(&Chrome::builtin(&t, &UNICODE), &c, Some("Mike"), 2, 5, Some(1384), None, w);
             assert_eq!(line.width(), w as usize, "width {w}");
         }
     }
@@ -882,17 +937,17 @@ mod tests {
     #[test]
     fn header_mark_is_a_four_cell_chip_unicode_and_ascii() {
         let t = Theme::truecolor();
-        let uni = header_line(&t, &UNICODE, &[], None, 0, 0, None, 80);
+        let uni = header_line(&Chrome::builtin(&t, &UNICODE), &[], None, 0, 0, None, None, 80);
         // lead space + the chip, one span: " WF " white-on-blue, bold.
-        assert_eq!(uni.spans[1].content.as_ref(), MARK_CHIP);
+        assert_eq!(uni.spans[1].content.as_ref(), " WF ");
         assert_eq!(uni.spans[1].width(), 4);
         assert_eq!(uni.spans[1].style.fg, Some(t.chrome_bg));
         assert_eq!(uni.spans[1].style.bg, Some(t.chrome_fg));
         assert!(uni.spans[1].style.add_modifier.contains(Modifier::BOLD));
 
         // Pure letters: ASCII draws the identical chip, not a shrunken one.
-        let ascii = header_line(&t, &ASCII, &[], None, 0, 0, None, 80);
-        assert_eq!(ascii.spans[1].content.as_ref(), MARK_CHIP);
+        let ascii = header_line(&Chrome::builtin(&t, &ASCII), &[], None, 0, 0, None, None, 80);
+        assert_eq!(ascii.spans[1].content.as_ref(), " WF ");
         assert_eq!(ascii.spans[1].width(), 4);
     }
 
@@ -902,13 +957,76 @@ mod tests {
         let is_badge = |s: &Span<'static>| {
             s.style.bg == Some(t.badge_bg) && s.style.fg == Some(t.badge_fg)
         };
-        let with = header_line(&t, &UNICODE, &[], Some("Mike"), 2, 0, None, 80);
+        let with = header_line(&Chrome::builtin(&t, &UNICODE), &[], Some("Mike"), 2, 0, None, None, 80);
         assert!(with.spans.iter().any(is_badge));
         let text: String = with.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("Alerts 0"), "{text}");
 
-        let without = header_line(&t, &UNICODE, &[], Some("Mike"), 0, 0, None, 80);
+        let without = header_line(&Chrome::builtin(&t, &UNICODE), &[], Some("Mike"), 0, 0, None, None, 80);
         assert!(!without.spans.iter().any(is_badge));
+    }
+
+    /// The self-update chip (#722) is a badge after the counters, drawn
+    /// signed in or not, and the first thing the overflow ladder drops — so
+    /// a narrow frame still shows the member's own name and counts.
+    #[test]
+    fn header_update_chip_renders_after_alerts_and_drops_before_crumbs_elide() {
+        let t = Theme::truecolor();
+        let is_badge = |s: &Span<'static>| {
+            s.style.bg == Some(t.badge_bg) && s.style.fg == Some(t.badge_fg)
+        };
+        let line = header_line(&Chrome::builtin(&t, &UNICODE), &[], Some("Mike"), 0, 0, None, Some("update v0.0.2 ready"), 100);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("Alerts 0    update v0.0.2 ready "), "{text}");
+        let chip = line.spans.iter().find(|s| s.content.contains("update v0.0.2")).expect("chip");
+        assert!(is_badge(chip), "the chip wears the badge colour");
+
+        let out = header_line(&Chrome::builtin(&t, &UNICODE), &[], None, 3, 5, None, Some("update v0.0.2 ready"), 100);
+        let text: String = out.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("not signed in") && text.contains("update v0.0.2"), "{text}");
+
+        let c = crumbs(&["Forums", "Windows Help and Support", "A thread with a long title"]);
+        let wide = header_line(&Chrome::builtin(&t, &UNICODE), &c, Some("Mike"), 2, 5, None, Some("update v0.0.2 ready"), 160);
+        let wide_text: String = wide.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(wide_text.contains("update v0.0.2") && !wide_text.contains(ELLIPSIS), "{wide_text}");
+        let narrow = header_line(&Chrome::builtin(&t, &UNICODE), &c, Some("Mike"), 2, 5, None, Some("update v0.0.2 ready"), 90);
+        let narrow_text: String = narrow.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!narrow_text.contains("update"), "the chip goes before the path does: {narrow_text}");
+        assert!(narrow_text.contains("Mike") && narrow_text.contains("Alerts"), "{narrow_text}");
+        assert_eq!(narrow.width(), 90);
+    }
+
+    /// Another site's brand goes through the same cell-width arithmetic as
+    /// the built-in one: a two-letter mark, a CJK wordmark with a bold
+    /// prefix, and an 80-column frame that still comes out exactly 80 wide.
+    #[test]
+    fn header_with_a_two_cell_mark_and_a_long_cjk_brand_fits_80_cols() {
+        let t = Theme::truecolor();
+        let brand = common::site::Brand {
+            name: "日本フォーラム".into(),
+            mark: "JP".into(),
+            bold_prefix: "日本".into(),
+            chrome_bg: None,
+            logo: None,
+        };
+        let cx = Chrome::new(&t, &UNICODE, &brand);
+        let c = crumbs(&["Forums", "A rather long thread title that will need clipping"]);
+        let line = header_line(&cx, &c, Some("Mike"), 2, 5, None, None, 80);
+        assert_eq!(line.width(), 80);
+        assert_eq!(line.spans[1].content.as_ref(), " JP ");
+        assert!(line.spans[1].width() == 4);
+        assert_eq!(line.spans[3].content.as_ref(), "日本");
+        assert!(line.spans[3].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(line.spans[4].content.as_ref(), "フォーラム");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("Mike") && text.contains("Alerts"), "{text}");
+        // A one-letter mark and a name with no bold prefix.
+        let plain = common::site::Brand { name: "Forum".into(), mark: "F".into(), bold_prefix: String::new(), chrome_bg: None, logo: None };
+        let line = header_line(&Chrome::new(&t, &ASCII, &plain), &[], None, 0, 0, None, None, 40);
+        assert_eq!(line.width(), 40);
+        assert_eq!(line.spans[1].content.as_ref(), " F ");
+        assert_eq!(line.spans[3].content.as_ref(), "Forum");
+        assert!(!line.spans[3].style.add_modifier.contains(Modifier::BOLD));
     }
 
     /// Issue #561: a logged-out header (no stored session, or one that just
@@ -919,7 +1037,7 @@ mod tests {
     #[test]
     fn header_says_not_signed_in_and_hides_badges_when_logged_out() {
         let t = Theme::truecolor();
-        let line = header_line(&t, &UNICODE, &[], None, 3, 5, None, 80);
+        let line = header_line(&Chrome::builtin(&t, &UNICODE), &[], None, 3, 5, None, None, 80);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("not signed in"), "{text}");
         assert!(!text.contains("Inbox"), "{text}");
@@ -1075,15 +1193,15 @@ mod tests {
 
     #[test]
     fn short_prefix_shortens_the_way_the_design_says() {
-        assert_eq!(short_prefix("Windows 11"), "Win11");
-        assert_eq!(short_prefix("Windows 10"), "Win10");
-        assert_eq!(short_prefix("Windows Server"), "Server");
-        assert_eq!(short_prefix("Windows 11 24H2"), "Win11");
-        assert_eq!(short_prefix("Solved"), "Solved");
-        assert_eq!(short_prefix("  Windows 11  "), "Win11");
-        assert_eq!(short_prefix("Windows"), "Windows");
+        assert_eq!(short_prefix("Windows 11", &["Windows ".to_string()]), "Win11");
+        assert_eq!(short_prefix("Windows 10", &["Windows ".to_string()]), "Win10");
+        assert_eq!(short_prefix("Windows Server", &["Windows ".to_string()]), "Server");
+        assert_eq!(short_prefix("Windows 11 24H2", &["Windows ".to_string()]), "Win11");
+        assert_eq!(short_prefix("Solved", &["Windows ".to_string()]), "Solved");
+        assert_eq!(short_prefix("  Windows 11  ", &["Windows ".to_string()]), "Win11");
+        assert_eq!(short_prefix("Windows", &["Windows ".to_string()]), "Windows");
         // Capped so the title column keeps its width.
-        assert_eq!(short_prefix("Announcement").chars().count(), 8);
+        assert_eq!(short_prefix("Announcement", &["Windows ".to_string()]).chars().count(), 8);
     }
 
     #[test]

@@ -2,7 +2,32 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-# wftui_app — WindowsForum.com terminal client (Linux + Windows)
+# wftui_app — WindowsForum Terminal (Linux + Windows)
+
+The product name is **WindowsForum Terminal**; `wftui` is the command, the
+crate, the UA prefix (hard rule 6), the MSIX execution alias and the release
+asset prefix — none of those change with the display name.
+
+It is a client for **any XenForo 2.3 forum**, in two editions from one
+codebase, switched by the cargo feature `builtin-windowsforum` (default on):
+
+- **WindowsForum Terminal** — windowsforum.com is the compiled-in default
+  site (no config file ⇒ exactly the client that always shipped), and
+  `<config dir>/config.json` adds other forums or overrides the built-in one.
+- **Terminal for XenForo** (`--no-default-features --features images`) — no
+  built-in site, no embedded logo; the first run shows the Setup screen
+  (`screens/setup.rs`: forum address, public OAuth client id, name), which
+  writes `config.json` and adopts the site in-process (`App::adopt_site`).
+  Release assets carry `-xf` in the prefix (`site::EDITION_SUFFIX`) so the
+  two updaters, sharing one feed, never install each other's binary.
+
+The feature decides only `resolve`'s fallback, `example_json`, the embedded
+logo, `site::PRODUCT_NAME` and the asset prefix. `SiteConfig::default()` is
+the WF site in **both** editions — it is test data, and every screen gets
+the real site through `set_site` before it draws — which is why every test
+passes under every feature combination. "XenForo" is XenForo Ltd's mark: the
+generic edition is *named* "Terminal for XenForo", never "XenForo Terminal".
+See "Site configuration" below and `docs/CONFIG.md`.
 
 Rust TUI for windowsforum.com: OAuth login, forum/thread/news browsing, replies,
 DMs (conversations), alerts, search, member profiles, inline images. Pure client —
@@ -20,11 +45,14 @@ export WFTUI_CONFIG_DIR=/tmp/wftui-test-cfg          # ALWAYS before cargo test 
 cargo check                                          # while iterating
 cargo test --workspace                               # unit + wiremock, both crates
 cargo test -p wftui --no-default-features            # the no-images build must stay green too
+cargo test -p common --no-default-features && cargo test -p wftui --no-default-features --features images   # the generic edition too
 cargo test -p wftui thread_row_keeps_exact_width     # one test (substring match on the name)
 cargo test -p common bbcode::tests::                 # one module
 cargo clippy --all-targets --release -- -D warnings                              # gate: 0 warnings
 cargo clippy -p wftui --no-default-features --all-targets --release -- -D warnings
+cargo clippy -p wftui --no-default-features --features images --all-targets --release -- -D warnings
 cargo build --release && cp target/release/wftui bin/wftui   # bin/wftui is committed
+cargo build --release -p wftui --no-default-features --features images   # Terminal for XenForo (generic edition)
 # Deploy on this server. Install-then-rename, NOT `cp`: a plain copy over a
 # running wftui fails with "Text file busy", while a rename swaps the path
 # atomically and leaves the running process on its old inode.
@@ -83,15 +111,25 @@ plain-enum errors, no anyhow/thiserror, inline `#[cfg(test)]` tests, `rust-versi
   envelope (`{"errors":[{"code":..}]}`) even on the OAuth token endpoint —
   `error_from_response` and `oauth::token_request` both parse it; a raw-body
   `"http_error"` code means "not JSON" and is treated as transient.
-- `oauth.rs` — PKCE (S256) login through the TuiLink addon
-  (`/api/wf-tuilink/register` → short link; `/api/wf-tuilink/poll` → code) and
-  `/api/oauth2/token`; refresh; revoke (client half only — see Known gaps). Every
-  call takes the origin as an argument; nothing reads `WFTUI_BASE_URL` at request
-  time. `browser_command` builds the opener argv: **on Windows it is
+- `site.rs` — `SiteConfig`: which forum, its public OAuth client id, brand,
+  quick destinations, add-on flags and login mode; `Config::load` /
+  `resolve` for `config.json`; `SiteConfig::windowsforum()` is the built-in
+  site and `windowsforum_equals_the_shipped_constants` pins every value of
+  it. `oauth.rs` — PKCE (S256) login in three modes: the TuiLink addon
+  (`/api/wf-tuilink/register` → short link; `/api/wf-tuilink/poll` → code),
+  a loopback listener (`bind_loopback`: 9420, else any port — XF matches
+  loopback-IP redirect URIs port-agnostically), or a pasted redirect
+  (`code_from_pasted`, bare codes included); `/api/oauth2/token`; refresh;
+  revoke (client half only — see Known gaps). Every call takes the origin,
+  client id and scopes as arguments; nothing reads `WFTUI_BASE_URL` at
+  request time. `browser_command` builds the opener argv: **on Windows it is
   `rundll32 url.dll,FileProtocolHandler <url>`, never `cmd /C start`** (cmd parses
   `&`/`%` inside forum URLs — command injection).
 - `token.rs` — 0600 atomic token store; `quarantine_corrupt` renames an unreadable
-  file instead of bricking startup. `models.rs` — XF API shapes. Field names come from the
+  file instead of bricking startup, and `quarantine_as("foreign", ..)` sets
+  aside a grant that belongs to another origin or client id (`TokenSet`
+  records both; an empty pair is a pre-sites store and means the built-in
+  site). `models.rs` — XF API shapes. Field names come from the
   entity classes under `/web/public_html/src/XF/Entity/*.php`
   (`setupApiResultData` / `getStructure`) or from a captured response, never
   from a guess — and **the fixture must be a whole captured body**. Three
@@ -317,6 +355,55 @@ and headings as bold + accent + underline by level. `[HIGHLIGHT]` is
 captured live post bodies in `common/src/testdata/`; that corpus is what
 caught the `SIZE` reading. Re-capture it when the parser changes.
 
+## Self-update (#722)
+
+Ported from htop-win's `installer.rs`. `common/src/update.rs` is the whole
+mechanism; `wftui/src/app/update.rs` only decides when to run it and what to
+say. The flow is **stage now, apply at the next start**, never a relaunch:
+
+- ~3 s after start, `check_and_stage` asks the feed
+  (`https://api.github.com/repos/faratech/wftui/releases/latest`) with its own
+  short-lived `http::build()` client — off-origin, so **no forum gate and
+  never the bearer** — at most once per 6 h (`<config dir>/update/last-check`;
+  `g u` and the palette's "Check for updates" row ignore the interval). A
+  newer, non-draft, non-prerelease tag downloads the bare binary for this
+  platform (`Target::asset_name`: `wftui-<ver>-linux-x86_64`,
+  `wftui-<ver>-windows-x64.exe`, …) and the release's `SHA256SUMS.txt`, and
+  refuses anything whose digest is not in it or whose PE/ELF header is not
+  this architecture's. The verified bytes are staged as
+  `<config dir>/update/pending-<id>/{wftui[.exe],meta}` — written into
+  `.stage-<id>/` and published by one same-dir rename, so a reader never
+  sees half a generation. The header then wears the `update vX ready` chip.
+- The next start runs `apply_pending_update` **first thing in `main`**,
+  before the panic hook, `tty::snapshot` and the graphics probe, so its one
+  stderr line lands on the normal screen. Linux copies to `wftui.new` beside
+  the binary and renames over it (the install-then-rename swap above);
+  Windows renames the running image aside to `wftui.exe.old`, moves the new
+  one in, and deletes `.old` at the following start. The session that
+  applied is still the old image: it shows `vX applied, restart` and skips
+  its own check, or it would re-download what it just installed.
+- Refusals, never silent: an MSIX install (`\WindowsApps\` or an
+  `AppxManifest.xml` beside the exe) downloads nothing and `g u` opens the
+  release page; a binary under a cargo `target/` dir (a `Cargo.toml` beside
+  it) is left alone; an install dir the user cannot write to is staged
+  anyway and the hint carries the `sudo install … && sudo mv` line.
+  **`bin/wftui` in a checkout is a real install** and *would* be replaced —
+  `WFTUI_NO_UPDATE=1` is the escape.
+- One `fs2` lock (`<config dir>/update/staging.lock`) covers staging, pruning
+  and applying across instances; start-up *tries* it and never waits.
+  Generations that are not newer than the running build are pruned, so a
+  deliberate downgrade is never re-applied.
+
+The release side of the contract is `release-binaries.yml`: it refuses a tag
+that differs from `wftui/Cargo.toml` (or a `common` version that differs from
+`wftui`'s — `common_and_wftui_versions_are_in_lockstep` pins the same thing
+in the suite), publishes the bare binaries beside the tarballs and MSIX, and
+writes ONE `SHA256SUMS.txt` (`sha256sum` format, two spaces) over every
+asset in the `release` job. The repo is private and has no release yet, so
+the feed 404s until the first one ships and the repo is made public; the
+fixture `common/src/testdata/github_release_latest.json` is htop-win's
+`releases/latest` body (same shape) until then.
+
 ## Writing: reply, quote, edit, delete, solution
 
 The thread view's write keys are `r` reply, `Q` quote (see below), `e` edit,
@@ -503,8 +590,12 @@ field on that model is `#[serde(default)]`.
 5. **Mouse selection extracts text from `App::screen_rows`** (the mirror captured
    in `draw`), never from `terminal.current_buffer_mut()`; image cells and
    wide-char continuation cells are skipped.
-6. **The UA is `wftui/<ver> (+https://windowsforum.com)`.** Cloudflare's bot rule
-   403s bare library UAs; never "fix" a blocked request by spoofing a browser UA.
+6. **The UA is `wftui/<ver> (+<url>)`** — `+https://windowsforum.com` for the
+   built-in site (Cloudflare's bot rule there is keyed to it) and
+   `+https://github.com/faratech/wftui` for any other site
+   (`SiteConfig::user_agent`). Cloudflare's bot rule 403s bare library UAs;
+   never "fix" a blocked request by spoofing a browser UA, and never send
+   one forum's address to another.
 7. **Self-throttling is not optional** — the zone's flood ceiling is shared with
    all visitors and the gate constants mirror XF's own flood checks.
 
@@ -574,7 +665,10 @@ field on that model is `#[serde(default)]`.
 `WFTUI_ASCII=1` (glyph fallback), `WFTUI_MOUSE=0` (no mouse capture — the
 permanent form of Shift+drag), `WFTUI_NO_IMAGES=1` (text tier),
 `WFTUI_GRAPHICS=kitty|sixel|iterm2|halfblocks|none` (skip the capability query),
-`NO_COLOR` (mono theme and text tier).
+`NO_COLOR` (mono theme and text tier), `WFTUI_SITE` (which `config.json`
+site, when no argument names one), `WFTUI_NO_UPDATE=1` (no self-update:
+no feed check, nothing staged, nothing applied at start), `WFTUI_UPDATE_URL`
+(a `releases/latest`-shaped JSON feed to use instead of GitHub's).
 
 ## Mouse and touch
 
@@ -597,16 +691,69 @@ own middle and truncates its last crumb to fit, so a recomputed position
 points at the wrong place. The crumb for the screen you are on is inert, and
 no crumb may pop the sign-in gate.
 
+## Site configuration
+
+`<config dir>/config.json` (`wftui --init-config` writes an annotated example;
+`docs/CONFIG.md` has the schema and the forum admin's steps). Selection:
+`wftui <site>` / `--site` → `WFTUI_SITE` → the file's `default_site` → the
+only site the file lists → `windowsforum`. Field precedence: the
+`WFTUI_BASE_URL` / `WFTUI_OAUTH_CLIENT_ID` environment → the file's entry →
+the compiled-in default (`site::resolve`). A corrupt file or an unknown
+site name is a hard error with the path and line:column, printed before
+the terminal is touched. Rules that follow from it:
+
+- **The built-in site keeps the flat layout** (`<config dir>/token.json`,
+  `drafts.json`, `login-url.txt`); any other site's live under
+  `sites/<name>/` (`config::site_root`). `update/`, `cache/img/` and the log
+  are shared. Nobody is signed out by the upgrade, and no migration exists.
+- **Screens get the site through `Screen::set_site`**, called from
+  `push_screen` and once per frame like `set_image_policy`; a state built
+  with `Default` is the built-in site until then. A test that pushes a
+  screen with `Vec::push` and expects another site's quick list must use
+  `push_screen`.
+- **Everything `'static` comes from a fixed alphabet**: quick destinations
+  use `QUICK_DIGITS` (`1`-`9`, so at most nine), chord letters go through
+  `overlay::static_letter` (validated `a-z`, not in `RESERVED_CHORDS`).
+  Nothing is leaked.
+- **Add-ons are flags, not probes**: `features.xfmg` / `xfrm` hide the
+  palette rows, the which-key cells and the search types, and drop
+  `media:read` / `resource:read` from `effective_scopes` (a scope the client
+  row lacks fails the whole handshake, #695). `g m` / `g r` still resolve —
+  to a notice. `features.tuilink` / `drafts_relay` are `Option<bool>`:
+  `None` is auto — a 404 from the relay route flips them off for the
+  session (`Msg::DraftRelayAbsent`, `oauth::is_route_missing`).
+- **The brand is data**: `chrome::Chrome{theme, glyphs, brand}` is the
+  header's context; `Chrome::builtin` is what tests use. The mark is 1-4
+  ASCII characters, `bold_prefix` a prefix of `name`, `chrome_bg` re-derives
+  the three chrome roles per tier (`Theme::detect_with`), `logo` a PNG read
+  at start (`Images::set_logo`; unreadable = the text mark).
+
 ## Login flow (works over SSH, no copy-paste)
 
-No token → `begin_login` registers a PKCE challenge and shows the short link
-`https://windowsforum.com/tui-start/<id>`, also pushed to the clipboard (OSC 52)
-and saved to `<config dir>/login-url.txt`. The user approves on the real site
-(Turnstile, 2FA); the redirect to `/tui-done` captures the code; the TUI polls
-every 2 s, exchanges it, and persists the token set (access 2 h / refresh 90 d,
-silent refresh). Enter restarts a stuck flow (flows are generation-stamped). The
-OAuth client is a public PKCE client — no secret anywhere — registered by
-`/web/ops/wftui_oauth_client.php`.
+No token → `begin_login` runs `run_login_flow` in the site's mode (`m` on the
+sign-in screen cycles auto → relay → loopback → paste and restarts):
+
+- **TuiLink relay** (the built-in site, or any forum with the add-on):
+  register a PKCE challenge, show the short link
+  `https://<site>/tui-start/<id>` — also on the clipboard (OSC 52) and in
+  the site's `login-url.txt` — approve on the site (Turnstile, 2FA), the
+  redirect to `/tui-done` captures the code, the TUI polls every 2 s and
+  exchanges it. `denied` from the poll (the generalised add-on) fails the
+  flow instead of waiting out the link.
+- **Loopback** (stock XenForo): bind 127.0.0.1 (9420, else any port), open
+  `/oauth2/authorize` with that redirect; the browser on this machine comes
+  back by itself, or `p` opens a paste field for a browser elsewhere.
+- **Paste**: the same URL with `http://127.0.0.1/callback`, which the browser
+  cannot load; the user pastes the address it landed on (or the bare code).
+
+`Auto` falls through only on a *missing route* (XF's 404 envelope) and a
+refused bind — a transport error or a 500 is reported, never reinterpreted.
+Every mode persists the token set stamped with its origin and client id
+(access 2 h / refresh 90 d, silent refresh). Enter restarts a stuck flow
+(flows are generation-stamped; a restart drops the old paste channel). The
+OAuth client is a public PKCE client — no secret anywhere; the built-in
+site's was registered by `/web/ops/wftui_oauth_client.php`, another site's
+by its admin (`docs/CONFIG.md`).
 
 ## tmux notes
 

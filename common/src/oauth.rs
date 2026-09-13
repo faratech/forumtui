@@ -59,22 +59,59 @@ fn fill_from_os(dst: &mut [u8]) {
         .expect("the OS entropy source must be available to start a login");
 }
 
-fn authorize_endpoint() -> String {
-    format!("{}{}", config::base_url(), config::OAUTH_AUTHORIZE_PATH)
-}
-
-/// Build the authorize URL the browser is pointed at.
-pub fn authorize_url(pkce: &Pkce, state: &str, redirect_uri: &str, client_id: &str) -> String {
-    let scopes = config::SCOPES.join(" ");
+/// Build the authorize URL the browser is pointed at. `base` is the site
+/// origin — passed in like every other call here, never read from the
+/// process environment, so the URL can never name a different site than
+/// the client that will exchange the code.
+pub fn authorize_url(
+    base: &str,
+    pkce: &Pkce,
+    state: &str,
+    redirect_uri: &str,
+    client_id: &str,
+    scopes: &[String],
+) -> String {
+    let scopes = scopes.join(" ");
     format!(
-        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
-        authorize_endpoint(),
+        "{base}{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+        config::OAUTH_AUTHORIZE_PATH,
         urlencode(client_id),
         urlencode(redirect_uri),
         urlencode(&scopes),
         urlencode(state),
         urlencode(&pkce.challenge),
     )
+}
+
+/// The redirect URI paste mode advertises: no port, no listener. XenForo
+/// matches loopback-IP redirect URIs ignoring the port, so this is also
+/// what an admin registers once for every mode.
+pub const PASTE_REDIRECT_URI: &str = "http://127.0.0.1/callback";
+
+/// Bind the loopback listener for the redirect: `config::LOOPBACK_PORT`
+/// first (an exact `:9420` registration still works), else any free port
+/// (RFC 8252 — XenForo ignores the port for loopback IPs). Returns the
+/// listener and the exact `redirect_uri` the authorize request must carry.
+pub async fn bind_loopback() -> Result<(TcpListener, String)> {
+    let listener = match TcpListener::bind(("127.0.0.1", config::LOOPBACK_PORT)).await {
+        Ok(l) => l,
+        Err(_) => TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .map_err(|e| Error::Handshake(format!("cannot listen on 127.0.0.1: {e}")))?,
+    };
+    let port = listener
+        .local_addr()
+        .map_err(|e| Error::Handshake(format!("listener address: {e}")))?
+        .port();
+    Ok((listener, format!("http://127.0.0.1:{port}/callback")))
+}
+
+/// A relay call answered "no such route": the site has no TuiLink add-on.
+/// XenForo returns its JSON envelope with HTTP 404 for an unknown API
+/// route, which `register_link` surfaces as a structured OAuth/API error;
+/// a transport failure or a 5xx is NOT this — the add-on may well be there.
+pub fn is_route_missing(e: &Error) -> bool {
+    matches!(e, Error::OAuth { status: 404, .. } | Error::Api { status: 404, .. })
 }
 
 /// Wait for the browser redirect on an already-bound listener and return the
@@ -181,7 +218,10 @@ pub async fn wait_for_redirect(
 }
 
 /// Fallback for headless/SSH sessions: the user pastes the failed redirect
-/// URL (or just `code=X&state=Y`) from their local browser's address bar.
+/// URL (or just `code=X&state=Y`, or the bare code) from their local
+/// browser's address bar. A bare code carries no state to check — the
+/// person typing it is the one who just approved the request, and the
+/// PKCE verifier still binds the code to this process.
 pub fn code_from_pasted(input: &str, expected_state: &str) -> Result<String> {
     let raw = input.trim();
     let query = if let Some(pos) = raw.find('?') {
@@ -189,6 +229,12 @@ pub fn code_from_pasted(input: &str, expected_state: &str) -> Result<String> {
     } else {
         raw
     };
+    if !query.is_empty()
+        && !query.contains('=')
+        && query.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    {
+        return Ok(query.to_string());
+    }
     let params = parse_query(query);
     if let Some(err) = params.get("error") {
         return Err(Error::Handshake(format!(
@@ -233,11 +279,12 @@ pub async fn refresh(
     client: &reqwest::Client,
     base: &str,
     refresh_token: &str,
+    client_id: &str,
 ) -> Result<TokenSet> {
     let form = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
-        ("client_id", &config::oauth_client_id()?),
+        ("client_id", client_id),
     ];
     token_request(client, base, &form).await
 }
@@ -259,9 +306,9 @@ pub async fn revoke(
     base: &str,
     token: &str,
     hint: Option<&str>,
+    client_id: &str,
 ) -> Result<()> {
-    let client_id = config::oauth_client_id()?;
-    let mut form: Vec<(&str, &str)> = vec![("token", token), ("client_id", &client_id)];
+    let mut form: Vec<(&str, &str)> = vec![("token", token), ("client_id", client_id)];
     if let Some(hint) = hint {
         form.push(("token_type_hint", hint));
     }
@@ -339,6 +386,8 @@ pub enum PollStatus {
     Waiting,
     Authorized(String),
     Expired,
+    /// The person declined the authorization request.
+    Denied,
 }
 
 pub async fn poll_link(client: &reqwest::Client, base: &str, id: &str) -> Result<PollStatus> {
@@ -365,6 +414,9 @@ pub async fn poll_link(client: &reqwest::Client, base: &str, id: &str) -> Result
         // may carry it.
         "authorized" if !poll.code.is_empty() => Ok(PollStatus::Authorized(poll.code)),
         "expired" => Ok(PollStatus::Expired),
+        // The generalised relay reports a refused approval; the original
+        // one never did (it stayed `waiting` until the link expired).
+        "denied" => Ok(PollStatus::Denied),
         _ => Ok(PollStatus::Waiting),
     }
 }
@@ -440,7 +492,7 @@ async fn token_request(
     // is already the client's ceiling for any access token.
     const MAX_EXPIRES_IN_SECS: i64 = 90 * 24 * 3600;
     let expires_in = parsed.expires_in.clamp(0, MAX_EXPIRES_IN_SECS);
-    Ok(TokenSet {
+    Ok(TokenSet { origin: String::new(), client_id: String::new(),
         access_token: parsed.access_token,
         refresh_token: parsed.refresh_token,
         expires_at: now.saturating_add(expires_in),
@@ -621,8 +673,9 @@ mod tests {
             verifier: "v".repeat(64),
             challenge: "chal".into(),
         };
-        let url = authorize_url(&pkce, "state123", "http://127.0.0.1:9420/callback", "cid");
-        assert!(url.starts_with(&authorize_endpoint()));
+        let scopes = crate::site::SiteConfig::windowsforum().effective_scopes();
+        let url = authorize_url("https://forum.example", &pkce, "state123", "http://127.0.0.1:9420/callback", "cid", &scopes);
+        assert!(url.starts_with("https://forum.example/oauth2/authorize?"), "{url}");
         assert!(url.contains("response_type=code"));
         assert!(url.contains("client_id=cid"));
         assert!(url.contains("code_challenge=chal"));
@@ -644,6 +697,32 @@ mod tests {
         // Denial surfaces as an error, not a code.
         let denied = "http://127.0.0.1:9420/callback?error=access_denied&state=st1";
         assert!(code_from_pasted(denied, "st1").is_err());
+    }
+
+    /// Paste mode on a phone: the person copies just the code. There is no
+    /// state to check, so it is taken as-is; anything with `=` in it is a
+    /// query and goes through the state check as before.
+    #[test]
+    fn pasted_bare_code_is_accepted() {
+        assert_eq!(code_from_pasted("  abc-DEF_123.x  ", "st1").unwrap(), "abc-DEF_123.x");
+        assert!(code_from_pasted("", "st1").is_err());
+        assert!(code_from_pasted("has space", "st1").is_err());
+        assert!(code_from_pasted("code=abc&state=wrong", "st1").is_err(), "a query still checks state");
+    }
+
+    #[tokio::test]
+    async fn bind_loopback_falls_back_to_an_ephemeral_port() {
+        let (a, uri_a) = bind_loopback().await.unwrap();
+        let port_a = a.local_addr().unwrap().port();
+        assert_eq!(uri_a, format!("http://127.0.0.1:{port_a}/callback"));
+        // With the first port held, a second bind must still succeed elsewhere.
+        let (b, uri_b) = bind_loopback().await.unwrap();
+        let port_b = b.local_addr().unwrap().port();
+        assert_ne!(port_a, port_b);
+        assert_eq!(uri_b, format!("http://127.0.0.1:{port_b}/callback"));
+        assert!(is_route_missing(&Error::OAuth { code: "x".into(), message: "".into(), status: 404 }));
+        assert!(!is_route_missing(&Error::OAuth { code: "x".into(), message: "".into(), status: 500 }));
+        assert!(!is_route_missing(&Error::NoToken));
     }
 
     #[test]
@@ -722,7 +801,7 @@ mod tests {
             .await;
 
         let client = crate::http::build().unwrap();
-        let err = refresh(&client, &server.uri(), "stale-refresh-token").await.unwrap_err();
+        let err = refresh(&client, &server.uri(), "stale-refresh-token", "cid").await.unwrap_err();
         match err {
             Error::OAuth { code, message, status } => {
                 assert_eq!(code, "invalid_grant");
@@ -749,7 +828,7 @@ mod tests {
             .await;
 
         let client = crate::http::build().unwrap();
-        let err = refresh(&client, &server.uri(), "stale-refresh-token").await.unwrap_err();
+        let err = refresh(&client, &server.uri(), "stale-refresh-token", "cid").await.unwrap_err();
         match err {
             Error::OAuth { code, message, status } => {
                 assert_eq!(code, "invalid_grant");
@@ -782,7 +861,7 @@ mod tests {
             .await;
 
         let client = crate::http::build().unwrap();
-        let tokens = refresh(&client, &server.uri(), "rt").await.unwrap();
+        let tokens = refresh(&client, &server.uri(), "rt", "cid").await.unwrap();
         let now = OffsetDateTime::now_utc().unix_timestamp();
         assert!(
             tokens.expires_at > now,
@@ -827,7 +906,7 @@ mod tests {
             .await;
 
         let client = crate::http::build().unwrap();
-        let err = refresh(&client, &server.uri(), "whatever").await.unwrap_err();
+        let err = refresh(&client, &server.uri(), "whatever", "cid").await.unwrap_err();
         match err {
             Error::OAuth { code, status, .. } => {
                 assert_eq!(code, "http_error");

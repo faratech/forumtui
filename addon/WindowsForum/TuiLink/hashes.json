@@ -1,0 +1,14 @@
+{
+    "src/addons/WindowsForum/TuiLink/Api/Controller/DraftController.php": "43a394cf8c855b36d087fd8828ec9b7dc9a97dbb14efc38b80e61d171ce73810",
+    "src/addons/WindowsForum/TuiLink/Api/Controller/LinkController.php": "428b6a5679f87970a76f2dd1fc60f4f46ad425152f9c7c992e9c25eef798a9d5",
+    "src/addons/WindowsForum/TuiLink/Config.php": "72276323a51ccaa06934df1bedb0c6cf9b2f61ae4bb405e2a5519e9a3cc516b1",
+    "src/addons/WindowsForum/TuiLink/Pub/Controller/DoneController.php": "d7267b27beb40df9ceb72082c17bae6c7695afdd18882548e4a754238fad4e20",
+    "src/addons/WindowsForum/TuiLink/Pub/Controller/StartController.php": "b32deb0230965fc0d7a901465591ecf890dc1486bc62aa8cb9c3bc940a61fa4f",
+    "src/addons/WindowsForum/TuiLink/Service/LinkStore.php": "d54d0e416eb12639f419c4675d911bcb257b638071d9e60683480f63cd23e3a9",
+    "src/addons/WindowsForum/TuiLink/Setup.php": "db996b0f366f294bfd6a000f23cded00c33825c495df5843a51c6611d2b5feaa",
+    "src/addons/WindowsForum/TuiLink/_data/option_groups.xml": "1dcb7700e10f807b43dffe67902a649ecbcf4057fae7adbd0d732a5fb8d859b5",
+    "src/addons/WindowsForum/TuiLink/_data/options.xml": "02e076e9958c8b93150cb417fec973397f7fe33bff2846400e58acebca8be4d8",
+    "src/addons/WindowsForum/TuiLink/_data/phrases.xml": "4a3f24454d4bcd1dac8e06e0df3594970007356a90d05379119c397ca2adf813",
+    "src/addons/WindowsForum/TuiLink/_data/routes.xml": "57e915282438e5b80ecb628ef69aafcd17b4a4c4c6f1be58859c1e1bcf26f14c",
+    "src/addons/WindowsForum/TuiLink/addon.json": "b821c93b8e1ed6d6412b9995fd9cd6614b469d3d0a29c3a9ff29aa46c7ca918d"
+}

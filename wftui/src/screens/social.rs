@@ -840,7 +840,7 @@ impl ConversationViewState {
             };
             let mut sink: Vec<Line<'static>> = Vec::new();
             let mut links = Vec::new();
-            push_bbcode(&mut sink, &mut links, &msg.message, theme, self.reveal_spoilers);
+            push_bbcode(&mut sink, &mut links, &msg.message, &self.site.origin, theme, self.reveal_spoilers);
             for logical in sink {
                 for wrapped in wrap_line(&logical.spans, body_w) {
                     let mut spans = vec![

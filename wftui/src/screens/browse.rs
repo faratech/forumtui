@@ -13,6 +13,7 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
 use common::bbcode::{self, Chunk};
 use common::models::{ContentState, Node, Post, Thread};
+use common::site::SiteConfig;
 
 use super::{
     Action, ForumTreeState, HomeState, Pane, ThreadListState, ThreadViewState, link_style,
@@ -24,13 +25,18 @@ use crate::hit::{Hit, HitMap, HitPane};
 use crate::images::{self, Slot};
 use crate::theme::{Theme, fmt_age};
 
-pub(crate) const NEWS_NODE: u32 = 4;
-pub(crate) const SECURITY_NODE: u32 = 84;
-pub(crate) const TUTORIALS_NODE: u32 = 305;
+/// The Home-screen keys for a site's quick destinations (`site.quick`), in
+/// order. `&'static str` because a click on the row presses exactly that key
+/// (`Hit::Key`) and a key bar cap is a static label; a site may declare at
+/// most `site::MAX_QUICK` of them, which is this array's length.
+pub(crate) const QUICK_DIGITS: [&str; common::site::MAX_QUICK] =
+    ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
 
-/// The site bot (`project_bot_rename_windowsforum_ai_2026_07`): its posts get
-/// an `AI` chip so a member never mistakes generated text for a human answer.
-const AI_USER_ID: u32 = 125_694;
+/// The quick destination a digit key names, if the site has that many.
+pub(crate) fn quick_for_digit(site: &SiteConfig, c: char) -> Option<&common::site::QuickNode> {
+    let i = c.to_digit(10)? as usize;
+    (1..=site.quick.len()).contains(&i).then(|| &site.quick[i - 1])
+}
 
 /// Both panes fit side by side from here up (DESIGN.md). Below it Home renders
 /// whichever half has focus, and Enter pushes a screen as it always did.
@@ -145,6 +151,7 @@ pub(crate) fn thread_row(
     t: &Thread,
     theme: &Theme,
     g: &Glyphs,
+    site: &SiteConfig,
     gram: Grammar,
     inner: usize,
 ) -> Line<'static> {
@@ -204,7 +211,7 @@ pub(crate) fn thread_row(
     if let Some(prefix) = &t.prefix
         && !prefix.trim().is_empty()
     {
-        let chip = chrome::chip(theme, &chrome::short_prefix(prefix));
+        let chip = chrome::chip(theme, &chrome::short_prefix(prefix, &site.prefix_strip));
         let cw = chip.width();
         if used + cw + 4 <= tw {
             spans.push(chip);
@@ -274,15 +281,15 @@ struct TreeRow {
     key: Option<&'static str>,
 }
 
-/// The QUICK block: the four keys that skip the tree entirely. The key is
-/// `&'static str` because a click on the row presses exactly it
+/// The QUICK block: `L` (Latest, every site) then the site's own quick
+/// destinations under their digits — the keys that skip the tree entirely.
+/// The key is `&'static str` because a click on the row presses exactly it
 /// (`Hit::Key`), through `handle_key`, rather than duplicating what it does.
-const QUICK: [(&str, &str); 4] = [
-    ("L", "Latest posts"),
-    ("1", "Windows News"),
-    ("2", "Security Alerts"),
-    ("3", "Windows Tutorials"),
-];
+fn quick_rows(site: &SiteConfig) -> Vec<(&'static str, String)> {
+    let mut rows = vec![("L", "Latest posts".to_string())];
+    rows.extend(site.quick.iter().zip(QUICK_DIGITS).map(|(q, d)| (d, q.label.clone())));
+    rows
+}
 
 fn forum_rows(
     s: &ForumTreeState,
@@ -291,7 +298,8 @@ fn forum_rows(
     g: &Glyphs,
     width: usize,
 ) -> Vec<TreeRow> {
-    let mut rows: Vec<TreeRow> = Vec::with_capacity(s.nodes.len() + QUICK.len() + 2);
+    let quick = quick_rows(&s.site);
+    let mut rows: Vec<TreeRow> = Vec::with_capacity(s.nodes.len() + quick.len() + 2);
     let plain = |line: Line<'static>| TreeRow {
         line,
         node: None,
@@ -302,7 +310,7 @@ fn forum_rows(
         " QUICK".to_string(),
         theme.dim().add_modifier(Modifier::BOLD),
     ))));
-    for (key, label) in QUICK {
+    for (key, label) in quick {
         rows.push(TreeRow {
             line: Line::from(vec![
                 Span::raw(" "),
@@ -748,7 +756,7 @@ pub(crate) fn render_thread_panel(
     let items: Vec<ListItem> = s
         .threads
         .iter()
-        .map(|t| ListItem::new(thread_row(t, theme, g, gram, iw)))
+        .map(|t| ListItem::new(thread_row(t, theme, g, &s.site, gram, iw)))
         .collect();
     let mut state = ListState::default().with_selected(Some(s.sel.min(s.threads.len() - 1)));
     // What "enough rows to fill the pane" means for the fill loop (#699).
@@ -858,11 +866,10 @@ pub fn home_key(s: &mut HomeState, key: KeyEvent) -> Action {
                 s.focus = Pane::Tree;
                 Action::None
             }
-            KeyCode::Char('1') => open_node_action(&s.tree.nodes, NEWS_NODE, "Windows News"),
-            KeyCode::Char('2') => open_node_action(&s.tree.nodes, SECURITY_NODE, "Security Alerts"),
-            KeyCode::Char('3') => {
-                open_node_action(&s.tree.nodes, TUTORIALS_NODE, "Windows Tutorials")
-            }
+            KeyCode::Char(c @ '1'..='9') => match quick_for_digit(&s.tree.site, c) {
+                Some(q) => open_node_action(&s.tree.nodes, q.node_id, &q.label),
+                None => Action::None,
+            },
             KeyCode::Char('L') => Action::OpenLatestThreads,
             _ => thread_list_key(&mut s.list, key),
         },
@@ -1008,9 +1015,10 @@ pub fn forum_tree_key(s: &mut ForumTreeState, key: KeyEvent) -> Action {
             },
             None => Action::None,
         },
-        KeyCode::Char('1') => open_node_action(&s.nodes, NEWS_NODE, "Windows News"),
-        KeyCode::Char('2') => open_node_action(&s.nodes, SECURITY_NODE, "Security Alerts"),
-        KeyCode::Char('3') => open_node_action(&s.nodes, TUTORIALS_NODE, "Windows Tutorials"),
+        KeyCode::Char(c @ '1'..='9') => match quick_for_digit(&s.site, c) {
+            Some(q) => open_node_action(&s.nodes, q.node_id, &q.label),
+            None => Action::None,
+        },
         KeyCode::Char('L') => Action::OpenLatestThreads,
         KeyCode::Char('r') => {
             if s.loading {
@@ -1058,20 +1066,38 @@ pub(crate) fn open_node_action(nodes: &[Node], id: u32, fallback_title: &str) ->
     }
 }
 
-pub fn forum_tree_hints() -> Hints {
+/// The digit cap for a site's quick destinations: none without any, the
+/// built-in site's own wording, or a span sized to the list. Both halves are
+/// `'static` (a `Hint` is), so they come from a table rather than a format.
+pub(crate) fn quick_hint(site: &SiteConfig) -> Option<(&'static str, &'static str)> {
+    const SPANS: [&str; 9] = ["1", "1/2", "1/2/3", "1-4", "1-5", "1-6", "1-7", "1-8", "1-9"];
+    if site.is_builtin() && site.quick.len() == 3 {
+        return Some(("1/2/3", "news/security/tutorials"));
+    }
+    match site.quick.len() {
+        0 => None,
+        1 => Some(("1", "quick forum")),
+        n => Some((SPANS[(n - 1).min(8)], "quick forums")),
+    }
+}
+
+pub fn forum_tree_hints(site: &SiteConfig) -> Hints {
+    let mut keys: Vec<(&'static str, &'static str)> = vec![
+        ("Enter", "open"),
+        ("j/k", "move"),
+        ("h/l", "tree in/out"),
+    ];
+    keys.extend(quick_hint(site));
+    keys.extend([
+        ("N", "new thread"),
+        ("r", "refresh"),
+        ("c", "DMs"),
+        ("a", "alerts"),
+        ("s", "search"),
+        ("q", "quit"),
+    ]);
     Hints::with_short(
-        &[
-            ("Enter", "open"),
-            ("j/k", "move"),
-            ("h/l", "tree in/out"),
-            ("1/2/3", "news/security/tutorials"),
-            ("N", "new thread"),
-            ("r", "refresh"),
-            ("c", "DMs"),
-            ("a", "alerts"),
-            ("s", "search"),
-            ("q", "quit"),
-        ],
+        &keys,
         &[
             ("Enter", "open"),
             ("j/k", ""),
@@ -1488,11 +1514,12 @@ pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<
 /// Render BBCode into logical (unwrapped) lines, collecting link targets.
 fn bbcode_lines(
     src: &str,
+    origin: &str,
     links: &mut Vec<String>,
     theme: &Theme,
     reveal_spoilers: bool,
 ) -> Vec<Vec<Span<'static>>> {
-    chunk_lines(&bbcode::render(src), links, theme, reveal_spoilers)
+    chunk_lines(&bbcode::render_at(src, origin), links, theme, reveal_spoilers)
 }
 
 /// `bbcode_lines` over an already-parsed chunk stream. Split out so a screen
@@ -1674,10 +1701,11 @@ pub(crate) fn push_bbcode(
     lines: &mut Vec<Line<'static>>,
     links: &mut Vec<String>,
     src: &str,
+    origin: &str,
     theme: &Theme,
     reveal_spoilers: bool,
 ) {
-    for l in bbcode_lines(src, links, theme, reveal_spoilers) {
+    for l in bbcode_lines(src, origin, links, theme, reveal_spoilers) {
         lines.push(Line::from(l));
     }
 }
@@ -1730,7 +1758,7 @@ impl ThreadViewState {
             let selected = i == self.sel_post;
             let number = self.post_number(i);
             let header_line = lines.len();
-            lines.push(post_header_line(post, number, theme, width));
+            lines.push(post_header_line(post, number, theme, width, &self.site.bot_user_ids));
             // Only when the payload actually carries author details; a blank
             // dim row under every header just loosens the card for nothing.
             let meta = post_meta_line(post, theme, width);
@@ -1801,7 +1829,7 @@ impl ThreadViewState {
             // `[attachment 3]` in the flow and pile every picture at the
             // bottom, so a post that alternates text and screenshots read as
             // a wall of text followed by unlabelled images.
-            let chunks = common::bbcode::render(&post.message);
+            let chunks = common::bbcode::render_at(&post.message, &self.site.origin);
             let imgs = post_images(post, &chunks);
             let videos = post_videos(Some(post));
             let image_count = imgs.all.len();
@@ -2005,7 +2033,7 @@ fn thread_summary_line(
     if let Some(prefix) = &s.thread.prefix
         && !prefix.trim().is_empty()
     {
-        spans.push(chrome::chip(theme, &chrome::short_prefix(prefix)));
+        spans.push(chrome::chip(theme, &chrome::short_prefix(prefix, &s.site.prefix_strip)));
         spans.push(Span::raw(" "));
     }
     let mut meta = String::new();
@@ -2042,7 +2070,9 @@ fn thread_summary_line(
 
 /// A post's header: the 4-cell avatar slot, the author, their chips, and the
 /// timestamp + `#n` on the right.
-fn post_header_line(post: &Post, number: u64, theme: &Theme, width: usize) -> Line<'static> {
+/// `bots` are the site's bot accounts: their posts wear an `AI` chip so a
+/// member never mistakes generated text for a human answer.
+fn post_header_line(post: &Post, number: u64, theme: &Theme, width: usize, bots: &[u32]) -> Line<'static> {
     let mut spans = vec![
         Span::raw(" "),
         // Phase 3 paints an avatar image over exactly these four cells; the
@@ -2056,7 +2086,7 @@ fn post_header_line(post: &Post, number: u64, theme: &Theme, width: usize) -> Li
             theme.base().add_modifier(Modifier::BOLD),
         ),
     ];
-    if post.user_id == AI_USER_ID {
+    if bots.contains(&post.user_id) {
         spans.push(Span::raw(" "));
         spans.push(chrome::chip_active(theme, "AI"));
     }
@@ -2851,7 +2881,7 @@ mod tests {
             discussion_open: true,
             ..Default::default()
         };
-        let row = text(&thread_row(&t, &theme, &UNICODE, gram, 78));
+        let row = text(&thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), gram, 78));
         assert_eq!(row.chars().count(), 78);
         assert_eq!(col(&row, "HItest"), Some(56));
         // Replies are right-aligned in a 4-cell column ending at 69.
@@ -2870,7 +2900,7 @@ mod tests {
             discussion_open: true,
             ..Default::default()
         };
-        let line = thread_row(&t, &theme, &UNICODE, Grammar::Wide, 81);
+        let line = thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), Grammar::Wide, 81);
         let row = text(&line);
         assert_eq!(line.width(), 81, "{row}");
         assert_eq!(&row[..1], " ");
@@ -2897,7 +2927,7 @@ mod tests {
             discussion_open: true,
             ..Default::default()
         };
-        let line = thread_row(&t, &theme, &UNICODE, Grammar::Wide, 81);
+        let line = thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), Grammar::Wide, 81);
         assert_eq!(line.width(), 81, "{}", text(&line));
     }
 
@@ -2916,7 +2946,7 @@ mod tests {
         };
         for inner in 42usize..=120 {
             for gram in [Grammar::Narrow, Grammar::Wide] {
-                let line = thread_row(&t, &theme, &UNICODE, gram, inner);
+                let line = thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), gram, inner);
                 assert_eq!(line.width(), inner, "state + prefix at inner {inner}: {}", text(&line));
             }
         }
@@ -2934,11 +2964,11 @@ mod tests {
         };
         for inner in [40usize, 60, 71, 78, 81, 120] {
             for gram in [Grammar::Wide, Grammar::Narrow] {
-                let line = thread_row(&t, &theme, &UNICODE, gram, inner);
+                let line = thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), gram, inner);
                 assert_eq!(line.width(), inner, "{gram:?} at inner {inner}");
             }
         }
-        let row = text(&thread_row(&t, &theme, &UNICODE, Grammar::Wide, 81));
+        let row = text(&thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), Grammar::Wide, 81));
         assert!(row.contains('\u{2026}'), "long titles clip with an ellipsis");
         // The author column clips too rather than pushing the age column.
         assert_eq!(col(&row, "Starwind"), Some(51));
@@ -2970,7 +3000,7 @@ mod tests {
             "article outranks locked"
         );
         // ...and it reaches the rendered row, dim, in the type column.
-        let row = text(&thread_row(&closed, &theme, &UNICODE, Grammar::Wide, 81));
+        let row = text(&thread_row(&closed, &theme, &UNICODE, &SiteConfig::windowsforum(), Grammar::Wide, 81));
         assert_eq!(row.chars().nth(3), Some('\u{2298}'), "type column: {row}");
     }
 
@@ -2996,7 +3026,7 @@ mod tests {
             };
             for inner in 40usize..=120 {
                 for gram in [Grammar::Wide, Grammar::Narrow] {
-                    let line = thread_row(&t, &theme, &UNICODE, gram, inner);
+                    let line = thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), gram, inner);
                     if gram.title_width(inner) >= 4 {
                         assert_eq!(line.width(), inner, "{title:?} {gram:?} at inner {inner}");
                     } else {
@@ -3039,7 +3069,7 @@ mod tests {
             ..Default::default()
         };
         for inner in 0..40usize {
-            let line = thread_row(&t, &theme, &UNICODE, Grammar::Wide, inner);
+            let line = thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), Grammar::Wide, inner);
             assert!(line.width() <= inner, "overflowed at inner {inner}");
         }
     }
@@ -3553,14 +3583,14 @@ mod tests {
                 },
                 Post {
                     post_id: 202,
-                    user_id: AI_USER_ID,
+                    user_id: 125_694,
                     username: "WindowsForum AI".into(),
                     message: "Microsoft Edge supports a daily update-suppression window."
                         .into(),
                     reaction_score: 2,
                     vote_score: 1,
                     user: Some(User {
-                        user_id: AI_USER_ID,
+                        user_id: 125_694,
                         username: "WindowsForum AI".into(),
                         custom_title: "site assistant".into(),
                         message_count: 48_102,
@@ -4204,7 +4234,7 @@ mod tests {
                 user: u,
                 ..Default::default()
             };
-            thread_row(&t, &theme, &UNICODE, Grammar::Wide, 100)
+            thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), Grammar::Wide, 100)
         };
         let struck = |line: &ratatui::text::Line<'static>| {
             line.spans
@@ -4229,7 +4259,7 @@ mod tests {
                 user: u,
                 ..Default::default()
             };
-            post_header_line(&post, 1, &theme, 100)
+            post_header_line(&post, 1, &theme, 100, &[125_694])
         };
         let h = header(Some(banned(true)));
         assert!(struck(&h));
@@ -4258,7 +4288,7 @@ mod tests {
                 is_unread: true,
                 ..Default::default()
             };
-            thread_row(&t, &theme, &UNICODE, Grammar::Wide, 100)
+            thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), Grammar::Wide, 100)
         };
 
         let deleted = row_of("deleted");
@@ -4300,7 +4330,7 @@ mod tests {
                     discussion_state: state.into(),
                     ..Default::default()
                 };
-                let row = thread_row(&t, &theme, &UNICODE, Grammar::Wide, inner);
+                let row = thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), Grammar::Wide, inner);
                 assert!(row.width() <= inner, "{state} overflowed at {inner}");
             }
         }
@@ -4678,7 +4708,7 @@ mod tests {
     fn chunk_lines_expands_tabs_instead_of_dropping_them() {
         let theme = Theme::truecolor();
         let mut links = Vec::new();
-        let lines = bbcode_lines("[CODE]Name\tValue[/CODE]", &mut links, &theme, false);
+        let lines = bbcode_lines("[CODE]Name\tValue[/CODE]", "https://x.example", &mut links, &theme, false);
         assert_eq!(lines.len(), 1);
         let rendered: String = lines[0].iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rendered, "Name    Value", "a tab must expand to spaces, not disappear");
@@ -4821,6 +4851,7 @@ mod tests {
             &mut lines,
             &mut links,
             "Hello [B]world[/B] from [URL=https://example.com]Windows[/URL]!",
+            "https://x.example",
             &theme,
             false,
         );
@@ -4838,6 +4869,7 @@ mod tests {
             &mut lines,
             &mut links,
             "Line 1 with [B]bold[/B]\nLine 2 with [I]italic[/I]\n\nLine 4",
+            "https://x.example",
             &theme,
             false,
         );
@@ -5083,7 +5115,7 @@ mod tests {
             ..Default::default()
         };
         for width in [36usize, 40, 48, 58, 78] {
-            let l = post_header_line(&post, 1, &theme, width);
+            let l = post_header_line(&post, 1, &theme, width, &[]);
             assert!(l.width() <= width, "width {width}: {}", text(&l));
         }
     }

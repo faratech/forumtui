@@ -43,6 +43,25 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Building wftui $VERSION"
 
+      # The self-updater names its asset after the *tag* but compares the
+      # *binary's* Cargo version against it: a tag that does not match
+      # wftui/Cargo.toml would publish a release that re-downloads itself
+      # forever. Refuse it here, before anything is built.
+      - name: Check the tag matches wftui/Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          CRATE="$(grep -m1 '^version = ' wftui/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          COMMON="$(grep -m1 '^version = ' common/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          if [[ "$TAG" != "$CRATE" ]]; then
+            echo "tag v$TAG does not match wftui/Cargo.toml version $CRATE" >&2
+            exit 1
+          fi
+          if [[ "$COMMON" != "$CRATE" ]]; then
+            echo "common/Cargo.toml ($COMMON) and wftui/Cargo.toml ($CRATE) versions differ" >&2
+            exit 1
+          fi
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1482605baf5e54c3a4a81144c8575711b97477ef # master
         with:
@@ -59,17 +78,30 @@ jobs:
       - name: Build release tarball (no-images)
         run: packaging/linux/build-tarball.sh --no-images
 
+      - name: Build release tarball (Terminal for XenForo)
+        run: packaging/linux/build-tarball.sh --generic
+
       - name: Generate artifact attestation (Linux)
         uses: actions/attest-build-provenance@1a1e8bfc1e22a1bdc8daca44b85ce38c7eb72032 # v1
         continue-on-error: true
         with:
-          subject-path: dist/*.tar.gz*
+          subject-path: |
+            dist/*.tar.gz
+            dist/wftui-*-linux-x86_64
+            dist/wftui-*-linux-aarch64
+            dist/wftui-xf-*-linux-x86_64
+            dist/wftui-xf-*-linux-aarch64
 
-      - name: Upload tarballs
+      - name: Upload tarballs and bare binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: linux-tarballs
-          path: dist/*.tar.gz*
+          path: |
+            dist/*.tar.gz
+            dist/wftui-*-linux-x86_64
+            dist/wftui-*-linux-aarch64
+            dist/wftui-xf-*-linux-x86_64
+            dist/wftui-xf-*-linux-aarch64
           if-no-files-found: error
 
   build-windows-msix:
@@ -136,15 +168,16 @@ jobs:
           subject-path: |
             dist/*.msix
             dist/*.msixbundle
+            dist/*.exe
 
-      - name: Upload MSIX packages
+      - name: Upload MSIX packages and bare executables
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: windows-msix
           path: |
             dist/*.msix
             dist/*.msixbundle
-            dist/*.SHA256SUMS.txt
+            dist/*.exe
           if-no-files-found: error
 
   release:
@@ -166,21 +199,40 @@ jobs:
           name: windows-msix
           path: artifacts
 
+      # One checksum file for every asset, in `sha256sum` format
+      # (`<hex>  <name>`, two spaces). The client's self-updater downloads
+      # SHA256SUMS.txt by that exact name and refuses a binary whose digest
+      # is not in it, so it is recomputed here over what is actually being
+      # published rather than merged from the per-job files.
+      - name: Write SHA256SUMS.txt
+        run: |
+          cd artifacts
+          rm -f -- *.sha256 *.SHA256SUMS.txt
+          sha256sum wftui-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: Create release
         uses: softprops/action-gh-release@4634c74ebf45fcf45f81b36c464ba38ab8c4759c # v2
         with:
           name: wftui ${{ needs.build-linux-tarball.outputs.version }}
           body: |
-            WindowsForum.com Terminal UI Client — release ${{ needs.build-linux-tarball.outputs.version }}
+            WindowsForum Terminal (wftui) — release ${{ needs.build-linux-tarball.outputs.version }}
 
             **Linux**
             - `wftui-*-linux-x86_64.tar.gz` — native binary + README (requires default features)
             - `wftui-*-linux-x86_64-no-images.tar.gz` — text-only tier (no graphics)
+            - `wftui-*-linux-x86_64` — the bare binary (what a running wftui fetches to update itself)
+
+            **Terminal for XenForo** (the same client with no built-in site — connects to any XenForo 2.3 forum)
+            - `wftui-xf-*-linux-x86_64.tar.gz` — tarball
+            - `wftui-xf-*-linux-x86_64` — the bare binary its self-updater fetches
 
             **Windows**
             - `wftui-*.msixbundle` — signed, installable on x64/x86/arm64 (recommended)
             - `wftui-*-x64.msix`, `wftui-*-x86.msix`, `wftui-*-arm64.msix` — per-architecture
-            - `wftui-*.SHA256SUMS.txt` — checksums for verification
+            - `wftui-*-windows-{x64,x86,arm64}.exe` — the bare dual-signed executables (self-update)
+
+            `SHA256SUMS.txt` covers every asset above; a running wftui verifies its own update against it.
 
             Proprietary software — in development.
           files: artifacts/*

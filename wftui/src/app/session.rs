@@ -37,6 +37,7 @@ impl App {
         self.abort_session_tasks();
         self.abort_writes();
         if let Some(task) = self.login_task.take() { task.abort(); }
+        if let Some(task) = self.update_task.take() { task.abort(); }
         let read: Vec<_> = self.screens.iter().filter_map(|screen| {
             match screen {
                 Screen::ThreadView(view) if view.seen_date > view.reported_date && view.seen_date > 0 =>
@@ -51,6 +52,56 @@ impl App {
                 for (id, seen) in read { let _ = api.mark_thread_read(id, Some(seen)).await; }
             }).await;
         }
+    }
+
+    /// The Setup screen's submit (generic edition, first run): validate the
+    /// answers, write `config.json`, and become that site in-process —
+    /// client, stores, theme — then start sign-in. Every refusal goes back
+    /// onto the screen as a row under the fields, never a silent no-op.
+    pub(super) fn setup_site(&mut self, origin: &str, client_id: &str, name: &str) {
+        let path = self.config_path.clone();
+        let outcome = common::site::site_from_setup(origin, client_id, name).and_then(|site| {
+            common::site::save_site(&path, &site)?;
+            let client = WfApiClient::for_site(&site)?;
+            Ok((site, client))
+        });
+        match outcome {
+            Ok((site, client)) => self.adopt_site(site, client),
+            Err(e) => {
+                let message = match &e {
+                    common::error::Error::Config(m) => m.clone(),
+                    other => other.to_string(),
+                };
+                if let Some(Screen::Setup(s)) = self.screens.last_mut() {
+                    s.errors = vec![message.clone()];
+                }
+                self.set_status(message);
+            }
+        }
+    }
+
+    /// Swap the process onto `site`: what `run` did at start, redone for a
+    /// site that did not exist then. The Setup screen is popped and sign-in
+    /// begins — a site just created has no session to restore.
+    pub(super) fn adopt_site(&mut self, site: common::site::SiteConfig, client: WfApiClient) {
+        let site = Arc::new(site);
+        let client = Arc::new(client);
+        self.site = site.clone();
+        self.api = client.clone();
+        self.client = client;
+        self.draft_store = common::drafts::Store::for_site(&site.name);
+        self.theme = Theme::detect_with(site.brand.chrome_bg);
+        self.images.set_logo(None);
+        while self.screens.len() > 1 {
+            self.pop_screen();
+        }
+        if matches!(self.screens.last(), Some(Screen::Setup(_))) {
+            self.screens.pop();
+        }
+        self.set_hint(format!("Saved {} to {}", site.brand.name, self.config_path.display()));
+        self.push_screen(screens::home_state(true));
+        self.push_screen(screens::login_state());
+        self.begin_login();
     }
 
     pub(super) async fn bootstrap(&mut self) {
@@ -188,7 +239,8 @@ impl App {
         // was built.
         const BOOTSTRAP_STATUS_MSG_CAP: usize = 30;
         self.set_hint(format!(
-            "Can't reach windowsforum.com ({}) — press r to retry.",
+            "Can't reach {} ({}) — press r to retry.",
+            self.site.host(),
             cap_message(&e.message, BOOTSTRAP_STATUS_MSG_CAP)
         ));
     }
@@ -449,17 +501,26 @@ impl App {
         }
         self.login_generation = self.login_generation.wrapping_add(1);
         let generation = self.login_generation;
+        let mut mode = self.site.login;
         if let Some(Screen::Login(ls)) = self.screens.last_mut() {
             ls.busy = true;
             ls.error = None;
             ls.stage = crate::screens::LoginStage::Idle;
             ls.url.clear();
+            ls.paste.clear();
+            ls.paste_cursor = 0;
+            mode = ls.login_mode();
         }
         let tx = self.tx.clone();
         let client = self.client.clone();
         let browser_opener = self.browser_opener;
+        let site = self.site.clone();
+        let (paste_tx, paste_rx) = mpsc::unbounded_channel();
+        self.login_paste_tx = Some(paste_tx);
         let handle = tokio::spawn(async move {
-            if let Err(message) = run_login_flow(&tx, client, generation, browser_opener).await {
+            if let Err(message) =
+                run_login_flow(&tx, client, generation, browser_opener, site, mode, paste_rx).await
+            {
                 tx.send(Msg::LoginFailed { generation, message }).ok();
             }
         });
@@ -475,6 +536,7 @@ impl App {
         self.logout_pending = true;
         let client = self.client.clone();
         let tx = self.tx.clone();
+        let ua = self.site.user_agent();
         let generation = self.session_generation.wrapping_add(1);
         tokio::spawn(async move {
             // Take the token set out of memory and erase the store *all at
@@ -511,7 +573,7 @@ impl App {
             // is out of this client's scope.
             let mut failed: Vec<&str> = Vec::new();
             if let Some(tokens) = tokens {
-                match common::http::build() {
+                match common::http::build_with_ua(&ua) {
                     Ok(http) => {
                         for (token, hint) in [
                             (&tokens.refresh_token, "refresh_token"),
@@ -522,7 +584,7 @@ impl App {
                             }
                             let base = client.base_url();
                             if let Err(e) =
-                                common::oauth::revoke(&http, base, token, Some(hint)).await
+                                common::oauth::revoke(&http, base, token, Some(hint), client.client_id()).await
                             {
                                 tracing::warn!("logout: {hint} was not revoked server-side: {e}");
                                 failed.push(hint);

@@ -40,6 +40,9 @@ jobs:
       - name: Clippy (no-images)
         run: cargo clippy -p wftui --no-default-features --all-targets --release -- -D warnings
 
+      - name: Clippy (Terminal for XenForo)
+        run: cargo clippy -p wftui --no-default-features --features images --all-targets --release -- -D warnings
+
       - name: Test
         env:
           WFTUI_CONFIG_DIR: /tmp/wftui-test
@@ -49,6 +52,13 @@ jobs:
         env:
           WFTUI_CONFIG_DIR: /tmp/wftui-test-no-images
         run: cargo test -p wftui --no-default-features
+
+      - name: Test (Terminal for XenForo)
+        env:
+          WFTUI_CONFIG_DIR: /tmp/wftui-test-generic
+        run: |
+          cargo test -p common --no-default-features
+          cargo test -p wftui --no-default-features --features images
 
       - name: No embedded escapes
         run: /usr/bin/grep -rn $'\x1b' wftui/src && exit 1 || exit 0

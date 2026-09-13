@@ -4,7 +4,15 @@ version = "0.0.1"
 edition = "2024"
 rust-version = "1.98"
 publish = false
-description = "Core library for the wftui WindowsForum terminal client: OAuth login, API client, throttling, BBCode rendering"
+description = "Core library for WindowsForum Terminal (wftui): OAuth login, API client, throttling, BBCode rendering"
+
+[features]
+default = ["builtin-windowsforum"]
+# The WindowsForum Terminal edition: windowsforum.com is the site the client
+# uses when no config file names one, and its logo/name are compiled in.
+# Without it the same code is "Terminal for XenForo": no site until the
+# first run's Setup screen (or config.json) names one.
+builtin-windowsforum = []
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "signal"] }

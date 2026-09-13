@@ -127,6 +127,7 @@ if (Test-Path $Work) { Remove-Item -Recurse -Force $Work }
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
 
 $produced = @()
+$bareExes = @()
 
 # ---------------------------------------------------------------------------
 # Per-architecture build + pack + sign
@@ -157,7 +158,7 @@ foreach ($arch in $Architectures) {
 
     Copy-Item $exe (Join-Path $stage "wftui.exe") -Force
     if (-not $SkipSign) {
-        & $signScript (Join-Path $stage 'wftui.exe') -Description 'WindowsForum TUI'
+        & $signScript (Join-Path $stage 'wftui.exe') -Description 'WindowsForum Terminal'
         if ($LASTEXITCODE -ne 0) { throw "Dual signing failed for $arch executable" }
     }
     Copy-Item (Join-Path $AssetsDir "*.png") (Join-Path $stage "Assets") -Force
@@ -175,7 +176,7 @@ foreach ($arch in $Architectures) {
 
     if (-not $SkipSign) {
         Write-Host "-- signing ($arch)"
-        & (Join-Path $SignKitRoot "sign.ps1") $msixPath -Description "WindowsForum TUI" -DescriptionUrl "https://windowsforum.com"
+        & (Join-Path $SignKitRoot "sign.ps1") $msixPath -Description "WindowsForum Terminal" -DescriptionUrl "https://windowsforum.com"
         if ($LASTEXITCODE -ne 0) { throw "Signing failed for $arch" }
     } else {
         Write-Host "-- skipped signing ($arch)" -ForegroundColor Yellow
@@ -183,6 +184,16 @@ foreach ($arch in $Architectures) {
 
     $produced += $msixPath
     Write-Host "[OK] $msixPath" -ForegroundColor Green
+
+    # The bare dual-signed executable is a release asset in its own right:
+    # the client's self-updater (`common::update`) downloads exactly this
+    # file, by exactly this name, and verifies it against SHA256SUMS.txt.
+    # Kept out of $produced until after the bundle step, which copies every
+    # produced package into the bundle directory.
+    $bareExe = Join-Path $OutDir "wftui-$Version-windows-$arch.exe"
+    Copy-Item (Join-Path $stage "wftui.exe") $bareExe -Force
+    $bareExes += $bareExe
+    Write-Host "[OK] $bareExe" -ForegroundColor Green
 }
 
 # ---------------------------------------------------------------------------
@@ -203,13 +214,15 @@ if (-not $SkipBundle -and $produced.Count -gt 1) {
 
     if (-not $SkipSign) {
         Write-Host "-- signing bundle"
-        & (Join-Path $SignKitRoot "sign.ps1") $bundlePath -Description "WindowsForum TUI" -DescriptionUrl "https://windowsforum.com"
+        & (Join-Path $SignKitRoot "sign.ps1") $bundlePath -Description "WindowsForum Terminal" -DescriptionUrl "https://windowsforum.com"
         if ($LASTEXITCODE -ne 0) { throw "Signing failed for bundle" }
     }
 
     $produced += $bundlePath
     Write-Host "[OK] $bundlePath" -ForegroundColor Green
 }
+
+$produced += $bareExes
 
 # ---------------------------------------------------------------------------
 # Checksums

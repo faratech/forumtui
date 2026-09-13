@@ -29,6 +29,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -52,8 +53,21 @@ pub const QUEUE_CAP: usize = 64;
 
 pub const LOGO_KEY: &str = "wftui:logo";
 
-#[cfg(feature = "images")]
+#[cfg(all(feature = "images", feature = "builtin-windowsforum"))]
 const LOGO_BYTES: &[u8] = include_bytes!("../assets/wf-logo.png");
+
+/// The built-in site's sign-in logo, compiled in. `None` on the text-only
+/// build, which never draws one.
+pub fn embedded_logo() -> Option<Arc<[u8]>> {
+    #[cfg(all(feature = "images", feature = "builtin-windowsforum"))]
+    {
+        Some(Arc::from(LOGO_BYTES))
+    }
+    #[cfg(not(all(feature = "images", feature = "builtin-windowsforum")))]
+    {
+        None
+    }
+}
 
 /// Attachment images take at most this share of the panel width (DESIGN.md).
 pub const WIDTH_PERCENT: u16 = 40;
@@ -753,6 +767,10 @@ pub struct Images {
     /// only; captions read it for their `W×H` segment.
     sizes: Sizes,
     disk: DiskCache,
+    /// The PNG behind [`LOGO_KEY`]: the embedded one for the built-in site,
+    /// a site's own from `brand.logo`, or none — then the sign-in screen
+    /// keeps its text mark on every tier.
+    logo: Option<Arc<[u8]>>,
 }
 
 impl Default for Images {
@@ -775,7 +793,23 @@ impl Images {
             failed: HashSet::new(),
             sizes: Sizes::new(),
             disk: DiskCache::new(),
+            logo: embedded_logo(),
         }
+    }
+
+    /// Replace the sign-in logo (`main` decides per site).
+    pub fn set_logo(&mut self, logo: Option<Arc<[u8]>>) {
+        self.logo = logo;
+    }
+
+    /// Whether there is a picture to draw at all.
+    pub fn has_logo(&self) -> bool {
+        self.logo.is_some()
+    }
+
+    /// The logo bytes for a load task.
+    pub fn logo(&self) -> Option<Arc<[u8]>> {
+        self.logo.clone()
     }
 
     /// Tier 5 with the disk cache pointed somewhere explicit. Test-only:
@@ -1023,9 +1057,10 @@ pub async fn load(
     picker: ratatui_image::picker::Picker,
     pending: &Pending,
     permit: tokio::sync::OwnedSemaphorePermit,
+    logo: Option<Arc<[u8]>>,
 ) -> Result<Loaded, String> {
     let bytes = if pending.key == LOGO_KEY {
-        LOGO_BYTES.to_vec()
+        logo.ok_or_else(|| "this site has no logo".to_string())?.to_vec()
     } else if let Some(cached) = disk.get(&pending.key) {
         cached
     } else {
@@ -1503,6 +1538,12 @@ mod tests {
         frame
     }
 
+    /// A real PNG for the decode tests — the WindowsForum logo, used as
+    /// test data in both editions (it is compiled into the generic
+    /// edition's *tests* only, never its binary).
+    #[cfg(feature = "images")]
+    const TEST_PNG: &[u8] = include_bytes!("../assets/wf-logo.png");
+
     #[cfg(feature = "images")]
     fn loaded(tier: Tier) -> Images {
         let mut picker = ratatui_image::picker::Picker::halfblocks();
@@ -1512,7 +1553,7 @@ mod tests {
             Tier::Iterm2 => ratatui_image::picker::ProtocolType::Iterm2,
             _ => ratatui_image::picker::ProtocolType::Halfblocks,
         });
-        let proto = decode(&picker, LOGO_BYTES, LOGO_COLS, LOGO_ROWS).expect("decode the logo");
+        let proto = decode(&picker, TEST_PNG, LOGO_COLS, LOGO_ROWS).expect("decode the logo");
         let mut images = Images::text_only();
         images.policy = Policy { tier, font: font_pair(&picker) };
         images.picker = Some(picker);
@@ -1815,7 +1856,6 @@ mod tests {
     #[cfg(feature = "images")]
     #[tokio::test]
     async fn delayed_image_loads_give_the_current_viewer_the_next_slot_and_share_bytes() {
-        use std::sync::Arc;
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
         let server = MockServer::start().await;
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1831,7 +1871,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut client = common::api::WfApiClient::with_store(
-            common::token::Store::with_path(dir.join("token.json")), server.uri()
+            common::token::Store::with_path(dir.join("token.json")), server.uri(), "test-client"
         ).unwrap();
         client.image_gate = Arc::new(common::ratelimit::Gate::new(0));
         let client = Arc::new(client);
@@ -1847,7 +1887,7 @@ mod tests {
                 let (client, disk, picker, slots) = (client.clone(), disk.clone(), picker.clone(), slots.clone());
                 jobs.spawn(async move {
                     let permit = slots.acquire_owned().await.unwrap();
-                    let result = load(&client, &disk, picker, &pending, permit).await;
+                    let result = load(&client, &disk, picker, &pending, permit, embedded_logo()).await;
                     (pending.store_key(), result)
                 });
             }

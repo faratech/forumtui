@@ -208,6 +208,13 @@ impl Store {
         }
     }
 
+    /// The store for a configured site (`config::drafts_path_for`): the
+    /// built-in site's is the flat `<config dir>/drafts.json` every install
+    /// already has, any other site's lives under `sites/<name>/`.
+    pub fn for_site(name: &str) -> Self {
+        Self::with_path(crate::config::drafts_path_for(name))
+    }
+
     pub fn with_path(path: std::path::PathBuf) -> Self {
         Store { path }
     }

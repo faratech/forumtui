@@ -28,6 +28,9 @@ pub struct WfApiClient {
     /// pointed somewhere harmless for a whole test regardless of what any
     /// other thread is doing to `WFTUI_BASE_URL`.
     base: String,
+    /// The OAuth client this session was issued to; sent with every refresh
+    /// and revoke. Public (PKCE) — no secret anywhere.
+    client_id: String,
     pub api_gate: Arc<Gate>,
     pub search_gate: Arc<Gate>,
     pub write_gate: Arc<Gate>,
@@ -41,7 +44,18 @@ impl WfApiClient {
     /// The production client: the user's own token store and the configured
     /// site origin.
     pub fn new() -> Result<Self> {
-        Self::with_store(token::Store::new(), config::base_url())
+        Self::with_store(token::Store::new(), config::base_url(), config::oauth_client_id()?)
+    }
+
+    /// The client for a configured site: its own token store
+    /// (`config::token_path_for`), origin, client id and user agent.
+    pub fn for_site(site: &crate::site::SiteConfig) -> Result<Self> {
+        Self::with_store_and_ua(
+            token::Store::with_path(config::token_path_for(&site.name)),
+            site.origin.clone(),
+            site.oauth_client_id.clone(),
+            &site.user_agent(),
+        )
     }
 
     /// A client bound to an explicit token store and origin.
@@ -53,8 +67,22 @@ impl WfApiClient {
     /// issue #565, where `test_app()` built a real `WfApiClient::new()`, one
     /// test really `GET /api/me`'d windowsforum.com with the operator's own
     /// bearer, and the fixture store overwrote the real `token.json`.
-    pub fn with_store(store: token::Store, base_url: impl Into<String>) -> Result<Self> {
+    pub fn with_store(
+        store: token::Store,
+        base_url: impl Into<String>,
+        client_id: impl Into<String>,
+    ) -> Result<Self> {
+        Self::with_store_and_ua(store, base_url, client_id, &config::user_agent())
+    }
+
+    fn with_store_and_ua(
+        store: token::Store,
+        base_url: impl Into<String>,
+        client_id: impl Into<String>,
+        user_agent: &str,
+    ) -> Result<Self> {
         let base_url = config::validate_base_url(&base_url.into())?;
+        let client_id = client_id.into();
         // A store that fails to *parse* (hand-edited, truncated, or written
         // by a build whose `TokenSet` shape has since changed) is not a
         // reason to refuse to start: quarantine it and begin as if there
@@ -70,11 +98,28 @@ impl WfApiClient {
             }
             Err(e) => return Err(e),
         };
+        // A grant for another site or client is never sent here: the store
+        // goes aside as `token.json.foreign` and this process starts signed
+        // out. A legacy store (no origin recorded) is the built-in site's.
+        let tokens = match tokens {
+            Some(t) if !t.belongs_to(&base_url, &client_id) => {
+                tracing::warn!(
+                    "{} holds a session for {} (client {}), not {base_url} — set aside",
+                    store.path().display(),
+                    t.origin,
+                    t.client_id
+                );
+                store.quarantine_as("foreign", &base_url, &client_id);
+                None
+            }
+            other => other,
+        };
         Ok(WfApiClient {
-            http: crate::http::build()?,
+            http: crate::http::build_with_ua(user_agent)?,
             tokens: Mutex::new(tokens),
             store,
             base: base_url,
+            client_id,
             api_gate: Arc::new(Gate::new(config::GLOBAL_MIN_INTERVAL_MS)),
             search_gate: Arc::new(Gate::new(config::SEARCH_MIN_INTERVAL_MS)),
             write_gate: Arc::new(Gate::new(config::WRITE_COOLDOWN_MS)),
@@ -99,8 +144,16 @@ impl WfApiClient {
         format!("{}/api", self.base)
     }
 
-    /// Adopt a freshly obtained token set (login/refresh) and persist it.
-    pub async fn set_tokens(&self, tokens: TokenSet) -> Result<()> {
+    /// The OAuth client id this session belongs to.
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// Adopt a freshly obtained token set (login/refresh) and persist it,
+    /// stamped with this client's origin and client id.
+    pub async fn set_tokens(&self, mut tokens: TokenSet) -> Result<()> {
+        tokens.origin = self.base.clone();
+        tokens.client_id = self.client_id.clone();
         let mut guard = self.tokens.lock().await;
         self.store.save(&tokens)?;
         *guard = Some(tokens);
@@ -215,7 +268,7 @@ impl WfApiClient {
         // Refresh is origin traffic too. Callers acquire their own dispatch
         // slots only AFTER this refresh and its token lock have completed.
         self.api_gate.wait().await;
-        let err = match oauth::refresh(&self.http, &self.base, &refresh_token).await {
+        let err = match oauth::refresh(&self.http, &self.base, &refresh_token, &self.client_id).await {
             Ok(mut refreshed) => {
                 // RFC 6749 permits a refresh response to omit
                 // `refresh_token` when the grant is not rotated. Keeping the
@@ -269,7 +322,9 @@ impl WfApiClient {
     /// warning avoids stranding the revoked refresh token in the guard/the
     /// store, which would otherwise force a full browser re-login on the
     /// very next call (see issue #513).
-    fn keep_refreshed(&self, guard: &mut Option<TokenSet>, refreshed: TokenSet) -> String {
+    fn keep_refreshed(&self, guard: &mut Option<TokenSet>, mut refreshed: TokenSet) -> String {
+        refreshed.origin = self.base.clone();
+        refreshed.client_id = self.client_id.clone();
         let access = refreshed.access_token.clone();
         *guard = Some(refreshed.clone());
         if let Err(e) = self.store.save(&refreshed) {
@@ -1356,7 +1411,7 @@ mod tests {
             "refusing to write a fixture token set into the real config dir: {:?}",
             c.store_path()
         );
-        c.set_tokens(TokenSet {
+        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
             access_token: token.into(),
             refresh_token: "refresh-1".into(),
             expires_at: OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -1409,7 +1464,14 @@ mod tests {
             // `hold` pid-suffixes the fixture dir (#660); compare against
             // the dir it actually created.
             let dir = env.dir.to_string_lossy().to_string();
-            for path in [config::token_path(), config::log_path()] {
+            for path in [
+                config::token_path(),
+                config::log_path(),
+                config::update_root(),
+                config::token_path_for("other-site"),
+                config::drafts_path_for("other-site"),
+                crate::site::config_path(),
+            ] {
                 assert!(path.starts_with(&dir), "escaped the scratch dir: {path:?}");
                 assert!(!path.starts_with(&real), "resolved the real config dir: {path:?}");
             }
@@ -1442,7 +1504,7 @@ mod tests {
             );
             assert!(
                 store
-                    .save(&TokenSet {
+                    .save(&TokenSet { origin: String::new(), client_id: String::new(),
                         access_token: "guard".into(),
                         refresh_token: "guard".into(),
                         expires_at: 0,
@@ -1861,7 +1923,7 @@ mod tests {
         // A sibling instance refreshes and rewrites the store.
         let store = token::Store::new();
         store
-            .save(&TokenSet {
+            .save(&TokenSet { origin: String::new(), client_id: String::new(),
                 access_token: "access-2".into(),
                 refresh_token: "refresh-2".into(),
                 expires_at: OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -2239,10 +2301,10 @@ mod tests {
             .await;
 
         let http = crate::http::build().unwrap();
-        crate::oauth::revoke(&http, &server.uri(), "refresh-1", Some("refresh_token"))
+        crate::oauth::revoke(&http, &server.uri(), "refresh-1", Some("refresh_token"), "test-client")
             .await
             .expect("refresh-token revoke");
-        crate::oauth::revoke(&http, &server.uri(), "tok-1", Some("access_token"))
+        crate::oauth::revoke(&http, &server.uri(), "tok-1", Some("access_token"), "test-client")
             .await
             .expect("access-token revoke");
     }
@@ -2288,7 +2350,7 @@ mod tests {
             .await;
 
         let c = WfApiClient::new().unwrap();
-        c.set_tokens(TokenSet {
+        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
             access_token: "expired".into(),
             refresh_token: "refresh-1".into(),
             expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
@@ -2305,6 +2367,104 @@ mod tests {
             .unwrap();
         assert_eq!(stored.access_token, "tok-2");
         assert_eq!(stored.refresh_token, "refresh-2");
+        assert_eq!(stored.origin, server.uri(), "a refreshed grant is stamped with its site");
+        assert_eq!(stored.client_id, "test-client");
+    }
+
+    /// The refresh grant is presented under the client id the session was
+    /// issued to — the configured site's, not a process-global constant.
+    #[tokio::test]
+    async fn refresh_sends_the_sites_client_id() {
+        let server = MockServer::start().await;
+        let dir = "/tmp/wftui-t-refresh-cid";
+        let env = EnvGuard::hold(&server.uri(), dir);
+        let dir = env.dir.to_string_lossy().to_string();
+        Mock::given(method("POST"))
+            .and(path("/api/oauth2/token"))
+            .and(wiremock::matchers::body_string_contains("client_id=site-client-9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "tok-2", "refresh_token": "refresh-2",
+                "expires_in": 7200, "token_type": "bearer", "scope": "test"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"me": {"user_id": 1, "username": "me"}}),
+            ))
+            .mount(&server)
+            .await;
+        let store = token::Store::with_path(std::path::PathBuf::from(&dir).join("token.json"));
+        let c = WfApiClient::with_store(store, server.uri(), "site-client-9").unwrap();
+        assert_eq!(c.client_id(), "site-client-9");
+        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
+            access_token: "expired".into(),
+            refresh_token: "refresh-1".into(),
+            expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
+            scope: "test".into(),
+        })
+        .await
+        .unwrap();
+        c.me().await.unwrap();
+    }
+
+    /// A store holding another site's (or another client's) grant is never
+    /// used: it is set aside as `token.json.foreign` and the client starts
+    /// signed out. A legacy store with no origin recorded is the built-in
+    /// site's and is accepted, then back-filled by the next save.
+    #[tokio::test]
+    async fn token_from_another_origin_is_quarantined_not_used() {
+        let dir = std::env::temp_dir().join(format!("wftui-t-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token.json");
+        let store = token::Store::with_path(path.clone());
+        store
+            .save(&TokenSet {
+                access_token: "a".into(),
+                refresh_token: "r".into(),
+                expires_at: OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                scope: "s".into(),
+                origin: "https://other.example".into(),
+                client_id: "other-client".into(),
+            })
+            .unwrap();
+        let c = WfApiClient::with_store(token::Store::with_path(path.clone()), "http://127.0.0.1:1", "mine").unwrap();
+        assert!(!c.has_tokens().await, "a foreign grant must not become this client's session");
+        assert!(!path.exists(), "the foreign store is moved aside");
+        assert!(dir.join("token.json.foreign").exists());
+
+        // Same origin, different client id: also foreign.
+        store
+            .save(&TokenSet {
+                access_token: "a".into(),
+                refresh_token: "r".into(),
+                expires_at: OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                scope: "s".into(),
+                origin: "http://127.0.0.1:1".into(),
+                client_id: "other-client".into(),
+            })
+            .unwrap();
+        let c = WfApiClient::with_store(token::Store::with_path(path.clone()), "http://127.0.0.1:1", "mine").unwrap();
+        assert!(!c.has_tokens().await);
+
+        // Legacy: no origin recorded — accepted, and stamped on the next save.
+        std::fs::write(&path, r#"{"access_token":"a","refresh_token":"r","expires_at":9999999999,"scope":"s"}"#).unwrap();
+        let c = WfApiClient::with_store(token::Store::with_path(path.clone()), "http://127.0.0.1:1", "mine").unwrap();
+        assert!(c.has_tokens().await, "a pre-sites store is the built-in site's");
+        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
+            access_token: "b".into(),
+            refresh_token: "r2".into(),
+            expires_at: 9_999_999_999,
+            scope: "s".into(),
+        })
+        .await
+        .unwrap();
+        let stored = token::Store::with_path(path.clone()).load().unwrap().unwrap();
+        assert_eq!((stored.origin.as_str(), stored.client_id.as_str()), ("http://127.0.0.1:1", "mine"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A refresh-token response is allowed to omit `refresh_token` when the
@@ -2338,7 +2498,7 @@ mod tests {
             .await;
 
         let c = WfApiClient::new().unwrap();
-        c.set_tokens(TokenSet {
+        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
             access_token: "expired".into(),
             refresh_token: "refresh-1".into(),
             expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
@@ -2389,7 +2549,7 @@ mod tests {
             .await;
 
         let c = WfApiClient::new().unwrap();
-        c.set_tokens(TokenSet {
+        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
             access_token: "expired".into(),
             refresh_token: "refresh-1".into(),
             expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
@@ -2465,7 +2625,7 @@ mod tests {
             .await;
 
         let c = WfApiClient::new().unwrap();
-        c.set_tokens(TokenSet {
+        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
             access_token: "expired".into(),
             refresh_token: "refresh-1".into(),
             expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
@@ -2478,7 +2638,7 @@ mod tests {
         // shared machine. Either way `valid_token` must not adopt it.
         let store = token::Store::with_path(std::path::PathBuf::from(dir).join("token.json"));
         store
-            .save(&TokenSet {
+            .save(&TokenSet { origin: String::new(), client_id: String::new(),
                 access_token: "access-2".into(),
                 refresh_token: "refresh-2".into(),
                 expires_at: OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -2528,7 +2688,7 @@ mod tests {
             .await;
 
         let c = WfApiClient::new().unwrap();
-        c.set_tokens(TokenSet {
+        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
             access_token: "expired".into(),
             refresh_token: "refresh-1".into(),
             expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
@@ -2538,7 +2698,7 @@ mod tests {
         .unwrap();
         let store = token::Store::with_path(std::path::PathBuf::from(dir).join("token.json"));
         store
-            .save(&TokenSet {
+            .save(&TokenSet { origin: String::new(), client_id: String::new(),
                 access_token: "access-2".into(),
                 refresh_token: "refresh-2".into(),
                 expires_at: OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -2570,7 +2730,7 @@ mod tests {
             .await;
 
         let c = WfApiClient::new().unwrap();
-        c.set_tokens(TokenSet {
+        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
             access_token: "expired".into(),
             refresh_token: "refresh-1".into(),
             expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,

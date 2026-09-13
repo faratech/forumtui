@@ -25,10 +25,18 @@ fn install_crypto_provider() {
     });
 }
 
+/// The built-in site's client (its UA names windowsforum.com — hard rule 6).
+/// The updater and the login/logout flows for that site use it.
 pub fn build() -> Result<reqwest::Client> {
+    build_with_ua(&config::user_agent())
+}
+
+/// A client wearing a site's own UA (`site::SiteConfig::user_agent`): the
+/// same distinctive `wftui/<ver>` prefix, never a library default.
+pub fn build_with_ua(ua: &str) -> Result<reqwest::Client> {
     install_crypto_provider();
     Ok(reqwest::Client::builder()
-        .user_agent(config::user_agent())
+        .user_agent(ua)
         .connect_timeout(config::CONNECT_TIMEOUT)
         .timeout(config::REQUEST_TIMEOUT)
         // Be a well-behaved API client: we speak for one user, not a scraper.

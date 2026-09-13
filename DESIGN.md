@@ -12,8 +12,10 @@ they are the pixel-exact reference for column widths and copy.
 ## Principle
 
 **Brand in the chrome, content in the reader's own colors.** The header band, key caps,
-selection band and unread marks carry WindowsForum blue and the white bubble mark (a
-` WF ` chip, chrome_fg on chrome_bg, echoing the rounded speech-bubble shape of
+selection band and unread marks carry the site's brand colour (WindowsForum blue
+by default — `brand.chrome_bg` in `config.json` replaces it) and the white bubble
+mark (a ` WF ` chip — the site's 1-4 letter `brand.mark` — chrome_fg on chrome_bg,
+echoing the rounded speech-bubble shape of
 `wf-logo.png`). Body text, backgrounds and borders defer to the terminal
 (`Color::Reset`), so the client looks right in light and dark terminals. Hard rules
 1–7 in CLAUDE.md are unchanged.
@@ -104,14 +106,19 @@ row n-2      key bar:  " [Enter] open  [j/k] move  [Tab] pane  … "  — exactl
 row n-1      status:   " left text / toast                                   write gate ● ready "
 ```
 
-* The mark is a single ` WF ` chip (4 cells): chrome_fg (white) on chrome_bg (brand
+* The mark is a single ` WF ` chip (mark + 2 cells; `WF` is the built-in site's,
+  another site's comes from its config): chrome_fg (white) on chrome_bg (brand
   blue), bold — the white bubble chip, same in both glyph sets since it is letters
   rather than block-drawing characters. Then `Windows` bold + `Forum` regular. (The
   mark used to be two `▀` cells painting a four-color red/green/blue/yellow quadrant;
   that reads as the Microsoft Windows logo out of context, so it was dropped.)
 * Crumbs = titles of the screen stack (Login excluded). Overflow: drop the online
-  count, then replace middle crumbs with `…`, then clip the last crumb with `…`.
+  count and the update chip, then replace middle crumbs with `…`, then clip the
+  last crumb with `…`.
 * Badges render only when the count is > 0; otherwise `Inbox 0` in chrome_dim.
+* A staged self-update is a badge too — ` update v0.0.2 ready ` after the
+  counters, drawn signed in or not — because it is something waiting for the
+  reader, and it is the first thing the overflow ladder drops.
 * Key caps are ` Enter `, ` j/k `, ` ^S ` — words, not symbols. Key bar clips with `…`
 * **Spoilers** (`[SPOILER]`/`[ISPOILER]`): bodies render hidden (black on
   black) until `x` in the thread view toggles reveal; a link inside a hidden
