@@ -10160,7 +10160,10 @@ mod tests {
             panic!("expected the thread view");
         };
         assert_eq!(v.sel_post, 1);
-        assert_eq!(v.width, 0, "the gutter colour is baked in, so the lines must rebuild");
+        assert_ne!(
+            v.width, 0,
+            "the gutter is painted, not baked (#25): a click must not invalidate the lines"
+        );
     }
 
     /// The Inbox: its tab chips switch tabs in place, and its rows are two

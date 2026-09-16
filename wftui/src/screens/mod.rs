@@ -30,6 +30,40 @@ use crate::theme::Theme;
 
 // ---------- state structs ----------
 
+/// Paint the selection gutter onto a window of pre-wrapped lines (#25).
+///
+/// The gutter glyph is baked into the laid-out lines faint; which post or
+/// message is selected changes far too often to re-lay-out content for (the
+/// old `width = 0` invalidate re-ran `bbcode::render_at` for every post on
+/// every `n`), so the accent is applied here, to the visible rows of the
+/// selected range only, after they are cloned for drawing. A row qualifies
+/// by its shape — the `" " gutter " "` prefix the builders lay down — which
+/// body rows do not have. `range` is the selected post's (or message's)
+/// half-open line range in the full line list; `scroll` is the window's
+/// first line.
+pub(crate) fn paint_selection_gutter(
+    window: &mut [ratatui::text::Line<'static>],
+    scroll: usize,
+    range: std::ops::Range<usize>,
+    gutter: &str,
+    accent: ratatui::style::Style,
+) {
+    for (i, row) in window.iter_mut().enumerate() {
+        let line = scroll + i;
+        if !range.contains(&line) {
+            continue;
+        }
+        let is_gutter_row = row.spans.len() >= 3
+            && row.spans[0].content.as_ref() == " "
+            && row.spans[1].content.as_ref() == gutter
+            && row.spans[2].content.as_ref() == " ";
+        if is_gutter_row {
+            row.spans[1].style = accent;
+        }
+    }
+}
+
+
 /// Cached list rows (#23): the list renderers used to format every row on
 /// every frame — `truncate`, chip, width measure, pad — though only a pane's
 /// worth are on screen, and while anything loads those frames come eight a
@@ -526,11 +560,14 @@ pub struct ConversationViewState {
     pub sel_msg: usize,
     pub msg_line_offsets: Vec<usize>,
     /// What `lines`/`msg_line_offsets` were last built for: the pane width
-    /// and the selected message (the only two things the layout depends on).
-    /// `None` forces a rebuild — every writer of `messages` clears it. Both
-    /// the Inbox pane and the standalone screen used to re-wrap and re-parse
-    /// every message on every frame (issue #522).
-    pub built: Option<(u16, usize, bool)>,
+    /// and the spoiler flag. `None` forces a rebuild — every writer of
+    /// `messages` clears it. Both the Inbox pane and the standalone screen
+    /// used to re-wrap and re-parse every message on every frame (issue
+    /// #522). The selected message is deliberately NOT part of the key
+    /// (#25): the accent gutter is painted onto the visible rows at draw
+    /// time, so stepping through a DM with `n` no longer re-parses every
+    /// message.
+    pub built: Option<(u16, bool)>,
     pub loading: bool,
     pub error: Option<String>,
     /// `[SPOILER]` bodies in the messages render hidden until `x` flips
@@ -1360,7 +1397,8 @@ impl Screen {
             Screen::ThreadView(v) => {
                 if i < v.posts.len() {
                     v.sel_post = i;
-                    v.width = 0;
+                    // Painted selection (#25): no rebuild, the click's new
+                    // gutter is drawn on the next frame.
                 }
             }
             Screen::ConversationView(v) => {
@@ -1539,9 +1577,6 @@ impl Screen {
             Screen::ThreadView(v) => {
                 v.scroll = 0;
                 v.sel_post = 0;
-                // Force `rebuild_lines` (issue #542 — see thread_view_key's
-                // n/N for the same fix and why).
-                v.width = 0;
             }
             Screen::Inbox(ib) => match ib.focus {
                 // The view pane is a real pane with its own scroll: `g` must
@@ -1591,7 +1626,6 @@ impl Screen {
             Screen::ThreadView(v) => {
                 v.scroll = v.lines.len();
                 v.sel_post = v.posts.len().saturating_sub(1);
-                v.width = 0;
             }
             Screen::Inbox(ib) => match ib.focus {
                 InboxPane::View => {

@@ -1781,7 +1781,6 @@ impl ThreadViewState {
         let solution_id = self.thread.solution_post_id();
         for (i, post) in self.posts.iter().enumerate() {
             offsets.push(lines.len());
-            let selected = i == self.sel_post;
             let number = self.post_number(i);
             let header_line = lines.len();
             lines.push(post_header_line(post, number, theme, width, &self.site.bot_user_ids));
@@ -1810,11 +1809,10 @@ impl ThreadViewState {
                 });
             }
 
-            let gutter_style = if selected {
-                Style::new().fg(theme.accent)
-            } else {
-                theme.faint()
-            };
+            // The accent for the selected post is painted at draw time
+            // (#25): baking it here is what forced a full re-parse of every
+            // post on every `n`/`N`/click.
+            let gutter_style = theme.faint();
             let gutter = |extra: Vec<Span<'static>>| -> Line<'static> {
                 let mut spans = vec![
                     Span::raw(" "),
@@ -2378,12 +2376,9 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
         KeyCode::Char('n') => {
             if s.sel_post + 1 < s.posts.len() {
                 s.sel_post += 1;
-                // `lines`' gutter colour is baked in by `rebuild_lines` off
-                // `sel_post`; `s.width != inner.width` is the renderer's only
-                // rebuild trigger, so force it by invalidating the cached
-                // width — otherwise the accent gutter stays on the old post
-                // while the footer/l/v/p/1-9 all act on the new one (issue #542).
-                s.width = 0;
+                // The gutter follows the selection at paint time (#25), so
+                // there is nothing to invalidate here — the lines are the
+                // same lines the old selection drew.
                 if let Some(&line) = s.post_line_offsets.get(s.sel_post) {
                     s.scroll = line;
                 }
@@ -2393,7 +2388,6 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
         KeyCode::Char('N') => {
             if s.sel_post > 0 {
                 s.sel_post -= 1;
-                s.width = 0;
                 if let Some(&line) = s.post_line_offsets.get(s.sel_post) {
                     s.scroll = line;
                 }
@@ -2651,10 +2645,26 @@ pub fn render_thread_view(
     }
     // Sliced, not `Paragraph::scroll`: that offset is a `u16`, and a post on
     // this site can wrap past 65,536 rows (issue #558).
-    f.render_widget(
-        Paragraph::new(crate::editor::visible_window(&s.lines, s.scroll, inner.height)),
-        inner,
+    let mut window = crate::editor::visible_window(&s.lines, s.scroll, inner.height);
+    // The selected post's gutter, painted rather than baked (#25): `n`, `N`
+    // and a click change only this paint, not the laid-out lines, so none of
+    // them needs `rebuild_lines` (and its per-post `bbcode::render_at`) to
+    // run again.
+    let sel = s.sel_post.min(s.posts.len().saturating_sub(1));
+    let sel_start = s.post_line_offsets.get(sel).copied().unwrap_or(0);
+    let sel_end = s
+        .post_line_offsets
+        .get(sel + 1)
+        .copied()
+        .unwrap_or(s.lines.len());
+    super::paint_selection_gutter(
+        &mut window,
+        s.scroll,
+        sel_start..sel_end,
+        g.gutter,
+        Style::new().fg(theme.accent),
     );
+    f.render_widget(Paragraph::new(window), inner);
 
     // Hits, in the order that makes the topmost one the most specific: the
     // post card under every row it owns, then the link and image rows over
@@ -3851,6 +3861,9 @@ mod tests {
         let mut s = thread_view_fixture();
         s.sel_post = 1;
         s.rebuild_lines(&theme, &UNICODE);
+        // The laid-out lines bake the gutter FAINT for every post (#25):
+        // which post is selected is paint, not content, so a selection step
+        // must not need a re-parse.
         let gutters: Vec<(usize, Option<ratatui::style::Color>)> = s
             .lines
             .iter()
@@ -3858,38 +3871,42 @@ mod tests {
             .filter(|(_, l)| l.spans.get(1).is_some_and(|sp| sp.content == "\u{2503}"))
             .map(|(i, l)| (i, l.spans[1].style.fg))
             .collect();
-        let first = s.post_line_offsets[0];
-        let second = s.post_line_offsets[1];
+        assert!(gutters.len() > 1, "fixture: gutters on both posts");
         for (i, fg) in gutters {
-            let want = if i >= second { theme.accent } else { theme.faint };
-            assert_eq!(fg, Some(want), "gutter at line {i} (post starts {first}/{second})");
+            assert_eq!(fg, Some(theme.faint), "line {i} must bake faint");
         }
 
-        // Issue #542: `n` alone (no resize in between) must move the gutter
-        // too — thread_view_key's `n`/`N` write `sel_post` directly and used
-        // to leave `lines` (and its baked gutter colour) stale until a
-        // resize, tier change, or reload happened to rebuild it. The
-        // renderer's only rebuild trigger is `s.width != inner.width`, so
-        // pin that `n` now invalidates that cache.
+        // The accent appears at render time on the selected post's rows only.
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        term.draw(|f| {
+            render_thread_view(&mut s, f, f.area(), &theme, &UNICODE, &mut crate::hit::HitMap::default());
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut accent_rows = 0u32;
+        let mut faint_rows = 0u32;
+        for y in 0..24 {
+            for x in 0..80 {
+                if buf[(x, y)].symbol() == "\u{2503}" {
+                    match buf[(x, y)].fg {
+                        fg if fg == theme.accent => accent_rows += 1,
+                        fg if fg == theme.faint => faint_rows += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(accent_rows > 0, "the selected post's gutter must paint accent");
+        assert!(faint_rows > 0, "the unselected post's gutter stays faint");
+
+        // Issue #542's shape, under the new contract: `n` alone still moves
+        // the accent (the next render paints it), and it must NOT need a
+        // rebuild — no width invalidation, no re-parse.
         s.sel_post = 0;
         s.width = 80; // pretend a previous render already settled this width
-        s.rebuild_lines(&theme, &UNICODE);
         thread_view_key(&mut s, key('n'));
         assert_eq!(s.sel_post, 1);
-        assert_eq!(s.width, 0, "n must invalidate the cached width so the next render rebuilds");
-        s.width = 80;
-        s.rebuild_lines(&theme, &UNICODE);
-        let gutters_after_n: Vec<(usize, Option<ratatui::style::Color>)> = s
-            .lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.spans.get(1).is_some_and(|sp| sp.content == "\u{2503}"))
-            .map(|(i, l)| (i, l.spans[1].style.fg))
-            .collect();
-        for (i, fg) in gutters_after_n {
-            let want = if i >= second { theme.accent } else { theme.faint };
-            assert_eq!(fg, Some(want), "gutter at line {i} did not follow `n`");
-        }
+        assert_eq!(s.width, 80, "a selection step must not invalidate the lines");
     }
 
     // ---------- inline images (phase 3) ----------

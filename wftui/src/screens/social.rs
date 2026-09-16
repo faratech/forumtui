@@ -701,10 +701,22 @@ fn render_inbox_view_panel(
     }
     // Sliced rather than `Paragraph::scroll`, whose offset is a `u16`
     // (issue #558).
-    f.render_widget(
-        Paragraph::new(crate::editor::visible_window(&view.lines, view.scroll, body_area.height)),
-        body_area,
+    let mut window =
+        crate::editor::visible_window(&view.lines, view.scroll, body_area.height);
+    let sel_start = view.msg_line_offsets.get(view.sel_msg).copied().unwrap_or(0);
+    let sel_end = view
+        .msg_line_offsets
+        .get(view.sel_msg + 1)
+        .copied()
+        .unwrap_or(view.lines.len());
+    super::paint_selection_gutter(
+        &mut window,
+        view.scroll,
+        sel_start..sel_end,
+        g.gutter,
+        Style::new().fg(theme.accent),
     );
+    f.render_widget(Paragraph::new(window), body_area);
     message_hits(view, body_area, hits);
 }
 
@@ -853,15 +865,15 @@ impl ConversationViewState {
         self.sel_msg = self
             .sel_msg
             .min(self.messages.len().saturating_sub(1));
-        if self.built == Some((width, self.sel_msg, self.reveal_spoilers)) {
+        if self.built == Some((width, self.reveal_spoilers)) {
             return;
         }
-        self.built = Some((width, self.sel_msg, self.reveal_spoilers));
+        self.built = Some((width, self.reveal_spoilers));
         let width = width.max(1) as usize;
         let body_w = width.saturating_sub(3).max(4);
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut offsets: Vec<usize> = Vec::new();
-        for (i, msg) in self.messages.iter().enumerate() {
+        for msg in self.messages.iter() {
             offsets.push(lines.len());
             let header_left = vec![
                 chrome::initials_chip(theme, &msg.username),
@@ -874,11 +886,9 @@ impl ConversationViewState {
             let header_right = vec![Span::styled(fmt_age(msg.message_date), theme.dim())];
             lines.push(justify_line(header_left, header_right, width));
 
-            let gutter_style = if i == self.sel_msg {
-                Style::new().fg(theme.accent)
-            } else {
-                theme.faint()
-            };
+            // The accent for the selected message is painted at draw time
+            // (#25), so every card lays its gutter down faint.
+            let gutter_style = theme.faint();
             let mut sink: Vec<Line<'static>> = Vec::new();
             let mut links = Vec::new();
             push_bbcode(&mut sink, &mut links, &msg.message, &self.site.origin, theme, self.reveal_spoilers);
@@ -1108,9 +1118,21 @@ pub fn render_conversation_view(
         s.scroll = max_scroll;
     }
 
-    f.render_widget(
-        Paragraph::new(crate::editor::visible_window(&s.lines, s.scroll, view.height)),
-        view,
+    let mut window = crate::editor::visible_window(&s.lines, s.scroll, view.height);
+    let sel_start = s.msg_line_offsets.get(s.sel_msg).copied().unwrap_or(0);
+    let sel_end = s
+        .msg_line_offsets
+        .get(s.sel_msg + 1)
+        .copied()
+        .unwrap_or(s.lines.len());
+    super::paint_selection_gutter(
+        &mut window,
+        s.scroll,
+        sel_start..sel_end,
+        g.gutter,
+        Style::new().fg(theme.accent),
+    );
+    f.render_widget(Paragraph::new(window), view,
     );
     message_hits(s, view, hits);
 }
@@ -1837,11 +1859,13 @@ mod tests {
         state.rebuild_message_lines(&theme, &g, 40);
         assert!(state.lines.len() > 1, "a resize must rebuild");
 
-        // ...so does moving the selection (the gutter is styled by it)...
+        // ...but moving the selection must NOT: the accent gutter is
+        // painted onto the visible rows at draw time (#25), so stepping
+        // through a DM with `n` re-parses nothing.
         state.lines = vec![Line::from(Span::raw("SENTINEL"))];
         state.sel_msg = 1;
         state.rebuild_message_lines(&theme, &g, 40);
-        assert!(state.lines.len() > 1, "a new selection must rebuild");
+        assert_eq!(state.lines.len(), 1, "a new selection must not rebuild");
 
         // ...and so does new data, which clears the key.
         state.lines = vec![Line::from(Span::raw("SENTINEL"))];
