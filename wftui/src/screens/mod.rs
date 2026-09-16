@@ -30,6 +30,55 @@ use crate::theme::Theme;
 
 // ---------- state structs ----------
 
+/// Cached list rows (#23): the list renderers used to format every row on
+/// every frame — `truncate`, chip, width measure, pad — though only a pane's
+/// worth are on screen, and while anything loads those frames come eight a
+/// second. The cache holds the built rows keyed by everything that shapes
+/// them: the content width and a fingerprint of the data itself, so no
+/// mutation site can forget to invalidate — an in-place change moves the
+/// fingerprint the way a replacement would. Theme, glyphs and site take no
+/// part in the key on purpose: the theme and glyph set are fixed at start
+/// and the site is stamped identical every frame. `rebuild_count` is what
+/// the tests pin the behaviour with (`WrapCache::rewrapped`'s sibling).
+pub struct RowCache<R: Clone> {
+    width: usize,
+    fingerprint: u64,
+    rebuild_count: usize,
+    rows: Vec<R>,
+}
+
+impl<R: Clone> Default for RowCache<R> {
+    fn default() -> Self {
+        // Width 0 never matches a real render (the renderers return before
+        // building rows when the pane has none), so the first frame rebuilds.
+        Self { width: 0, fingerprint: 0, rebuild_count: 0, rows: Vec::new() }
+    }
+}
+
+impl<R: Clone> RowCache<R> {
+    /// The cached rows for `width` + `fingerprint`, rebuilt by `build` when
+    /// either moved. The fingerprint is a hash pass over the data — no
+    /// allocation — which is an order of magnitude cheaper than the
+    /// formatting it guards, and it cannot miss a change the way a
+    /// hand-maintained version counter can.
+    fn get(&mut self, width: usize, fingerprint: u64, build: impl FnOnce() -> Vec<R>) -> &[R] {
+        if self.width != width || self.fingerprint != fingerprint {
+            self.rows = build();
+            self.width = width;
+            self.fingerprint = fingerprint;
+            self.rebuild_count += 1;
+        }
+        &self.rows
+    }
+
+    /// How many times `get` has rebuilt — test-only, the pin the invalidation
+    /// contract hangs on.
+    #[cfg(test)]
+    fn rebuilds(&self) -> usize {
+        self.rebuild_count
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginStage {
     Idle,
@@ -176,6 +225,8 @@ pub struct ThreadListState {
     pub visible: usize,
     pub loading: bool,
     pub error: Option<String>,
+    /// The built rows, keyed by width + data fingerprint (#23).
+    pub row_cache: RowCache<ratatui::text::Line<'static>>,
 }
 
 impl ThreadListState {
@@ -446,6 +497,9 @@ pub struct ConversationsState {
     pub sel: usize,
     pub loading: bool,
     pub error: Option<String>,
+    /// The built rows (title + meta per conversation), keyed by width + data
+    /// fingerprint (#23).
+    pub row_cache: RowCache<(ratatui::text::Line<'static>, ratatui::text::Line<'static>)>,
 }
 
 #[derive(Default)]
@@ -522,6 +576,8 @@ pub struct AlertsState {
     pub sel: usize,
     pub loading: bool,
     pub error: Option<String>,
+    /// The built rows, keyed by width + data fingerprint (#23).
+    pub row_cache: RowCache<ratatui::text::Line<'static>>,
 }
 
 /// Which tab of the Inbox has its data on screen.
@@ -725,6 +781,9 @@ pub struct DraftRow {
 pub struct DraftsState {
     pub rows: Vec<DraftRow>,
     pub sel: usize,
+    /// The built rows (label + optional preview), keyed by width + data
+    /// fingerprint (#23).
+    pub row_cache: RowCache<(ratatui::text::Line<'static>, Option<ratatui::text::Line<'static>>)>,
 }
 
 /// The resource page (#697): one resource rendered in the client, from the
@@ -1891,6 +1950,7 @@ mod dispatch_tests {
                     shared: true,
                 }],
                 sel: 0,
+                ..Default::default()
             }),
             // The empty state renders a different body, so it needs covering
             // at 20x5 too.
@@ -2444,6 +2504,7 @@ mod dispatch_tests {
                         shared: true,
                     }],
                     sel: 0,
+                    ..Default::default()
                 }),
                 // Esc is the app's (pop the screen), like every other
                 // pushable list here.

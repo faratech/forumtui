@@ -16,7 +16,7 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use super::browse::{chunk_lines_aligned, truncate, wrap_spans, wrap_spans_aligned, RuleWidth};
-use super::{Action, HitMap, MediaItem, Resource};
+use super::{Action, DraftRow, HitMap, MediaItem, Resource};
 use crate::hit::{Hit, HitPane};
 use crate::chrome::{self, Hints};
 use crate::glyph::Glyphs;
@@ -1124,6 +1124,21 @@ pub fn image_view_hints(s: &super::ImageViewState) -> Hints {
 /// Before this a draft could only be seen by reopening the exact composer that
 /// made it, so a new-thread draft in a forum you were not looking at was
 /// effectively invisible and "what am I part-way through?" had no answer.
+/// What the drafts row cache keys on (#23): the four fields a row renders
+/// (`key` is identity, never shown). `DraftRow` is a local projection, so
+/// unlike the model types its fingerprint is spelled out here.
+fn drafts_fingerprint(rows: &[DraftRow]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    for r in rows {
+        r.label.hash(&mut h);
+        r.preview.hash(&mut h);
+        r.saved_at.hash(&mut h);
+        r.shared.hash(&mut h);
+    }
+    h.finish()
+}
+
 pub fn render_drafts(
     s: &mut super::DraftsState,
     f: &mut Frame,
@@ -1168,31 +1183,47 @@ pub fn render_drafts(
     }
 
     let w = inner.width as usize;
-    let items: Vec<ListItem> = s
-        .rows
-        .iter()
-        .map(|r| {
-            let label = if r.label.is_empty() {
-                "(untitled)".to_string()
-            } else {
-                r.label.clone()
-            };
-            let mut meta = fmt_age(r.saved_at);
-            if !r.shared {
-                // An edit has no XF draft to sync to, so say why this one is
-                // not on the website rather than let it look like a failure.
-                meta.push_str(" \u{b7} this device only");
-            }
-            let mut lines = vec![catalog_line(theme, &label, &meta, w)];
-            if !r.preview.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("   {}", truncate(&r.preview, w.saturating_sub(3))),
-                    theme.dim(),
-                )));
-            }
-            ListItem::new(lines)
-        })
-        .collect();
+    // Rows are built once per (width, data) and reused (#23) — the drafts list
+    // is short, but it shares the thread list's cache so the shape stays one.
+    let items: Vec<ListItem> = {
+        let rows = s.row_cache.get(w, drafts_fingerprint(&s.rows), || {
+            s.rows
+                .iter()
+                .map(|r| {
+                    let label = if r.label.is_empty() {
+                        "(untitled)".to_string()
+                    } else {
+                        r.label.clone()
+                    };
+                    let mut meta = fmt_age(r.saved_at);
+                    if !r.shared {
+                        // An edit has no XF draft to sync to, so say why this one is
+                        // not on the website rather than let it look like a failure.
+                        meta.push_str(" \u{b7} this device only");
+                    }
+                    let main = catalog_line(theme, &label, &meta, w);
+                    let preview = if r.preview.is_empty() {
+                        None
+                    } else {
+                        Some(Line::from(Span::styled(
+                            format!("   {}", truncate(&r.preview, w.saturating_sub(3))),
+                            theme.dim(),
+                        )))
+                    };
+                    (main, preview)
+                })
+                .collect()
+        });
+        rows.iter()
+            .map(|(main, preview)| {
+                let mut lines = vec![main.clone()];
+                if let Some(p) = preview {
+                    lines.push(p.clone());
+                }
+                ListItem::new(lines)
+            })
+            .collect()
+    };
     let mut state = ListState::default().with_selected(Some(s.sel.min(s.rows.len() - 1)));
     let heights: Vec<u16> = s
         .rows

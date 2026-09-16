@@ -3,6 +3,8 @@
 //! view + new-conversation composer it can still push, and the pieces shared
 //! between the inline and standalone view.
 
+use std::hash::{Hash, Hasher};
+
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -14,6 +16,8 @@ use super::{
     Action, AlertsState, ConversationViewState, ConversationsState, InboxPane, InboxState,
     InboxTab, NewConversationState,
 };
+use common::models::{Alert, Conversation};
+
 use crate::chrome::{self, Hints};
 use crate::glyph::Glyphs;
 use crate::hit::{Hit, HitMap, HitPane};
@@ -397,6 +401,25 @@ fn alerts_range(s: &AlertsState) -> Option<String> {
 /// Two-line conversation rows: unread glyph + bold title, then dim
 /// `participants · N replies · age`.
 #[allow(clippy::too_many_arguments)]
+/// What the two inbox row caches key on (#23): a hash pass over the data —
+/// no allocation. `Conversation` and `Alert` derive `Hash` outright (no
+/// unhashable fields), so these are one-liners per row.
+fn conversations_fingerprint(conversations: &[Conversation]) -> u64 {
+    let mut h = std::hash::DefaultHasher::new();
+    for c in conversations {
+        c.hash(&mut h);
+    }
+    h.finish()
+}
+
+fn alerts_fingerprint(alerts: &[Alert]) -> u64 {
+    let mut h = std::hash::DefaultHasher::new();
+    for a in alerts {
+        a.hash(&mut h);
+    }
+    h.finish()
+}
+
 fn render_conversations_rows(
     s: &mut ConversationsState,
     f: &mut ratatui::Frame,
@@ -429,40 +452,50 @@ fn render_conversations_rows(
     }
 
     let tw = (area.width as usize).saturating_sub(3);
-    let items: Vec<ListItem> = s
-        .conversations
-        .iter()
-        .map(|c| {
-            let unread = c.is_unread_conv();
-            let title_style = if unread {
-                theme.base().add_modifier(Modifier::BOLD)
-            } else {
-                theme.base()
-            };
-            let marker = if unread {
-                Span::styled(g.unread.to_string(), Style::new().fg(theme.accent))
-            } else {
-                Span::raw(" ")
-            };
-            let line1 = Line::from(vec![
-                Span::raw(" "),
-                marker,
-                Span::raw(" "),
-                Span::styled(truncate(&c.title, tw), title_style),
-            ]);
-            let meta = format!(
-                "{} \u{00B7} {} replies \u{00B7} {}",
-                c.participants_display(),
-                c.reply_count,
-                fmt_age(c.last_message_date)
-            );
-            let line2 = Line::from(vec![
-                Span::raw("   "),
-                Span::styled(truncate(&meta, tw), theme.dim()),
-            ]);
-            ListItem::new(vec![line1, line2])
-        })
-        .collect();
+    // Rows are built once per (width, data) and reused (#23) — same shape as
+    // the thread list's cache.
+    let items: Vec<ListItem> = {
+        let rows = s
+            .row_cache
+            .get(tw, conversations_fingerprint(&s.conversations), || {
+                s.conversations
+                    .iter()
+                    .map(|c| {
+                        let unread = c.is_unread_conv();
+                        let title_style = if unread {
+                            theme.base().add_modifier(Modifier::BOLD)
+                        } else {
+                            theme.base()
+                        };
+                        let marker = if unread {
+                            Span::styled(g.unread.to_string(), Style::new().fg(theme.accent))
+                        } else {
+                            Span::raw(" ")
+                        };
+                        let line1 = Line::from(vec![
+                            Span::raw(" "),
+                            marker,
+                            Span::raw(" "),
+                            Span::styled(truncate(&c.title, tw), title_style),
+                        ]);
+                        let meta = format!(
+                            "{} \u{00B7} {} replies \u{00B7} {}",
+                            c.participants_display(),
+                            c.reply_count,
+                            fmt_age(c.last_message_date)
+                        );
+                        let line2 = Line::from(vec![
+                            Span::raw("   "),
+                            Span::styled(truncate(&meta, tw), theme.dim()),
+                        ]);
+                        (line1, line2)
+                    })
+                    .collect()
+            });
+        rows.iter()
+            .map(|(title, meta)| ListItem::new(vec![title.clone(), meta.clone()]))
+            .collect()
+    };
     let mut state = ListState::default().with_selected(Some(s.sel.min(s.conversations.len() - 1)));
     let list = List::new(items);
     let list = if focused {
@@ -510,51 +543,59 @@ fn render_alerts_rows(
         return;
     }
 
-    let items: Vec<ListItem> = s
-        .alerts
-        .iter()
-        .map(|a| {
-            let (marker, style) = if a.viewed() {
-                (Span::raw(" "), theme.dim())
-            } else {
-                (
-                    Span::styled(g.unread.to_string(), Style::new().fg(theme.accent)),
-                    theme.base().add_modifier(Modifier::BOLD),
-                )
-            };
-            // XF carries the alert KIND in `action` (`quote`/`mention`/
-            // `reaction`/`insert`/`award`/…); `content_type` is the CONTENT's
-            // type (`post`/`trophy`/`user`/…) and never contains "quote" or
-            // "mention" (issue #601).
-            let action = a.action.to_ascii_lowercase();
-            let kind_glyph = if action.contains("quote") {
-                g.quote_alert
-            } else if action.contains("mention") {
-                g.mention
-            } else {
-                // Reaction/insert/award/etc. share the reply glyph — the
-                // glyph set has no dedicated reaction mark.
-                g.reply_alert
-            };
-            // `alert_text` is the server-rendered human-readable body (built
-            // from the alert handler's push template); fall back to
-            // `content_type action` for a payload that hasn't populated it.
-            let body = if a.alert_text.is_empty() {
-                format!("{} {}", a.content_type, a.action).trim().replace('_', " ")
-            } else {
-                a.alert_text.clone()
-            };
-            ListItem::new(Line::from(vec![
-                Span::raw(" "),
-                marker,
-                Span::raw(" "),
-                Span::styled(format!("{kind_glyph} "), theme.dim()),
-                Span::styled(a.username.clone(), style),
-                Span::styled(format!("  {body} "), theme.dim()),
-                Span::styled(fmt_age(a.event_date), theme.dim()),
-            ]))
-        })
-        .collect();
+    // Alert rows are width-independent (nothing truncates against the pane),
+    // so the cache keys on the data fingerprint alone (#23).
+    let items: Vec<ListItem> = {
+        let rows = s
+            .row_cache
+            .get(0, alerts_fingerprint(&s.alerts), || {
+                s.alerts
+                    .iter()
+                    .map(|a| {
+                        let (marker, style) = if a.viewed() {
+                            (Span::raw(" "), theme.dim())
+                        } else {
+                            (
+                                Span::styled(g.unread.to_string(), Style::new().fg(theme.accent)),
+                                theme.base().add_modifier(Modifier::BOLD),
+                            )
+                        };
+                        // XF carries the alert KIND in `action` (`quote`/`mention`/
+                        // `reaction`/`insert`/`award`/…); `content_type` is the CONTENT's
+                        // type (`post`/`trophy`/`user`/…) and never contains "quote" or
+                        // "mention" (issue #601).
+                        let action = a.action.to_ascii_lowercase();
+                        let kind_glyph = if action.contains("quote") {
+                            g.quote_alert
+                        } else if action.contains("mention") {
+                            g.mention
+                        } else {
+                            // Reaction/insert/award/etc. share the reply glyph — the
+                            // glyph set has no dedicated reaction mark.
+                            g.reply_alert
+                        };
+                        // `alert_text` is the server-rendered human-readable body (built
+                        // from the alert handler's push template); fall back to
+                        // `content_type action` for a payload that hasn't populated it.
+                        let body = if a.alert_text.is_empty() {
+                            format!("{} {}", a.content_type, a.action).trim().replace('_', " ")
+                        } else {
+                            a.alert_text.clone()
+                        };
+                        Line::from(vec![
+                            Span::raw(" "),
+                            marker,
+                            Span::raw(" "),
+                            Span::styled(format!("{kind_glyph} "), theme.dim()),
+                            Span::styled(a.username.clone(), style),
+                            Span::styled(format!("  {body} "), theme.dim()),
+                            Span::styled(fmt_age(a.event_date), theme.dim()),
+                        ])
+                    })
+                    .collect()
+            });
+        rows.iter().map(|l| ListItem::new(l.clone())).collect()
+    };
     let mut state = ListState::default().with_selected(Some(s.sel.min(s.alerts.len() - 1)));
     let list = List::new(items);
     let list = if focused {

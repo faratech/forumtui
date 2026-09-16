@@ -5,6 +5,8 @@
 //! pinned by unit tests against the reference artboards. Changing a width here
 //! changes what the reference renders promise, so change the tests with it.
 
+use std::hash::{Hash, Hasher};
+
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -143,6 +145,19 @@ pub(crate) fn thread_list_header(theme: &Theme, gram: Grammar, inner: usize) -> 
         rj("Active", Grammar::AGE),
     );
     Line::from(Span::styled(text, theme.dim()))
+}
+
+/// What the list panel's row cache keys on (#23): a hash pass over every
+/// thread — no allocation, an order of magnitude cheaper than the formatting
+/// it guards. `Thread`'s `Hash` covers exactly the fields the rows render;
+/// if `thread_row` starts reading a new field, that field must join the hash
+/// (see the `impl Hash for Thread` note in `common/src/models.rs`).
+fn threads_fingerprint(threads: &[Thread]) -> u64 {
+    let mut h = std::hash::DefaultHasher::new();
+    for t in threads {
+        t.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// One thread row, exactly `inner` cells wide so the selection band covers the
@@ -753,11 +768,22 @@ pub(crate) fn render_thread_panel(
         f.render_widget(Paragraph::new(thread_list_header(theme, gram, iw)), h);
     }
 
-    let items: Vec<ListItem> = s
-        .threads
-        .iter()
-        .map(|t| ListItem::new(thread_row(t, theme, g, &s.site, gram, iw)))
-        .collect();
+    // Rows are built once per (width, data) and reused (#23): the pane shows
+    // a few dozen, the list can hold hundreds, and while anything loads the
+    // frames come eight a second. What is left per frame is the clone into
+    // `ListItem`s — ratatui owns its widgets, so the borrow-free clone is the
+    // cheapest shape it accepts.
+    let items: Vec<ListItem> = {
+        let rows = s
+            .row_cache
+            .get(iw, threads_fingerprint(&s.threads), || {
+                s.threads
+                    .iter()
+                    .map(|t| thread_row(t, theme, g, &s.site, gram, iw))
+                    .collect()
+            });
+        rows.iter().map(|l| ListItem::new(l.clone())).collect()
+    };
     let mut state = ListState::default().with_selected(Some(s.sel.min(s.threads.len() - 1)));
     // What "enough rows to fill the pane" means for the fill loop (#699).
     s.visible = list_area.height as usize;
@@ -3330,6 +3356,57 @@ mod tests {
         assert!(!s.dual);
         assert_eq!(s.list_rect, Rect::new(0, 0, 80, 24));
         assert_eq!(s.tree_rect, Rect::default(), "the hidden pane takes no wheel");
+    }
+
+    /// The list panel's row cache (#23): an unchanged frame must not
+    /// reformat, and an in-place change to a thread — the shape of a
+    /// mark-read or an unread-count refresh, where `threads` is never
+    /// replaced — must still invalidate, because the cache keys on a
+    /// fingerprint of the data and not on a hand-maintained version.
+    #[test]
+    fn thread_list_rows_rebuild_on_in_place_change_not_per_frame() {
+        let theme = Theme::truecolor();
+        let mut s = Screen::ThreadList(ThreadListState {
+            node_id: 4,
+            threads: vec![
+                Thread {
+                    thread_id: 1,
+                    title: "First thread".into(),
+                    username: "u1".into(),
+                    ..Default::default()
+                },
+                Thread {
+                    thread_id: 2,
+                    title: "Second thread".into(),
+                    username: "u2".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 8)).expect("terminal");
+        let draw_once = |s: &mut Screen, term: &mut Terminal<TestBackend>| {
+            term.draw(|f| {
+                s.render(f, f.area(), &theme, &UNICODE, &mut crate::hit::HitMap::default());
+            })
+            .expect("draw");
+        };
+        draw_once(&mut s, &mut term);
+        let Screen::ThreadList(list) = &s else { panic!("thread list") };
+        assert_eq!(list.row_cache.rebuilds(), 1);
+        draw_once(&mut s, &mut term);
+        let Screen::ThreadList(list) = &s else { panic!("thread list") };
+        assert_eq!(list.row_cache.rebuilds(), 1, "an unchanged frame must not reformat");
+
+        if let Screen::ThreadList(list) = &mut s {
+            list.threads[1].title = "Edited in place".into();
+        }
+        draw_once(&mut s, &mut term);
+        let Screen::ThreadList(list) = &s else { panic!("thread list") };
+        assert_eq!(list.row_cache.rebuilds(), 2);
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Edited in place"), "row must reflect the change: {text}");
     }
 
     /// Render a screen headless and return the rows as strings.

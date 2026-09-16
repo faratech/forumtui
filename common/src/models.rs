@@ -4,6 +4,8 @@
 //! API change can never brick the client. List replies follow XF's envelope
 //! `<collection> + pagination` (AbstractController::getPaginationData).
 
+use std::hash::{Hash, Hasher};
+
 use serde::{Deserialize, Serialize};
 
 pub fn r<T: Default>() -> T {
@@ -189,6 +191,43 @@ impl Thread {
     }
 }
 
+/// `Hash` for the list-row row caches (wftui #23): the caches key on a hash
+/// of the data, so every field a list row renders must move the hash, and a
+/// field added to a row renderer must be added here. `type_data` is a
+/// `serde_json::Value` — not `Hash` (f64s and maps) — and the rows read
+/// exactly one thing out of it, so that one thing is hashed instead;
+/// likewise `user` contributes only the banned mark a row can show.
+impl Hash for Thread {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.thread_id.hash(state);
+        self.node_id.hash(state);
+        self.discussion_state.hash(state);
+        self.title.hash(state);
+        self.username.hash(state);
+        self.user_id.hash(state);
+        self.post_date.hash(state);
+        self.reply_count.hash(state);
+        self.view_count.hash(state);
+        self.last_post_date.hash(state);
+        self.last_post_username.hash(state);
+        self.sticky.hash(state);
+        self.discussion_open.hash(state);
+        self.discussion_type.hash(state);
+        self.prefix.hash(state);
+        self.tags.hash(state);
+        self.vote_score.hash(state);
+        self.highlighted_post_ids.hash(state);
+        self.type_data
+            .get("solution_post_id")
+            .and_then(serde_json::Value::as_u64)
+            .hash(state);
+        self.is_unread.hash(state);
+        self.is_watching.hash(state);
+        self.view_url.hash(state);
+        self.user.as_ref().map(|u| u.is_banned).hash(state);
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Post {
     #[serde(default)]
@@ -286,7 +325,7 @@ pub struct PostsReply {
     pub pagination: Pagination,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct ConversationRecipient {
     #[serde(default)]
     pub user_id: u32,
@@ -371,7 +410,7 @@ where
     Ok(recipients)
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Hash, Deserialize)]
 pub struct Conversation {
     #[serde(default)]
     pub conversation_id: u32,
@@ -534,7 +573,7 @@ pub struct MessagesReply {
     pub pagination: Pagination,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Hash, Deserialize)]
 pub struct Alert {
     #[serde(default)]
     pub alert_id: u32,
