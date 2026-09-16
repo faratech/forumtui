@@ -212,7 +212,7 @@ jobs:
           cat SHA256SUMS.txt
 
       - name: Create release
-        uses: softprops/action-gh-release@4634c74ebf45fcf45f81b36c464ba38ab8c4759c # v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: wftui ${{ needs.build-linux-tarball.outputs.version }}
           body: |
