@@ -63,12 +63,12 @@ jobs:
           fi
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1482605baf5e54c3a4a81144c8575711b97477ef # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.98
 
       - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@82a92a6e3519e677e0ddc7726a767aea594a9a53 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: release-linux
 
@@ -82,7 +82,7 @@ jobs:
         run: packaging/linux/build-tarball.sh --generic
 
       - name: Generate artifact attestation (Linux)
-        uses: actions/attest-build-provenance@1a1e8bfc1e22a1bdc8daca44b85ce38c7eb72032 # v1
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
         continue-on-error: true
         with:
           subject-path: |
@@ -136,13 +136,13 @@ jobs:
         shell: pwsh
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1482605baf5e54c3a4a81144c8575711b97477ef # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.98
           targets: x86_64-pc-windows-msvc,i686-pc-windows-msvc,aarch64-pc-windows-msvc
 
       - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@82a92a6e3519e677e0ddc7726a767aea594a9a53 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: release-windows
 
@@ -162,7 +162,7 @@ jobs:
         shell: pwsh
 
       - name: Generate artifact attestation (Windows)
-        uses: actions/attest-build-provenance@1a1e8bfc1e22a1bdc8daca44b85ce38c7eb72032 # v1
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
         continue-on-error: true
         with:
           subject-path: |
