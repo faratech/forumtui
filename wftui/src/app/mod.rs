@@ -1082,6 +1082,10 @@ impl App {
         // the tick where the gate frees must still paint "Ready".
         let mut dirty = true;
         let mut last_drawn_gate = self.client.write_gate.pending_wait();
+        // The first-frame latency line (#21): how far the reader had to wait
+        // from process start to a painted screen. Written once, to the log
+        // file (WFTUI_LOG=info); tests never set `PROCESS_START`.
+        let mut first_frame_logged = false;
         loop {
             if self.expire_status_toast() {
                 dirty = true;
@@ -1094,6 +1098,12 @@ impl App {
                 if let Err(error) = terminal.draw(|f| self.draw(f)) {
                     tracing::warn!("terminal draw failed: {error}");
                     return 3;
+                }
+                if !first_frame_logged {
+                    first_frame_logged = true;
+                    if let Some(start) = crate::PROCESS_START.get() {
+                        tracing::info!("first frame drawn {} ms after process start", start.elapsed().as_millis());
+                    }
                 }
                 last_drawn_gate = gate_pending;
                 dirty = false;
@@ -10724,6 +10734,167 @@ mod tests {
         let start = std::time::Instant::now();
         for _ in 0..20 { terminal.draw(|frame| app.draw(frame)).unwrap(); }
         println!("warmed 70k-line composer frame: {:?}", start.elapsed() / 20);
+    }
+
+    /// Same body as `benchmark_large_composer_frames`, but it times the FIRST
+    /// draw — the cold wrap the reader waits on after a giant paste, which
+    /// the warmed benchmark above deliberately amortises away.
+    #[test]
+    #[ignore = "manual release-mode frame benchmark"]
+    fn benchmark_cold_wrap_first_frame() {
+        let mut app = test_app();
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply { thread_id: 7, thread_title: "benchmark".into() }),
+            body: "a log line with details to read.\n".repeat(70_000),
+            ..Default::default()
+        }));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        let start = std::time::Instant::now();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        println!("cold first frame after 70k-line paste: {:?}", start.elapsed());
+    }
+
+    /// A long thread list is the other screen a reader sits on: `render_thread_panel`
+    /// currently formats a `ListItem` for every thread on every frame, and the
+    /// autoload window (#700) grows without bound. 500 threads models a long
+    /// scroll session.
+    #[test]
+    #[ignore = "manual release-mode frame benchmark"]
+    fn benchmark_thread_list_frames() {
+        let mut app = test_app();
+        let threads: Vec<Thread> = (0..500)
+            .map(|i| Thread {
+                thread_id: i as u32 + 1,
+                title: format!("Benchmark thread {i}: Windows 11 update schedule and driver questions"),
+                username: format!("user{}", i % 40),
+                user_id: (i % 40) as u32 + 1,
+                reply_count: (i % 97) as u64,
+                view_count: (i * 13 % 4_000) as u64,
+                is_unread: i % 3 == 0,
+                prefix: (i % 5 == 0).then(|| "Windows 11".into()),
+                ..Default::default()
+            })
+            .collect();
+        app.screens.push(Screen::ThreadList(screens::ThreadListState {
+            node_id: 4,
+            title: "Windows News".into(),
+            threads,
+            page: 1,
+            last_page: 25,
+            total: 500,
+            ..Default::default()
+        }));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..20 { terminal.draw(|frame| app.draw(frame)).unwrap(); }
+        println!("warmed 500-thread list frame: {:?}", start.elapsed() / 20);
+    }
+
+    fn bench_post_body(i: usize) -> String {
+        format!(
+            "Post {i}: the update schedule is controlled by group policy, and the \
+             deadline only bites once the deferral window closes. [B]Update rings[/B] \
+             matter more than the deadline itself. \
+             [URL='https://windowsforum.com/threads/123']See the earlier thread[/URL] \
+             for context, and [I]ignore[/I] the noise. \
+             [QUOTE=\"user{}, post: 9{}, member: {}\"]earlier advice about deferred updates[/QUOTE]\n",
+            i % 7,
+            i,
+            i % 7
+        )
+        .repeat(12)
+    }
+
+    /// Thread view, two numbers: a warmed frame over cached `lines`, and a
+    /// selection step (`n`), which today sets `width = 0` and re-runs
+    /// `bbcode::render_at` for every post before it can paint. Twenty posts
+    /// of realistic length models one XenForo page.
+    #[test]
+    #[ignore = "manual release-mode frame benchmark"]
+    fn benchmark_thread_view_frames_and_selection() {
+        let mut app = test_app();
+        let posts: Vec<Post> = (0..20)
+            .map(|i| Post {
+                post_id: 300 + i as u32,
+                user_id: i as u32 + 1,
+                username: format!("user{i}"),
+                message: bench_post_body(i),
+                ..Default::default()
+            })
+            .collect();
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread {
+                thread_id: 101,
+                title: "Benchmark: how do I control update schedules?".into(),
+                username: "user0".into(),
+                user_id: 1,
+                ..Default::default()
+            },
+            forum_title: "Windows Help and Support".into(),
+            posts,
+            page: 1,
+            last_page: 1,
+            total: 20,
+            ..Default::default()
+        }));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..20 { terminal.draw(|frame| app.draw(frame)).unwrap(); }
+        println!("warmed 20-post thread view frame: {:?}", start.elapsed() / 20);
+        // Ten selection steps across the page's twenty posts; each one pays
+        // the full re-parse + re-wrap until selection is O(changed posts).
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+        }
+        println!("thread view selection step (n, full rebuild): {:?}", start.elapsed() / 10);
+    }
+
+    /// The conversation view re-parses every message whenever the memo key
+    /// (`width, sel_msg, spoilers`) changes; this is the per-selection-step
+    /// cost of walking a long DM with `n`. `sel_msg` is moved directly —
+    /// exactly the state change the key makes, without benchmarking the
+    /// dispatch around it.
+    #[test]
+    #[ignore = "manual release-mode frame benchmark"]
+    fn benchmark_conversation_selection_steps() {
+        let mut app = test_app();
+        let dm_body = "Reply about the meeting: the logs are attached, and the fix \
+                       shipped in yesterday's build.\n"
+            .repeat(20);
+        let messages: Vec<ConversationMessage> = (0..50)
+            .map(|i| ConversationMessage {
+                message_id: i as u32 + 1,
+                conversation_id: 9,
+                user_id: (i % 2) as u32 + 1,
+                username: if i % 2 == 0 { "alice".into() } else { "bob".into() },
+                message: dm_body.clone(),
+                ..Default::default()
+            })
+            .collect();
+        app.screens.push(Screen::ConversationView(screens::ConversationViewState {
+            conversation: Conversation {
+                conversation_id: 9,
+                title: "benchmark".into(),
+                ..Default::default()
+            },
+            messages,
+            ..Default::default()
+        }));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let start = std::time::Instant::now();
+        for step in 0..10 {
+            let Screen::ConversationView(s) = app.screens.last_mut().unwrap() else {
+                panic!("conversation view");
+            };
+            s.sel_msg = (step + 1) % s.messages.len();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+        }
+        println!("conversation selection step (50 messages, full rebuild): {:?}", start.elapsed() / 10);
     }
 
 }

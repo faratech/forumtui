@@ -16,6 +16,11 @@ mod screens;
 mod theme;
 pub mod tty;
 
+/// When this process started — the zero for the first-frame latency line the
+/// event loop writes to the log (visible with `WFTUI_LOG=info`). Tests never
+/// set it, so their draws stay silent.
+pub static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 /// What the command line asked for. Hand-parsed: four flags and one
 /// positional do not need a parser crate.
 struct Cli {
@@ -68,6 +73,7 @@ fn parse_cli() -> Result<Cli, String> {
 }
 
 fn main() -> std::process::ExitCode {
+    let _ = PROCESS_START.set(std::time::Instant::now());
     common::logging::init();
 
     // Which forum, before anything else: a bad config file or an unknown
