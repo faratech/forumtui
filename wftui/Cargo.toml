@@ -46,10 +46,15 @@ sha2 = "0.11"
 # it. With just `crossterm` + `image-defaults` the whole graph stays pure Rust
 # (icy_sixel, base64-simd, self_cell, rustix). kitty, sixel, iterm2 and
 # halfblocks are not feature-gated — they are always compiled and chosen at
-# runtime by `Picker`. `image-defaults` is what gives us PNG/GIF/WEBP; without
-# it only JPEG decodes.
-ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"], optional = true }
-image = { version = "0.25", default-features = false, optional = true }
+# runtime by `Picker`. Decoders come from OUR `image` dependency below, with
+# only the formats forum images actually arrive in (bmp stays: screenshots
+# arrive as attachments, and it costs almost nothing): `image-defaults` would
+# enable `image/default` — the full default format set, including the AVIF
+# *encoder* (`ravif` -> `rav1e`) plus EXR/TIFF/QOI/DDS/HDR/PNM/TGA that no
+# forum ever sends this client — all of it LTO'd into the binary. AVIF
+# *decoding* needs `avif-native` and was never enabled either way.
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "gif", "jpeg", "webp", "bmp"], optional = true }
 
 # Unix only, and only for `tty.rs`: a `tcgetattr` snapshot of the terminal's
 # line discipline taken before the graphics query, re-applied on every exit
