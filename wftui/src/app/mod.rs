@@ -10419,6 +10419,7 @@ mod tests {
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "\u{6f22}\u{5b57}\u{30c6}\u{30b9}\u{30c8}".into();
             c.body_cursor = 0;
+            c.body_epoch += 1;
         }
         frame(&mut app, 40, 24);
         click(&mut app, rect.x + 4, rect.y);
@@ -10747,6 +10748,8 @@ mod tests {
             }
         }
     }
+
+
 
     #[test]
     #[ignore = "manual release-mode composer frame benchmark"]

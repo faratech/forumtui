@@ -1121,6 +1121,9 @@ pub fn new_conversation_key(s: &mut super::NewConversationState, key: KeyEvent) 
     if s.busy {
         return Action::None;
     }
+    // Any key MAY have edited the body, so any key bumps its version (#26) —
+    // the same coarse contract `compose_key` uses.
+    s.body_epoch += 1;
     if !matches!(
         key.code,
         KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
@@ -1261,7 +1264,7 @@ pub fn new_conversation_key(s: &mut super::NewConversationState, key: KeyEvent) 
             };
             let width = if s.body_width == 0 { 1 } else { s.body_width as usize };
             // Through the cache, like the Reply editor (issue #678).
-            s.wrap.sync(&s.body, width);
+            s.wrap.sync(&s.body, width, s.body_epoch);
             s.wrap
                 .move_vertical(&mut s.body_cursor, &mut s.body_desired_col, delta);
             Action::None
@@ -1356,7 +1359,7 @@ pub(crate) fn new_conversation_click_field(
         _ => {
             let line = s.body_scroll + row.saturating_sub(s.body_rect.y) as usize;
             let x = col.saturating_sub(s.body_rect.x) as usize;
-            s.wrap.sync(&s.body, s.body_width as usize);
+            s.wrap.sync(&s.body, s.body_width as usize, s.body_epoch);
             s.body_cursor = s.wrap.caret_at_cell(line, x);
             // Any non-vertical move clears the sticky column (issue #523).
             s.body_desired_col = None;
@@ -1430,7 +1433,7 @@ pub fn render_new_conversation(
     // past the pane's last row unreachable.
     s.body_width = body_area.width;
     s.body_height = body_area.height;
-    s.wrap.sync(&s.body, body_area.width as usize);
+    s.wrap.sync(&s.body, body_area.width as usize, s.body_epoch);
     let (caret_row, caret_col) = s.wrap.caret(s.body_cursor);
     s.body_scroll = crate::editor::follow_caret(
         s.body_scroll,

@@ -563,6 +563,11 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
     if s.busy {
         return Action::None;
     }
+    // Any key MAY have edited the body, so any key bumps its version (#26):
+    // over-bumping costs one locating walk, missing a bump would show stale
+    // rows. Keys are the only in-place mutator here — pastes and the
+    // attachment reference bump where they edit.
+    s.body_epoch += 1;
     let target = match &s.target {
         Some(t) => t.clone(),
         None => return Action::None,
@@ -937,7 +942,7 @@ fn compose_move_vertical(s: &mut super::ComposeState, delta: isize) {
     let width = if s.body_width == 0 { 1 } else { s.body_width as usize };
     // Through the cache (issue #678): on a pasted log this used to re-wrap
     // every row of the draft per arrow key.
-    s.wrap.sync(&s.body, width);
+    s.wrap.sync(&s.body, width, s.body_epoch);
     s.wrap
         .move_vertical(&mut s.body_cursor, &mut s.body_desired_col, delta);
 }
@@ -1164,7 +1169,7 @@ fn draw_editor_panel(
     // The wrap is incremental (issue #678) and only the rows the pane shows
     // are turned into `Line`s — building one per row allocated a String for
     // every row of a 70 000-row paste, on every frame.
-    s.wrap.sync(&s.body, body_area.width as usize);
+    s.wrap.sync(&s.body, body_area.width as usize, s.body_epoch);
     let (caret_row, caret_col) = s.wrap.caret(s.body_cursor);
     let mut tail: Vec<Line<'static>> = Vec::new();
     if let Some(err) = &s.error {
@@ -1542,8 +1547,12 @@ fn draw_preview_panel(
     }
 
     // Already wrapped to `body.width` by `build_preview` — no widget-level
-    // `Wrap`, or the reserved image rows would stop lining up.
-    f.render_widget(Paragraph::new(s.preview_cache.lines.clone()), body);
+    // `Wrap`, or the reserved image rows would stop lining up. Only the rows
+    // the pane can show are handed to the widget: the preview shows the top
+    // of the draft, and cloning the whole list put a 70 000-line paste
+    // through ~70 000 line clones per frame (issue #26).
+    let visible = (body.height as usize).min(s.preview_cache.lines.len());
+    f.render_widget(Paragraph::new(s.preview_cache.lines[..visible].to_vec()), body);
 
     // Translate the reserved slots into absolute screen rects for the app to
     // paint. A slot that does not fit whole is dropped and its caption left
@@ -1645,7 +1654,7 @@ pub(crate) fn compose_click_field(
     s.title_field = false;
     let line = s.body_scroll + row.saturating_sub(s.body_rect.y) as usize;
     let x = col.saturating_sub(s.body_rect.x) as usize;
-    s.wrap.sync(&s.body, s.body_width as usize);
+    s.wrap.sync(&s.body, s.body_width as usize, s.body_epoch);
     s.body_cursor = s.wrap.caret_at_cell(line, x);
     // Any non-vertical move clears the sticky Up/Down column (issue #523).
     s.body_desired_col = None;

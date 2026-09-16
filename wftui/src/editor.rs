@@ -381,6 +381,25 @@ pub struct WrapCache {
     /// and it is what pins the cache's whole reason to exist
     /// (`a_keystroke_rewraps_one_logical_line_not_the_whole_draft`).
     rewrapped: usize,
+    /// The caller's body version at the last `sync`. The renderer syncs
+    /// every frame, but a frame is not an edit: with the epoch unchanged
+    /// (and the width), the cache is returned without even the
+    /// common-prefix walk that locates an edit — which on a 70 000-line
+    /// draft is itself 1.5 ms of char compares per frame. Over-bumping an
+    /// epoch only costs a walk; under-bumping would show stale rows, so
+    /// callers bump coarsely (any key, a paste, an attachment insert)
+    /// rather than finely.
+    epoch: u64,
+    /// The text's byte length at the last `sync` — the fast path's safety
+    /// net. Production mutators all bump the epoch, but anything that swaps
+    /// the body behind the composer's back (a test, a future bulk edit)
+    /// with a different length still misses the fast path instead of
+    /// wrapping stale rows; only a same-length mutation could, and the
+    /// editors have no overtype mode.
+    text_len: usize,
+    /// How many `sync` calls took the epoch fast path (`#[cfg(test)]`).
+    #[cfg(test)]
+    fast_paths: usize,
 }
 
 /// Grapheme boundaries and cumulative cell widths, relative to one line.
@@ -419,12 +438,32 @@ impl WrapCache {
     /// change (or the first call) rebuilds; otherwise the edit is located by
     /// common prefix + common suffix and only the logical lines it spans are
     /// re-wrapped. Every accessor below reads the state this leaves.
-    pub fn sync(&mut self, text: &str, width: usize) {
+    ///
+    /// `epoch` is the caller's body version, bumped by every path that may
+    /// have mutated the text. The renderer calls this on frames where
+    /// nothing was typed; the epoch compare lets those frames return
+    /// immediately instead of re-walking the whole draft to discover the
+    /// edit they do not contain.
+    pub fn sync(&mut self, text: &str, width: usize, epoch: u64) {
         let width = width.max(1);
+        if width == self.width
+            && epoch == self.epoch
+            && text.len() == self.text_len
+            && !self.line_starts.is_empty()
+        {
+            #[cfg(test)]
+            {
+                self.fast_paths += 1;
+            }
+            self.rewrapped = 0;
+            return;
+        }
+        self.epoch = epoch;
         if width != self.width || self.line_starts.is_empty() {
             self.width = width;
             self.chars.clear();
             self.chars.extend(text.chars());
+            self.text_len = text.len();
             self.rebuild();
             self.rewrapped = self.row_count();
             return;
@@ -448,6 +487,7 @@ impl WrapCache {
             p += 1;
         }
         if p == self.chars.len() && pb == text.len() {
+            self.text_len = text.len();
             self.rewrapped = 0;
             return;
         }
@@ -492,6 +532,7 @@ impl WrapCache {
         for st in self.line_starts.iter_mut().skip(first + replaced) {
             *st = (*st as isize + delta).max(0) as usize;
         }
+        self.text_len = text.len();
         self.rebuild_prefix();
     }
 
@@ -528,9 +569,16 @@ impl WrapCache {
 
     /// Sync, then report how many rows that sync re-wrapped.
     #[cfg(test)]
-    fn rewrapped_rows_for_test(&mut self, text: &str, width: usize) -> usize {
-        self.sync(text, width);
+    fn rewrapped_rows_for_test(&mut self, text: &str, width: usize, epoch: u64) -> usize {
+        self.sync(text, width, epoch);
         self.rewrapped
+    }
+
+    /// How many `sync` calls took the epoch fast path — the pin that says an
+    /// unchanged frame does no work.
+    #[cfg(test)]
+    fn fast_paths(&self) -> usize {
+        self.fast_paths
     }
 
     /// The wrapped text, for slicing a row's characters out of.
@@ -1063,6 +1111,7 @@ mod tests {
         let mut seed = 0x5eed_1234u64;
         for width in [1usize, 3, 7, 12, 40] {
             let mut cache = WrapCache::default();
+            let mut epoch = 0u64;
             let mut text = String::new();
             for step in 0..200 {
                 // Insert, delete a span, or paste a block — the three shapes
@@ -1103,7 +1152,8 @@ mod tests {
                     }
                 }
 
-                cache.sync(&text, width);
+                epoch += 1;
+                cache.sync(&text, width, epoch);
                 let chars: Vec<char> = text.chars().collect();
                 let want = visual_rows_of(&chars, width);
                 assert_eq!(
@@ -1126,6 +1176,28 @@ mod tests {
         }
     }
 
+    /// The epoch fast path (#26): a sync whose epoch and width are unchanged
+    /// does no work at all — not even the prefix walk that locates an edit —
+    /// while a bumped epoch still lands in the edit path.
+    #[test]
+    fn an_unchanged_epoch_takes_the_fast_path_and_a_bump_does_not() {
+        let text = "line one\nline two\n";
+        let mut cache = WrapCache::default();
+        cache.sync(text, 40, 0);
+        assert_eq!(cache.fast_paths(), 0, "the first sync has no cache to match");
+
+        cache.sync(text, 40, 0);
+        assert_eq!(cache.fast_paths(), 1, "the unchanged frame returns immediately");
+
+        cache.sync(text, 40, 1);
+        assert_eq!(cache.fast_paths(), 1, "a bumped epoch is an edit and re-locates");
+        assert_eq!(
+            cache.rewrapped_rows_for_test(text, 40, 1),
+            0,
+            "the bump's own walk reported the edit it did (not) find"
+        );
+    }
+
     /// A width change re-wraps from scratch rather than reusing rows cut for
     /// the old width — the one case the prefix/suffix diff cannot see.
     #[test]
@@ -1133,8 +1205,8 @@ mod tests {
         let text = "the quick brown fox jumps over the lazy dog";
         let chars: Vec<char> = text.chars().collect();
         let mut cache = WrapCache::default();
-        for width in [40usize, 9, 80, 5] {
-            cache.sync(text, width);
+        for (epoch, width) in [40usize, 9, 80, 5].into_iter().enumerate() {
+            cache.sync(text, width, epoch as u64);
             assert_eq!(
                 cache.window(0, cache.row_count()),
                 visual_rows_of(&chars, width),
@@ -1153,14 +1225,14 @@ mod tests {
             .map(|i| format!("line {i} of a pasted log file\n"))
             .collect();
         let mut cache = WrapCache::default();
-        cache.sync(&text, 40);
+        cache.sync(&text, 40, 0);
         let rows_before = cache.row_count();
         assert!(rows_before >= 20_000, "test setup: a big draft");
 
         // Type one character into the middle line.
         let at = text.char_indices().nth(text.chars().count() / 2).expect("a midpoint").0;
         text.insert(at, 'x');
-        let touched = cache.rewrapped_rows_for_test(&text, 40);
+        let touched = cache.rewrapped_rows_for_test(&text, 40, 1);
         assert!(
             touched <= 4,
             "a one-character edit re-wrapped {touched} rows; it must only re-wrap the line it touched"

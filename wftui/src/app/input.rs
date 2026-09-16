@@ -233,6 +233,7 @@ impl App {
                     } else {
                         let sanitized = crate::editor::normalize_control_chars(&text.replace('\r', ""));
                         crate::editor::insert_str(&mut cs.body, &mut cs.body_cursor, &sanitized);
+                        cs.body_epoch += 1;
                     }
                     self.set_status(format!("Pasted {} characters", text.chars().count()));
                 }
@@ -275,6 +276,7 @@ impl App {
                                 &mut ncs.body_cursor,
                                 &sanitized,
                             );
+                            ncs.body_epoch += 1;
                         }
                     }
                     self.set_status(format!("Pasted {} characters", text.chars().count()));

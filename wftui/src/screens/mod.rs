@@ -405,6 +405,13 @@ pub struct ComposeState {
     pub title_cursor: usize,
     pub body_cursor: usize,
     pub title_field: bool,
+    /// The body's version, bumped by every path that may have edited it (any
+    /// key the composer takes, a paste, an attachment reference going in at
+    /// the caret). The wrap cache keys its unchanged-frame fast path on it:
+    /// a draw is not an edit, and on a 70 000-line draft even locating "no
+    /// edit" costs 1.5 ms of char compares (#26). Over-bumping only costs a
+    /// walk; the composers bump coarsely on purpose.
+    pub body_epoch: u64,
     pub busy: bool,
     pub error: Option<String>,
     /// The signed-in member, for the editor's `as <user>` segment. Empty
@@ -539,6 +546,8 @@ pub struct NewConversationState {
     pub body: String,
     /// Same contract as `ComposeState::wrap` (issue #678).
     pub wrap: crate::editor::WrapCache,
+    /// The body's version — `ComposeState::body_epoch`'s twin (#26).
+    pub body_epoch: u64,
     pub recipients_cursor: usize,
     pub title_cursor: usize,
     pub body_cursor: usize,

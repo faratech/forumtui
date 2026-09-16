@@ -1125,6 +1125,7 @@ impl App {
                         }
                         c.body = chars.into_iter().collect();
                         c.body_cursor = at + tag.chars().count();
+                        c.body_epoch += 1;
                         let name = attachment.filename.clone();
                         c.attachments.push(attachment);
                         status = Some(format!("Attached {name}."));
