@@ -2,16 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-# wftui_app — WindowsForum Terminal (Linux + Windows)
+# wftui_app — Forum Terminal (TUI) (Linux + Windows)
 
-The product name is **WindowsForum Terminal**; `wftui` is the command, the
+The product name is **Forum Terminal (TUI)**; `wftui` is the command, the
 crate, the UA prefix (hard rule 6), the MSIX execution alias and the release
 asset prefix — none of those change with the display name.
 
 It is a client for **any XenForo 2.3 forum**, in two editions from one
 codebase, switched by the cargo feature `builtin-windowsforum` (default on):
 
-- **WindowsForum Terminal** — windowsforum.com is the compiled-in default
+- **Forum Terminal (TUI)** — windowsforum.com is the compiled-in default
   site (no config file ⇒ exactly the client that always shipped), and
   `<config dir>/config.json` adds other forums or overrides the built-in one.
 - **Terminal for XenForo** (`--no-default-features --features images`) — no
@@ -362,7 +362,7 @@ mechanism; `wftui/src/app/update.rs` only decides when to run it and what to
 say. The flow is **stage now, apply at the next start**, never a relaunch:
 
 - ~3 s after start, `check_and_stage` asks the feed
-  (`https://api.github.com/repos/faratech/wftui/releases/latest`) with its own
+  (`https://api.github.com/repos/faratech/forumtui/releases/latest`) with its own
   short-lived `http::build()` client — off-origin, so **no forum gate and
   never the bearer** — at most once per 6 h (`<config dir>/update/last-check`;
   `g u` and the palette's "Check for updates" row ignore the interval). A
@@ -592,7 +592,7 @@ field on that model is `#[serde(default)]`.
    wide-char continuation cells are skipped.
 6. **The UA is `wftui/<ver> (+<url>)`** — `+https://windowsforum.com` for the
    built-in site (Cloudflare's bot rule there is keyed to it) and
-   `+https://github.com/faratech/wftui` for any other site
+   `+https://github.com/faratech/forumtui` for any other site
    (`SiteConfig::user_agent`). Cloudflare's bot rule 403s bare library UAs;
    never "fix" a blocked request by spoofing a browser UA, and never send
    one forum's address to another.

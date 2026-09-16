@@ -1,7 +1,7 @@
 # TuiLink — XenForo add-on for the wftui terminal client
 
 `WindowsForum/TuiLink` gives a XenForo 2.3 forum two things for its terminal
-users (the [wftui](https://github.com/faratech/wftui) client):
+users (the [wftui](https://github.com/faratech/forumtui) client):
 
 - **A sign-in link that works from any device.** The client shows
   `https://<forum>/tui-start/<id>`; the person opens it in any browser — a

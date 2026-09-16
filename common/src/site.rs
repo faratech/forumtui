@@ -21,13 +21,13 @@ use crate::error::{Error, Result};
 pub const BUILTIN_NAME: &str = "windowsforum";
 
 /// Whether this binary has a site built in (the `builtin-windowsforum`
-/// cargo feature). The WindowsForum Terminal edition does; "Terminal for
+/// cargo feature). The Forum Terminal (TUI) edition does; "Terminal for
 /// XenForo" does not and asks on first run.
 pub const HAS_BUILTIN_SITE: bool = cfg!(feature = "builtin-windowsforum");
 
 /// What the product is called in this edition (the `--help` banner, the
 /// Setup screen, packaging). The command is `wftui` in both.
-pub const PRODUCT_NAME: &str = if HAS_BUILTIN_SITE { "WindowsForum Terminal" } else { "Terminal for XenForo" };
+pub const PRODUCT_NAME: &str = if HAS_BUILTIN_SITE { "Forum Terminal (TUI)" } else { "Terminal for XenForo" };
 
 /// The edition's mark in release asset names: the two editions share one
 /// update feed, and the updater must never install the other one's binary.
@@ -36,7 +36,7 @@ pub const EDITION_SUFFIX: &str = if HAS_BUILTIN_SITE { "" } else { "-xf" };
 /// Where the client's own project lives — the `+url` half of the UA for any
 /// site that is not the built-in one (hard rule 6 keeps the UA distinctive;
 /// it must not advertise another forum's address).
-pub const PROJECT_URL: &str = "https://github.com/faratech/wftui";
+pub const PROJECT_URL: &str = "https://github.com/faratech/forumtui";
 
 /// Scopes every screen needs on a stock XenForo 2.3. XFMG (`media:read`)
 /// and XFRM (`resource:read`) are added by [`SiteConfig::effective_scopes`]
@@ -873,7 +873,7 @@ mod tests {
             }
             assert_eq!(resolve(&cfg, Some("windowsforum"), &dir).unwrap(), SiteConfig::windowsforum());
         });
-        assert_eq!(PRODUCT_NAME, if HAS_BUILTIN_SITE { "WindowsForum Terminal" } else { "Terminal for XenForo" });
+        assert_eq!(PRODUCT_NAME, if HAS_BUILTIN_SITE { "Forum Terminal (TUI)" } else { "Terminal for XenForo" });
         assert_eq!(EDITION_SUFFIX, if HAS_BUILTIN_SITE { "" } else { "-xf" });
     }
 

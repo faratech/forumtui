@@ -4,7 +4,8 @@ version = "0.0.1"
 edition = "2024"
 rust-version = "1.98"
 publish = false
-description = "WindowsForum Terminal: a terminal client for windowsforum.com (Linux + Windows)"
+license = "MIT"
+description = "Forum Terminal (TUI): a terminal client for XenForo forums (Linux + Windows)"
 
 [[bin]]
 name = "wftui"
@@ -12,7 +13,7 @@ path = "src/main.rs"
 
 [features]
 default = ["images", "builtin-windowsforum"]
-# The WindowsForum Terminal edition (see common/Cargo.toml). Off, the same
+# The Forum Terminal (TUI) edition (see common/Cargo.toml). Off, the same
 # binary is "Terminal for XenForo": no compiled-in site, no embedded logo,
 # a Setup screen on first run.
 builtin-windowsforum = ["common/builtin-windowsforum"]

@@ -2,7 +2,7 @@
 # Build a plain release tarball of wftui for Linux.
 #
 # Usage:
-#   packaging/linux/build-tarball.sh                # WindowsForum Terminal, native target
+#   packaging/linux/build-tarball.sh                # Forum Terminal (TUI), native target
 #   packaging/linux/build-tarball.sh --no-images     # cargo test's other supported build
 #   packaging/linux/build-tarball.sh --generic       # Terminal for XenForo (no built-in site)
 #
@@ -19,7 +19,7 @@ SUFFIX=""
 # (`wftui-xf-<ver>-…`), which is what the self-updater looks for
 # (`common::site::EDITION_SUFFIX`); the no-images tier is a suffix.
 EDITION=""
-PRODUCT="WindowsForum Terminal"
+PRODUCT="Forum Terminal (TUI)"
 BLURB="Terminal client for windowsforum.com."
 HOMEPAGE="https://windowsforum.com"
 case "${1:-}" in
@@ -32,7 +32,7 @@ case "${1:-}" in
         EDITION="-xf"
         PRODUCT="Terminal for XenForo"
         BLURB="Terminal client for XenForo 2.3 forums. On first run it asks for the forum's address and OAuth client ID; see docs/CONFIG.md in the project repository."
-        HOMEPAGE="https://github.com/faratech/wftui"
+        HOMEPAGE="https://github.com/faratech/forumtui"
         ;;
 esac
 
@@ -62,7 +62,7 @@ ${PRODUCT} (wftui) ${VERSION} — linux-${ARCH_TAG}${SUFFIX}
 ${BLURB} Run ./wftui, or copy it onto your
 PATH (e.g. /usr/local/bin/wftui).
 
-Proprietary software — in development. Not for redistribution.
+Released under the MIT license — see LICENSE in the repository.
 ${HOMEPAGE}
 EOF
 

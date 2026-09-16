@@ -5,9 +5,9 @@
     "version_id": 1010170,
     "version_string": "1.1.1",
     "dev": "WindowsForum",
-    "dev_url": "https://github.com/faratech/wftui",
+    "dev_url": "https://github.com/faratech/forumtui",
     "faq_url": "",
-    "support_url": "https://github.com/faratech/wftui/issues",
+    "support_url": "https://github.com/faratech/forumtui/issues",
     "extra_urls": [],
     "require": {
         "XF": [

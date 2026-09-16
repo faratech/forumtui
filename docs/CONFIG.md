@@ -1,7 +1,7 @@
 # Connecting wftui to a XenForo forum
 
 wftui is a terminal client for XenForo 2.3 forums. With no configuration it
-is the WindowsForum Terminal: it talks to windowsforum.com exactly as it
+is the Forum Terminal (TUI): it talks to windowsforum.com exactly as it
 always has. A `config.json` in its config directory adds other forums, or
 overrides fields of the built-in one.
 

@@ -1,4 +1,4 @@
-//! Core library for WindowsForum Terminal (`wftui`).
+//! Core library for Forum Terminal (TUI) (`wftui`).
 //!
 //! Layout: [`config`] (constants + env overrides), [`error`] (house-style
 //! plain enum), [`http`]/[`ratelimit`] (client + politeness gates),

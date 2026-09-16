@@ -281,7 +281,7 @@ mod tests {
         assert!(ua.contains("windowsforum.com"));
         let project = user_agent_for_project();
         assert!(project.starts_with("wftui/"));
-        assert!(project.contains("github.com/faratech/wftui") && !project.contains("windowsforum"));
+        assert!(project.contains("github.com/faratech/forumtui") && !project.contains("windowsforum"));
         // Cloudflare's bot rules block bare library UAs (reqwest/hyper/...);
         // ours must never degrade to one of those signatures.
         for ua in [ua, project] {

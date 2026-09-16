@@ -1,4 +1,4 @@
-//! wftui — WindowsForum Terminal, the terminal client for windowsforum.com.
+//! wftui — Forum Terminal (TUI), the terminal client for windowsforum.com.
 //!
 //! Panic contract: the run loop is wrapped in catch_unwind and the terminal
 //! guard restores raw mode / the alternate screen on every path (Drop runs

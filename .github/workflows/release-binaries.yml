@@ -216,7 +216,7 @@ jobs:
         with:
           name: wftui ${{ needs.build-linux-tarball.outputs.version }}
           body: |
-            WindowsForum Terminal (wftui) — release ${{ needs.build-linux-tarball.outputs.version }}
+            Forum Terminal (TUI) (wftui) — release ${{ needs.build-linux-tarball.outputs.version }}
 
             **Linux**
             - `wftui-*-linux-x86_64.tar.gz` — native binary + README (requires default features)

@@ -7,8 +7,8 @@ Two independent outputs, built and verified separately:
 - **Linux** — a plain release tarball for the host's native target, under
   `packaging/linux/`.
 
-Proprietary, in-development software — no LICENSE file yet, so neither
-artifact is meant for public redistribution.
+MIT-licensed (`LICENSE` in the repository root): both artifacts may be
+redistributed under its terms.
 
 ## Linux
 

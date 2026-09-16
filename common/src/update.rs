@@ -36,7 +36,7 @@ use crate::http;
 use crate::token;
 
 /// GitHub's `releases/latest` for the client's own repository.
-pub const DEFAULT_FEED_URL: &str = "https://api.github.com/repos/faratech/wftui/releases/latest";
+pub const DEFAULT_FEED_URL: &str = "https://api.github.com/repos/faratech/forumtui/releases/latest";
 /// The background check waits this long after start so it never competes
 /// with the bootstrap fetches for the first paint.
 pub const STARTUP_DELAY: Duration = Duration::from_secs(3);
@@ -244,7 +244,7 @@ impl Target {
     }
 
     /// [`asset_name`] for an explicit edition: `wftui-0.0.2-linux-x86_64`
-    /// for the WindowsForum Terminal edition (`""`), `wftui-xf-0.0.2-…` for
+    /// for the Forum Terminal (TUI) edition (`""`), `wftui-xf-0.0.2-…` for
     /// Terminal for XenForo (`"-xf"`). Two editions share one release, and
     /// the suffix is what keeps each updater on its own binary.
     pub fn asset_name_for(self, edition_suffix: &str, version: &str) -> String {

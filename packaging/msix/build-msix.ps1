@@ -158,7 +158,7 @@ foreach ($arch in $Architectures) {
 
     Copy-Item $exe (Join-Path $stage "wftui.exe") -Force
     if (-not $SkipSign) {
-        & $signScript (Join-Path $stage 'wftui.exe') -Description 'WindowsForum Terminal'
+        & $signScript (Join-Path $stage 'wftui.exe') -Description 'Forum Terminal (TUI)'
         if ($LASTEXITCODE -ne 0) { throw "Dual signing failed for $arch executable" }
     }
     Copy-Item (Join-Path $AssetsDir "*.png") (Join-Path $stage "Assets") -Force
@@ -176,7 +176,7 @@ foreach ($arch in $Architectures) {
 
     if (-not $SkipSign) {
         Write-Host "-- signing ($arch)"
-        & (Join-Path $SignKitRoot "sign.ps1") $msixPath -Description "WindowsForum Terminal" -DescriptionUrl "https://windowsforum.com"
+        & (Join-Path $SignKitRoot "sign.ps1") $msixPath -Description "Forum Terminal (TUI)" -DescriptionUrl "https://windowsforum.com"
         if ($LASTEXITCODE -ne 0) { throw "Signing failed for $arch" }
     } else {
         Write-Host "-- skipped signing ($arch)" -ForegroundColor Yellow
@@ -214,7 +214,7 @@ if (-not $SkipBundle -and $produced.Count -gt 1) {
 
     if (-not $SkipSign) {
         Write-Host "-- signing bundle"
-        & (Join-Path $SignKitRoot "sign.ps1") $bundlePath -Description "WindowsForum Terminal" -DescriptionUrl "https://windowsforum.com"
+        & (Join-Path $SignKitRoot "sign.ps1") $bundlePath -Description "Forum Terminal (TUI)" -DescriptionUrl "https://windowsforum.com"
         if ($LASTEXITCODE -ne 0) { throw "Signing failed for bundle" }
     }
 
