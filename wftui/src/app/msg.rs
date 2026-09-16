@@ -556,7 +556,14 @@ impl App {
                                     sel_post.min(view.posts.len().saturating_sub(1));
                                 view.scroll = scroll;
                             }
-                            view.rebuild_lines(&self.theme, &self.glyphs);
+                            // `width == 0` is the "never laid out" state (#27):
+                            // the first load would wrap everything at the 80
+                            // fallback here and throw it away at the first
+                            // render, which lays out at the real width. Let
+                            // that first render do the only layout.
+                            if view.width != 0 {
+                                view.rebuild_lines(&self.theme, &self.glyphs);
+                            }
                         }
                         Err(e) => {
                             view.loading = false;

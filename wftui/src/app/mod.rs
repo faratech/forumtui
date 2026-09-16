@@ -10754,6 +10754,77 @@ mod tests {
 
 
 
+    /// #27: the FIRST thread load arrives with `width == 0` — the view has
+    /// never been on screen — so the eager layout in `ThreadLoaded` would
+    /// wrap everything at the 80 fallback and throw it away at the first
+    /// render, which lays out again at the real width. The first load must
+    /// leave the layout to the render; a load into a view already on screen
+    /// keeps the eager path.
+    #[test]
+    fn the_first_thread_load_leaves_the_layout_to_the_render() {
+        let mut app = test_app();
+        app.screens.clear();
+        app.push_screen(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 9, ..Default::default() },
+            loading: true,
+            ..Default::default()
+        }));
+        app.handle_msg(Msg::ThreadLoaded {
+            id: 9,
+            page: 1,
+            load_id: 0,
+            result: Ok(ThreadReply {
+                thread: Thread { thread_id: 9, ..Default::default() },
+                posts: vec![Post { post_id: 1, ..Default::default() }],
+                ..Default::default()
+            }),
+        });
+        {
+            let Some(Screen::ThreadView(v)) = app.screens.last() else {
+                panic!("expected the ThreadView screen");
+            };
+            assert_eq!(v.width, 0, "a first load must not lay out at the fallback width");
+            assert!(v.lines.is_empty(), "no lines before a real width is known");
+        }
+
+        // The first render lays out once, at the real width.
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            let screen = app.screens.last_mut().expect("screen");
+            screen.render(f, area, &app.theme, &app.glyphs, &mut crate::hit::HitMap::default());
+        })
+        .expect("draw");
+        {
+            let Some(Screen::ThreadView(v)) = app.screens.last() else {
+                panic!("expected the ThreadView screen");
+            };
+            assert_eq!(v.width, 98, "the render lays out at the pane's inner width");
+            assert!(!v.lines.is_empty());
+        }
+
+        // A refresh into an already-laid-out view still lays out eagerly.
+        app.handle_msg(Msg::ThreadLoaded {
+            id: 9,
+            page: 1,
+            load_id: 0,
+            result: Ok(ThreadReply {
+                thread: Thread { thread_id: 9, ..Default::default() },
+                posts: vec![
+                    Post { post_id: 1, ..Default::default() },
+                    Post { post_id: 2, ..Default::default() },
+                ],
+                ..Default::default()
+            }),
+        });
+        let Some(Screen::ThreadView(v)) = app.screens.last() else {
+            panic!("expected the ThreadView screen");
+        };
+        assert_eq!(v.posts.len(), 2);
+        assert!(!v.lines.is_empty(), "a refresh keeps the eager layout");
+    }
+
     #[test]
     #[ignore = "manual release-mode composer frame benchmark"]
     fn benchmark_large_composer_frames() {
