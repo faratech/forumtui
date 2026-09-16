@@ -1052,15 +1052,27 @@ impl App {
         false
     }
 
-    /// Does the next tick owe the screen a repaint even if no event or
-    /// message arrived (#674)? Only things that ANIMATE on the wall clock
-    /// qualify: the write-gate countdown (its seconds and bar fill
-    /// continuously) and any in-flight fetch's spinner (8 fps off the wall
-    /// clock). Everything else — toasts expiring, the recovery backstop,
-    /// poller replies — marks the loop dirty exactly once via its own path.
-    fn needs_continuous_redraw(&self) -> bool {
-        !self.client.write_gate.pending_wait().is_zero()
-            || self.screens.iter().any(|s| s.is_loading())
+    /// What the next tick would animate, if anything (#674, refined by #24):
+    /// `None` when the session is static — the common case — and otherwise a
+    /// coarse step per animated thing. The spinner glyph moves at 8 fps and
+    /// the gate countdown's bar has at most a cell of resolution, so
+    /// redrawing at the loop's 50 ms cadence bought nothing but frames: each
+    /// one paid the full frame build (list rows, the mirror capture) for
+    /// pixels that could not have changed. The steps derive from the wall
+    /// clock exactly like `chrome::spinner_tick`, so "would this frame look
+    /// different" is a value compare rather than a timer per source.
+    /// Everything that does not animate — toasts expiring, the recovery
+    /// backstop, poller replies — still marks the loop dirty exactly once
+    /// via its own path.
+    fn animation_step(&self) -> Option<(u64, u64)> {
+        let gate = self.client.write_gate.pending_wait();
+        if gate.is_zero() && !self.screens.iter().any(|s| s.is_loading()) {
+            return None;
+        }
+        let spinner = chrome::spinner_tick() as u64;
+        // The countdown repaints at the spinner's 8 fps; a finer step than
+        // the bar's cell resolution buys nothing.
+        Some((spinner, gate.as_millis() as u64 / 125))
     }
 
     async fn event_loop(
@@ -1076,12 +1088,15 @@ impl App {
         let mut reader_deaths = 0u32;
         // The dirty flag is the idle-CPU fix (#674): the frame is rebuilt
         // only when something happened (input, message, a timer boundary)
-        // or while something animates (gate countdown, loading spinners).
+        // or while something actually animated since the last draw (#24).
         // An idle session's loop costs one 50 ms `recv_timeout` and nothing
-        // else. `last_drawn_gate` catches the countdown's zero crossing —
-        // the tick where the gate frees must still paint "Ready".
+        // else, and a loading session repaints at the animation's own 8 fps
+        // rather than the loop's cadence. The `None` <-> `Some` edges of
+        // `last_step` catch the countdown's zero crossing — the tick where
+        // the gate frees must still paint "Ready" — and a load starting,
+        // without an extra timer for either.
         let mut dirty = true;
-        let mut last_drawn_gate = self.client.write_gate.pending_wait();
+        let mut last_step = self.animation_step();
         // The first-frame latency line (#21): how far the reader had to wait
         // from process start to a painted screen. Written once, to the log
         // file (WFTUI_LOG=info); tests never set `PROCESS_START`.
@@ -1093,8 +1108,8 @@ impl App {
             if self.expire_session_recovery_timeout() {
                 dirty = true;
             }
-            let gate_pending = self.client.write_gate.pending_wait();
-            if dirty || gate_pending != last_drawn_gate || self.needs_continuous_redraw() {
+            let step = self.animation_step();
+            if dirty || step != last_step {
                 if let Err(error) = terminal.draw(|f| self.draw(f)) {
                     tracing::warn!("terminal draw failed: {error}");
                     return 3;
@@ -1105,7 +1120,7 @@ impl App {
                         tracing::info!("first frame drawn {} ms after process start", start.elapsed().as_millis());
                     }
                 }
-                last_drawn_gate = gate_pending;
+                last_step = step;
                 dirty = false;
             }
             // Drain background messages.
@@ -1787,7 +1802,7 @@ impl App {
 
     fn open_drafts(&mut self) {
         let rows = self.draft_rows();
-        self.push_screen(Screen::Drafts(screens::DraftsState { rows, sel: 0 }));
+        self.push_screen(Screen::Drafts(screens::DraftsState { rows, sel: 0, ..Default::default() }));
     }
 
     /// Reopen the composer a listed draft belongs to.
@@ -9227,16 +9242,19 @@ mod tests {
         assert_eq!(view.posts[0].post_id, 2);
     }
 
-    /// #674: the idle-skip predicate — an idle session needs no redraw,
-    /// a pending write gate (its countdown animates) or any in-flight
-    /// fetch's spinner does.
+    /// #674, refined into the animation-step predicate (#24): an idle
+    /// session yields no step (so no redraw), and only things that actually
+    /// animate — a pending write gate's countdown, an in-flight fetch's
+    /// spinner — yield one. The gate's step is the countdown quantized to
+    /// the spinner's 125 ms tick, so a load repaints at its own 8 fps, not
+    /// the loop's cadence.
     #[test]
-    fn needs_continuous_redraw_tracks_animation_sources_only() {
+    fn animation_step_tracks_animation_sources_only() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
         assert!(
-            !app.needs_continuous_redraw(),
-            "an idle session must not force redraws"
+            app.animation_step().is_none(),
+            "an idle session must not animate"
         );
 
         // A static busy text (compose "Sending…") does NOT animate.
@@ -9246,22 +9264,32 @@ mod tests {
             ..Default::default()
         }));
         assert!(
-            !app.needs_continuous_redraw(),
-            "static busy text must not force redraws"
+            app.animation_step().is_none(),
+            "static busy text must not animate"
         );
 
-        // A pending write gate animates its countdown.
+        // A pending write gate animates its countdown; its step is the
+        // remaining wait on the 125 ms tick (30 s → 240, within one tick).
         app.client.write_gate.penalize(Duration::from_secs(30));
-        assert!(app.needs_continuous_redraw());
+        let step = app.animation_step();
+        assert!(
+            matches!(step, Some((_, 239..=240))),
+            "gate countdown must animate on the spinner's tick, got {step:?}"
+        );
 
-        // A loading screen animates its spinner.
-        app.screens.clear();
+        // A loading screen animates its spinner even with no gate pending.
+        let mut app = test_app();
         app.screens.push(Screen::ThreadView(screens::ThreadViewState {
             thread: Thread { thread_id: 42, ..Default::default() },
             loading: true,
             ..Default::default()
         }));
-        assert!(app.needs_continuous_redraw());
+        let step = app.animation_step();
+        assert_eq!(
+            step.map(|(spinner, _)| spinner),
+            Some(chrome::spinner_tick() as u64),
+            "a loading screen animates on the spinner's tick"
+        );
     }
 
     /// #674: the toast-expiry boundary marks dirty exactly once — while a
