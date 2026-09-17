@@ -11,6 +11,10 @@ Two editions build from this one repo:
 
 The command is `wftui` in both.
 
+<p align="center">
+  <img src="docs/demo/wftui-demo.gif" alt="Forum Terminal (TUI): browsing the forum tree, opening a thread, stepping through posts, starting a reply (saved as a draft), and jumping to the inbox from the palette" width="832">
+</p>
+
 ## Install
 
 **Linux (x86_64 / aarch64)**
