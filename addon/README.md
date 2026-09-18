@@ -1,5 +1,9 @@
 # TuiLink — XenForo add-on for the wftui terminal client
 
+The canonical source is `addon/WindowsForum/TuiLink/` in the
+`faratech/forumtui` repository. Run `./deploy-addon.sh` from the repository
+root to export it into the XenForo installation.
+
 `WindowsForum/TuiLink` gives a XenForo 2.3 forum two things for its terminal
 users (the [wftui](https://github.com/faratech/forumtui) client):
 

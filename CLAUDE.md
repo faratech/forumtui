@@ -4,6 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # wftui_app — Forum Terminal (TUI) (Linux + Windows)
 
+The XenForo add-on source is owned by this repository at
+`addon/WindowsForum/TuiLink/`. The copy under
+`public_html/src/addons/WindowsForum/TuiLink/` is deployment output. Export it
+with `./deploy-addon.sh`; do not edit the deployed copy directly or add a
+nested Git repository there.
+
 The product name is **Forum Terminal (TUI)**; `wftui` is the command, the
 crate, the UA prefix (hard rule 6), the MSIX execution alias and the release
 asset prefix — none of those change with the display name.
