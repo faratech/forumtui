@@ -4,4 +4,5 @@
   <route route_type="public" route_prefix="tui-done" format="" controller="WindowsForum\TuiLink:Done"/>
   <route route_type="api" route_prefix="wf-tuilink" format="" controller="WindowsForum\TuiLink:Link"/>
   <route route_type="api" route_prefix="wf-tui-drafts" format="" controller="WindowsForum\TuiLink:Draft"/>
+  <route route_type="api" route_prefix="wf-tui-ai" format="" controller="WindowsForum\TuiLink:Ai"/>
 </routes>

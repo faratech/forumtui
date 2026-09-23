@@ -262,6 +262,9 @@ impl App {
             Msg::UpdateChecked { generation, forced, result } => {
                 self.handle_update_checked(generation, forced, result);
             }
+            Msg::AskAiEvent { turn, event } => self.on_ask_event(turn, event),
+            Msg::AskAiDone { turn, result } => self.on_ask_done(turn, result),
+            Msg::AiUsageLoaded(result) => self.on_ai_usage(result),
             Msg::DraftRelayAbsent => {
                 if !self.drafts_relay_absent {
                     tracing::info!("this site has no draft relay; drafts stay local");

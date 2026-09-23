@@ -38,6 +38,9 @@ pub struct WfApiClient {
     /// thumbnails can never sit in front of the request the user is waiting
     /// on (issue #543).
     pub image_gate: Arc<Gate>,
+    /// Ask the AI turns (`ask_ai`): chat.php's own 3 s spacing, kept apart
+    /// from `api_gate` so a question never delays the next navigation.
+    pub ai_gate: Arc<Gate>,
 }
 
 impl WfApiClient {
@@ -124,6 +127,7 @@ impl WfApiClient {
             search_gate: Arc::new(Gate::new(config::SEARCH_MIN_INTERVAL_MS)),
             write_gate: Arc::new(Gate::new(config::WRITE_COOLDOWN_MS)),
             image_gate: Arc::new(Gate::new(config::IMAGE_MIN_INTERVAL_MS)),
+            ai_gate: Arc::new(Gate::new(config::AI_MIN_INTERVAL_MS)),
         })
     }
 
@@ -848,6 +852,19 @@ pub trait WfApi: Send + Sync {
     /// list is shown: it clears the counter and leaves unactioned alerts
     /// highlighted (#694).
     async fn mark_alerts_viewed(&self) -> Result<()>;
+    /// Ask the AI (WindowsForum's `/pages/ai/` assistant), through the
+    /// TuiLink relay `/api/wf-tui-ai`. The member's allowance today.
+    async fn ai_usage(&self) -> Result<crate::ai::AiUsage>;
+    /// One turn. The answer streams into `events` as it arrives; the call
+    /// returns when the stream ends (the last event sent is `Completed` or
+    /// `Failed`) or the receiver is dropped, which is how a turn is
+    /// cancelled. A refusal before the stream starts — a 429, the relay's
+    /// validation, `history_required` — is the `Err`, like any other call.
+    async fn ask_ai(
+        &self,
+        request: &crate::ai::AskRequest,
+        events: tokio::sync::mpsc::UnboundedSender<crate::ai::AiEvent>,
+    ) -> Result<()>;
     /// Composer drafts shared with the website, through the TuiLink relay
     /// (#716). Stock XF exposes no draft endpoint at all, so this is the only
     /// way the two stores meet.
@@ -1011,6 +1028,52 @@ impl WfApi for WfApiClient {
     async fn mark_alerts_viewed(&self) -> Result<()> {
         self.post_unit("/alerts/mark-all", &[("viewed", "1".to_string())])
             .await
+    }
+
+    async fn ai_usage(&self) -> Result<crate::ai::AiUsage> {
+        let reply: crate::ai::UsageReply = self.get("/wf-tui-ai", &[]).await?;
+        Ok(reply.usage)
+    }
+
+    async fn ask_ai(
+        &self,
+        request: &crate::ai::AskRequest,
+        events: tokio::sync::mpsc::UnboundedSender<crate::ai::AiEvent>,
+    ) -> Result<()> {
+        let gates: [&Gate; 2] = [&self.api_gate, &self.ai_gate];
+        let token = self.dispatch_token(&gates).await?;
+        let url = format!("{}/wf-tui-ai", self.api_base());
+        let mut req = self
+            .http
+            .post(url)
+            .form(&request.form())
+            .bearer_auth(&token)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .timeout(config::AI_TURN_TIMEOUT);
+        if !request.turn_id.is_empty() {
+            req = req.header("X-WF-Turn-Id", &request.turn_id);
+        }
+        let mut resp = req.send().await?;
+        if !resp.status().is_success() {
+            let err = error_from_response(resp).await;
+            self.note_rate_limit(&err, &gates);
+            return Err(err);
+        }
+        let mut parser = crate::ai::SseParser::new();
+        while let Some(chunk) = resp.chunk().await? {
+            for event in parser.push(&chunk) {
+                if events.send(event).is_err() {
+                    return Ok(());
+                }
+            }
+            if parser.is_done() {
+                return Ok(());
+            }
+        }
+        for event in parser.finish() {
+            let _ = events.send(event);
+        }
+        Ok(())
     }
 
     async fn list_drafts(&self) -> Result<Vec<RemoteDraft>> {
@@ -1442,6 +1505,7 @@ mod tests {
     fn open_gates(c: &mut WfApiClient) {
         c.write_gate = Arc::new(Gate::new(0));
         c.image_gate = Arc::new(Gate::new(0));
+        c.ai_gate = Arc::new(Gate::new(0));
     }
 
     /// GUARD (issue #565). The suite must never read or write the machine
@@ -1754,6 +1818,144 @@ mod tests {
             c.write_gate.pending_wait() <= before,
             "a draft must not consume the 30s write cool-down a real post needs"
         );
+    }
+
+    /// Ask the AI: one whole turn captured from the live relay, streamed back
+    /// in small pieces the way a real connection delivers it.
+    const AI_STREAM: &str = include_str!("testdata/ask_ai_stream.sse");
+    const AI_USAGE_JSON: &str = include_str!("testdata/ask_ai_usage.json");
+
+    fn ai_request() -> crate::ai::AskRequest {
+        crate::ai::AskRequest {
+            message: "What is KB5044284?".into(),
+            conversation_id: "tuiC0nv".into(),
+            turn_id: "tuiTurn1".into(),
+            ..Default::default()
+        }
+    }
+
+    async fn collect(mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::ai::AiEvent>) -> Vec<crate::ai::AiEvent> {
+        let mut out = Vec::new();
+        while let Some(e) = rx.recv().await {
+            out.push(e);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn ask_ai_streams_the_captured_turn_through_the_relay() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-askai");
+        Mock::given(method("POST"))
+            .and(path("/api/wf-tui-ai"))
+            .and(header("X-WF-Turn-Id", "tuiTurn1"))
+            .and(header("authorization", "Bearer tok-1"))
+            .and(wiremock::matchers::body_string_contains("conversation_id=tuiC0nv"))
+            .and(wiremock::matchers::body_string_contains("message=What+is+KB5044284%3F"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(AI_STREAM, "text/event-stream; charset=utf-8"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        c.ask_ai(&ai_request(), tx).await.expect("turn");
+        let events = collect(rx).await;
+        assert_eq!(events.last(), Some(&crate::ai::AiEvent::Completed));
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                crate::ai::AiEvent::Delta(d) => Some(d.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.starts_with("KB5044284 is the"), "{text}");
+        assert!(c.ai_gate.pending_wait() > Duration::ZERO, "a turn spends the AI lane");
+        assert!(
+            c.write_gate.pending_wait() == Duration::ZERO,
+            "a question is not a forum write and must not arm the 30 s cool-down"
+        );
+    }
+
+    /// chat.php's own flood refusal comes back as a 429 with Retry-After; it
+    /// has to hold the AI lane shut for that long, or the next Enter asks
+    /// again immediately and is refused again.
+    #[tokio::test]
+    async fn ask_ai_rate_limit_holds_the_ai_lane_for_retry_after() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-askai429");
+        Mock::given(method("POST"))
+            .and(path("/api/wf-tui-ai"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "9")
+                    .set_body_json(serde_json::json!({
+                        "errors": [{"code": "rate_limited", "message": "Wait 9s before messaging again.", "params": []}]
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let err = c.ask_ai(&ai_request(), tx).await.expect_err("429");
+        assert!(matches!(err, Error::RateLimited { retry_after: Some(d) } if d == Duration::from_secs(9)), "{err:?}");
+        assert!(c.ai_gate.pending_wait() >= Duration::from_secs(8));
+    }
+
+    /// The relay reports chat.php's refusals in XF's envelope with
+    /// chat.php's own code, which the app acts on (`history_required` means
+    /// resend with the transcript).
+    #[tokio::test]
+    async fn ask_ai_surfaces_chat_codes_from_the_relay_envelope() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-askai409");
+        Mock::given(method("POST"))
+            .and(path("/api/wf-tui-ai"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "errors": [{"code": "history_required", "message": "Local history is required to restore this conversation.", "params": []}]
+            })))
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let err = c.ask_ai(&ai_request(), tx).await.expect_err("409");
+        assert!(matches!(&err, Error::Api { code, status: 409, .. } if code == "history_required"), "{err:?}");
+    }
+
+    /// Dropping the receiver is how the app cancels a turn: the call must
+    /// stop reading and return, not drain the rest of a long answer.
+    #[tokio::test]
+    async fn ask_ai_stops_when_the_receiver_is_gone() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-askaicancel");
+        Mock::given(method("POST"))
+            .and(path("/api/wf-tui-ai"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(AI_STREAM, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        c.ask_ai(&ai_request(), tx).await.expect("a cancelled turn is not an error");
+    }
+
+    #[tokio::test]
+    async fn ai_usage_maps_the_captured_relay_body() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-aiusage");
+        Mock::given(method("GET"))
+            .and(path("/api/wf-tui-ai"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(AI_USAGE_JSON, "application/json"))
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let usage = c.ai_usage().await.expect("usage");
+        assert!(usage.unlimited);
+        assert_eq!(usage.tier.as_deref(), Some("unlimited"));
     }
 
     #[tokio::test]

@@ -1,9 +1,9 @@
 {
     "legacy_addon_id": "",
     "title": "TuiLink — terminal client login relay",
-    "description": "Short-URL sign-in bootstrap, callback relay and draft sync for the wftui terminal client (any XenForo 2.3 forum): /tui-start/<id> 302s into the OAuth authorize page with the stored PKCE challenge, /tui-done catches the authorization response and hands the code to the terminal via a poll endpoint, and /api/wf-tui-drafts mirrors composer drafts. No credentials or tokens are stored - PKCE keeps codes non-exercisable without the client's verifier.",
-    "version_id": 1010170,
-    "version_string": "1.1.1",
+    "description": "Short-URL sign-in bootstrap, callback relay and draft sync for the wftui terminal client (any XenForo 2.3 forum): /tui-start/<id> 302s into the OAuth authorize page with the stored PKCE challenge, /tui-done catches the authorization response and hands the code to the terminal via a poll endpoint, /api/wf-tui-drafts mirrors composer drafts, and /api/wf-tui-ai relays Ask the AI (WindowsForum's /chat.php) to the terminal. No credentials or tokens are stored - PKCE keeps codes non-exercisable without the client's verifier.",
+    "version_id": 1010270,
+    "version_string": "1.1.2",
     "dev": "WindowsForum",
     "dev_url": "https://github.com/faratech/forumtui",
     "faq_url": "",

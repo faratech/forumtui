@@ -1,0 +1,18 @@
+{
+    "usage": {
+        "exempt": false,
+        "tier": "unlimited",
+        "used": 1,
+        "limit": null,
+        "remaining": null,
+        "unlimited": true,
+        "tokens_today": 12163,
+        "tokens_total": 12378923,
+        "reset_at": "2026-09-24T00:00:00",
+        "allowed": true,
+        "user_id": 1,
+        "free_daily_allowance": 25,
+        "premium_daily_allowance": 250,
+        "logged_in": true
+    }
+}

@@ -433,6 +433,16 @@ pub enum Msg {
     /// A draft-relay call answered 404: this site has no TuiLink draft
     /// endpoint, so the mirror stops asking (drafts stay local).
     DraftRelayAbsent,
+    /// Ask the AI: one piece of the answer in flight. `turn` is the
+    /// `App::ask_generation` the question was asked under; a stopped turn's
+    /// stragglers carry an older one and are dropped.
+    AskAiEvent { turn: u64, event: common::ai::AiEvent },
+    /// The turn's request is over. Its `Err` is the refusal before any
+    /// answer started (429, `history_required`, a 401) — the one that may
+    /// end the session, like any other call's.
+    AskAiDone { turn: u64, result: TaskResult<()> },
+    /// The member's assistant allowance, for the panel's cap.
+    AiUsageLoaded(TaskResult<common::ai::AiUsage>),
     Notice(String),
 }
 
@@ -658,6 +668,11 @@ pub struct App {
     update: update::UpdateState,
     update_generation: u64,
     update_task: Option<tokio::task::AbortHandle>,
+    /// Ask the AI: the turn being answered, and the handle that stops it.
+    /// The generation also goes on `AskAiState::turn_seq`, so a stopped
+    /// turn's queued frames can never land in the next one.
+    ask_generation: u64,
+    ask_task: Option<tokio::task::AbortHandle>,
     /// The body zone of the last frame (between the header band and the key
     /// bar). The wheel scrolls what is inside it and nothing else (#549).
     body_rect: ratatui::layout::Rect,
@@ -945,6 +960,8 @@ pub async fn run(
         },
         update_generation: 0,
         update_task: None,
+        ask_generation: 0,
+        ask_task: None,
         body_rect: ratatui::layout::Rect::default(),
         hits: HitMap::new(common::config::mouse_enabled()),
         // Drafts left by the previous run (#715): an Esc or a crash mid-post
@@ -1573,6 +1590,9 @@ impl App {
                 Target::Drafts,
             ));
         }
+        if self.site.features.ask_ai {
+            items.push(Item::action("Ask the AI".to_string(), "gk", Target::AskAi));
+        }
         items.push(Item::action("Search".to_string(), "/", Target::Search));
         items.push(self.update_palette_item());
         items.push(Item::action("Sign out".to_string(), "^L", Target::SignOut));
@@ -1653,6 +1673,13 @@ impl App {
         // `screens.remove(idx)` and clear the draft explicitly.
         if let Some(Screen::Compose(c)) = &gone {
             self.stash_draft(c, relay);
+        }
+        // An answer nobody can see any more is an answer nobody should pay
+        // to stream.
+        if let Some(Screen::AskAi(a)) = &gone
+            && a.busy
+        {
+            self.stop_ask_task();
         }
         true
     }
@@ -2166,6 +2193,7 @@ impl App {
             T::MediaGallery => self.execute_action(Action::OpenMediaGallery),
             T::Resources => self.execute_action(Action::OpenResources),
             T::Drafts => self.execute_action(Action::OpenDrafts),
+            T::AskAi => self.execute_action(Action::OpenAskAi),
             T::Search => self.push_screen(screens::search_state()),
             T::Update => self.check_for_updates_now(),
             T::SignOut => self.logout(),
@@ -2205,6 +2233,9 @@ impl App {
             GoTarget::Media => self.execute_action(Action::OpenMediaGallery),
             GoTarget::Resources => self.execute_action(Action::OpenResources),
             GoTarget::Drafts => self.execute_action(Action::OpenDrafts),
+            // On a site without it, `open_ask_ai` says so rather than
+            // doing nothing.
+            GoTarget::AskAi => self.execute_action(Action::OpenAskAi),
             GoTarget::Inbox => self.open_inbox(screens::InboxTab::Conversations),
             GoTarget::Alerts => self.open_inbox(screens::InboxTab::Alerts),
             GoTarget::Home => {
@@ -2876,7 +2907,9 @@ fn session_error_of(msg: &Msg) -> Option<&TaskError> {
         | Msg::PostEdited { result: Err(e), .. }
         | Msg::PostDeleted { result: Err(e), .. }
         | Msg::SolutionMarked { result: Err(e), .. }
-        | Msg::PostToggled { result: Err(e), .. } => e,
+        | Msg::PostToggled { result: Err(e), .. }
+        | Msg::AskAiDone { result: Err(e), .. }
+        | Msg::AiUsageLoaded(Err(e)) => e,
         _ => return None,
     };
     (err.ends_session() || (is_bootstrap && err.is_account_gone())).then_some(err)
@@ -2925,7 +2958,9 @@ fn mark_retryable(msg: &mut Msg) {
         | Msg::PostEdited { result: Err(e), .. }
         | Msg::PostDeleted { result: Err(e), .. }
         | Msg::SolutionMarked { result: Err(e), .. }
-        | Msg::PostToggled { result: Err(e), .. } => e,
+        | Msg::PostToggled { result: Err(e), .. }
+        | Msg::AskAiDone { result: Err(e), .. }
+        | Msg::AiUsageLoaded(Err(e)) => e,
         _ => return,
     };
     err.message = SESSION_RECHECK_RETRY_MSG.to_string();
@@ -3711,6 +3746,14 @@ mod tests {
         drafts_deleted: std::sync::Mutex<Vec<String>>,
         drafts_remote: std::sync::Mutex<Vec<common::models::RemoteDraft>>,
         drafts_fail: std::sync::atomic::AtomicBool,
+        /// Ask the AI: every turn that reached the stub, the frames each one
+        /// streams back, refusals answered before any frame (one per call,
+        /// oldest first), and whether to hang after the second frame — an
+        /// answer still streaming, for the tests that stop one.
+        ai_requests: std::sync::Mutex<Vec<common::ai::AskRequest>>,
+        ai_events: std::sync::Mutex<Vec<common::ai::AiEvent>>,
+        ai_refusals: std::sync::Mutex<Vec<common::error::Error>>,
+        ai_hold: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingApi {
@@ -3742,6 +3785,33 @@ mod tests {
 
     #[async_trait::async_trait]
     impl WfApi for RecordingApi {
+        async fn ai_usage(&self) -> common::error::Result<common::ai::AiUsage> {
+            Ok(common::ai::AiUsage { remaining: Some(3), limit: Some(25), ..Default::default() })
+        }
+        async fn ask_ai(
+            &self,
+            request: &common::ai::AskRequest,
+            events: tokio::sync::mpsc::UnboundedSender<common::ai::AiEvent>,
+        ) -> common::error::Result<()> {
+            self.ai_requests.lock().expect("lock").push(request.clone());
+            let refusal = {
+                let mut r = self.ai_refusals.lock().expect("lock");
+                (!r.is_empty()).then(|| r.remove(0))
+            };
+            if let Some(e) = refusal {
+                return Err(e);
+            }
+            let script = self.ai_events.lock().expect("lock").clone();
+            for (i, event) in script.into_iter().enumerate() {
+                if i == 2 && self.ai_hold.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+                if events.send(event).is_err() {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        }
         async fn list_drafts(&self) -> common::error::Result<Vec<common::models::RemoteDraft>> {
             if self.drafts_fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(common::error::Error::NoToken);
@@ -7004,6 +7074,8 @@ mod tests {
             update: update::UpdateState::Idle,
             update_generation: 0,
             update_task: None,
+            ask_generation: 0,
+            ask_task: None,
             body_rect: ratatui::layout::Rect::default(),
             // Tests build the map enabled: every hit-map test drives it
             // directly, and `WFTUI_MOUSE` is process-global (the env lock
@@ -9956,8 +10028,8 @@ mod tests {
     }
 
     /// row 23. The Forums panel is 37 wide (inner x 1..=35, y from 2): the
-    /// QUICK block is rows 2..=6 (` QUICK`, then L/1/2/3), row 7 is blank and
-    /// the nodes start at row 8. The thread list's inner starts at x 38, with
+    /// QUICK block is rows 2..=7 (` QUICK`, then L/A/1/2/3), row 8 is blank and
+    /// the nodes start at row 9. The thread list's inner starts at x 38, with
     /// the column header on row 2 and the first thread on row 3.
     #[test]
     fn the_home_frame_maps_quick_keys_forum_rows_and_thread_rows_to_their_own_panes() {
@@ -9966,16 +10038,17 @@ mod tests {
 
         // QUICK rows are keys, not list rows: clicking one presses it.
         assert_eq!(app.hits.at(3, 3), Some(&Hit::Key("L")));
-        assert_eq!(app.hits.at(3, 4), Some(&Hit::Key("1")));
+        assert_eq!(app.hits.at(3, 4), Some(&Hit::Key("A")));
+        assert_eq!(app.hits.at(3, 5), Some(&Hit::Key("1")));
         // The ` QUICK` header and the blank row below the block are inert —
         // the pane underneath is all they answer with.
         assert_eq!(app.hits.at(3, 2), Some(&Hit::Pane(HitPane::Tree)));
-        assert_eq!(app.hits.at(3, 7), Some(&Hit::Pane(HitPane::Tree)));
+        assert_eq!(app.hits.at(3, 8), Some(&Hit::Pane(HitPane::Tree)));
 
         // Forum rows, and the pane under them.
-        assert_eq!(app.hits.at(3, 8), Some(&Hit::Row(0)));
-        assert_eq!(app.hits.at(3, 10), Some(&Hit::Row(2)));
-        assert_eq!(app.hits.pane_at(3, 8), Some(HitPane::Tree));
+        assert_eq!(app.hits.at(3, 9), Some(&Hit::Row(0)));
+        assert_eq!(app.hits.at(3, 11), Some(&Hit::Row(2)));
+        assert_eq!(app.hits.pane_at(3, 9), Some(HitPane::Tree));
 
         // The thread list is the other pane, with its own row indices.
         assert_eq!(app.hits.at(60, 3), Some(&Hit::Row(0)));
@@ -11002,4 +11075,274 @@ mod tests {
         println!("conversation selection step (50 messages, full rebuild): {:?}", start.elapsed() / 10);
     }
 
+    // ================= Ask the AI =================
+
+    fn ask_api(hold: bool) -> Arc<RecordingApi> {
+        use common::ai::AiEvent;
+        let api = RecordingApi::default();
+        *api.ai_events.lock().expect("lock") = vec![
+            AiEvent::Progress {
+                id: "s1".into(),
+                label: "Searching WindowsForum".into(),
+                done: false,
+            },
+            AiEvent::Delta("See ".into()),
+            AiEvent::Delta("[the thread](https://windowsforum.com/threads/1/)".into()),
+            AiEvent::Completed,
+        ];
+        api.ai_hold.store(hold, std::sync::atomic::Ordering::SeqCst);
+        Arc::new(api)
+    }
+
+    fn ask_app(api: &Arc<RecordingApi>) -> App {
+        let mut app = test_app();
+        app.api = api.clone();
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.screens.push(screens::home_state(false));
+        app
+    }
+
+    fn ask_state(app: &App) -> &screens::AskAiState {
+        match app.screens.last() {
+            Some(Screen::AskAi(a)) => a,
+            _ => panic!("expected the Ask the AI screen on top"),
+        }
+    }
+
+    fn type_keys(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    /// Deliver the background tasks' messages until `done` holds.
+    async fn pump_until(app: &mut App, done: impl Fn(&App) -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !done(app) {
+            let msg = tokio::time::timeout_at(deadline, app.rx.recv())
+                .await
+                .expect("the condition should be reached in time")
+                .expect("channel open");
+            app.handle_msg(msg);
+        }
+    }
+
+    #[tokio::test]
+    async fn g_k_opens_ask_the_ai_typing_and_fetches_the_allowance() {
+        let api = ask_api(false);
+        let mut app = ask_app(&api);
+        type_keys(&mut app, "gk");
+        let a = ask_state(&app);
+        assert!(a.input_mode, "the question field owns the keyboard on open");
+        assert!(!a.conversation_id.is_empty());
+        assert!(app.input_active(), "so c/a/s/g type letters instead of navigating");
+        pump_until(&mut app, |app| ask_state(app).usage.is_some()).await;
+        assert_eq!(ask_state(&app).usage.as_deref(), Some("3 of 25 left today"));
+        // Opening it again on top is a no-op, not a second conversation.
+        app.execute_action(Action::OpenAskAi);
+        assert_eq!(app.screens.iter().filter(|s| matches!(s, Screen::AskAi(_))).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn g_k_on_a_site_without_the_module_says_so() {
+        let api = ask_api(false);
+        let mut app = ask_app(&api);
+        let mut site = common::site::SiteConfig::blank("other");
+        site.features.ask_ai = false;
+        app.site = Arc::new(site);
+        type_keys(&mut app, "gk");
+        assert!(!matches!(app.screens.last(), Some(Screen::AskAi(_))));
+        assert!(app.status.contains("not available"), "{}", app.status);
+        app.open_palette();
+        let rows = app.palette.as_ref().map(|p| p.titles()).unwrap_or_default();
+        assert!(!rows.iter().any(|t| t == "Ask the AI"), "{rows:?}");
+    }
+
+    #[tokio::test]
+    async fn a_question_streams_into_the_transcript_and_the_next_one_keeps_context() {
+        let api = ask_api(false);
+        let mut app = ask_app(&api);
+        app.execute_action(Action::OpenAskAi);
+        type_keys(&mut app, "why is my pc slow");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        {
+            let a = ask_state(&app);
+            assert!(a.busy && a.input.is_empty());
+            assert_eq!(a.turns.len(), 1);
+        }
+        pump_until(&mut app, |app| !ask_state(app).busy).await;
+        let a = ask_state(&app);
+        let turn = &a.turns[0];
+        assert_eq!(turn.state, screens::AskTurnState::Done);
+        assert_eq!(turn.answer, "See [the thread](https://windowsforum.com/threads/1/)");
+        assert_eq!(turn.steps, vec![("s1".into(), "Searching WindowsForum".into(), false)]);
+        let conversation = a.conversation_id.clone();
+
+        type_keys(&mut app, "and after that?");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        pump_until(&mut app, |app| !ask_state(app).busy).await;
+        let requests = api.ai_requests.lock().expect("lock").clone();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].message, "why is my pc slow");
+        assert!(!requests[0].has_local_history);
+        assert!(requests.iter().all(|r| r.conversation_id == conversation), "one conversation");
+        assert!(requests[1].has_local_history, "the server may ask for the transcript");
+        assert_ne!(requests[0].turn_id, requests[1].turn_id);
+
+        // Drawn, the answer's link is source [1] and `1` opens it.
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            let screen = app.screens.last_mut().expect("screen");
+            screen.render(f, area, &app.theme, &app.glyphs, &mut crate::hit::HitMap::default());
+        })
+        .expect("draw");
+        let text: String = {
+            let buf = term.backend().buffer();
+            (0..24).map(|y| (0..80).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()).collect()
+        };
+        assert!(text.contains("the thread [1]"), "{text}");
+        assert!(text.contains("3 of 25 left today"), "the allowance is in the panel cap: {text}");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let Some(Screen::AskAi(a)) = app.screens.last_mut() else { panic!() };
+        assert!(!a.input_mode);
+        match screens::Screen::AskAi(std::mem::take(a)).on_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)) {
+            Action::OpenUrl(u) => assert_eq!(u, "https://windowsforum.com/threads/1/"),
+            _ => panic!("1 opens the first source"),
+        }
+    }
+
+    #[tokio::test]
+    async fn esc_stops_a_streaming_answer_and_its_stragglers_are_dropped() {
+        let api = ask_api(true);
+        let mut app = ask_app(&api);
+        app.execute_action(Action::OpenAskAi);
+        type_keys(&mut app, "q");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        pump_until(&mut app, |app| !ask_state(app).turns[0].answer.is_empty()).await;
+        let turn = ask_state(&app).turn_seq;
+
+        // Esc leaves the field; a second Esc, with the answer still coming,
+        // stops it instead of leaving the screen.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ask_state(&app).busy && !ask_state(&app).input_mode);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let a = ask_state(&app);
+        assert!(!a.busy);
+        assert_eq!(a.turns[0].state, screens::AskTurnState::Cancelled);
+        assert_eq!(a.turns[0].answer, "See ", "what arrived is kept");
+        assert!(app.ask_task.is_none());
+
+        app.handle_msg(session_msg(
+            app.session_generation,
+            Msg::AskAiEvent { turn, event: common::ai::AiEvent::Delta("late".into()) },
+        ));
+        app.handle_msg(session_msg(app.session_generation, Msg::AskAiDone { turn, result: Ok(()) }));
+        let a = ask_state(&app);
+        assert_eq!(a.turns[0].answer, "See ");
+        assert_eq!(a.turns[0].state, screens::AskTurnState::Cancelled);
+        // An idle transcript's Esc leaves.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.screens.last(), Some(Screen::Home(_))));
+    }
+
+    #[tokio::test]
+    async fn leaving_the_screen_or_the_session_stops_the_answer() {
+        for how in ["pop", "end_session", "new chat"] {
+            let api = ask_api(true);
+            let mut app = ask_app(&api);
+            app.execute_action(Action::OpenAskAi);
+            type_keys(&mut app, "q");
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            pump_until(&mut app, |app| !ask_state(app).turns[0].answer.is_empty()).await;
+            let task = app.ask_task.as_ref().expect("a turn in flight").clone();
+            match how {
+                "pop" => {
+                    app.pop_screen();
+                }
+                "end_session" => app.end_session("Signed out."),
+                _ => {
+                    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+                    let a = ask_state(&app);
+                    assert!(a.turns.is_empty() && !a.busy, "{how}: a fresh transcript");
+                }
+            }
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert!(task.is_finished(), "{how}: the stream must not keep running");
+        }
+    }
+
+    #[tokio::test]
+    async fn history_required_resends_once_with_the_transcript() {
+        let api = ask_api(false);
+        let mut app = ask_app(&api);
+        app.execute_action(Action::OpenAskAi);
+        type_keys(&mut app, "first");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        pump_until(&mut app, |app| !ask_state(app).busy).await;
+
+        let lost = || common::error::Error::Api {
+            code: "history_required".into(),
+            message: "Local history is required to restore this conversation.".into(),
+            status: 409,
+            max_page: None,
+        };
+        api.ai_refusals.lock().expect("lock").extend([lost(), lost()]);
+        type_keys(&mut app, "second");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        pump_until(&mut app, |app| !ask_state(app).busy).await;
+
+        let requests = api.ai_requests.lock().expect("lock").clone();
+        assert_eq!(requests.len(), 3, "asked, refused, resent once — never a loop");
+        assert_eq!(requests[2].message, "second");
+        assert_eq!(
+            requests[2].history,
+            vec![
+                (common::ai::Role::User, "first".to_string()),
+                (
+                    common::ai::Role::Assistant,
+                    "See [the thread](https://windowsforum.com/threads/1/)".to_string()
+                ),
+            ]
+        );
+        assert!(matches!(&ask_state(&app).turns[1].state, screens::AskTurnState::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn a_refused_turn_says_why_and_a_401_still_ends_the_session() {
+        let api = ask_api(false);
+        let mut app = ask_app(&api);
+        app.execute_action(Action::OpenAskAi);
+        api.ai_refusals.lock().expect("lock").push(common::error::Error::RateLimited {
+            retry_after: Some(Duration::from_secs(9)),
+        });
+        type_keys(&mut app, "q");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        pump_until(&mut app, |app| !ask_state(app).busy).await;
+        match &ask_state(&app).turns[0].state {
+            screens::AskTurnState::Failed(msg) => assert!(msg.contains("9s"), "{msg}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(app.me.is_some(), "a 429 is not a reason to sign anyone out");
+
+        let turn = ask_state(&app).turn_seq;
+        app.handle_msg(session_msg(
+            app.session_generation,
+            Msg::AskAiDone {
+                turn,
+                result: Err(TaskError::of(&common::error::Error::Api {
+                    code: "invalid_token".into(),
+                    message: "expired".into(),
+                    status: 401,
+                    max_page: None,
+                })),
+            },
+        ));
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Login(_))) || app.session_recovery_pending,
+            "a 401 from the relay is a dead session like any other call's"
+        );
+    }
 }

@@ -234,7 +234,7 @@ so, since XF gates `is_banned` to viewers who may bypass user privacy.
 * **Go-to palette + g which-key** (`c2.png` top): Ctrl+K or `:` opens a 60-wide
   `Go to` panel over the dimmed body (forums, actions with their key, members);
   `g` shows a small which-key panel bottom-right (n news · s security · t tutorials ·
-  l latest · i inbox · a alerts · m media · r resources · h home · p profile · g top).
+  l latest · i inbox · a alerts · m media · r resources · k ask ai · h home · p profile · g top).
 * **Media Gallery** (`g m`): categories panel 28 wide (nested by parent, with
   counts, "All media" first) beside the media panel — one pane at a time below
   90 cols, like Home. Rows are a thumbnail plus title, uploader · age, and
@@ -248,6 +248,15 @@ so, since XF gates `is_banned` to viewers who may bypass user privacy.
   `by author · category · updated · ↓ n · ★ n (n) · n reviews · n views`, a
   rule, and the description rendered from the same BBCode path the thread view
   uses. Keys: j/k scroll · d download · o web · R refresh · Esc back.
+* **Ask the AI** (`g k`, `A` on Home — the QUICK block's `A  Ask the AI` row under Latest — WindowsForum only): one `Ask the AI` panel with the
+  allowance (`22 of 25 left today`) as its top-right cap. The transcript fills
+  it — `You` in accent bold over the question, `Assistant` in the title style
+  over the answer, rendered from its Markdown through the post pipeline so
+  links wear `[n]` — above a status row (spinner + "Searching WindowsForum…"
+  / "Writing…" while it streams) and a one-line `> ` question field. The
+  field owns the keyboard on open; Esc hands it to the transcript (j/k, `1`-`9`
+  sources, `y` copy, `n` new chat), and Esc there stops a streaming answer,
+  which keeps what arrived and says `(stopped)`.
 * **Image viewer**: one picture, centred, as large as the pane allows, caption
   pinned underneath (title, uploader · date · W×H, description). On the text
   tier it says so and offers `o`.

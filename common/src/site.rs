@@ -58,7 +58,9 @@ pub const BASE_SCOPES: [&str; 12] = [
 ];
 
 /// `g` chords the client owns; a site's quick-node letters may not collide.
-pub const RESERVED_CHORDS: [char; 10] = ['l', 'i', 'a', 'm', 'r', 'd', 'h', 'p', 'g', 'u'];
+/// `k` is Ask the AI ("as*k*"), reserved on every site so a config never
+/// changes meaning when a forum turns the feature on.
+pub const RESERVED_CHORDS: [char; 11] = ['l', 'i', 'a', 'm', 'r', 'd', 'h', 'p', 'g', 'u', 'k'];
 
 /// The most quick destinations a site may declare: they are also the `1`-`9`
 /// keys on the Home screen.
@@ -108,6 +110,10 @@ pub struct Features {
     pub xfrm: bool,
     pub tuilink: Option<bool>,
     pub drafts_relay: Option<bool>,
+    /// Ask the AI (`/api/wf-tui-ai`). A WindowsForum module, not a XenForo
+    /// one: the relay forwards to that site's own `chat.php`, which no other
+    /// forum has, so it is a plain flag rather than something to probe for.
+    pub ask_ai: bool,
 }
 
 /// What the chrome calls the site.
@@ -186,6 +192,7 @@ impl SiteConfig {
                 xfrm: true,
                 tuilink: Some(true),
                 drafts_relay: Some(true),
+                ask_ai: true,
             },
             login: LoginMode::Auto,
             brand: Brand {
@@ -393,6 +400,7 @@ pub struct RawFeatures {
     pub xfrm: Option<bool>,
     pub tuilink: Option<bool>,
     pub drafts_relay: Option<bool>,
+    pub ask_ai: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -438,6 +446,9 @@ impl RawSite {
         }
         if let Some(v) = self.features.drafts_relay {
             site.features.drafts_relay = Some(v);
+        }
+        if let Some(v) = self.features.ask_ai {
+            site.features.ask_ai = v;
         }
         if let Some(v) = self.login {
             site.login = v;
@@ -560,7 +571,7 @@ impl Config {
                     "origin": "https://forum.example.com",
                     "oauth_client_id": "PASTE-CLIENT-ID",
                     "login": "auto",
-                    "features": { "xfmg": false, "xfrm": false, "tuilink": null, "drafts_relay": null },
+                    "features": { "xfmg": false, "xfrm": false, "tuilink": null, "drafts_relay": null, "ask_ai": false },
                     "brand": {
                         "name": "ExampleForum",
                         "bold_prefix": "Example",
@@ -612,6 +623,7 @@ pub fn save_site(path: &Path, site: &SiteConfig) -> Result<()> {
             "xfrm": site.features.xfrm,
             "tuilink": site.features.tuilink,
             "drafts_relay": site.features.drafts_relay,
+            "ask_ai": site.features.ask_ai,
         },
         "brand": {
             "name": site.brand.name,
@@ -789,7 +801,7 @@ mod tests {
         assert_eq!(wf.scopes, None);
         assert_eq!(
             wf.features,
-            Features { xfmg: true, xfrm: true, tuilink: Some(true), drafts_relay: Some(true) }
+            Features { xfmg: true, xfrm: true, tuilink: Some(true), drafts_relay: Some(true), ask_ai: true }
         );
         assert_eq!(wf.login, LoginMode::Auto);
         assert_eq!(wf.brand.name, "WindowsForum");
@@ -912,7 +924,10 @@ mod tests {
             assert_eq!(ex.brand.split(), ("Example", "Forum"));
             assert_eq!(ex.brand.mark, "EX");
             assert_eq!(ex.brand.chrome_bg, Some(Rgb { r: 0x3A, g: 0x7D, b: 0x44 }));
-            assert_eq!(ex.features, Features { xfmg: false, xfrm: false, tuilink: None, drafts_relay: None });
+            assert_eq!(
+                ex.features,
+                Features { xfmg: false, xfrm: false, tuilink: None, drafts_relay: None, ask_ai: false }
+            );
             assert_eq!(ex.quick, vec![QuickNode { key: 'n', label: "News".into(), node_id: 12 }]);
             assert_eq!(ex.effective_scopes().len(), 12);
             assert!(!ex.is_builtin());
@@ -929,6 +944,7 @@ mod tests {
         assert_eq!(site.brand.mark, "W");
         assert_eq!(site.brand.name, "WindowsForum");
         assert!(!site.features.xfmg && site.features.xfrm);
+        assert!(site.features.ask_ai, "overriding one flag keeps Ask the AI on the built-in site");
         assert!(site.quick.is_empty());
         assert_eq!(site.oauth_client_id, "6014883021104153");
         assert_eq!(site.effective_scopes().len(), 13);

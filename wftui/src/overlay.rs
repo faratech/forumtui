@@ -154,6 +154,8 @@ pub enum Target {
     Resources,
     /// Unsent composer drafts (#716) — the palette twin of `g d`.
     Drafts,
+    /// Ask the AI — the palette twin of `g k`.
+    AskAi,
     Search,
     /// Check for a newer release, or act on one already found (#722) — the
     /// palette twin of `g u`.
@@ -595,6 +597,8 @@ pub enum GoTarget {
     Resources,
     /// Unsent composer drafts (#716).
     Drafts,
+    /// Ask the AI ("as*k*"), where the site has it.
+    AskAi,
     Home,
     Profile,
     Top,
@@ -652,6 +656,7 @@ impl Prefix {
             KeyCode::Char('m') => PrefixEvent::Go(GoTarget::Media),
             KeyCode::Char('r') => PrefixEvent::Go(GoTarget::Resources),
             KeyCode::Char('d') => PrefixEvent::Go(GoTarget::Drafts),
+            KeyCode::Char('k') => PrefixEvent::Go(GoTarget::AskAi),
             KeyCode::Char('h') => PrefixEvent::Go(GoTarget::Home),
             KeyCode::Char('p') => PrefixEvent::Go(GoTarget::Profile),
             KeyCode::Char('g') => PrefixEvent::Go(GoTarget::Top),
@@ -693,6 +698,9 @@ pub fn which_key_cells(site: &common::site::SiteConfig) -> Vec<(&'static str, St
     }
     if site.features.xfrm {
         cells.push(("r", "resources".into()));
+    }
+    if site.features.ask_ai {
+        cells.push(("k", "ask ai".into()));
     }
     for (k, label) in [("d", "drafts"), ("h", "home"), ("p", "profile"), ("g", "top"), ("u", "update")] {
         cells.push((k, label.into()));

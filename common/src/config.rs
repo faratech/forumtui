@@ -95,6 +95,9 @@ pub const SEARCH_MIN_INTERVAL_MS: u64 = 3_000;
 /// that client-side so the compose screen can show the wait instead of 422ing.
 pub const WRITE_COOLDOWN_MS: u64 = 30_000;
 pub const NEW_THREAD_COOLDOWN_MS: u64 = 180_000;
+/// Ask the AI: chat.php refuses a member's next message inside 3 s of the
+/// last (`RATE_LIMIT_WINDOW`), and every turn is a paid model call.
+pub const AI_MIN_INTERVAL_MS: u64 = 3_000;
 
 /// Floor applied to the relevant gate when a 429 carries no `Retry-After`
 /// header at all — a conservative fallback, not a measured value.
@@ -109,6 +112,10 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// A release binary is ~8 MiB; a slow link needs longer than a page fetch.
 pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// One Ask the AI turn: chat.php gives the model 180 s and needs a little
+/// more to write its epilogue, so the default 30 s would cut most tool-using
+/// answers off mid-stream.
+pub const AI_TURN_TIMEOUT: Duration = Duration::from_secs(200);
 
 /// Ceiling for one attachment download (`attachment_data`): XF caps uploads
 /// well below this, so anything larger is a mistake or an attack. Enforced

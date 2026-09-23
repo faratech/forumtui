@@ -25,6 +25,13 @@ impl App {
         match action {
             Action::None => {}
             Action::Notice(msg) => self.set_status(msg),
+            Action::OpenAskAi => self.open_ask_ai(),
+            Action::AskAi(question) => self.ask_ai(question),
+            Action::AskAiCancel => {
+                self.stop_ask_task();
+                self.set_status("Stopped.");
+            }
+            Action::AskAiNewChat => self.new_ask_ai_chat(),
             Action::PopScreen => {
                 self.pop_screen();
             }
@@ -929,5 +936,266 @@ impl App {
         self.copy_text(&target);
         self.set_status(format!("Opening {target} (also copied to clipboard)"));
         let _ = (self.browser_opener)(&target);
+    }
+}
+
+// ---- Ask the AI ----
+
+impl App {
+    /// `g k` / the palette's "Ask the AI". One screen at a time: asking to
+    /// open it while it is on top is a no-op, not a second conversation.
+    pub(super) fn open_ask_ai(&mut self) {
+        if !self.site.features.ask_ai {
+            self.set_status("Ask the AI is not available on this site.");
+            return;
+        }
+        if matches!(self.screens.last(), Some(Screen::AskAi(_))) || self.navigation_is_blocked() {
+            return;
+        }
+        self.push_screen(Screen::AskAi(screens::AskAiState::new()));
+        self.load_ai_usage();
+    }
+
+    fn load_ai_usage(&mut self) {
+        let api = self.api.clone();
+        let tx = self.tx.clone();
+        let session_generation = self.session_generation;
+        self.spawn_session_task(async move {
+            let result = api.ai_usage().await.map_err(|e| TaskError::of(&e));
+            tx.send(session_msg(session_generation, Msg::AiUsageLoaded(result))).ok();
+        });
+    }
+
+    fn ask_ai_screen(&mut self, turn: Option<u64>) -> Option<&mut screens::AskAiState> {
+        self.screens.iter_mut().rev().find_map(|s| match s {
+            Screen::AskAi(a) if turn.is_none_or(|t| a.turn_seq == t) => Some(a),
+            _ => None,
+        })
+    }
+
+    /// Ask the question on the Ask screen on top of the stack.
+    pub(super) fn ask_ai(&mut self, question: String) {
+        self.ask_generation = self.ask_generation.wrapping_add(1);
+        let turn = self.ask_generation;
+        let Some(Screen::AskAi(a)) = self.screens.last_mut() else { return };
+        // chat.php can rebuild a conversation it lost from the transcript,
+        // but only if it hears that one exists (`has_local_history`).
+        let has_local_history = a
+            .turns
+            .iter()
+            .any(|t| t.state == screens::AskTurnState::Done && !t.answer.trim().is_empty());
+        a.turns.push(screens::AskTurn { question: question.clone(), ..Default::default() });
+        a.busy = true;
+        a.turn_seq = turn;
+        a.follow = true;
+        a.dirty = true;
+        let request = common::ai::AskRequest {
+            message: question,
+            conversation_id: a.conversation_id.clone(),
+            turn_id: common::ai::new_id("t"),
+            has_local_history,
+            ..Default::default()
+        };
+        self.spawn_ask(turn, request);
+    }
+
+    /// Run one turn: the answer's frames go to the screen as they arrive
+    /// (`Msg::AskAiEvent`), then the request's own outcome (`AskAiDone`).
+    fn spawn_ask(&mut self, turn: u64, request: common::ai::AskRequest) {
+        if let Some(task) = self.ask_task.take() {
+            task.abort();
+        }
+        let api = self.api.clone();
+        let tx = self.tx.clone();
+        let session_generation = self.session_generation;
+        let handle = tokio::spawn(async move {
+            let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+            let forward = async {
+                while let Some(event) = incoming.recv().await {
+                    tx.send(session_msg(session_generation, Msg::AskAiEvent { turn, event })).ok();
+                }
+            };
+            // `ask_ai` drops its sender when it returns, which ends
+            // `forward` after the last frame — so Done never overtakes one.
+            let (result, ()) = tokio::join!(api.ask_ai(&request, events), forward);
+            let result = result.map_err(|e| TaskError::of(&e));
+            tx.send(session_msg(session_generation, Msg::AskAiDone { turn, result })).ok();
+        });
+        // Session work like any other (`end_session` aborts it), and ours to
+        // stop on Esc, a new chat or the screen leaving.
+        self.session_handles.retain(|h| !h.is_finished());
+        self.session_handles.push(handle.abort_handle());
+        self.ask_task = Some(handle.abort_handle());
+    }
+
+    /// Stop the answer in flight. Its frames already queued are dropped by
+    /// the generation bump, and the turn says it was stopped rather than
+    /// sitting half-written as if more were coming.
+    pub(super) fn stop_ask_task(&mut self) {
+        if let Some(task) = self.ask_task.take() {
+            task.abort();
+        }
+        self.ask_generation = self.ask_generation.wrapping_add(1);
+        for screen in &mut self.screens {
+            if let Screen::AskAi(a) = screen
+                && a.busy
+            {
+                a.busy = false;
+                if let Some(t) = a.turns.last_mut()
+                    && t.state == screens::AskTurnState::Streaming
+                {
+                    t.state = screens::AskTurnState::Cancelled;
+                }
+                a.dirty = true;
+            }
+        }
+    }
+
+    /// A fresh conversation: new server-side context, empty transcript. What
+    /// was being typed stays.
+    fn new_ask_ai_chat(&mut self) {
+        self.stop_ask_task();
+        if let Some(Screen::AskAi(a)) = self.screens.last_mut() {
+            let fresh = screens::AskAiState {
+                site: a.site.clone(),
+                usage: a.usage.take(),
+                input: std::mem::take(&mut a.input),
+                cursor: a.cursor,
+                ..screens::AskAiState::new()
+            };
+            *a = fresh;
+            self.set_status("New chat.");
+        }
+    }
+
+    pub(super) fn on_ask_event(&mut self, turn: u64, event: common::ai::AiEvent) {
+        use common::ai::AiEvent;
+        use screens::AskTurnState;
+        let mut finished = false;
+        let Some(a) = self.ask_ai_screen(Some(turn)).filter(|a| a.busy) else { return };
+        let Some(t) = a.turns.last_mut() else { return };
+        match event {
+            AiEvent::Delta(text) => t.answer.push_str(&text),
+            AiEvent::Progress { id, label, done } => {
+                if let Some(step) = t.steps.iter_mut().find(|s| s.0 == id) {
+                    if !label.is_empty() {
+                        step.1 = label;
+                    }
+                    step.2 |= done;
+                } else if !done && !label.is_empty() {
+                    t.steps.push((id, label, false));
+                }
+            }
+            AiEvent::Citation { url, title } => {
+                if !t.citations.iter().any(|(u, _)| *u == url) {
+                    t.citations.push((url, title));
+                }
+            }
+            AiEvent::Completed => {
+                t.state = AskTurnState::Done;
+                a.busy = false;
+                finished = true;
+            }
+            AiEvent::Failed { message, retry_after, .. } => {
+                t.state = AskTurnState::Failed(match retry_after {
+                    Some(d) => format!("{message} Try again in {}s.", d.as_secs().max(1)),
+                    None => message,
+                });
+                a.busy = false;
+            }
+        }
+        a.dirty = true;
+        if finished {
+            // The allowance just changed.
+            self.load_ai_usage();
+        }
+    }
+
+    pub(super) fn on_ask_done(&mut self, turn: u64, result: TaskResult<()>) {
+        use screens::AskTurnState;
+        let Some(a) = self.ask_ai_screen(Some(turn)) else { return };
+        let Some(t) = a.turns.last_mut() else { return };
+        match result {
+            Ok(()) => {
+                if a.busy {
+                    // The parser always ends a stream with a verdict, so a
+                    // busy screen here lost its reader; say so rather than
+                    // spin forever.
+                    a.busy = false;
+                    if t.state == AskTurnState::Streaming {
+                        t.state = AskTurnState::Failed("No answer came back.".into());
+                    }
+                }
+            }
+            Err(e) => {
+                // chat.php lost the conversation and wants the transcript to
+                // rebuild it (the web client resends the same way). Once.
+                if e.code.as_deref() == Some("history_required")
+                    && !t.resent_with_history
+                    && t.answer.is_empty()
+                {
+                    t.resent_with_history = true;
+                    let question = t.question.clone();
+                    let earlier = a.turns.len() - 1;
+                    let history: Vec<(common::ai::Role, String)> = a.turns[..earlier]
+                        .iter()
+                        .filter(|t| t.state == AskTurnState::Done && !t.answer.trim().is_empty())
+                        .flat_map(|t| {
+                            [
+                                (common::ai::Role::User, t.question.clone()),
+                                (common::ai::Role::Assistant, t.answer.clone()),
+                            ]
+                        })
+                        .collect();
+                    let conversation_id = a.conversation_id.clone();
+                    self.ask_generation = self.ask_generation.wrapping_add(1);
+                    let next = self.ask_generation;
+                    if let Some(a) = self.ask_ai_screen(Some(turn)) {
+                        a.turn_seq = next;
+                    }
+                    self.spawn_ask(
+                        next,
+                        common::ai::AskRequest {
+                            message: question,
+                            conversation_id,
+                            turn_id: common::ai::new_id("t"),
+                            history,
+                            ..Default::default()
+                        },
+                    );
+                    return;
+                }
+                a.busy = false;
+                t.state = AskTurnState::Failed(ask_error_text(&e));
+            }
+        }
+        a.dirty = true;
+    }
+
+    pub(super) fn on_ai_usage(&mut self, result: TaskResult<common::ai::AiUsage>) {
+        match result {
+            Ok(usage) => {
+                let chip = usage.summary();
+                for screen in &mut self.screens {
+                    if let Screen::AskAi(a) = screen {
+                        a.usage = chip.clone();
+                    }
+                }
+            }
+            // Decoration: the question still works without the chip.
+            Err(e) => tracing::debug!("AI usage unavailable: {}", e.message),
+        }
+    }
+}
+
+/// What a refused turn says on its own row.
+fn ask_error_text(e: &TaskError) -> String {
+    match (e.kind, e.code.as_deref()) {
+        (TaskErrorKind::Api(404), _) => "Ask the AI is not available on this site right now.".into(),
+        (_, Some("member_required")) => "Sign in again to ask the assistant.".into(),
+        (_, Some("conversation_busy")) => {
+            "The previous answer is still being finished \u{2014} try again in a moment.".into()
+        }
+        _ => e.message.clone(),
     }
 }

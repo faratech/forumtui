@@ -53,7 +53,7 @@ pub fn generate_state() -> String {
 /// rand 0.8's `OsRng::fill_bytes` did, and it is the right behaviour here:
 /// these bytes are the PKCE verifier and the OAuth state parameter, so a
 /// degraded fallback would be a security bug, not a graceful degradation.
-fn fill_from_os(dst: &mut [u8]) {
+pub(crate) fn fill_from_os(dst: &mut [u8]) {
     rand::rngs::SysRng
         .try_fill_bytes(dst)
         .expect("the OS entropy source must be available to start a login");

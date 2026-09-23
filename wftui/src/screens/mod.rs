@@ -4,6 +4,7 @@
 //! app executes them (spawning tasks, pushing screens). Screens never hold an
 //! `App` reference — that keeps borrows trivial and screens testable.
 
+mod ask;
 pub(crate) mod browse;
 mod library;
 mod misc;
@@ -804,6 +805,82 @@ pub struct ResourceListState {
     pub error: Option<String>,
 }
 
+/// Where one Ask the AI answer stands.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AskTurnState {
+    #[default]
+    Streaming,
+    Done,
+    /// Stopped by the reader (Esc), or left behind by a new chat.
+    Cancelled,
+    /// Refused or broken off; what text arrived is still shown above this.
+    Failed(String),
+}
+
+/// One question and the answer to it.
+#[derive(Debug, Clone, Default)]
+pub struct AskTurn {
+    pub question: String,
+    /// Markdown, as the assistant writes it; appended to as it streams.
+    pub answer: String,
+    /// `(url, title)` from citation annotations — sources the model cited
+    /// outside the text.
+    pub citations: Vec<(String, String)>,
+    /// `(id, label, done)` — what the assistant is doing ("Searching
+    /// WindowsForum"), for the status row.
+    pub steps: Vec<(String, String, bool)>,
+    pub state: AskTurnState,
+    /// chat.php lost this conversation and asked for the transcript
+    /// (`history_required`); the resend is made once, never in a loop.
+    pub resent_with_history: bool,
+}
+
+/// Ask the AI — WindowsForum's assistant (`screens/ask.rs`).
+#[derive(Default)]
+pub struct AskAiState {
+    /// For the `o` key: the site's own assistant page.
+    pub site: Arc<SiteConfig>,
+    /// The server's handle on this conversation (`common::ai::new_id`),
+    /// which is what carries context from one question to the next.
+    pub conversation_id: String,
+    pub turns: Vec<AskTurn>,
+    pub input: String,
+    pub cursor: usize,
+    /// The question field owns the keyboard (the default). Off, the keys
+    /// read the transcript instead.
+    pub input_mode: bool,
+    /// An answer is streaming.
+    pub busy: bool,
+    /// The `App::ask_generation` of the turn this screen is waiting on;
+    /// frames from any other (a stopped turn's stragglers) are dropped.
+    pub turn_seq: u64,
+    /// The member's allowance, for the panel's top-right cap.
+    pub usage: Option<String>,
+    pub scroll: usize,
+    /// Keep the newest line in view while an answer streams, until the
+    /// reader scrolls up to look at something.
+    pub follow: bool,
+    pub lines: Vec<ratatui::text::Line<'static>>,
+    /// Every link in the transcript, in `[n]` order.
+    pub links: Vec<String>,
+    pub width: u16,
+    /// Something changed since the lines were laid out.
+    pub dirty: bool,
+    pub view_height: u16,
+    pub input_rect: Rect,
+}
+
+impl AskAiState {
+    pub fn new() -> Self {
+        AskAiState {
+            conversation_id: common::ai::new_id("tui"),
+            input_mode: true,
+            follow: true,
+            ..Default::default()
+        }
+    }
+}
+
 /// One row of the drafts list.
 pub struct DraftRow {
     pub key: common::drafts::DraftKey,
@@ -957,6 +1034,8 @@ pub enum Screen {
     /// One picture, as large as the pane allows (#697).
     ImageView(ImageViewState),
     Drafts(DraftsState),
+    /// Ask the AI (`g k`), where the site has it.
+    AskAi(AskAiState),
 }
 
 /// Where an upload's attachment key is anchored (#709). XF checks this
@@ -1082,6 +1161,14 @@ pub enum Action {
     /// mark read (issue #552).
     Notice(String),
     PasteClipboard,
+    /// Open Ask the AI (`g k` / the palette).
+    OpenAskAi,
+    /// Ask the assistant this question, in the screen's conversation.
+    AskAi(String),
+    /// Stop the answer that is streaming.
+    AskAiCancel,
+    /// Start a new conversation, stopping any answer in flight.
+    AskAiNewChat,
     Quit,
 }
 
@@ -1120,6 +1207,7 @@ impl Screen {
             Screen::ResourceView(s) => library::render_resource_view(s, f, area, theme, g, hits),
             Screen::ImageView(s) => library::render_image_view(s, f, area, theme, g, hits),
             Screen::Drafts(s) => library::render_drafts(s, f, area, theme, g, hits),
+            Screen::AskAi(s) => ask::render(s, f, area, theme, g, hits),
         }
     }
 
@@ -1164,6 +1252,7 @@ impl Screen {
                 s.site = site.clone();
                 s.width = 0;
             }
+            Screen::AskAi(s) if !same(&s.site) => s.site = site.clone(),
             _ => {}
         }
     }
@@ -1236,6 +1325,7 @@ impl Screen {
             Screen::Drafts(s) => library::drafts_hints(s),
             Screen::ResourceView(s) => library::resource_view_hints(s),
             Screen::ImageView(s) => library::image_view_hints(s),
+            Screen::AskAi(s) => ask::hints(s),
         }
     }
 
@@ -1264,6 +1354,7 @@ impl Screen {
                 .map(|r| r.title.clone())
                 .unwrap_or_else(|| "Resource".into()),
             Screen::ImageView(s) => s.title.clone(),
+            Screen::AskAi(_) => "Ask the AI".into(),
         }
     }
 
@@ -1286,6 +1377,7 @@ impl Screen {
             Screen::Drafts(s) => library::drafts_key(s, key),
             Screen::ResourceView(s) => library::resource_view_key(s, key),
             Screen::ImageView(s) => library::image_view_key(s, key),
+            Screen::AskAi(s) => ask::key(s, key),
         }
     }
 
@@ -1440,6 +1532,8 @@ impl Screen {
             Screen::Drafts(_) => false,
             Screen::ResourceView(r) => r.loading,
             Screen::ImageView(v) => v.loading,
+            // The status row's spinner turns while an answer streams.
+            Screen::AskAi(a) => a.busy,
             // The Login Waiting stage animates its "waiting for approval"
             // spinner too — but only while a flow is live.
             Screen::Login(l) => l.busy || matches!(l.stage, LoginStage::Waiting { .. }),
@@ -1498,6 +1592,7 @@ impl Screen {
             Screen::Drafts(_) => None,
             Screen::ResourceView(r) => r.resource.as_ref().and_then(|r| r.view_url.clone()),
             Screen::ImageView(v) => v.web_url.clone(),
+            Screen::AskAi(a) => Some(format!("{}/pages/ai/", a.site.origin)),
             Screen::Profile(p) => p.user.as_ref().and_then(|u| u.view_url.clone()),
             _ => None,
         }
@@ -1511,6 +1606,7 @@ impl Screen {
             Screen::Compose(s) => misc::compose_click_field(s, field, col, row),
             Screen::NewConversation(s) => social::new_conversation_click_field(s, field, col, row),
             Screen::Search(s) => misc::search_click_field(s, field, col),
+            Screen::AskAi(s) => ask::click_field(s, col),
             _ => {}
         }
     }
@@ -1550,6 +1646,9 @@ impl Screen {
             Screen::ThreadView(s) if s.link_popup => EscIntent::Screen,
             Screen::Compose(_) | Screen::NewConversation(_) => EscIntent::Screen,
             Screen::Search(s) if s.input_mode => EscIntent::Screen,
+            // In the field Esc goes back to reading; while an answer is
+            // streaming it stops it. Only an idle transcript leaves.
+            Screen::AskAi(a) if a.input_mode || a.busy => EscIntent::Screen,
             _ => EscIntent::App,
         }
     }
@@ -1608,6 +1707,10 @@ impl Screen {
             Screen::Resources(r) => r.sel = 0,
             Screen::Drafts(d) => d.sel = 0,
             Screen::ResourceView(r) => r.scroll = 0,
+            Screen::AskAi(a) => {
+                a.scroll = 0;
+                a.follow = false;
+            }
             _ => {}
         }
     }
@@ -1653,6 +1756,10 @@ impl Screen {
             Screen::Resources(r) => r.sel = r.items.len().saturating_sub(1),
             Screen::Drafts(d) => d.sel = d.rows.len().saturating_sub(1),
             Screen::ResourceView(r) => r.scroll = r.lines.len().saturating_sub(1),
+            Screen::AskAi(a) => {
+                a.scroll = a.lines.len();
+                a.follow = true;
+            }
             _ => {}
         }
     }
@@ -1675,6 +1782,7 @@ impl Screen {
             Screen::Drafts(_) => "THESE DRAFTS",
             Screen::ResourceView(_) => "THIS RESOURCE",
             Screen::ImageView(_) => "THIS IMAGE",
+            Screen::AskAi(_) => "THIS CHAT",
         }
     }
 
@@ -1697,6 +1805,7 @@ impl Screen {
             Screen::Drafts(_) => "Drafts",
             Screen::ResourceView(_) => "Resource",
             Screen::ImageView(_) => "Image",
+            Screen::AskAi(_) => "Ask the AI",
         }
     }
 }
@@ -2809,6 +2918,35 @@ mod dispatch_tests {
                     ..Default::default()
                 }),
                 skip: &["Esc"],
+            },
+            Case {
+                // Typing: Enter asks, ^N starts over.
+                name: "AskAi (typing)",
+                factory: || Screen::AskAi(AskAiState {
+                    input: "why is my pc slow".into(),
+                    cursor: 17,
+                    input_mode: true,
+                    ..Default::default()
+                }),
+                // `Esc` only leaves the field for the transcript — screen
+                // state, no `Action` (see `ask::input_key`).
+                skip: &["Esc"],
+            },
+            Case {
+                name: "AskAi (reading)",
+                factory: || Screen::AskAi(AskAiState {
+                    turns: vec![AskTurn {
+                        question: "q".into(),
+                        answer: "See [x](https://windowsforum.com/threads/1/)".into(),
+                        state: AskTurnState::Done,
+                        ..Default::default()
+                    }],
+                    links: vec!["https://windowsforum.com/threads/1/".into()],
+                    ..Default::default()
+                }),
+                // `i` only moves the keyboard into the field; `Esc` on an
+                // idle transcript is the app's pop (`esc_intent` is `App`).
+                skip: &["i", "j/k", "Esc"],
             },
             Case {
                 name: "Profile",

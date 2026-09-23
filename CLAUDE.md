@@ -361,6 +361,54 @@ and headings as bold + accent + underline by level. `[HIGHLIGHT]` is
 captured live post bodies in `common/src/testdata/`; that corpus is what
 caught the `SIZE` reading. Re-capture it when the parser changes.
 
+## Ask the AI — a WindowsForum module
+
+`g k`, `A` on Home (the QUICK block's row under Latest) or the palette row opens `Screen::AskAi` (`screens/ask.rs`): the
+site's own assistant (`/pages/ai/`), streamed into the terminal. It exists
+only where `features.ask_ai` is on — the built-in site; `false` in every
+generic config — because the backend is WindowsForum's `chat.php`, not
+XenForo. `k` is in `RESERVED_CHORDS` everywhere so a config never changes
+meaning.
+
+- **The path is a relay, not a second implementation.** `chat.php` authenticates
+  a *browser* (XF session cookie, a Turnstile approval cookie, `_xfToken`), none
+  of which a bearer has. TuiLink's `/api/wf-tui-ai`
+  (`Api/Controller/AiController.php`) turns the bearer into a visitor, then
+  forwards to `http://127.0.0.1/chat.php` with `X-WF-Relay:
+  v1.<user_id>.<ts>.<nonce>.<hmac>` over `sha256(body)`, and passes the SSE
+  straight back. `chat.php` trusts that header only from loopback, within 30 s,
+  once per nonce (Redis), and only for a message, `getUsage` and `getUserData`;
+  the relayed request skips the Turnstile block and nothing else — blocklist,
+  rate limit, turn ledger, leases and quotas all still apply in their one
+  place. The key is **derived** (`HMAC(secretKey, "wf-tui-relay|v1")` on both
+  sides): `config.php` and `/web/.env` are `chattr +i` on the server. No OAuth
+  scope was minted (#695); the route asserts `user:read`.
+- **The stream is chat.php's own.** `common::ai::SseParser` maps frames the way
+  the site's web bundle (`chatpage/static/js`) does: `response.output_text.delta`
+  is the answer, `url_citation` annotations are sources, `output_item.added` /
+  `<tool>_call.<phase>` are progress, and only `chat.stream.completed` (or
+  `[DONE]`) finishes a turn — a stream that ends earlier is `stream_truncated`.
+  `testdata/ask_ai_stream.sse` is a whole captured turn (the member's
+  `safety_identifier` zeroed, nothing else touched).
+- **Answers are Markdown**, so `common::markdown` turns them into the same
+  `bbcode::Chunk`s posts produce and the renderer is reused unchanged. It is
+  re-run on half-written answers, so unclosed markers must degrade.
+- **One conversation per screen** (`AskAiState::conversation_id`, chat.php's
+  `client_conversation_id`); `^N`/`n` mints a new one. A later question sends
+  `has_local_history`; `history_required` (chat.php lost it) resends once with
+  the transcript, as the web client does.
+- **Turns are stamped** (`App::ask_generation` = `AskAiState::turn_seq`); Esc,
+  a new chat, `pop_screen` and `end_session` abort the task and bump the
+  generation, so a stopped turn's queued frames are dropped. `AskAiDone`'s
+  `Err` is in `session_error_of`, so a 401 ends the session like any call.
+- `ai_gate` (3 s, chat.php's `RATE_LIMIT_WINDOW`) + `api_gate`; a 429's
+  `Retry-After` holds the lane. `AI_TURN_TIMEOUT` is 200 s — chat.php gives the
+  model 180 s and the default 30 s would cut tool-using answers off.
+
+Verify the server half with the relay itself, not this note:
+`KEY=$(grep -m1 '^XF_API_KEY=' /web/.env | cut -d= -f2-); curl -sN -H "XF-Api-Key: $KEY" -H 'XF-Api-User: <id>' --data-urlencode 'message=…' -d conversation_id=tuitest1 https://windowsforum.com/api/wf-tui-ai`
+(an API key bypasses scopes, so it proves the stream, not the permission).
+
 ## Self-update (#722)
 
 Ported from htop-win's `installer.rs`. `common/src/update.rs` is the whole
@@ -851,6 +899,10 @@ an image past either returns `Err` and falls back to the placeholder.
   not its updates, reviews or versions (`XFRM:ResourceUpdates`,
   `ResourceReviews`, `ResourceVersions`). All of those endpoints exist.
 - There is no @mention completion.
+- Ask the AI is one conversation per open screen: the web page's saved
+  conversations, attachments, feedback and sharing (chat.php's product
+  actions) are not offered — the relay refuses them by design, since they
+  need the browser's CSRF token.
 
 
 ## Production readiness corrections (2026-09)

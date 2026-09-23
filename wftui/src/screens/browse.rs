@@ -302,6 +302,10 @@ struct TreeRow {
 /// (`Hit::Key`), through `handle_key`, rather than duplicating what it does.
 fn quick_rows(site: &SiteConfig) -> Vec<(&'static str, String)> {
     let mut rows = vec![("L", "Latest posts".to_string())];
+    // Ask the AI sits with the other places to go, where the site has it.
+    if site.features.ask_ai {
+        rows.push(("A", "Ask the AI".to_string()));
+    }
     rows.extend(site.quick.iter().zip(QUICK_DIGITS).map(|(q, d)| (d, q.label.clone())));
     rows
 }
@@ -897,6 +901,7 @@ pub fn home_key(s: &mut HomeState, key: KeyEvent) -> Action {
                 None => Action::None,
             },
             KeyCode::Char('L') => Action::OpenLatestThreads,
+            KeyCode::Char('A') if s.tree.site.features.ask_ai => Action::OpenAskAi,
             _ => thread_list_key(&mut s.list, key),
         },
     }
@@ -1046,6 +1051,7 @@ pub fn forum_tree_key(s: &mut ForumTreeState, key: KeyEvent) -> Action {
             None => Action::None,
         },
         KeyCode::Char('L') => Action::OpenLatestThreads,
+        KeyCode::Char('A') if s.site.features.ask_ai => Action::OpenAskAi,
         KeyCode::Char('r') => {
             if s.loading {
                 return Action::Notice("Already loading — one moment.".into());
@@ -3267,21 +3273,42 @@ mod tests {
         let t: Vec<String> = rows.iter().map(|r| text(&r.line)).collect();
         assert_eq!(t[0], " QUICK");
         assert_eq!(t[1], " L  Latest posts");
-        assert_eq!(t[2], " 1  Windows News");
-        assert_eq!(t[3], " 2  Security Alerts");
-        assert_eq!(t[4], " 3  Windows Tutorials");
-        assert_eq!(t[5], "");
+        assert_eq!(t[2], " A  Ask the AI");
+        assert_eq!(t[3], " 1  Windows News");
+        assert_eq!(t[4], " 2  Security Alerts");
+        assert_eq!(t[5], " 3  Windows Tutorials");
+        assert_eq!(t[6], "");
         // Categories: CAPS at column 1.
-        assert_eq!(t[6], " WINDOWS FORUMS");
+        assert_eq!(t[7], " WINDOWS FORUMS");
         // The current forum carries the `›` marker; siblings are indented two.
-        assert_eq!(t[7], " \u{203A} Windows Help and Support");
-        assert_eq!(t[8], "   Windows Upgrade and Installation");
+        assert_eq!(t[8], " \u{203A} Windows Help and Support");
+        assert_eq!(t[9], "   Windows Upgrade and Installation");
         // A link forum is marked and indented one level deeper.
-        assert_eq!(t[9], "     BSOD AI Analyzer \u{2197}");
+        assert_eq!(t[10], "     BSOD AI Analyzer \u{2197}");
         // Only the four node rows map back to `nodes`.
-        assert_eq!(rows[6].node, Some(0));
-        assert_eq!(rows[9].node, Some(3));
+        assert_eq!(rows[7].node, Some(0));
+        assert_eq!(rows[10].node, Some(3));
         assert!(rows[0].node.is_none());
+        // A click on the Ask row presses its key.
+        assert_eq!(rows[2].key, Some("A"));
+    }
+
+    /// Ask the AI is on the Home menu where the site has it, and `A` opens
+    /// it from either pane; elsewhere there is no row and `A` does nothing.
+    #[test]
+    fn the_quick_block_offers_ask_the_ai_only_where_the_site_has_it() {
+        let theme = Theme::truecolor();
+        let mut s = ForumTreeState { nodes: sample_nodes(), ..Default::default() };
+        assert!(matches!(forum_tree_key(&mut s, key('A')), Action::OpenAskAi));
+        let mut h = HomeState { focus: Pane::List, ..Default::default() };
+        assert!(matches!(home_key(&mut h, key('A')), Action::OpenAskAi));
+
+        let mut other = SiteConfig::blank("other");
+        other.features.ask_ai = false;
+        s.site = std::sync::Arc::new(other);
+        let rows = forum_rows(&s, 0, &theme, &UNICODE, 35);
+        assert!(!rows.iter().any(|r| text(&r.line).contains("Ask the AI")));
+        assert!(!matches!(forum_tree_key(&mut s, key('A')), Action::OpenAskAi));
     }
 
     #[test]

@@ -246,6 +246,14 @@ impl App {
                     }
                     self.set_status(format!("Pasted {} characters into search", text.chars().count()));
                 }
+                // The question field is one line: a pasted error log or
+                // command output arrives as one question, not as Enters.
+                Screen::AskAi(a) => {
+                    let sanitized = crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], " "));
+                    a.input_mode = true;
+                    crate::editor::insert_str(&mut a.input, &mut a.cursor, &sanitized);
+                    self.set_status(format!("Pasted {} characters into the question", text.chars().count()));
+                }
                 Screen::NewConversation(ncs) => {
                     match ncs.field {
                         0 => {
@@ -819,6 +827,9 @@ impl App {
         matches!(
             self.screens.last(),
             Some(Screen::Search(s)) if s.input_mode
+        ) || matches!(
+            self.screens.last(),
+            Some(Screen::AskAi(a)) if a.input_mode
         ) || matches!(
             self.screens.last(),
             Some(Screen::Compose(_)) | Some(Screen::NewConversation(_))

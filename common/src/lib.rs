@@ -5,8 +5,10 @@
 //! [`oauth`] (PKCE browser-handoff login), [`token`] (0600 token store),
 //! [`site`] (which forum, how to sign in, what it is called),
 //! [`models`] (lenient serde shapes), [`api`] (the `WfApi` seam),
-//! [`bbcode`] (styled-chunk renderer), [`logging`] (file-only tracing).
+//! [`bbcode`] (styled-chunk renderer), [`logging`] (file-only tracing),
+//! [`ai`] (Ask the AI stream), [`markdown`] (its answers, as styled chunks).
 
+pub mod ai;
 pub mod api;
 pub mod bbcode;
 pub mod config;
@@ -14,6 +16,7 @@ pub mod drafts;
 pub mod error;
 pub mod http;
 pub mod logging;
+pub mod markdown;
 pub mod models;
 pub mod oauth;
 pub mod osc;

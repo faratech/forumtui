@@ -52,7 +52,7 @@ are pointed elsewhere).
       "origin": "https://forum.example.com",
       "oauth_client_id": "PASTE-CLIENT-ID",
       "login": "auto",
-      "features": { "xfmg": false, "xfrm": false, "tuilink": null, "drafts_relay": null },
+      "features": { "xfmg": false, "xfrm": false, "tuilink": null, "drafts_relay": null, "ask_ai": false },
       "brand": {
         "name": "ExampleForum",
         "bold_prefix": "Example",
@@ -83,13 +83,14 @@ are ignored, so a file written for a newer build loads on an older one.
 | `features.xfrm` | the forum runs the Resource Manager: likewise with `resource:read` | `false` (WF: `true`) |
 | `features.tuilink` | the forum has the TuiLink add-on (`null` = find out) | `null` (WF: `true`) |
 | `features.drafts_relay` | its draft endpoint too (`null` = find out) | `null` (WF: `true`) |
+| `features.ask_ai` | Ask the AI (`g k`): WindowsForum's assistant through `/api/wf-tui-ai`. The relay forwards to that site's own `chat.php`, so on any other forum leave it `false` | `false` (WF: `true`) |
 | `login` | `auto`, `tuilink`, `loopback` or `paste` — see below | `auto` |
 | `brand.name` | the wordmark in the header and on the sign-in screen | the slug |
 | `brand.bold_prefix` | the leading part of `name` drawn bold (`Windows` in `WindowsForum`) | none |
 | `brand.mark` | the 1-4 character chip in front of it | first two letters of the slug, upper-cased |
 | `brand.chrome_bg` | the header band colour, any CSS colour | WindowsForum blue |
 | `brand.logo` | a PNG for the sign-in screen on terminals that draw pixels; relative paths resolve against the config dir | none (WF: built in) |
-| `quick` | up to nine `{key, label, node_id}`: a `g <key>` chord, a palette row and a `1`-`9` key on the Home screen each. `key` is one lowercase letter that is not one of `l i a m r d h p g u`. | none (WF: news / security / tutorials) |
+| `quick` | up to nine `{key, label, node_id}`: a `g <key>` chord, a palette row and a `1`-`9` key on the Home screen each. `key` is one lowercase letter that is not one of `l i a m r d h p g u k`. | none (WF: news / security / tutorials) |
 | `bot_user_ids` | members whose posts wear an `AI` chip | none (WF: its bot) |
 | `prefix_strip` | words dropped from thread prefixes in narrow rows | none (WF: `"Windows "`) |
 
