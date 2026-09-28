@@ -6180,8 +6180,34 @@ mod tests {
 
     /// An origin no test can actually reach: port 1 on loopback refuses
     /// instantly, so a request that escapes a stub fails fast instead of
-    /// travelling to windowsforum.com.
+    /// travelling to windowsforum.com. Nothing here connects to it in
+    /// practice (the API seam is `RecordingApi`); a test that must really
+    /// perform a failing request uses [`Self::black_hole_feed`] — a closed
+    /// port is not portable, because a sandbox that drops SYNs instead of
+    /// refusing turns each connect into the client's full 10 s timeout (#30).
     const OFFLINE_BASE: &str = "http://127.0.0.1:1";
+
+    /// A local stand-in for "the network is down": a listener that accepts
+    /// every connection and closes it at once, so the request fails in
+    /// milliseconds on every platform. Unlike a closed port this cannot be
+    /// turned into a connect-timeout by a SYN-dropping sandbox (#30), and
+    /// unlike a real host it can never leave the machine.
+    fn black_hole_feed() -> &'static str {
+        static FEED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        FEED.get_or_init(|| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind black-hole feed");
+            let addr = listener.local_addr().expect("black-hole feed addr");
+            std::thread::spawn(move || {
+                // Accept and drop: the peer sees EOF before it can send a
+                // complete request, which reqwest reports immediately.
+                while let Ok((stream, _)) = listener.accept() {
+                    drop(stream);
+                }
+            });
+            format!("http://{addr}")
+        })
+        .as_str()
+    }
 
     /// The `WfApiClient` every test's `App` owns: a token store in the
     /// scratch dir (so it starts with NO session and can never read, rewrite
@@ -7063,11 +7089,13 @@ mod tests {
                 TEST_DRAFT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             )),
             drafts_relay_absent: false,
-            // Scratch root, unreachable feed, and a scratch "binary" that is
+            // Scratch root, a feed that fails fast on every machine (not a
+            // closed port, whose connects some sandboxes drop until the
+            // connect timeout — #30), and a scratch "binary" that is
             // not under any cargo target dir (#722).
             update_cfg: common::update::UpdateConfig::for_test(
                 scratch_config_dir().join("update"),
-                format!("{OFFLINE_BASE}/latest"),
+                format!("{}/latest", black_hole_feed()),
                 scratch_config_dir().join("bin").join("wftui"),
                 env!("CARGO_PKG_VERSION"),
             ),
