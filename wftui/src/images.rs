@@ -1592,47 +1592,42 @@ mod tests {
     }
 
     /// Pins the mechanism CLAUDE.md hard rule 1 depends on: the escape payload
-    /// lives in exactly one anchor cell per row — flagged `ForcedWidth(1)`, so
-    /// ratatui bills it one column rather than its byte width — and every
-    /// other cell of the rect is `Skip`, so the frame diff can never re-emit a
-    /// fragment of it out of context. A crate upgrade that changed this would
-    /// break the login-corruption fix (and `app::is_image_cell`, which reads
-    /// exactly these flags), so it is asserted rather than assumed.
+    /// lives in the top-left cell, flagged `ForcedWidth(1)`, so ratatui bills
+    /// it one column rather than its byte width. The remaining cells carry
+    /// Kitty placeholders, also flagged `ForcedWidth(1)`, so the frame diff
+    /// cannot re-emit a fragment of the payload out of context. A crate
+    /// upgrade that changed this would break the login-corruption fix (and
+    /// `app::is_image_cell`, which reads exactly these flags), so it is
+    /// asserted rather than assumed.
     #[cfg(feature = "images")]
     #[test]
-    fn the_kitty_tier_keeps_its_payload_in_skip_protected_anchor_cells() {
+    fn the_kitty_payload_is_transmitted_once_into_width_protected_cells() {
         let mut images = loaded(Tier::Kitty);
         let rect = Rect::new(2, 1, LOGO_COLS, LOGO_ROWS);
         let buf = painted(&mut images, rect, 40, 12);
 
         let mut anchors = 0usize;
         for y in rect.y..rect.bottom() {
-            let mut row_anchors = 0usize;
             for x in rect.x..rect.right() {
                 let cell = &buf[(x, y)];
                 if cell.symbol().contains('\u{1b}') {
                     assert_eq!(x, rect.x, "the payload must live in the row's first cell");
+                    assert_eq!(y, rect.y, "the payload must live in the image's first row");
                     assert!(
                         matches!(cell.diff_option, CellDiffOption::ForcedWidth(w) if w.get() == 1),
                         "the anchor must be billed one column, not its byte width"
                     );
-                    row_anchors += 1;
                     anchors += 1;
-                    continue;
                 }
-                // Everything else is either skipped (the image covers it) or
-                // untouched (the fitted image is narrower than the reserved
-                // box). What must never happen is a cell carrying a fragment
-                // of the payload, or text the image would sit on top of.
                 assert!(
-                    !matches!(cell.diff_option, CellDiffOption::None) || cell.symbol() == " ",
-                    "a kitty image cell carries text at {x},{y}: {:?}",
-                    cell.symbol()
+                    matches!(cell.diff_option, CellDiffOption::ForcedWidth(w) if w.get() == 1)
+                        || (matches!(cell.diff_option, CellDiffOption::None)
+                            && cell.symbol() == " "),
+                    "a kitty cell must be a width-protected placeholder or untouched blank at {x},{y}"
                 );
             }
-            assert_eq!(row_anchors, 1, "row {y} carries {row_anchors} escape payloads");
         }
-        assert_eq!(anchors, rect.height as usize, "one payload per image row");
+        assert_eq!(anchors, 1, "the image payload is transmitted once");
 
         // Nothing outside the rect was touched.
         for y in 0..12u16 {
