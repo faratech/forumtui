@@ -122,6 +122,20 @@ pub async fn wait_for_redirect(
     expected_state: &str,
     timeout: Duration,
 ) -> Result<String> {
+    /// How long one accepted connection may take to send its request head
+    /// before it is dropped as a stalled peer (#36).
+    const PER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+    wait_for_redirect_with(listener, expected_state, timeout, PER_READ_TIMEOUT).await
+}
+
+/// The body of `wait_for_redirect`, with the per-read bound as a parameter
+/// so tests can run the stall scenario at real-time speed.
+async fn wait_for_redirect_with(
+    listener: TcpListener,
+    expected_state: &str,
+    timeout: Duration,
+    per_read_timeout: Duration,
+) -> Result<String> {
     let fut = async {
         // A favicon request or browser preconnect that resets mid-read (a
         // local port probe, a RST race) must not kill the whole handshake:
@@ -143,15 +157,31 @@ pub async fn wait_for_redirect(
                     continue;
                 }
             };
-            let raw = match read_request_head(&mut stream).await {
-                Ok(raw) => {
+            // A peer that connects and never sends (a local port probe, a
+            // browser preconnect opened but never written) must not sit in
+            // this one sequential read until the flow-level timeout kills
+            // the whole login: bound the read and treat expiry as one more
+            // dropped peer (#36).
+            let raw = match tokio::time::timeout(per_read_timeout, read_request_head(&mut stream))
+                .await
+            {
+                Ok(Ok(raw)) => {
                     consecutive_failures = 0;
                     raw
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     consecutive_failures += 1;
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                         return Err(e);
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        return Err(Error::Handshake(
+                            "a connection stalled the redirect listener".into(),
+                        ));
                     }
                     continue;
                 }
@@ -758,6 +788,49 @@ mod tests {
             .await
             .unwrap();
         let code = waiter.await.unwrap().unwrap();
+        assert_eq!(code, "thecode");
+    }
+
+    /// A peer that connects and never sends (a port probe, an idle browser
+    /// preconnect) must not sit in the listener's one sequential read until
+    /// the flow-level timeout kills the whole login: the read is bounded,
+    /// the stalled peer is dropped, and the real redirect still completes
+    /// (#36). Real time, with the per-read bound shortened to keep the
+    /// test quick.
+    #[tokio::test]
+    async fn a_silent_connection_cannot_stall_the_redirect_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let waiter = tokio::spawn(wait_for_redirect_with(
+            listener,
+            "st9",
+            Duration::from_secs(30),
+            Duration::from_millis(150),
+        ));
+
+        // The staller: connects, never writes. Give the listener time to
+        // accept it and park in its bounded read before the real redirect
+        // arrives — taking the head of the queue is the scenario.
+        let _stall = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        use tokio::io::AsyncWriteExt;
+        stream
+            .write_all(b"GET /callback?code=thecode&state=st9 HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        // Far longer than the shortened per-read bound: only the stalled
+        // read's deadline should ever matter.
+        let code = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("the flow must finish despite the silent peer")
+            .unwrap()
+            .unwrap();
         assert_eq!(code, "thecode");
     }
 
