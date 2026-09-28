@@ -140,7 +140,8 @@ fn named_color(name: &str) -> Option<Rgb> {
         "red" => rgb(255, 0, 0),
         "darkred" => rgb(139, 0, 0),
         "green" => rgb(0, 128, 0),
-        "lime" | "limegreen" => rgb(50, 205, 50),
+        "lime" => rgb(0, 255, 0),
+        "limegreen" => rgb(50, 205, 50),
         "darkgreen" => rgb(0, 100, 0),
         "blue" => rgb(0, 0, 255),
         "darkblue" => rgb(0, 0, 139),
@@ -478,7 +479,12 @@ fn is_closer(name: &str, f: &Frame) -> bool {
         | ("i", Frame::Italic)
         | ("u", Frame::Underline)
         | ("s" | "strike", Frame::Strike)
-        | ("sub" | "sup" | "highlight", Frame::Italic | Frame::Bold)
+        | ("sub" | "sup", Frame::Italic | Frame::Bold)
+        // #702 gave highlight its own frame; the closer table still paired
+        // the name with Italic/Bold, so `[/HIGHLIGHT]` could never pop it —
+        // it printed literally (leaking highlight to end of post) or stole
+        // an enclosing bold/italic frame instead (#42).
+        | ("highlight", Frame::Highlight)
         | ("list", Frame::List(_))
         | ("spoiler" | "ispoiler", Frame::Spoiler)
         | ("icode" | "inlinecode", Frame::InlineCode)
@@ -1268,7 +1274,14 @@ pub fn strip_quote_blocks(src: &str) -> String {
             && name == "quote"
         {
             if closing {
-                depth = depth.saturating_sub(1);
+                // An unmatched closer is literal text, as XF's parser treats
+                // it — dropping it would delete characters the integrity
+                // check's substring rule still needs (#43).
+                if depth == 0 {
+                    out.push_str(&src[i..end]);
+                } else {
+                    depth -= 1;
+                }
             } else {
                 depth += 1;
             }
@@ -1291,26 +1304,69 @@ pub fn strip_quote_blocks(src: &str) -> String {
 
 /// The tag starting at `at`, as `(end_offset, is_closing, lowercase_name)`.
 /// `None` when the bracket does not open a well-formed tag.
+///
+/// The end of the tag is found by the same rules the render path applies
+/// (`tag_close`, #602/#615): in `NAME="v]"` a `]` inside the quotes does
+/// not close the tag (the terminator is `"]`), and in the attribute form
+/// the first `]` outside a quoted value ends it — so the strip pass and
+/// the parser can never disagree about where a `[QUOTE=…]` block ends (#43).
 fn tag_at(src: &str, at: usize) -> Option<(usize, bool, String)> {
-    let rest = &src[at + 1..];
-    let close = rest.find(']')?;
-    let inner = &rest[..close];
-    if inner.is_empty() || inner.contains('[') {
+    /// Longest tag body we will look through for its terminator, matching
+    /// the render path's cap.
+    const TAG_BODY_SCAN: usize = 4096;
+    let bytes = src.as_bytes();
+    let mut i = at + 1;
+    let closing = bytes.get(i) == Some(&b'/');
+    if closing {
+        i += 1;
+    }
+    let name_start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'*') {
+        i += 1;
+    }
+    if i == name_start {
         return None;
     }
-    let (closing, body) = match inner.strip_prefix('/') {
-        Some(b) => (true, b),
-        None => (false, inner),
+    let name = src[name_start..i].to_ascii_lowercase();
+    // Byte scanning is safe: `"`, `'`, `]` and `[` are ASCII and never
+    // appear inside a multi-byte UTF-8 sequence.
+    let end = match bytes.get(i) {
+        Some(b']') => i + 1,
+        Some(b'=') if matches!(bytes.get(i + 1), Some(b'"' | b'\'')) => {
+            // Value form: the terminator is `delim]`.
+            let delim = bytes[i + 1];
+            let start = i + 2;
+            let limit = bytes.len().min(start + TAG_BODY_SCAN);
+            bytes[start..limit]
+                .windows(2)
+                .position(|w| w[0] == delim && w[1] == b']')
+                .map(|p| start + p + 2)
+                // A value that never closes falls back to the plain first
+                // `]`, exactly as the render path does past its cap.
+                .or_else(|| bytes[i..].iter().position(|&b| b == b']').map(|p| i + p + 1))?
+        }
+        Some(b) if b.is_ascii_whitespace() => {
+            // Attribute form: the first `]` outside a quoted value.
+            let close = scan_attr_close(bytes, i, TAG_BODY_SCAN)
+                .or_else(|| bytes[i..].iter().position(|&b| b == b']'))?
+                + 1;
+            // A `[` in the unquoted stretches means this bracket never
+            // opens a tag — the same verdict parse_tag's inner check gives.
+            let mut quote: Option<u8> = None;
+            for &b in &bytes[i..close - 1] {
+                match quote {
+                    Some(q) if b == q => quote = None,
+                    Some(_) => {}
+                    None if b == b'"' || b == b'\'' => quote = Some(b),
+                    None if b == b'[' => return None,
+                    None => {}
+                }
+            }
+            close
+        }
+        _ => return None,
     };
-    let name: String = body
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '*')
-        .collect::<String>()
-        .to_ascii_lowercase();
-    if name.is_empty() {
-        return None;
-    }
-    Some((at + 1 + close + 1, closing, name))
+    Some((end, closing, name))
 }
 
 /// Build the `[QUOTE]` block WindowsForum's integrity checker will accept
@@ -2881,6 +2937,32 @@ mod tests {
         assert_eq!(strip_quote_blocks("before [QUOTE]after"), "before");
     }
 
+    /// The strip pass must agree with the parser about where a quoted value
+    /// ends (#602/#615): a byline like `[hun]tobias88` holds `[` and `]`
+    /// inside `NAME="…"`, and the old first-`]`-and-no-`[` rule left the
+    /// whole nested quote in the body — a nested attributed quote is the
+    /// one thing the integrity analyzer fires on (#43).
+    #[test]
+    fn stripping_removes_a_quote_whose_byline_holds_brackets() {
+        let src = "[QUOTE=\"[hun]tobias88, post: 1, member: 2\"]hi[/QUOTE] tail";
+        assert_eq!(strip_quote_blocks(src), "tail");
+        // End to end: quoting such a post must not nest an attributed
+        // quote — the block carries exactly one `post:` key, our own.
+        let q = quote_block("me", 9, 8, src);
+        assert_eq!(q.matches("post:").count(), 1, "{q}");
+        assert_eq!(q.matches("member:").count(), 1, "{q}");
+        assert!(q.ends_with("tail\n[/QUOTE]\n\n"), "{q}");
+    }
+
+    /// A stray closer with no open block is literal text, as XF's parser
+    /// treats it — dropping it would delete characters the integrity
+    /// check's substring rule needs (#43).
+    #[test]
+    fn a_stray_quote_closer_is_literal_text() {
+        let src = "a [/QUOTE] b";
+        assert_eq!(strip_quote_blocks(src), src);
+    }
+
     /// #703: `[HR]` is a rule of its own, not a run of dashes glued into the
     /// text. XF renders `<hr />`, and 52,557 posts here use it — including
     /// the `[HR][/HR]` spelling the news template writes (#610).
@@ -2932,6 +3014,10 @@ mod tests {
             ("rgba(18,52,86,0.5)", Some(Rgb { r: 18, g: 52, b: 86 })),
             ("rgb(100%, 0%, 0%)", Some(Rgb { r: 255, g: 0, b: 0 })),
             ("rebeccapurple", Some(Rgb { r: 102, g: 51, b: 153 })),
+            // CSS lime is #0f0; limegreen is the darker 50,205,50 — they
+            // are different colours and were conflated (#44).
+            ("lime", Some(Rgb { r: 0, g: 255, b: 0 })),
+            ("limegreen", Some(Rgb { r: 50, g: 205, b: 50 })),
             ("nonsense", None),
             ("#12345", None),
             ("#éa", None),
@@ -3043,6 +3129,32 @@ mod tests {
         let hl = style_of("[HIGHLIGHT]look[/HIGHLIGHT]", "look");
         assert!(hl.highlight, "highlight is its own mark");
         assert!(!hl.bold, "and it is not bold (#702)");
+    }
+
+    /// The close side of highlight (#42): the #702 frame needs its own
+    /// closer pairing, or `[/HIGHLIGHT]` either prints literally (leaking
+    /// highlight to the end of the post) or steals an enclosing frame.
+    #[test]
+    fn a_highlight_closer_ends_the_highlight_and_nothing_else() {
+        let chunks = render("[HIGHLIGHT]look[/HIGHLIGHT] after");
+        let text: String = chunks
+            .iter()
+            .map(|c| match c {
+                Chunk::Text(t, _) => t.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert_eq!(text, "look after", "the closer must never print literally");
+        let after = style_of("[HIGHLIGHT]look[/HIGHLIGHT] after", "after");
+        assert!(!after.highlight, "highlight must end at its closer");
+        // An enclosing italic survives its own closer: [/HIGHLIGHT] pops
+        // the highlight frame, not the innermost bold/italic.
+        let inner = style_of("[I]a[HIGHLIGHT]b[/HIGHLIGHT]c[/I]", "c");
+        assert!(inner.italic, "[/HIGHLIGHT] must not steal the italic frame");
+        assert!(!inner.highlight, "and the highlight still ends where it should");
+        let outer = style_of("[I]a[HIGHLIGHT]b[/HIGHLIGHT]c[/I]", "a");
+        assert!(outer.italic);
+        assert!(!outer.highlight);
     }
 
     /// Alignment is carried on the style, because only the renderer knows
