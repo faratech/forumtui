@@ -674,7 +674,30 @@ impl WrapCache {
         if target == row {
             return;
         }
-        *cursor = self.caret_at_cell(target, want);
+        let mut landed = self.caret_at_cell(target, want);
+        // A landing exactly on a continuation row's `end` would draw at
+        // column 0 of the *following* row (`caret` resolves `r.end` to the
+        // next row), so Up/Down would move sideways and, `desired` being
+        // sticky, stick there forever. Clamp to the row's last real
+        // character, exactly as the free reference `move_vertical` does —
+        // the #678 cache had dropped that clamp (#40, regressing #544).
+        if let Some(r) = self.row(target)
+            && landed == r.end
+            && landed > r.start
+            && self.row(target + 1).is_some_and(|next| next.start == r.end)
+        {
+            let li = self.line_of(r.start);
+            let base = self.line_starts[li];
+            if let Some(c) = self.line_metrics[li]
+                .clusters
+                .iter()
+                .rev()
+                .find(|c| base + c.start < landed)
+            {
+                landed = base + c.start;
+            }
+        }
+        *cursor = landed;
     }
 }
 
@@ -1172,6 +1195,21 @@ mod tests {
                         "caret at {cursor}, width {width}, step {step}, text {text:?}"
                     );
                 }
+                // Vertical motion must agree too: the #544 continuation-row
+                // clamp has to live in both twins or neither (#40 — the
+                // cached twin had lost it while the free reference kept it).
+                for from in [0usize, chars.len() / 2, chars.len()] {
+                    for delta in [-1isize, 1] {
+                        let (mut cached, mut cached_desired) = (from, None);
+                        let (mut free, mut free_desired) = (from, None);
+                        cache.move_vertical(&mut cached, &mut cached_desired, delta);
+                        move_vertical(&text, width, &mut free, &mut free_desired, delta);
+                        assert_eq!(
+                            cached, free,
+                            "move_vertical {delta} from {from}, width {width}, step {step}, text {text:?}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1371,6 +1409,29 @@ mod tests {
         // A second Up must actually do nothing more (already at row 0) —
         // not repeat the same sideways non-move.
         move_vertical(&text, 5, &mut cursor, &mut desired, -1);
+        assert_eq!(cursor, 4, "already at the top row: Up is a no-op");
+    }
+
+    /// The same #544 scenario through the *cached* twin the composers
+    /// actually call (#40): the WrapCache path had lost the continuation-row
+    /// clamp, so Up at a hard split moved to the next row's column 0 and
+    /// stuck there.
+    #[test]
+    fn cached_vertical_motion_does_not_stick_at_a_hard_split_continuation_boundary() {
+        let text = "x".repeat(10);
+        let mut cache = WrapCache::default();
+        cache.sync(&text, 5, 1);
+        assert_eq!(
+            cache.window(0, cache.row_count()),
+            vec![VisualRow { start: 0, end: 5 }, VisualRow { start: 5, end: 10 }]
+        );
+
+        let mut cursor = 10usize; // end of text: row 1, col 5
+        let mut desired: Option<usize> = None;
+        cache.move_vertical(&mut cursor, &mut desired, -1);
+        assert_eq!(cursor, 4, "must land on row 0's last real character, not row 1 col 0");
+
+        cache.move_vertical(&mut cursor, &mut desired, -1);
         assert_eq!(cursor, 4, "already at the top row: Up is a no-op");
     }
 
