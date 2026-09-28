@@ -491,7 +491,14 @@ async fn token_request(
     // debug, wrap in release) nor make a nonsense-negative expiry. 90 days
     // is already the client's ceiling for any access token.
     const MAX_EXPIRES_IN_SECS: i64 = 90 * 24 * 3600;
-    let expires_in = parsed.expires_in.clamp(0, MAX_EXPIRES_IN_SECS);
+    // Floor 61, not 0: `access_expired` counts a token expired 60 s early,
+    // so anything ≤ 60 — including a body that omits `expires_in`, whose
+    // default is 0 — would be born permanently expired and spin
+    // `dispatch_token`'s refresh loop forever (#47). A server granting
+    // sub-minute access tokens is broken; treating the grant as a minute
+    // long is the honest recovery.
+    const MIN_EXPIRES_IN_SECS: i64 = 61;
+    let expires_in = parsed.expires_in.clamp(MIN_EXPIRES_IN_SECS, MAX_EXPIRES_IN_SECS);
     Ok(TokenSet { origin: String::new(), client_id: String::new(),
         access_token: parsed.access_token,
         refresh_token: parsed.refresh_token,
@@ -872,6 +879,33 @@ mod tests {
             "the clamp caps the expiry at 90 days: {}",
             tokens.expires_at
         );
+    }
+
+    /// The floor side of the clamp (#47): `expires_in` at or below the 60 s
+    /// expiry skew — including a body that omits it, whose default is 0 —
+    /// used to mint a token that was born expired, spinning
+    /// `dispatch_token`'s refresh loop forever.
+    #[tokio::test]
+    async fn token_request_never_issues_a_token_born_expired() {
+        for body in [
+            serde_json::json!({ "access_token": "at", "refresh_token": "rt" }),
+            serde_json::json!({ "access_token": "at", "refresh_token": "rt", "expires_in": 0 }),
+            serde_json::json!({ "access_token": "at", "refresh_token": "rt", "expires_in": 30 }),
+            serde_json::json!({ "access_token": "at", "refresh_token": "rt", "expires_in": -5 }),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path(config::OAUTH_TOKEN_PATH))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body.clone()))
+                .mount(&server)
+                .await;
+            let client = crate::http::build().unwrap();
+            let tokens = refresh(&client, &server.uri(), "rt", "cid").await.unwrap();
+            assert!(
+                !tokens.access_expired(OffsetDateTime::now_utc()),
+                "expires_in {body} must not mint an already-expired token"
+            );
+        }
     }
 
     /// An "authorized" poll verdict with no code (the field defaults to
