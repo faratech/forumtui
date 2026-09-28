@@ -182,11 +182,30 @@ impl WfApiClient {
     /// something this process does not already have — so a caller can use it
     /// as "is there a session to recover?" without ever looping (issue #557).
     pub async fn adopt_stored_tokens(&self) -> bool {
+        // Load under the token lock, so a refresh completing between an
+        // earlier load and this lock cannot leave `stored` holding the
+        // grant that refresh just rotated out — the comparison would then
+        // differ, the dead grant would clobber the fresh one, and the next
+        // request would bounce through recovery again (#48).
+        let mut guard = self.tokens.lock().await;
         let stored = match self.store.load() {
             Ok(Some(t)) => t,
             _ => return false,
         };
-        let mut guard = self.tokens.lock().await;
+        // The construction-time contract — a grant for another origin or
+        // client is never sent from here — applies to adoption too: set it
+        // aside rather than install it (#35).
+        if !stored.belongs_to(&self.base, &self.client_id) {
+            tracing::warn!(
+                "{} holds a session for {} (client {}), not {} — set aside",
+                self.store.path().display(),
+                stored.origin,
+                stored.client_id,
+                self.base
+            );
+            self.store.quarantine_as("foreign", &self.base, &self.client_id);
+            return false;
+        }
         if guard.as_ref().is_some_and(|cur| {
             cur.refresh_token == stored.refresh_token && cur.access_token == stored.access_token
         }) {
@@ -746,10 +765,10 @@ pub(crate) async fn error_from_response(resp: reqwest::Response) -> Error {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.trim().parse::<u64>().ok())
             .map(|secs| Duration::from_secs(secs.min(MAX_RETRY_AFTER_SECS)));
-        let _ = resp.bytes().await; // drain politely; shape not needed
+        let _ = read_error_body(resp).await; // drain politely; shape not needed
         return Error::RateLimited { retry_after };
     }
-    let bytes = resp.bytes().await.unwrap_or_default();
+    let bytes = read_error_body(resp).await;
     if let Some(first) = serde_json::from_slice::<ApiErrorBody>(&bytes)
         .ok()
         .and_then(|parsed| parsed.errors.into_iter().next())
@@ -768,6 +787,25 @@ pub(crate) async fn error_from_response(resp: reqwest::Response) -> Error {
         status,
         max_page: None,
     }
+}
+
+/// Read an error body under a hard cap. The old code buffered the whole
+/// body with `resp.bytes()`, and this is the one path a hostile origin can
+/// fatten at will — `fetch_bytes` reads whatever `[IMG]` names, and its
+/// per-URL caps only guarded the success branch, so a multi-gigabyte 403
+/// body OOM'd the client (#46). 64 KiB is far more than any XF error
+/// envelope or Cloudflare page needs to say what went wrong.
+async fn read_error_body(resp: reqwest::Response) -> Vec<u8> {
+    const MAX_ERROR_BODY: usize = 64 * 1024;
+    let mut resp = resp;
+    let mut bytes = Vec::new();
+    while bytes.len() < MAX_ERROR_BODY
+        && let Ok(Some(chunk)) = resp.chunk().await
+    {
+        let room = MAX_ERROR_BODY - bytes.len();
+        bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+    bytes
 }
 
 /// XF's plain `/nodes` endpoint never emits `depth` (only
@@ -2140,6 +2178,82 @@ mod tests {
         // No store at all is not something to recover from either.
         client.forget_tokens().await.unwrap();
         assert!(!client.adopt_stored_tokens().await);
+    }
+
+    /// A grant minted for another origin (or client id) must never be
+    /// installed by the recovery path — the construction-time quarantine
+    /// contract applies to adoption too (#35). The store is also read under
+    /// the token lock, so a refresh racing the adoption cannot clobber the
+    /// grant it just rotated in with the one it rotated out (#48).
+    #[tokio::test]
+    async fn adopt_stored_tokens_sets_a_foreign_grant_aside() {
+        let _env = EnvGuard::hold("http://127.0.0.1:1", "/tmp/wftui-test-adopt-foreign");
+        let client = logged_in_client("access-1").await;
+
+        // A sibling running against another origin wrote its grant here.
+        token::Store::new()
+            .save(&TokenSet {
+                origin: "https://staging.example".into(),
+                client_id: "other-client".into(),
+                access_token: "staging-bearer".into(),
+                refresh_token: "staging-refresh".into(),
+                expires_at: OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                scope: "test".into(),
+            })
+            .unwrap();
+        assert!(
+            !client.adopt_stored_tokens().await,
+            "a grant minted for another origin must not be installed"
+        );
+        // The live session is untouched, and the store was set aside for
+        // inspection rather than deleted or sent anywhere.
+        assert_eq!(client.valid_token().await.unwrap(), "access-1");
+        let path = client.store_path().to_path_buf();
+        assert!(!path.exists(), "the foreign grant left the live store");
+        assert!(
+            std::path::Path::new(&format!("{}.foreign", path.display())).exists(),
+            "the foreign grant is kept aside, not destroyed"
+        );
+    }
+
+    /// #46: the error path is the one place a hostile origin can fatten a
+    /// response at will (`fetch_bytes`' caps only guard the success branch),
+    /// so the body is read under a hard cap instead of `resp.bytes()`-ing
+    /// the lot into memory and into the error message.
+    #[tokio::test]
+    async fn an_error_body_is_read_under_a_cap() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-errcap");
+        let big = "a".repeat(1024 * 1024); // 1 MiB, far over the 64 KiB cap
+        Mock::given(method("GET"))
+            .and(path("/api/me"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(big.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/nodes"))
+            .respond_with(ResponseTemplate::new(429).set_body_string(big))
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        match c.me().await {
+            Err(Error::Api { code, message, status: 403, .. }) => {
+                assert_eq!(code, "http_error");
+                assert!(
+                    message.len() < 80_000,
+                    "the body must be capped, not buffered whole: {}",
+                    message.len()
+                );
+            }
+            other => panic!("expected a capped http_error, got {other:?}"),
+        }
+        // The 429 drain is capped the same way, and still lands as
+        // RateLimited with its Retry-After handling intact.
+        match c.nodes().await {
+            Err(Error::RateLimited { .. }) => {}
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
     }
 
     #[test]
