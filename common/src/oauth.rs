@@ -222,13 +222,16 @@ async fn wait_for_redirect_with(
                     return Ok(code);
                 }
                 (false, _) => {
+                    // Audit #775: a single mismatched state probe (local
+                    // noise, another tab) must not abort the whole login —
+                    // keep listening; the real callback still succeeds.
                     respond(
                         &mut stream,
                         400,
                         "<html><body>State mismatch; return to the terminal and retry.</body></html>",
                     )
                     .await;
-                    return Err(Error::Handshake("redirect state mismatch".into()));
+                    continue;
                 }
                 (true, None) => {
                     respond(
@@ -835,7 +838,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loopback_listener_rejects_state_mismatch() {
+    async fn loopback_listener_tolerates_state_mismatch() {
+        // Audit #775: one mismatched probe (local noise, another tab) must
+        // not abort the login — the listener stays up and the REAL callback
+        // on the next connection still completes the handshake.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let waiter = tokio::spawn(wait_for_redirect(
@@ -843,16 +849,26 @@ mod tests {
             "good",
             Duration::from_secs(10),
         ));
-        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        let mut noise = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();
         use tokio::io::AsyncWriteExt;
-        stream
+        noise
             .write_all(b"GET /callback?code=x&state=evil HTTP/1.1\r\n\r\n")
             .await
             .unwrap();
-        let err = waiter.await.unwrap().unwrap_err();
-        assert!(err.to_string().contains("state mismatch"));
+        let mut buf = vec![0u8; 512];
+        let _ = noise.read(&mut buf).await; // drain the 400 response
+        drop(noise);
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /callback?code=real&state=good HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let code = waiter.await.unwrap().unwrap();
+        assert_eq!(code, "real");
     }
 
     // These token-endpoint tests take the mock server's origin as an

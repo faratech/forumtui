@@ -875,6 +875,24 @@ async fn fetch_capped(
     timeout: Duration,
     what: &str,
 ) -> Result<Vec<u8>> {
+    // Audit hardening (#775): asset URLs come from the release feed, so a
+    // compromised feed could otherwise redirect integrity checking into an
+    // http:// channel. Require https everywhere except loopback test hosts.
+    if !url.starts_with("https://") {
+        let host_ok = url
+            .strip_prefix("http://")
+            .map(|rest| {
+                rest.starts_with("127.0.0.1")
+                    || rest.starts_with("localhost")
+                    || rest.starts_with("[::1]")
+            })
+            .unwrap_or(false);
+        if !host_ok {
+            return Err(Error::FetchRejected(format!(
+                "{what} refused: only https:// asset URLs are accepted"
+            )));
+        }
+    }
     let mut resp = client
         .get(url)
         .header(reqwest::header::ACCEPT, "application/octet-stream")
