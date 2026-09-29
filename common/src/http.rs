@@ -40,6 +40,90 @@ pub fn build_with_ua(ua: &str) -> Result<reqwest::Client> {
         .connect_timeout(config::CONNECT_TIMEOUT)
         .timeout(config::REQUEST_TIMEOUT)
         // Be a well-behaved API client: we speak for one user, not a scraper.
-        .redirect(reqwest::redirect::Policy::limited(4))
+        .redirect(redirect_policy())
         .build()?)
+}
+
+
+/// Follow up to four redirects, but only through a scheme we would have
+/// requested in the first place: https, or http to an exact loopback host
+/// (the wiremock tests, a local dev forum). The stock `Policy::limited`
+/// follows every hop blindly, so an https URL that 302s to http:// would
+/// silently downgrade the channel — for the updater that channel is asset
+/// integrity: `fetch_capped` gates the initial URL (#775); the per-hop gate
+/// is #818. The host here is the URL's *parsed* host, so userinfo and suffix
+/// tricks (`127.0.0.1@evil.com`, `127.0.0.1.evil.com`) cannot pass — the
+/// same exact-match rule as update.rs's `is_loopback_host` (#68).
+fn redirect_policy() -> reqwest::redirect::Policy {
+    const MAX_HOPS: usize = 4;
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= MAX_HOPS {
+            return attempt.error("too many redirects");
+        }
+        let url = attempt.url();
+        let loopback = url.host_str().is_some_and(|h| {
+            matches!(
+                h.to_ascii_lowercase().as_str(),
+                "127.0.0.1" | "localhost" | "::1"
+            )
+        });
+        if url.scheme() == "https" || (url.scheme() == "http" && loopback) {
+            attempt.follow()
+        } else {
+            attempt.error("refusing to follow a redirect to a non-https, non-loopback URL")
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #818: every redirect hop passes the same scheme gate as the initial
+    // fetch — https, or http to an exact loopback host. The stock limited(4)
+    // policy this replaced followed an https→http downgrade without a word.
+    #[tokio::test]
+    async fn redirect_to_plain_http_off_loopback_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302)
+                    .insert_header("Location", "http://example.invalid/downgrade"),
+            )
+            .mount(&server)
+            .await;
+        let client = build().unwrap();
+        let err = client.get(server.uri()).send().await.unwrap_err();
+        // reqwest wraps a policy rejection as "error following redirect for
+        // url …"; the gate's own message sits further down the source chain.
+        assert!(err.is_redirect(), "expected a redirect error, got: {err}");
+        let mut saw_gate = false;
+        let mut source = std::error::Error::source(&err);
+        while let Some(e) = source {
+            saw_gate |= e.to_string().contains("non-https");
+            source = e.source();
+        }
+        assert!(saw_gate, "policy gate not in the error chain of: {err}");
+    }
+
+    #[tokio::test]
+    async fn redirect_between_loopback_hosts_still_follows() {
+        let target = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&target)
+            .await;
+        let hop = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/final", target.uri())),
+            )
+            .mount(&hop)
+            .await;
+        let client = build().unwrap();
+        let resp = client.get(hop.uri()).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "ok");
+    }
 }
