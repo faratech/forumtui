@@ -879,6 +879,24 @@ async fn feed_error(resp: reqwest::Response, what: &str) -> Error {
     Error::Config(format!("{what} answered http {status}"))
 }
 
+/// True when `rest` (the part of an http URL after `http://`) addresses the
+/// loopback host exactly: authority up to the first `/`, userinfo and port
+/// stripped, case-folded (#68).
+fn is_loopback_host(rest: &str) -> bool {
+    let authority = rest.split('/').next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    // Bracketed IPv6 first: `split(':')` would shred `[::1]`.
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        match rest.find(']') {
+            Some(end) => &rest[..end],
+            None => return false,
+        }
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    matches!(host.to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1")
+}
+
 /// GET `url` with a hard byte cap, streamed so an oversized body is cut off
 /// rather than buffered. Never carries a token: the feed is not our origin.
 async fn fetch_capped(
@@ -890,15 +908,13 @@ async fn fetch_capped(
 ) -> Result<Vec<u8>> {
     // Audit hardening (#775): asset URLs come from the release feed, so a
     // compromised feed could otherwise redirect integrity checking into an
-    // http:// channel. Require https everywhere except loopback test hosts.
+    // http:// channel. Require https everywhere except loopback test hosts
+    // — the HOST compared exactly, not a prefix: `127.0.0.1.evil.com` and
+    // userinfo tricks like `127.0.0.1@evil.com` must not pass (#68).
     if !url.starts_with("https://") {
         let host_ok = url
             .strip_prefix("http://")
-            .map(|rest| {
-                rest.starts_with("127.0.0.1")
-                    || rest.starts_with("localhost")
-                    || rest.starts_with("[::1]")
-            })
+            .map(is_loopback_host)
             .unwrap_or(false);
         if !host_ok {
             return Err(Error::FetchRejected(format!(
@@ -1238,6 +1254,34 @@ mod tests {
     /// which edition it belongs to, and this build prunes the other's —
     /// otherwise each edition would adopt (skip the download) and then
     /// install the other's binary at the next start.
+    /// #68: the http exemption is an EXACT loopback-host match — lookalike
+    /// hosts, userinfo tricks and ports do not slip through, and the three
+    /// real loopback spellings do.
+    #[test]
+    fn the_loopback_exemption_matches_the_host_exactly() {
+        let ok = [
+            "http://127.0.0.1/fed",
+            "http://127.0.0.1:9/latest",
+            "http://localhost/fed",
+            "http://LOCALHOST:8/fed",
+            "http://[::1]/fed",
+            "http://[::1]:9/fed",
+        ];
+        for url in ok {
+            assert!(url.strip_prefix("http://").is_some_and(is_loopback_host), "{url}");
+        }
+        let refused = [
+            "http://127.0.0.1.evil.com/fed",
+            "http://127.0.0.1@evil.com/fed",
+            "http://localhostx/fed",
+            "http://evil.com/127.0.0.1",
+            "http://1.127.0.0.1/fed",
+        ];
+        for url in refused {
+            assert!(!url.strip_prefix("http://").is_some_and(is_loopback_host), "{url}");
+        }
+    }
+
     #[test]
     fn a_generation_of_the_other_edition_is_pruned_not_adopted() {
         let root = scratch("edition");
