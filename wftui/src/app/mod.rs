@@ -1771,6 +1771,15 @@ impl App {
         let epoch = self.draft_epoch;
         self.draft_mutations.insert(key, epoch);
         self.draft_deletions.remove(&key);
+        // A NEW draft for a key whose remote delete was owed supersedes it:
+        // the site slot now belongs to this draft, so the sync's retry must
+        // not eat its mirror and the merge must treat the site's copy as
+        // news again (#86).
+        if self.pending_remote_deletes.lock().expect("lock").remove(&key)
+            && let Some(owner) = self.draft_owner.clone()
+        {
+            let _ = self.draft_store.clear_owed_delete(&owner, &key);
+        }
         let too_big = draft.too_big_to_persist();
         if relay { self.push_draft(key, &draft); }
         self.drafts.insert(key, draft);
@@ -2077,7 +2086,16 @@ impl App {
         // itself takes the key back off only when the delete provably
         // settled; nothing rides the event channel.
         self.pending_remote_deletes.lock().expect("lock").insert(key);
+        // And persist it: the guard has to outlive the process, or a
+        // restart's bootstrap merge resurrects the posted draft (#86).
+        if let Some(owner) = self.draft_owner.clone()
+            && let Err(e) = self.draft_store.record_owed_delete(&owner, &key)
+        {
+            tracing::warn!("could not record the owed delete for {key:?}: {e}");
+        }
         let pending = self.pending_remote_deletes.clone();
+        let store = self.draft_store.clone();
+        let owner = self.draft_owner.clone();
         let api = self.api.clone();
         let tx = self.tx.clone();
         let relay = self
@@ -2104,6 +2122,9 @@ impl App {
             };
             if settled {
                 pending.lock().expect("lock").remove(&key);
+                if let Some(owner) = &owner {
+                    let _ = store.clear_owed_delete(owner, &key);
+                }
             }
         });
     }
@@ -2212,6 +2233,8 @@ impl App {
                 .collect()
         };
         let pending = Arc::clone(&self.pending_remote_deletes);
+        let store = self.draft_store.clone();
+        let owner = self.draft_owner.clone();
         self.spawn_session_task(async move {
             // A list taken before a same-key save/delete can be stale even if
             // the HTTP response arrives later. Wait for all relay operations
@@ -2236,6 +2259,9 @@ impl App {
                 };
                 if settled {
                     pending.lock().expect("lock").remove(&key);
+                    if let Some(owner) = &owner {
+                        let _ = store.clear_owed_delete(owner, &key);
+                    }
                 }
             }
             match api.list_drafts().await {
@@ -2275,7 +2301,17 @@ impl App {
             Ok(drafts) => self.drafts = drafts,
             Err(e) => tracing::warn!("could not select account drafts: {e}"),
         }
-        self.draft_owner = Some(owner);
+        self.draft_owner = Some(owner.clone());
+        // Reseed the owed-delete set from the store: the record outlives
+        // the process, so a restart's bootstrap must restore the guard the
+        // merge and the sync read (#86).
+        let owed = self.draft_store.owed_deletes(&owner);
+        if !owed.is_empty() {
+            self.pending_remote_deletes
+                .lock()
+                .expect("lock")
+                .extend(owed);
+        }
     }
 
     /// Persist one explicit mutation, never a stale whole-file snapshot.
@@ -10418,6 +10454,46 @@ mod tests {
                 other.map(|s| s.title())
             ),
         }
+    }
+
+    /// #86: the owed-delete guard survives a restart — the bootstrap
+    /// reseeds the pending set from the store, and a NEW draft stashed for
+    /// an owed key supersedes the delete (its site mirror is not eaten).
+    #[tokio::test]
+    async fn the_bootstrap_reseeds_owed_deletes_and_a_new_draft_supersedes() {
+        let mut app = test_app();
+        let owner = common::drafts::Owner::new(app.client.base_url(), 7);
+        let key = common::drafts::DraftKey::ThreadReply(7);
+
+        // The previous process recorded the owed delete and died before it
+        // settled: the store still remembers it, the app set does not.
+        // (The store is activated first, as every bootstrap does.)
+        app.draft_store.activate(&owner).unwrap();
+        app.draft_store.record_owed_delete(&owner, &key).unwrap();
+        assert!(app.pending_remote_deletes.lock().expect("lock").is_empty());
+
+        app.select_draft_owner(7);
+        assert!(
+            app.pending_remote_deletes.lock().expect("lock").contains(&key),
+            "the bootstrap must restore the merge guard from the store"
+        );
+
+        // The reader writes a NEW draft for the same thread and stashes it:
+        // the owed delete is superseded — its mirror is not eaten.
+        app.screens.push(screens::home_state(false));
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "a fresh draft".into();
+        }
+        app.pop_screen();
+        assert!(
+            !app.pending_remote_deletes.lock().expect("lock").contains(&key),
+            "the new draft supersedes the owed delete"
+        );
+        assert!(
+            app.draft_store.owed_deletes(&owner).is_empty(),
+            "the persisted record is cleared with the in-memory set"
+        );
     }
 
     /// #82: the loading pane is reachable for a keyed viewer - the old

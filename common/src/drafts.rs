@@ -181,6 +181,11 @@ struct StoredDrafts {
     version: u32,
     owner: Option<Owner>,
     drafts: HashMap<String, Draft>,
+    /// Remote deletes that were scheduled but never provably settled
+    /// (#86): persisted so a restart's merge cannot resurrect the site's
+    /// copy of an already-posted draft. Sorted, deduplicated.
+    #[serde(default)]
+    owed_deletes: Vec<String>,
 }
 
 impl StoredDrafts {
@@ -191,6 +196,7 @@ impl StoredDrafts {
     }
 }
 
+#[derive(Clone)]
 pub struct Store {
     path: std::path::PathBuf,
 }
@@ -265,7 +271,12 @@ impl Store {
         let _lock = crate::token::lock_store(&self.path)?;
         let mut stored = self.read_locked()?;
         if stored.owner.as_ref() != Some(owner) {
-            stored = StoredDrafts { version: 2, owner: Some(owner.clone()), drafts: HashMap::new() };
+            stored = StoredDrafts {
+                version: 2,
+                owner: Some(owner.clone()),
+                drafts: HashMap::new(),
+                owed_deletes: Vec::new(),
+            };
             self.write_locked(&stored)?;
         }
         Ok(stored.entries())
@@ -304,6 +315,57 @@ impl Store {
         keys.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         for (key, _) in keys.into_iter().skip(MAX_DRAFTS) { stored.drafts.remove(&key); }
         self.write_locked(&stored)
+    }
+
+    /// Remember that a remote delete for `key` was scheduled but not
+    /// provably settled: the record outlives the process, so a restart's
+    /// merge cannot resurrect the site's copy of an already-posted draft
+    /// (#86). Cleared when the delete settles, or when a new draft for the
+    /// key supersedes it.
+    pub fn record_owed_delete(&self, owner: &Owner, key: &DraftKey) -> Result<()> {
+        self.ensure_parent()?;
+        let _lock = crate::token::lock_store(&self.path)?;
+        let mut stored = self.read_locked()?;
+        if stored.owner.as_ref() != Some(owner) {
+            return Err(Error::TokenStore("draft account changed; refusing a stale save".into()));
+        }
+        if !stored.owed_deletes.iter().any(|k| k.as_str() == key.as_key()) {
+            stored.owed_deletes.push(key.as_key().to_string());
+            stored.owed_deletes.sort();
+            stored.owed_deletes.dedup();
+            self.write_locked(&stored)?;
+        }
+        Ok(())
+    }
+
+    /// The delete settled, or a new draft superseded it (#86).
+    pub fn clear_owed_delete(&self, owner: &Owner, key: &DraftKey) -> Result<()> {
+        self.ensure_parent()?;
+        let _lock = crate::token::lock_store(&self.path)?;
+        let mut stored = self.read_locked()?;
+        if stored.owner.as_ref() != Some(owner) {
+            return Err(Error::TokenStore("draft account changed; refusing a stale save".into()));
+        }
+        let before = stored.owed_deletes.len();
+        stored.owed_deletes.retain(|k| k.as_str() != key.as_key());
+        if stored.owed_deletes.len() != before {
+            self.write_locked(&stored)?;
+        }
+        Ok(())
+    }
+
+    /// The owed keys this owner's store remembers — the bootstrap's seed
+    /// for the app's pending-delete set (#86).
+    pub fn owed_deletes(&self, owner: &Owner) -> Vec<DraftKey> {
+        let Ok(_lock) = crate::token::lock_store(&self.path) else { return Vec::new() };
+        match self.read_locked() {
+            Ok(stored) if stored.owner.as_ref() == Some(owner) => stored
+                .owed_deletes
+                .iter()
+                .filter_map(|k| DraftKey::from_key(k))
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// Leave an empty ownership tombstone on sign-out. A stale instance must
@@ -356,6 +418,38 @@ mod tests {
     }
 
     fn owner() -> Owner { Owner::new("http://127.0.0.1:9", 7) }
+
+    /// #86: an owed remote delete outlives the process — the record is
+    /// persisted with the store, survives a reload, and is cleared only
+    /// when it settles or a new draft supersedes it.
+    #[test]
+    fn an_owed_delete_survives_a_reload() {
+        let dir = scratch("owed");
+        let path = dir.join("drafts.json");
+        let store = Store::with_path(path.clone());
+        store.activate(&owner()).unwrap();
+        let key = DraftKey::ThreadReply(51465);
+
+        assert!(store.owed_deletes(&owner()).is_empty(), "nothing owed yet");
+        store.record_owed_delete(&owner(), &key).unwrap();
+        assert_eq!(store.owed_deletes(&owner()), vec![key]);
+
+        // A fresh handle over the same file — the restart's view — still
+        // owes the delete.
+        let reopened = Store::with_path(path.clone());
+        assert_eq!(reopened.owed_deletes(&owner()), vec![key]);
+
+        // Another account sees nothing of it.
+        let other = Owner::new("http://127.0.0.1:9", 8);
+        assert!(reopened.owed_deletes(&other).is_empty());
+        assert!(reopened.record_owed_delete(&other, &key).is_err());
+
+        // Settled: gone, for this and every later reload.
+        reopened.clear_owed_delete(&owner(), &key).unwrap();
+        assert!(store.owed_deletes(&owner()).is_empty());
+        // Clearing twice is a no-op, not an error.
+        reopened.clear_owed_delete(&owner(), &key).unwrap();
+    }
 
     fn draft(body: &str, saved_at: i64) -> Draft {
         Draft {
