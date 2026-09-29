@@ -597,20 +597,50 @@ mod tests {
     /// every streamed frame. 4x the input must cost about 4x the time.
     #[test]
     fn render_is_linear_in_emphasis_marker_count() {
-        fn parse_ms(src: &str) -> f64 {
-            let t = std::time::Instant::now();
-            let out = render(src);
-            assert!(!out.is_empty());
-            t.elapsed().as_secs_f64() * 1000.0
+        /// Absolute caps are meaningless on an oversubscribed machine
+        /// (4-40x swings at load 13-16 on this sandbox); the self-relative
+        /// ratio assert below is what pins linearity. Mirrors bbcode's
+        /// `machine_busy`.
+        fn machine_busy() -> bool {
+            std::fs::read_to_string("/proc/loadavg")
+                .ok()
+                .and_then(|s| s.split_whitespace().next().and_then(|f| f.parse::<f64>().ok()))
+                .is_some_and(|load| {
+                    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+                    load > cpus as f64
+                })
         }
 
-        let soup_4k = "a*b* ~~c~~ __d__ ".repeat(250);
-        let soup_16k = "a*b* ~~c~~ __d__ ".repeat(1000);
+        fn parse_ms(src: &str) -> f64 {
+            // Best of three: a scheduler star between the two measurements
+            // inflates the larger one and fakes a quadratic on a loaded
+            // host; the minimum approaches the true cost, and a real
+            // quadratic blows every run.
+            (0..3)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    let out = render(src);
+                    assert!(!out.is_empty());
+                    t.elapsed().as_secs_f64() * 1000.0
+                })
+                .fold(f64::INFINITY, f64::min)
+        }
+
+        // Space-preceded stars are the shape that actually triggers the
+        // old quadratic: each ` *` is an opener, and none of them is a
+        // closer for the ones after it, so the old per-opener scan ran to
+        // the end of the line every time. (An earlier draft used
+        // "a*b* ~~c~~ __d__" soup, whose closers stop every scan early and
+        // which passes even on the old quadratic code.)
+        let soup_4k = " *a".repeat(1000) + &" ~~c~~ ".repeat(300);
+        let soup_16k = " *a".repeat(4000) + &" ~~c~~ ".repeat(1200);
         let t4 = parse_ms(&soup_4k);
-        assert!(
-            t4 < 400.0,
-            "4 000 chars of emphasis soup took {t4:.1} ms - not linear"
-        );
+        if !machine_busy() {
+            assert!(
+                t4 < 400.0,
+                "4 000 chars of emphasis soup took {t4:.1} ms - not linear"
+            );
+        }
         let t16 = parse_ms(&soup_16k);
         assert!(
             t16 < 8.0 * t4.max(1.0),

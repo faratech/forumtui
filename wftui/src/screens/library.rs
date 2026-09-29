@@ -720,7 +720,11 @@ pub fn render_image_view(
     }
     hits.push(inner, Hit::Pane(HitPane::List));
 
-    if s.loading && s.key.is_none() {
+    // Stamped from the store each frame (#60): a keyed viewer spins while
+    // any size variant of its source is in flight — the old
+    // `&& s.key.is_none()` half made the pane unreachable, since every
+    // viewer carries a key (#82).
+    if s.loading {
         f.render_widget(
             Paragraph::new(format!(
                 "{} Loading\u{2026}",

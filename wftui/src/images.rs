@@ -912,6 +912,12 @@ impl Images {
         std::mem::take(&mut self.startup_input)
     }
 
+    /// Replace the runtime policy (detection normally sets it once; tests
+    /// and the graphics-probe path are the other writers).
+    pub fn set_policy(&mut self, policy: Policy) {
+        self.policy = policy;
+    }
+
     pub fn policy(&self) -> Policy {
         self.policy
     }
@@ -996,6 +1002,33 @@ impl Images {
         self.sizes.clear();
     }
 
+    /// Whether any size variant of `source` is mid-fetch. The viewer's
+    /// loading pane reads this — its loads complete through `on_loaded`,
+    /// which never touches the screen state (#60).
+    pub fn source_inflight(&self, source: &str) -> bool {
+        self.inflight.iter().any(|k| source_of(k) == source)
+    }
+
+    /// Whether any size variant of `source` has ever loaded: a known size
+    /// is a working variant, so a failure of a *smaller* variant must not
+    /// pre-empt a viewer whose own (larger-budget) fetch succeeds (#83).
+    pub fn source_known(&self, source: &str) -> bool {
+        self.sizes.contains_key(source)
+    }
+
+    /// The remembered failure for any size variant of `source` (#60).
+    pub fn source_failure(&self, source: &str) -> Option<String> {
+        self.failed
+            .iter()
+            .find(|(k, _)| source_of(k) == source)
+            .map(|(_, e)| e.clone())
+    }
+
+    /// Forget every size variant's failure for `source`, so the next
+    /// frame's demand re-requests it — `R` in the viewer (#60).
+    pub fn retry_source(&mut self, source: &str) {
+        self.failed.retain(|k, _| source_of(k) != source);
+    }
     /// A background load finished (or failed). A failure is remembered so a
     /// dead thumbnail is fetched once per session, not once per frame.
     pub fn on_loaded(&mut self, key: String, result: Result<Loaded, String>) {

@@ -1332,7 +1332,14 @@ impl App {
             // silent blank pane (#60).
             if let Some(key) = &v.key {
                 v.loading = self.images.source_inflight(key);
-                v.error = self.images.source_failure(key);
+                // A failure of a smaller variant (a 2 MiB thumbnail cap)
+                // must not pre-empt the viewer whose own fetch succeeds:
+                // a source with a learned size has a working variant (#83).
+                v.error = if self.images.source_known(key) {
+                    None
+                } else {
+                    self.images.source_failure(key)
+                };
             }
         }
         if let Screen::Login(l) = screen {
@@ -10411,6 +10418,64 @@ mod tests {
                 other.map(|s| s.title())
             ),
         }
+    }
+
+    /// #82: the loading pane is reachable for a keyed viewer - the old
+    /// `&& s.key.is_none()` half made it dead code, since every viewer
+    /// carries a key.
+    #[tokio::test]
+    async fn a_freshly_opened_viewer_spins_while_its_fetch_is_in_flight() {
+        let mut app = test_app();
+        // A tier that actually demands the bytes: the text tier never
+        // spawns a fetch, so nothing would ever be in flight.
+        app.images
+            .set_policy(crate::images::Policy { tier: crate::images::Tier::Halfblocks, font: (10, 20) });
+        app.screens.push(Screen::ImageView(screens::ImageViewState {
+            title: "shot".into(),
+            key: Some("https://wf/media/7.png".to_string()),
+            ..Default::default()
+        }));
+        // First frame queues and spawns the fetch; the second sees it in
+        // flight (the offline client cannot complete it synchronously).
+        frame(&mut app, 80, 24);
+        let text = frame_text(&mut app, 80, 24);
+        assert!(text.contains("Loading"), "{text}");
+        assert!(!text.contains("Error:"), "{text}");
+    }
+
+    /// #83: a failure of a SMALLER size variant must not pre-empt the
+    /// viewer - once the viewer's own fetch succeeds (the source learns a
+    /// size), the stale small-variant failure is suppressed and the pane
+    /// shows the image.
+    #[tokio::test]
+    #[cfg(feature = "images")]
+    async fn the_viewer_ignores_a_small_variant_failure_once_a_variant_loads() {
+        let mut app = test_app();
+        let src = "https://wf/media/9.png";
+        app.screens.push(Screen::ImageView(screens::ImageViewState {
+            title: "shot".into(),
+            key: Some(src.to_string()),
+            ..Default::default()
+        }));
+        // The small variant tripped its cap...
+        app.images
+            .on_loaded(crate::images::store_key(src, 12, 12), Err("http 404".into()));
+        let text = frame_text(&mut app, 80, 24);
+        assert!(text.contains("Error:"), "{text}");
+
+        // ...then the viewer's own (larger-budget) variant loaded.
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        let loaded = crate::images::decode(
+            &picker,
+            include_bytes!("../../assets/wf-logo.png"),
+            80,
+            40,
+        )
+        .expect("decode the sample");
+        app.images
+            .on_loaded(crate::images::store_key(src, 80, 40), Ok(loaded));
+        let text = frame_text(&mut app, 80, 24);
+        assert!(!text.contains("Error:"), "the stale failure must yield: {text}");
     }
 
     /// #60: the viewer's panes read the image store's live state - a
