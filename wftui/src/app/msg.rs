@@ -736,7 +736,14 @@ impl App {
                     }
                 }
                 if let Some(n) = new_unread {
-                    self.convos_unread = n;
+                    // The badge means "unread conversations", which only a
+                    // page-1 fetch counts completely: the unread poller reads
+                    // page 1 too, so adopting a later page's count replaced
+                    // the header badge with one page's worth until the next
+                    // poll tick (issue #52).
+                    if page <= 1 {
+                        self.convos_unread = n;
+                    }
                 }
                 if let Some(cid) = auto_load {
                     // Primed, not opened: never mark this one read (#541).

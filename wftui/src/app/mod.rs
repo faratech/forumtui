@@ -8758,6 +8758,59 @@ mod tests {
         assert!(!app.status.is_empty(), "the boundary says why");
     }
 
+    /// #52: the header unread badge counts ALL conversations, which only a
+    /// page-1 fetch measures — the unread poller reads page 1 too. A later
+    /// page's recount must not replace the badge with one page's worth
+    /// until the poller's next tick.
+    #[tokio::test]
+    async fn paging_conversations_does_not_recount_the_badge() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.open_inbox(screens::InboxTab::Conversations);
+        let load_id = match app.screens.last() {
+            Some(Screen::Inbox(inbox)) => inbox.convos.load_id,
+            other => panic!("expected the inbox, got {:?}", other.map(|s| s.title())),
+        };
+        app.convos_unread = 5;
+
+        // Page 2 arrives carrying one unread: the page lands, the badge
+        // does not move.
+        app.handle_msg(Msg::ConversationsLoaded {
+            page: 2,
+            load_id,
+            result: Ok(ConversationsReply {
+                conversations: vec![Conversation {
+                    conversation_id: 2,
+                    is_unread: true,
+                    ..Default::default()
+                }],
+                pagination: Pagination { current_page: 2, last_page: 3, total: 30, ..Default::default() },
+            }),
+        });
+        assert_eq!(app.convos_unread, 5, "a later page's count is not the badge");
+        match app.screens.last() {
+            Some(Screen::Inbox(inbox)) => {
+                assert_eq!(inbox.convos.page, 2, "the page itself still lands");
+                assert_eq!(inbox.convos.conversations.len(), 1);
+            }
+            other => panic!("expected the inbox, got {:?}", other.map(|s| s.title())),
+        }
+
+        // A page-1 load measures the whole list and may adopt its count.
+        app.handle_msg(Msg::ConversationsLoaded {
+            page: 1,
+            load_id,
+            result: Ok(ConversationsReply {
+                conversations: vec![
+                    Conversation { conversation_id: 1, is_unread: true, ..Default::default() },
+                    Conversation { conversation_id: 3, is_unread: false, ..Default::default() },
+                ],
+                pagination: Pagination { current_page: 1, last_page: 3, total: 30, ..Default::default() },
+            }),
+        });
+        assert_eq!(app.convos_unread, 1, "a page-1 recount is the real badge");
+    }
+
     /// #694: opening the Alerts tab marks them viewed — the badge clears and
     /// XF stops counting them, which is what the web UI does. Re-entering the
     /// same Inbox tab does not duplicate the request.
