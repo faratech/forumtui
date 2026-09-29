@@ -11383,6 +11383,29 @@ mod tests {
         let a = ask_state(&app);
         assert_eq!(a.turns[0].answer, "See ");
         assert_eq!(a.turns[0].state, screens::AskTurnState::Cancelled);
+
+        // The dangerous straggler (#55): a Done{Err} queued behind the Esc
+        // matched the screen's stale turn_seq — it must not overwrite
+        // Cancelled with Failed, and must not trip the history_required
+        // resend into re-issuing the question the reader just stopped.
+        app.handle_msg(session_msg(
+            app.session_generation,
+            Msg::AskAiDone {
+                turn,
+                result: Err(TaskError {
+                    message: "conversation lost".into(),
+                    code: Some("history_required".into()),
+                    max_page: None,
+                    kind: TaskErrorKind::Api(500),
+                }),
+            },
+        ));
+        let a = ask_state(&app);
+        assert_eq!(a.turns[0].state, screens::AskTurnState::Cancelled, "not Failed");
+        assert_eq!(a.turns[0].answer, "See ");
+        assert!(!a.busy);
+        assert!(app.ask_task.is_none(), "no resend went out for a stopped turn");
+
         // An idle transcript's Esc leaves.
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(app.screens.last(), Some(Screen::Home(_))));

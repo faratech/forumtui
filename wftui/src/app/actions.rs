@@ -1036,11 +1036,19 @@ impl App {
             task.abort();
         }
         self.ask_generation = self.ask_generation.wrapping_add(1);
+        let generation = self.ask_generation;
         for screen in &mut self.screens {
             if let Screen::AskAi(a) = screen
                 && a.busy
             {
                 a.busy = false;
+                // The generation bump only guards the event frames: a queued
+                // AskAiDone still matched this screen's turn_seq, overwrote
+                // Cancelled with Failed — or, from the history_required arm,
+                // re-issued the question the reader just stopped (#55). The
+                // screen now waits on a generation that will never finish,
+                // which is what "stopped" means.
+                a.turn_seq = generation;
                 if let Some(t) = a.turns.last_mut()
                     && t.state == screens::AskTurnState::Streaming
                 {
@@ -1129,8 +1137,12 @@ impl App {
             }
             Err(e) => {
                 // chat.php lost the conversation and wants the transcript to
-                // rebuild it (the web client resends the same way). Once.
-                if e.code.as_deref() == Some("history_required")
+                // rebuild it (the web client resends the same way). Once —
+                // and only on a live turn: a stopped screen must neither
+                // re-issue its question nor wear a Failed it did not ask
+                // for (#55).
+                if a.busy
+                    && e.code.as_deref() == Some("history_required")
                     && !t.resent_with_history
                     && t.answer.is_empty()
                 {
@@ -1165,8 +1177,13 @@ impl App {
                     );
                     return;
                 }
-                a.busy = false;
-                t.state = AskTurnState::Failed(ask_error_text(&e));
+                // The failure belongs to a live turn only: a stopped
+                // screen's turn_seq no longer matches, but belt-and-braces —
+                // the Ok arm has the same guard.
+                if a.busy {
+                    a.busy = false;
+                    t.state = AskTurnState::Failed(ask_error_text(&e));
+                }
             }
         }
         a.dirty = true;
