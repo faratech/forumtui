@@ -2729,7 +2729,7 @@ pub fn render_thread_view(
     // (hard rule 1 forbids OSC 8 in span content), so the bracketed number IS
     // the clickable part of that link — the `[n] url` rows under the post are
     // the other half of the same affordance.
-    let link_fg = link_style(theme).fg;
+    let link_mark = link_style(theme);
     for row in 0..inner.height {
         let Some(line) = s.lines.get(s.scroll + row as usize) else {
             break;
@@ -2737,7 +2737,13 @@ pub fn render_thread_view(
         let mut x = inner.x;
         for span in &line.spans {
             let w = cell_width(&span.content) as u16;
-            if span.style.fg == link_fg
+            // The underline is what makes a marker a marker on the mono
+            // tier: there `link` and body text are both Color::Reset, so
+            // keying on the foreground alone turned every literal "[1]" in
+            // a pasted log into a clickable link (#50). theme.link() never
+            // omits it, and no body/code/dim style carries it.
+            if span.style.fg == link_mark.fg
+                && span.style.add_modifier.contains(ratatui::style::Modifier::UNDERLINED)
                 && let Some(n) = link_marker_index(&span.content)
                 && let Some(url) = s.links.get(n - 1)
             {

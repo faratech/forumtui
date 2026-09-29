@@ -10077,6 +10077,60 @@ mod tests {
             .find(|(x, y)| app.hits.at(*x, *y).is_some_and(&pred))
     }
 
+    /// #50: on the mono tier the link foreground is Reset - the same as
+    /// body text - so the marker scan keyed on colour alone turned every
+    /// literal "[1]" in a pasted log into a clickable link. The scan now
+    /// also requires the underline theme.link() always applies.
+    #[tokio::test]
+    async fn a_literal_bracket_number_is_not_a_link_on_the_mono_tier() {
+        let mut app = test_app();
+        app.theme = Theme::mono();
+        let post = |id: u32, message: &str| Post {
+            post_id: id,
+            message: message.to_string(),
+            ..Default::default()
+        };
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: thread(9),
+            posts: vec![post(
+                1,
+                "cite [1] pasted from the log, see https://example.com/a for details",
+            )],
+            page: 1,
+            last_page: 1,
+            ..Default::default()
+        }));
+        frame(&mut app, 80, 24);
+
+        // The real link is still clickable somewhere.
+        assert!(find_hit(&app, 80, 24, |h| matches!(h, Hit::Link(_))).is_some());
+
+        // The literal "[1]" right after "cite" is not.
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+            .expect("terminal");
+        term.draw(|f| app.draw(f)).expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut lit = None;
+        for y in 0..24u16 {
+            let mut row = String::new();
+            let mut starts: Vec<usize> = Vec::new(); // byte offset of each cell
+            for x in 0..80u16 {
+                starts.push(row.len());
+                row.push_str(buf[(x, y)].symbol());
+            }
+            if let Some(c) = row.find("cite [1]") {
+                let at = c + "cite ".len();
+                let x = starts.iter().position(|&b| b == at).expect("cell of the literal") as u16;
+                lit = Some((x, y));
+            }
+        }
+        let (lx, ly) = lit.expect("the literal [1] is on screen");
+        assert!(
+            !matches!(app.hits.at(lx, ly), Some(Hit::Link(_))),
+            "a literal bracket number must not be a link"
+        );
+    }
+
     fn thread(id: u32) -> Thread {
         Thread {
             thread_id: id,
