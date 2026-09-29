@@ -1774,8 +1774,13 @@ impl App {
         // A NEW draft for a key whose remote delete was owed supersedes it:
         // the site slot now belongs to this draft, so the sync's retry must
         // not eat its mirror and the merge must treat the site's copy as
-        // news again (#86).
-        if self.pending_remote_deletes.lock().expect("lock").remove(&key)
+        // news again (#86). Only a stash that actually RE-MIRRORS the site
+        // may retire the record — the non-relaying callers (the shutdown
+        // unwind, the submit-time mirror) leave the site holding the old
+        // copy, and retiring the guard there is what let a quit resurrect
+        // the posted draft over the newer text (#87).
+        if relay
+            && self.pending_remote_deletes.lock().expect("lock").remove(&key)
             && let Some(owner) = self.draft_owner.clone()
         {
             let _ = self.draft_store.clear_owed_delete(&owner, &key);
@@ -10493,6 +10498,36 @@ mod tests {
         assert!(
             app.draft_store.owed_deletes(&owner).is_empty(),
             "the persisted record is cleared with the in-memory set"
+        );
+
+        // The non-relaying stash paths (the shutdown unwind, the
+        // submit-time mirror) never re-mirror the site slot: their stash
+        // must NOT retire the owed record, or a quit resurrects the posted
+        // draft over the newer text (#87).
+        app.draft_store.record_owed_delete(&owner, &key).unwrap();
+        app.pending_remote_deletes
+            .lock()
+            .expect("lock")
+            .insert(key);
+        app.select_draft_owner(7);
+        assert!(app.pending_remote_deletes.lock().expect("lock").contains(&key));
+        let compose = |body: &str| screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 7,
+                thread_title: "A thread".into(),
+            }),
+            body: body.into(),
+            ..Default::default()
+        };
+        app.stash_draft_impl(&compose("v2 written, quitting now"), false, false);
+        assert!(
+            app.pending_remote_deletes.lock().expect("lock").contains(&key),
+            "a non-relaying stash keeps the guard"
+        );
+        assert_eq!(
+            app.draft_store.owed_deletes(&owner),
+            vec![key],
+            "and keeps the persisted record the restart's retry reads"
         );
     }
 
