@@ -812,9 +812,12 @@ impl Drop for TerminalGuard {
 mod terminal_guard_tests {
     use super::*;
 
-    /// Pins the restore ordering: Pop first (mirroring Push-last on the way
-    /// in), then the three commands that actually restore visible terminal
-    /// state, then cursor::Show. Each is independent — see `restore_terminal`.
+    /// Documents the restore ordering: Pop first (mirroring Push-last on
+    /// the way in), then the three commands that actually restore visible
+    /// terminal state, then cursor::Show. The list is the written intent —
+    /// `restore_terminal` writes to the real stdout, so the ordering itself
+    /// is enforced by review, not by this test (a merged `execute!` chain,
+    /// the #531 bug, would pass here on Linux either way).
     #[test]
     fn restore_steps_are_ordered_and_independent() {
         let steps = restore_steps();
@@ -1050,6 +1053,15 @@ impl App {
         self.status_set_at = None;
     }
 
+    /// Clear the status line and its toast stamp together (#74): a bare
+    /// `.clear()` left `status_set_at` live, and the expiry tick then
+    /// reported a phantom expiry on an empty line — the residue class #576
+    /// fixed for assignments.
+    fn clear_status(&mut self) {
+        self.status.clear();
+        self.status_set_at = None;
+    }
+
     /// Clears a status toast once `STATUS_TOAST_SECS` have passed since
     /// `set_status` showed it — the event loop calls this once per tick,
     /// before `draw`, so a stale "Reply posted." doesn't sit on the status
@@ -1062,8 +1074,7 @@ impl App {
         if let Some(at) = self.status_set_at
             && at.elapsed() >= Duration::from_secs(STATUS_TOAST_SECS)
         {
-            self.status.clear();
-            self.status_set_at = None;
+            self.clear_status();
             return true;
         }
         false
@@ -2265,7 +2276,7 @@ impl App {
                 while self.screens.len() > 1 {
                     self.pop_screen();
                 }
-                self.status.clear();
+                self.clear_status();
             }
             GoTarget::Profile => {
                 if let Some(me) = &self.me {
@@ -3647,13 +3658,14 @@ mod tests {
         assert!(!row.is_unread, "the marked row must flip locally");
         let other = ib.convos.conversations.iter().find(|c| c.conversation_id == 21).unwrap();
         assert!(other.is_unread, "an unrelated row must be untouched");
-        assert_eq!(
-            app.convos_unread, 1,
-            "the badge must be recounted from the (now one-less-unread) list, not left stale"
-        );
+        // The badge counts ALL conversations; this list is page 2 of 2, so
+        // a page-local recount would report 1 and silently discard the
+        // unread living on page 1 (#67 — the test used to pin exactly that).
+        // A genuine unread→read flip anywhere is worth exactly one.
+        assert_eq!(app.convos_unread, 4, "the page-2 mark is worth one unread globally");
 
-        // No API call escaped besides the one this test already accounted
-        // for — no reload was spawned.
+        // No reload was spawned: the list above is still the page-2 window
+        // this test built (a reload would have replaced it).
         tokio::task::yield_now().await;
     }
 
@@ -7227,14 +7239,21 @@ mod tests {
         let direct_writes: Vec<&str> = src
             .lines()
             .map(str::trim_start)
-            .filter(|l| l.starts_with("self.status ="))
+            .filter(|l| l.starts_with("self.status =") || l.starts_with("self.status.clear()"))
             .collect();
         assert_eq!(
             direct_writes,
-            vec!["self.status = s.into();", "self.status = s.into();"],
-            "only set_status/set_hint may assign `self.status` directly — \
-             found an unexpected direct write, which will inherit or never \
-             clear a stale toast timer (issue #576)"
+            vec![
+                "self.status = s.into();",
+                "self.status = s.into();",
+                // Inside `clear_status` itself — the expiry tick routes
+                // through it too.
+                "self.status.clear();",
+            ],
+            "only set_status/set_hint (and the expiry tick) may touch `self.status` directly — \
+             found an unexpected write, which will inherit or never clear a stale \
+             toast timer (issue #576); the .clear() arm is the #74 extension: a \
+             cleared toast must also clear `status_set_at`"
         );
     }
 
@@ -7633,7 +7652,10 @@ mod tests {
     #[test]
     fn which_key_fits_with_zero_and_nine_quick_nodes_at_80x24() {
         let mut nine = common::site::SiteConfig::blank("nine");
-        nine.quick = "bcefjknoq"
+        // Reserved-free nine: `k` is RESERVED_CHORDS everywhere, so no real
+        // config can carry it — a fixture that did pinned a dead `k` row as
+        // renderable.
+        nine.quick = "bcefjnoqs"
             .chars()
             .enumerate()
             .map(|(i, key)| common::site::QuickNode { key, label: format!("Forum {i}"), node_id: i as u32 + 1 })
@@ -8033,11 +8055,14 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.status.contains("No sign-in in progress"), "{}", app.status);
 
-        // `m` while waiting cycles the mode and restarts.
+        // `m` while waiting cycles the mode and restarts — from the mode
+        // the screen DISPLAYS: this flow is Waiting{Loopback} (an Auto
+        // fallback), so `m` goes to paste, not to the site default's relay
+        // a stock site does not have.
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         let before = app.login_generation;
         app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
-        assert!(app.status.starts_with("Login mode: tuilink"), "{}", app.status);
+        assert!(app.status.starts_with("Login mode: paste"), "{}", app.status);
         assert_eq!(app.login_generation, before + 1, "a running flow restarts in the new mode");
         app.shutdown().await;
     }

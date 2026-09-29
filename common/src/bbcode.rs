@@ -1333,7 +1333,7 @@ fn tag_at(src: &str, at: usize) -> Option<(usize, bool, String)> {
     let end = match bytes.get(i) {
         Some(b']') => i + 1,
         Some(b'=') if matches!(bytes.get(i + 1), Some(b'"' | b'\'')) => {
-            // Value form: the terminator is `delim]`.
+            // Quoted value form: the terminator is `delim]`.
             let delim = bytes[i + 1];
             let start = i + 2;
             let limit = bytes.len().min(start + TAG_BODY_SCAN);
@@ -1344,6 +1344,18 @@ fn tag_at(src: &str, at: usize) -> Option<(usize, bool, String)> {
                 // A value that never closes falls back to the plain first
                 // `]`, exactly as the render path does past its cap.
                 .or_else(|| bytes[i..].iter().position(|&b| b == b']').map(|p| i + p + 1))?
+        }
+        Some(b'=') => {
+            // Unquoted value form — `[QUOTE=Trouble; 235284]`, the classic
+            // XF byline: the render path scans to the plain first `]` here
+            // (tag_close's non-quoted fallback), and the strip pass must
+            // agree, or quoting a post that quotes this form leaves it
+            // nested (#64).
+            let close = bytes[i..].iter().position(|&b| b == b']')? + i;
+            if bytes[i..close].contains(&b'[') {
+                return None;
+            }
+            close + 1
         }
         Some(b) if b.is_ascii_whitespace() => {
             // Attribute form: the first `]` outside a quoted value.
@@ -2961,6 +2973,23 @@ mod tests {
     fn a_stray_quote_closer_is_literal_text() {
         let src = "a [/QUOTE] b";
         assert_eq!(strip_quote_blocks(src), src);
+    }
+
+    /// The unquoted value form is still a quote: `[QUOTE=Trouble; 235284]`
+    /// is the classic XF byline, and the #43 rewrite of `tag_at` had
+    /// dropped it — quoting a post that quotes this form left it nested
+    /// (#64).
+    #[test]
+    fn stripping_removes_the_unquoted_byline_form() {
+        assert_eq!(
+            strip_quote_blocks("a [QUOTE=Trouble; 235284]x[/QUOTE] b"),
+            "a  b"
+        );
+        // And the produced block carries exactly our own attribution.
+        let q = quote_block("me", 9, 8, "[QUOTE=Trouble; 235284]hi[/QUOTE] tail");
+        assert_eq!(q.matches("post:").count(), 1, "{q}");
+        assert_eq!(q.matches("member:").count(), 1, "{q}");
+        assert!(q.ends_with("tail\n[/QUOTE]\n\n"), "{q}");
     }
 
     /// #703: `[HR]` is a rule of its own, not a run of dashes glued into the

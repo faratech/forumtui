@@ -1964,11 +1964,14 @@ impl ThreadViewState {
                 }
                 if hidden_media {
                     // The hidden chunk renders with the rest of the text:
-                    // run_start stays at `at`, so the next segment or the
-                    // tail pass picks the chunk up.
+                    // run_start stops AT the chunk, so the next segment or
+                    // the tail pass picks it up without re-drawing anything
+                    // before it (#65 — leaving run_start behind re-rendered
+                    // the whole prefix, doubling text and [n] links).
                     if video.is_none() {
                         ord += 1;
                     }
+                    run_start = at;
                     continue;
                 }
                 run_start = at + 1;
@@ -4042,6 +4045,26 @@ mod tests {
             all.iter().any(|l| l.contains("1 of 1")),
             "revealed, the picture is lifted with its caption: {all:#?}"
         );
+    }
+
+    /// #65: a hidden block must not leave `run_start` behind, or the tail
+    /// pass re-renders everything before it — doubled text and doubled
+    /// `[n]` links.
+    #[test]
+    fn a_hidden_block_does_not_duplicate_the_text_around_it() {
+        let theme = Theme::truecolor();
+        let mut s = thread_view_fixture();
+        s.posts[0].message = "Look [SPOILER][IMG]https://example.com/a.png[/IMG][/SPOILER] mid [IMG]https://example.com/b.png[/IMG] end".into();
+        s.rebuild_lines(&theme, &UNICODE);
+        let all: Vec<String> = s.lines.iter().map(text).collect();
+        let joined = all.join("\n");
+        assert_eq!(joined.matches("Look").count(), 1, "{joined}");
+        assert_eq!(joined.matches(" mid ").count(), 1, "{joined}");
+        assert_eq!(joined.matches(" end").count(), 1, "{joined}");
+        // The visible picture keeps its display-order caption: two images,
+        // the hidden one numbered first.
+        assert!(joined.contains("2 of 2"), "{joined}");
+        assert!(!joined.contains("1 of 2"), "the hidden picture shows no caption: {joined}");
     }
 
     #[test]

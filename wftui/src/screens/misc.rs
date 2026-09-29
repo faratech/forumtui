@@ -2478,9 +2478,14 @@ pub(crate) fn search_click_field(
             );
         }
         // `query` is a display label in member mode, not a search term —
-        // start from an empty field so Enter cannot submit it as one.
-        s.query.clear();
-        s.query_cursor = 0;
+        // entering edit mode starts from an empty field so Enter cannot
+        // submit it as one. A click that only re-places the caret inside a
+        // field already being edited must not wipe the typed query (#66;
+        // the keyboard's own clear happens in `i`, from browse mode only).
+        if !s.input_mode {
+            s.query.clear();
+            s.query_cursor = 0;
+        }
     }
     s.input_mode = true;
     s.active_field = if field == 1 { 1 } else { 0 };
@@ -3663,6 +3668,16 @@ mod tests {
         let act = search_key(&mut s, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(&act, Action::Notice(n) if n.contains("Type something")), "Enter must refuse an empty field, not search");
         assert!(s.member.is_some(), "member mode survives");
+
+        // A caret-placement click while already editing keeps the typed
+        // query (#66 — the clear belongs to entering edit mode, not to the
+        // click).
+        for c in "test".chars() {
+            search_key(&mut s, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let act = search_click_field(&mut s, 0, 12);
+        assert!(matches!(act, Action::None));
+        assert_eq!(s.query, "test", "a caret click must not wipe the query");
 
         // The author field refuses exactly like `a`, and the refused click
         // does not enter edit mode.

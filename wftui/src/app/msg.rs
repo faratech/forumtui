@@ -813,20 +813,32 @@ impl App {
                     // the Inbox row keeps its unread glyph (and the header
                     // badge its count) otherwise, until some later poll
                     // happens to contradict them (issue #541).
-                    if let Some(inbox) = self.inbox_mut() {
-                        if let Some(row) = inbox
+                    if let Some(inbox) = self.inbox_mut()
+                        && let Some(row) = inbox
                             .convos
                             .conversations
                             .iter_mut()
                             .find(|c| c.conversation_id == cid)
-                        {
+                    {
+                        let was_unread = row.is_unread || row.conversation_unread;
                             row.is_unread = false;
                             row.conversation_unread = false;
+                            // The badge counts ALL conversations, which only
+                            // a page-1 window measures (the poller reads
+                            // page 1 too): recounting over whatever page is
+                            // showing replaced the badge with one page's
+                            // worth, the sibling of what #52 fixed for the
+                            // load path. Elsewhere a genuine unread→read
+                            // flip is worth exactly one.
+                            if inbox.convos.page <= 1 {
+                                let unread = common::models::count_unread_conversations(
+                                    &inbox.convos.conversations,
+                                );
+                                self.convos_unread = unread;
+                            } else if was_unread {
+                                self.convos_unread = self.convos_unread.saturating_sub(1);
+                            }
                         }
-                        let unread =
-                            common::models::count_unread_conversations(&inbox.convos.conversations);
-                        self.convos_unread = unread;
-                    }
                     let api = self.api.clone();
                     self.spawn_session_task(async move {
                         let _ = api.mark_conversation_read(cid).await;
@@ -1311,15 +1323,28 @@ impl App {
                     // threw the user back to page 1 (and a re-clamped
                     // selection) no matter which page they marked from
                     // (issue #608).
-                    if let Some(inbox) = self.inbox_mut() {
-                        if let Some(row) =
+                    if let Some(inbox) = self.inbox_mut()
+                        && let Some(row) =
                             inbox.convos.conversations.iter_mut().find(|c| c.conversation_id == id)
-                        {
-                            row.is_unread = false;
-                            row.conversation_unread = false;
+                    {
+                        let was_unread = row.is_unread || row.conversation_unread;
+                        row.is_unread = false;
+                        row.conversation_unread = false;
+                            // The badge counts ALL conversations, which only
+                            // a page-1 window measures (the poller reads
+                            // page 1 too) — recounting whatever page is
+                            // showing replaced the badge with one page's
+                            // worth, the sibling of what #52 fixed for the
+                            // load path. Elsewhere a genuine unread→read
+                            // flip is worth exactly one; any drift heals at
+                            // the next poll.
+                        if inbox.convos.page <= 1 {
+                            self.convos_unread = common::models::count_unread_conversations(
+                                &inbox.convos.conversations,
+                            );
+                        } else if was_unread {
+                            self.convos_unread = self.convos_unread.saturating_sub(1);
                         }
-                        self.convos_unread =
-                            common::models::count_unread_conversations(&inbox.convos.conversations);
                     }
                     self.set_status("Conversation marked read.");
                 }
@@ -1327,8 +1352,7 @@ impl App {
             },
             Msg::SearchDone { generation, page, result } => {
                 if self.status.starts_with("Searching") {
-                    self.status.clear();
-                    self.status_set_at = None;
+                    self.clear_status();
                 }
                 // Only the screen waiting on *this* load adopts the reply —
                 // the topmost Search may belong to a newer query or member
