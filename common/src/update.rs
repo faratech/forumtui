@@ -410,7 +410,11 @@ fn write_synced(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 }
 
 fn meta_text(version: &str, target: Target, sha256: &str) -> String {
-    format!("version={version}\narch={}\nsha256={sha256}\n", target.arch_tag())
+    format!(
+        "version={version}\narch={}\nsha256={sha256}\nedition={}\n",
+        target.arch_tag(),
+        crate::site::EDITION_SUFFIX
+    )
 }
 
 fn meta_field<'a>(meta: &'a str, key: &str) -> Option<&'a str> {
@@ -505,6 +509,15 @@ fn read_generation(dir: &Path, target: Target, current: &str) -> Option<Pending>
     let meta = std::fs::read_to_string(dir.join(META_NAME)).ok()?;
     let version = meta_field(&meta, "version")?;
     if meta_field(&meta, "arch")? != target.arch_tag() || !is_newer(version, current) {
+        return None;
+    }
+    // The edition is part of the binary's identity, like the architecture:
+    // both editions share one update root, and `-xf` is decided at asset
+    // *pick* time only — a staged generation carries no other mark, so
+    // without this check each edition would adopt and install the other's
+    // binary (issue #31). A missing line is a pre-split staging by the
+    // built-in edition, which recorded "" implicitly.
+    if meta_field(&meta, "edition").unwrap_or("") != crate::site::EDITION_SUFFIX {
         return None;
     }
     let want = meta_field(&meta, "sha256")?;
@@ -1210,6 +1223,7 @@ mod tests {
         let meta = std::fs::read_to_string(p.dir.join(META_NAME)).unwrap();
         assert!(meta.contains("version=0.0.2\n"));
         assert!(meta.contains(&format!("arch={}\n", host().arch_tag())));
+        assert!(meta.contains(&format!("edition={}\n", crate::site::EDITION_SUFFIX)));
         let names: Vec<String> = std::fs::read_dir(&root)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -1217,6 +1231,55 @@ mod tests {
         assert!(!names.iter().any(|n| n.starts_with(".stage-")), "{names:?}");
         assert!(stage_pending_in(&root, "not-a-version", host(), "", &body).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #31: both editions share one update root, and the `-xf` split exists
+    /// only at asset-*pick* time. A staged generation therefore records
+    /// which edition it belongs to, and this build prunes the other's —
+    /// otherwise each edition would adopt (skip the download) and then
+    /// install the other's binary at the next start.
+    #[test]
+    fn a_generation_of_the_other_edition_is_pruned_not_adopted() {
+        let root = scratch("edition");
+        let target = host();
+        let current = env!("CARGO_PKG_VERSION");
+        let body = synthetic_binary(target, 2);
+
+        // This edition's own staging: kept.
+        let ours = stage_pending_in(&root, "9.9.9", target, &sha256_hex(&body), &body).unwrap();
+        // A generation the OTHER edition staged: same platform, correct
+        // digest, its meta carrying the foreign suffix.
+        let other_suffix = if crate::site::EDITION_SUFFIX == "-xf" { "" } else { "-xf" };
+        let foreign_body = synthetic_binary(target, 3);
+        let foreign = stage_pending_in(
+            &root,
+            "9.9.8",
+            target,
+            &sha256_hex(&foreign_body),
+            &foreign_body,
+        )
+        .unwrap();
+        std::fs::write(
+            foreign.dir.join(META_NAME),
+            format!(
+                "version=9.9.8\narch={}\nsha256={}\nedition={other_suffix}\n",
+                target.arch_tag(),
+                sha256_hex(&foreign_body)
+            ),
+        )
+        .unwrap();
+
+        let pending = load_pending(&root, target, current).unwrap();
+        assert!(
+            pending.iter().any(|p| p.version == "9.9.9"),
+            "our own staged generation is adopted"
+        );
+        assert!(
+            !pending.iter().any(|p| p.version == "9.9.8"),
+            "the other edition's generation is never adopted"
+        );
+        assert!(!foreign.dir.exists(), "it is pruned, not left for the next start");
+        assert!(ours.dir.exists());
     }
 
     #[test]
