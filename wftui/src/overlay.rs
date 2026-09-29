@@ -781,10 +781,22 @@ pub fn render_which_key(
                 // The whole `cap label` cell is the target, not the two-cell
                 // cap: the chord's key is pressed through `handle_key`, so an
                 // armed `g` resolves exactly as it does from the keyboard.
-                hits.push(
-                    Rect::new(inner.x + start as u16, inner.y + r as u16, stride as u16, 1),
-                    Hit::Key(key),
-                );
+                // Clipped to the drawn row: at widths below the layout's
+                // stride total, the last cell's label is cut by `clip` and a
+                // full-stride rect would reach past it onto the border —
+                // and, last-registered-wins, over the close region (#57).
+                let room = w.saturating_sub(start);
+                if room > 0 {
+                    hits.push(
+                        Rect::new(
+                            inner.x + start as u16,
+                            inner.y + r as u16,
+                            room.min(stride) as u16,
+                            1,
+                        ),
+                        Hit::Key(key),
+                    );
+                }
                 let key: &str = key;
                 spans.push(chrome::keycap(theme, key, false));
                 spans.push(Span::styled(format!(" {label}"), theme.dim()));
