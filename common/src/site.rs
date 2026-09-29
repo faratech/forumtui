@@ -639,7 +639,12 @@ pub fn save_site(path: &Path, site: &SiteConfig) -> Result<()> {
         return Err(Error::Config(format!("{}: \"sites\" is not a list", path.display())));
     };
     match list.iter_mut().find(|s| s.get("name").and_then(|n| n.as_str()) == Some(site.name.as_str())) {
-        Some(existing) => *existing = entry,
+        // The doc promise above is that keys the loader would ignore
+        // survive: merge the modelled fields INTO the existing entry
+        // instead of replacing it, so a Setup re-run over a colliding slug
+        // keeps hand-configured `scopes`, `quick`, `brand.logo`, comments
+        // and the rest (#37).
+        Some(existing) => merge_site_entry(existing, &entry),
         None => list.push(entry),
     }
     obj.insert("default_site".into(), serde_json::Value::String(site.name.clone()));
@@ -657,6 +662,29 @@ pub fn save_site(path: &Path, site: &SiteConfig) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
     })?;
     Ok(())
+}
+
+/// Overwrite the fields `save_site` models into `existing`, leaving every
+/// key it does not model exactly as the file had it. `features` and
+/// `brand` merge key-by-key, so a hand-set `logo` or `chrome_bg` survives
+/// a re-save of the flags around it (#37).
+fn merge_site_entry(existing: &mut serde_json::Value, entry: &serde_json::Value) {
+    let (Some(dst), Some(src)) = (existing.as_object_mut(), entry.as_object()) else {
+        *existing = entry.clone();
+        return;
+    };
+    for (key, value) in src {
+        if (key == "features" || key == "brand")
+            && let Some(serde_json::Value::Object(dst_inner)) = dst.get_mut(key)
+            && let serde_json::Value::Object(src_inner) = value
+        {
+            for (k, v) in src_inner {
+                dst_inner.insert(k.clone(), v.clone());
+            }
+        } else {
+            dst.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 /// The site the Setup screen's three answers describe, validated. The slug
@@ -767,6 +795,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// #37: re-saving a site through the Setup answers must not destroy
+    /// hand-configured keys the loader models elsewhere — scopes, quick
+    /// destinations, the logo, comments — only the fields the Setup screen
+    /// actually collects.
+    #[test]
+    fn save_site_keeps_the_keys_it_does_not_model() {
+        let dir = scratch("save-keep");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "sites": [{
+    "name": "forum",
+    "origin": "https://old.example",
+    "oauth_client_id": "old-id",
+    "scopes": ["node:read", "node:write"],
+    "quick": [{"label": "Rules", "node_id": 7}],
+    "_comment": "hand-edited",
+    "brand": {"name": "Old", "mark": "OL", "logo": "old.png"}
+  }],
+  "default_site": "forum"
+}"#,
+        )
+        .unwrap();
+
+        let mut site = SiteConfig::blank("forum");
+        site.origin = "https://new.example".into();
+        site.oauth_client_id = "new-id".into();
+        site.brand.name = "New".into();
+        save_site(&path, &site).unwrap();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let entry = &root["sites"][0];
+        assert_eq!(entry["origin"], "https://new.example", "modelled fields update");
+        assert_eq!(entry["oauth_client_id"], "new-id");
+        assert_eq!(entry["brand"]["name"], "New");
+        assert_eq!(
+            entry["scopes"],
+            serde_json::json!(["node:read", "node:write"]),
+            "hand-set scopes survive"
+        );
+        assert_eq!(entry["quick"][0]["label"], "Rules", "quick survives");
+        assert_eq!(entry["_comment"], "hand-edited");
+        assert_eq!(entry["brand"]["logo"], "old.png", "the logo survives the brand merge");
+        assert_eq!(root["default_site"], "forum");
     }
 
     /// Serialises on `ENV_LOCK` and clears the three variables `resolve`
