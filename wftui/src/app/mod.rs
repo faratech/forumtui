@@ -2239,6 +2239,14 @@ impl App {
             GoTarget::Inbox => self.open_inbox(screens::InboxTab::Conversations),
             GoTarget::Alerts => self.open_inbox(screens::InboxTab::Alerts),
             GoTarget::Home => {
+                // The same modal boundary every other header/palette
+                // navigation honours (#53): a busy composer must not be
+                // buried — popping it mid-write stashes its text as a
+                // draft, and the write's success then finds no composer to
+                // forget it with, leaving already-posted text resumable.
+                if self.navigation_is_blocked() {
+                    return;
+                }
                 // Every screen exit must pass through `pop_screen`: leaving a
                 // thread reports the posts that were actually seen, and
                 // leaving a composer persists its unsent draft. Directly
@@ -2301,7 +2309,7 @@ impl App {
                 // cannot be turned back into a key this client could spend
                 // (#716).
                 self.set_hint(
-                    "Resumed a draft from the website. Its attachments stay there —                      ^X discards the draft.",
+                    "Resumed a draft from the website. Its attachments stay there — ^X discards the draft.",
                 );
             } else {
                 self.set_hint("Resumed your saved draft — ^X discards it.");
@@ -6255,6 +6263,30 @@ mod tests {
         }
     }
 
+    /// #716's promise, worded cleanly (#54): resuming a draft that came
+    /// from the website says its attachments stay there — one space after
+    /// the dash, so the ^X instruction survives the status line's clip.
+    #[tokio::test]
+    async fn a_website_drafts_resume_hint_names_the_discard_key() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.drafts.insert(
+            common::drafts::DraftKey::ThreadReply(7),
+            common::drafts::Draft {
+                body: "written in the browser".into(),
+                remote_attachments: true,
+                ..Default::default()
+            },
+        );
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        let hint = app.status.clone();
+        assert!(
+            hint.contains("attachments stay there") && hint.contains("^X discards"),
+            "{hint}"
+        );
+        assert!(!hint.contains("  "), "no stray runs of spaces: {hint}");
+    }
+
     /// A draft belongs to one composer. An edit of a post and a fresh reply
     /// to the thread holding it must not share one, or a resumed edit would
     /// silently overwrite a post with someone's half-written reply.
@@ -8695,6 +8727,35 @@ mod tests {
             Some("unsent reply"),
             "Home navigation preserves the composer draft"
         );
+    }
+
+    /// #53: Home is header/palette navigation like any other, so it honours
+    /// the modal boundary a busy composer sets — burying one mid-write
+    /// would stash already-posted text as a resumable draft when the write
+    /// succeeded with no composer left to forget it.
+    #[tokio::test]
+    async fn go_home_honours_a_blocked_modal_boundary() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 9,
+                thread_title: "A thread".into(),
+            }),
+            body: "posting this right now".into(),
+            busy: true,
+            ..Default::default()
+        }));
+
+        app.go(GoTarget::Home);
+
+        assert_eq!(app.screens.len(), 2, "the blocked boundary stops the unwind");
+        assert!(app.screens.iter().any(|s| matches!(s, Screen::Compose(_))));
+        assert!(
+            app.drafts.get(&common::drafts::DraftKey::ThreadReply(9)).is_none(),
+            "nothing was stashed behind the write"
+        );
+        assert!(!app.status.is_empty(), "the boundary says why");
     }
 
     /// #694: opening the Alerts tab marks them viewed — the badge clears and
