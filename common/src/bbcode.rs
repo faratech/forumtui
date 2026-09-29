@@ -1376,8 +1376,14 @@ fn tag_at(src: &str, at: usize, closes: &[usize]) -> Option<(usize, bool, String
             // Attribute form: the first `]` outside a quoted value, capped
             // like the render path (#615). An attribute form with no
             // `key=` option is literal text, not a tag — the render path's
-            // own #616 rule, which the strip pass mirrors.
-            let close = scan_attr_close(bytes, i, TAG_BODY_SCAN).or_else(plain_close)?;
+            // own #616 rule, which the strip pass mirrors. The cap
+            // fallback's plain find is unit-converted to the inclusive
+            // index the `+ 1` below expects (plain_close is already the
+            // exclusive end) — audit r6 #821.
+            let close = match scan_attr_close(bytes, i, TAG_BODY_SCAN) {
+                Some(idx) => idx,
+                None => plain_close()?.saturating_sub(1),
+            };
             if !has_tag_option(&src[i..close]) {
                 return None;
             }
@@ -2998,6 +3004,9 @@ mod tests {
     #[test]
     fn stripping_quotes_leaves_the_rest_untouched() {
         assert_eq!(strip_quote_blocks("a [QUOTE]x[/QUOTE] b"), "a  b");
+
+        // Audit r6 #821: the cap-fallback path is unit-consistent — see
+        // tag_at_cap_fallback_ends_at_the_real_bracket below.
         assert_eq!(
             strip_quote_blocks("a [QUOTE=\"n, post: 1\"]x [QUOTE]deep[/QUOTE] y[/QUOTE] b"),
             "a  b",
@@ -3300,4 +3309,30 @@ mod tests {
         assert_eq!(last.color, None, "the closed colour is gone");
     }
 
+
+    /// Audit r6 #821: `plain_close` returns the index AFTER the `]` while
+    /// `scan_attr_close` returns the index OF it, and the attribute arm's
+    /// shared `+ 1` assumed the latter. On a capped attribute block (no
+    /// `]` findable inside the 4096-byte scan) the old fallback produced
+    /// end = bracket + 2 — one byte past the tag.
+    #[test]
+    fn tag_at_cap_fallback_ends_at_the_real_bracket() {
+        let attrs = "x".repeat(4200);
+        let src = format!("[QUOTE a=\"{attrs}\"]body");
+        let closes: Vec<usize> = src
+            .bytes()
+            .enumerate()
+            .filter(|(_, b)| *b == b']')
+            .map(|(i, _)| i)
+            .collect();
+        // The `]` sits past the 4096-byte TAG_BODY_SCAN cap, so the
+        // attribute scan gives up and the plain find (with the unit fix)
+        // decides the end.
+        assert!(closes[0] > 4096);
+        let (end, closing, name) = tag_at(&src, 0, &closes).expect("capped attr tag must resolve");
+        assert_eq!(name, "quote");
+        assert!(!closing);
+        let bracket = closes[0];
+        assert_eq!(end, bracket + 1, "end is the exclusive end of the real `]`");
+    }
 }
