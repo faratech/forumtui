@@ -1936,6 +1936,21 @@ impl ThreadViewState {
             blocks.sort_by_key(|(at, _)| *at);
 
             for &(at, video) in &blocks {
+                // #49: media inside a hidden spoiler is not lifted out of
+                // the text. The lift renders a readable caption — and, on
+                // graphics tiers, the picture itself — while the text path
+                // deliberately dims the `[image]` placeholder "so an
+                // invisible picture must not invite o/1-9" (#621). Leaving
+                // the chunk to the text path hides it black-on-black until
+                // `x`, which rebuilds and lifts it then; the picture keeps
+                // its place in post_images() order either way, so the `ord`
+                // numbering and the digit keys stay in step.
+                let hidden_media = match &chunks[at] {
+                    Chunk::Image { style: s, .. } | Chunk::Link(_, _, s) => {
+                        s.spoiler && !self.reveal_spoilers
+                    }
+                    _ => false,
+                };
                 for (logical, align) in chunk_lines_aligned(
                     &chunks[run_start..at],
                     &mut links,
@@ -1946,6 +1961,15 @@ impl ThreadViewState {
                     for wrapped in wrap_spans_aligned(&logical, body_w, align) {
                         lines.push(gutter(wrapped));
                     }
+                }
+                if hidden_media {
+                    // The hidden chunk renders with the rest of the text:
+                    // run_start stays at `at`, so the next segment or the
+                    // tail pass picks the chunk up.
+                    if video.is_none() {
+                        ord += 1;
+                    }
+                    continue;
                 }
                 run_start = at + 1;
                 let Some(video_n) = video else {
@@ -3977,6 +4001,47 @@ mod tests {
             ..Default::default()
         });
         s
+    }
+
+    /// #49: media inside a hidden spoiler is not lifted out of the text —
+    /// the lift rendered a readable caption and, on graphics tiers, the
+    /// picture itself, while the same file dims the placeholder "so an
+    /// invisible picture must not invite o/1-9" (#621). Hidden, the chunk
+    /// stays with the text path's black-on-black treatment; `x` lifts it.
+    #[test]
+    fn a_spoilered_image_stays_hidden_until_x_reveals_it() {
+        let theme = Theme::truecolor();
+        let mut s = thread_view_fixture();
+        s.posts[0].message =
+            "[SPOILER][IMG]https://example.com/secret.png[/IMG][/SPOILER] visible tail".into();
+        s.rebuild_lines(&theme, &UNICODE);
+        let all: Vec<String> = s.lines.iter().map(text).collect();
+        assert!(
+            !all.iter().any(|l| l.contains("1 of 1")),
+            "no readable caption while the spoiler is hidden: {all:#?}"
+        );
+        assert!(all.iter().any(|l| l.contains("visible tail")), "{all:#?}");
+        // The placeholder's [n] marker is dimmed, per the text path's own
+        // rule - "an invisible picture must not invite o/1-9".
+        let marker_dim = s.lines.iter().find(|line| {
+            let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            joined.contains("[image]")
+        }).and_then(|line| {
+            line.spans.iter().find(|s| s.content == "[1]").map(|s| s.style)
+        });
+        assert_eq!(
+            marker_dim.map(|st| st.fg),
+            Some(theme.dim().fg),
+            "the hidden picture's marker must be dim, not link-styled"
+        );
+
+        s.reveal_spoilers = true;
+        s.rebuild_lines(&theme, &UNICODE);
+        let all: Vec<String> = s.lines.iter().map(text).collect();
+        assert!(
+            all.iter().any(|l| l.contains("1 of 1")),
+            "revealed, the picture is lifted with its caption: {all:#?}"
+        );
     }
 
     #[test]
