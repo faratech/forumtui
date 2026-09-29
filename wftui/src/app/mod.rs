@@ -694,6 +694,14 @@ pub struct App {
     /// Same-key relay operations share a FIFO mutex, so a delete cannot beat
     /// the save that preceded it on the event loop.
     draft_relay_tail: std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Remote deletes that were attempted but not proven settled (#815): the
+    /// task failed, or was aborted before the answer came back. Re-tried by
+    /// the next `sync_drafts`; until one settles, the site's copy of that
+    /// draft is scheduled for removal and must not be merged back over the
+    /// deletion — that is how a posted reply's draft resurrects. Shared with
+    /// the delete tasks themselves (they only ever remove a proven-settled
+    /// key), so the outcome needs no message on the event channel.
+    pending_remote_deletes: Arc<std::sync::Mutex<std::collections::HashSet<common::drafts::DraftKey>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -976,6 +984,7 @@ pub async fn run(
         draft_mutations: std::collections::HashMap::new(),
         draft_deletions: std::collections::HashMap::new(),
         draft_relay_tail: std::collections::HashMap::new(),
+        pending_remote_deletes: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     };
     if needs_setup {
         app.push_screen(Screen::Setup(screens::setup::SetupState::default()));
@@ -1712,6 +1721,17 @@ impl App {
     /// blank one, so opening a reply, thinking better of it and pressing Esc
     /// does not leave an empty draft to be resumed later.
     fn stash_draft(&mut self, c: &screens::ComposeState, relay: bool) {
+        self.stash_draft_impl(c, relay, true);
+    }
+
+    /// The same stash with no status line: the submit-time mirror (#815) must
+    /// not overwrite the composer's own in-flight feedback with "Draft
+    /// saved." for a draft the successful send is about to discard.
+    fn stash_draft_quiet(&mut self, c: &screens::ComposeState) {
+        self.stash_draft_impl(c, false, false);
+    }
+
+    fn stash_draft_impl(&mut self, c: &screens::ComposeState, relay: bool, feedback: bool) {
         let Some(key) = c.target.as_ref().map(|t| t.draft_key()) else {
             return;
         };
@@ -1748,6 +1768,9 @@ impl App {
         if relay { self.push_draft(key, &draft); }
         self.drafts.insert(key, draft);
         let saved = self.persist_draft(key);
+        if !feedback {
+            return;
+        }
         if too_big {
             // Honest about the limit rather than promising a recovery that a
             // restart will not deliver.
@@ -1756,6 +1779,30 @@ impl App {
             self.set_status("Draft saved. Open this composer again to resume it.");
         } else {
             self.set_status("Draft kept for this session; could not save it to disk.");
+        }
+    }
+
+    /// Mirror a composer whose submission is about to leave for the network
+    /// into the LOCAL drafts store (#815): between the ^S and the site's
+    /// answer the words existed nowhere but the wire, so a crash, a kill or
+    /// a failed write could destroy them. Never relayed — the website's copy
+    /// must not be rewritten by a submission still in flight. On success
+    /// `close_sent_composer` discards the mirror; on failure the composer
+    /// stays open and the ordinary Esc/pop paths still own the slot.
+    fn stash_inflight_submission(&mut self, key: common::drafts::DraftKey) {
+        let Some(idx) = self.screens.iter().rposition(|s| {
+            matches!(s, Screen::Compose(c) if c.target.as_ref().is_some_and(|t| t.draft_key() == key))
+        }) else {
+            return;
+        };
+        // `ComposeState` is not `Clone`; borrow it out, stash, put it back.
+        let state = match &mut self.screens[idx] {
+            Screen::Compose(c) => std::mem::take(c),
+            _ => return,
+        };
+        self.stash_draft_quiet(&state);
+        if let Screen::Compose(c) = &mut self.screens[idx] {
+            *c = state;
         }
     }
 
@@ -1822,6 +1869,9 @@ impl App {
         self.draft_mutations.clear();
         self.draft_deletions.clear();
         self.draft_relay_tail.clear();
+        // The owed deletes belonged to the signing-out account's mirror
+        // (#815); the relay tail they would ride on is gone with it.
+        self.pending_remote_deletes.lock().expect("lock").clear();
     }
 
     /// The drafts list's rows, newest first.
@@ -2013,6 +2063,14 @@ impl App {
         if !self.draft_relay_enabled() {
             return;
         }
+        // Recorded before the task leaves (#815): a failure, a crash or a
+        // session boundary aborting the task would otherwise leave the site's
+        // copy in place with no record that a delete was owed — and the next
+        // sync would resurrect the draft the user already posted. The task
+        // itself takes the key back off only when the delete provably
+        // settled; nothing rides the event channel.
+        self.pending_remote_deletes.lock().expect("lock").insert(key);
+        let pending = self.pending_remote_deletes.clone();
         let api = self.api.clone();
         let tx = self.tx.clone();
         let relay = self
@@ -2022,11 +2080,23 @@ impl App {
             .clone();
         self.spawn_session_task(async move {
             let _guard = relay.lock().await;
-            if let Err(e) = api.delete_draft(&xf_key).await {
-                tracing::warn!("could not clear draft {xf_key} on the site: {e}");
-                if relay_route_missing(&e) {
-                    tx.send(Msg::DraftRelayAbsent).ok();
+            let settled = match api.delete_draft(&xf_key).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("could not clear draft {xf_key} on the site: {e}");
+                    if relay_route_missing(&e) {
+                        tx.send(Msg::DraftRelayAbsent).ok();
+                        // Also settled: either the copy is already gone or the
+                        // relay does not exist — and with the relay absent, no
+                        // sync can fetch the stale copy back.
+                        true
+                    } else {
+                        false
+                    }
                 }
+            };
+            if settled {
+                pending.lock().expect("lock").remove(&key);
             }
         });
     }
@@ -2059,13 +2129,17 @@ impl App {
                 continue;
             }
             self.draft_deletions.remove(&key);
-            if let Some(local) = self.drafts.get(&key)
-                && local.saved_at >= r.last_update
-            {
-                // Ours is the same age or newer: keep it. Equal timestamps
-                // mean this is the copy we pushed.
+            if self.pending_remote_deletes.lock().expect("lock").contains(&key) {
+                // A delete for this draft is still owed (#815): the site's
+                // copy is scheduled for removal, not news.
                 continue;
             }
+            // The local copy's `saved_at` and the relay's `last_update` come
+            // from two clocks whose skew is unknown, so they are never
+            // compared (#815). A draft mutated after this list was issued
+            // never reaches this line — the mutation-epoch guard above keeps
+            // it. Everything else predates the list, and the site's copy is
+            // what the website's own editor shows, so it wins.
             self.drafts.insert(
                 key,
                 common::drafts::Draft {
@@ -2091,6 +2165,23 @@ impl App {
         self.draft_deletions.retain(|_, deletion| *deletion > epoch);
     }
 
+    /// The relay-tail mutexes in a total order over their keys (#815).
+    ///
+    /// `sync_drafts` holds every one of these across its list call. Two
+    /// overlapping syncs acquiring them in `HashMap` order — which differs
+    /// between instances and between runs — could interleave into an ABBA
+    /// deadlock, each holding the one the other is waiting on. Sorting the
+    /// keys makes the acquisition order total, so no two takers can cycle.
+    fn sorted_relay_tails(&self) -> Vec<(String, Arc<tokio::sync::Mutex<()>>)> {
+        let mut tails: Vec<_> = self
+            .draft_relay_tail
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        tails.sort_by(|a, b| a.0.cmp(&b.0));
+        tails
+    }
+
     /// Ask the website for this account's drafts. Errors are logged and
     /// dropped: nothing about the composer depends on this call succeeding.
     fn sync_drafts(&mut self) {
@@ -2101,7 +2192,19 @@ impl App {
         let tx = self.tx.clone();
         let session_generation = self.session_generation;
         let epoch = self.draft_epoch;
-        let relays: Vec<_> = self.draft_relay_tail.values().cloned().collect();
+        let relays: Vec<_> = self.sorted_relay_tails().into_iter().map(|(_, m)| m).collect();
+        // Deletes that failed or were aborted earlier go first (#815), inside
+        // the relay locks and before the list — so the list cannot observe a
+        // draft whose delete is mid-flight, and a still-owed key cannot keep
+        // resurrecting its copy.
+        let retries: Vec<(String, common::drafts::DraftKey)> = {
+            let pending = self.pending_remote_deletes.lock().expect("lock");
+            pending
+                .iter()
+                .filter_map(|key| key.xf_key().map(|xf_key| (xf_key, *key)))
+                .collect()
+        };
+        let pending = Arc::clone(&self.pending_remote_deletes);
         self.spawn_session_task(async move {
             // A list taken before a same-key save/delete can be stale even if
             // the HTTP response arrives later. Wait for all relay operations
@@ -2110,6 +2213,23 @@ impl App {
             let mut _guards = Vec::with_capacity(_relay_refs.len());
             for relay in &_relay_refs {
                 _guards.push(relay.lock().await);
+            }
+            for (xf_key, key) in retries {
+                let settled = match api.delete_draft(&xf_key).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!("still owed: could not clear draft {xf_key} on the site: {e}");
+                        if relay_route_missing(&e) {
+                            tx.send(Msg::DraftRelayAbsent).ok();
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if settled {
+                    pending.lock().expect("lock").remove(&key);
+                }
             }
             match api.list_drafts().await {
                 Ok(drafts) => {
@@ -2140,6 +2260,9 @@ impl App {
         self.draft_mutations.clear();
         self.draft_deletions.clear();
         self.draft_relay_tail.clear();
+        // An owed delete belongs to the previous identity's mirror (#815);
+        // the next account's thread-7 is a different draft entirely.
+        self.pending_remote_deletes.lock().expect("lock").clear();
         self.draft_epoch = self.draft_epoch.wrapping_add(1);
         match selected {
             Ok(drafts) => self.drafts = drafts,
@@ -6592,8 +6715,12 @@ mod tests {
         }
     }
 
-    /// Newest wins, in both directions — otherwise a stale server copy would
-    /// silently overwrite words typed here a moment ago.
+    /// Recency without clock trust (#815). `saved_at` is this machine's
+    /// clock and `last_update` the server's; their skew is unknown, so the
+    /// two stamps are never compared. A draft typed here after the list was
+    /// issued wins on the mutation epoch alone — even against a "newer"
+    /// server stamp — and anything the list predates defers to the site's
+    /// copy, which is what the website's own editor shows.
     #[tokio::test]
     async fn the_newer_side_wins_the_merge() {
         let mut app = test_app();
@@ -6610,17 +6737,37 @@ mod tests {
             ..Default::default()
         };
 
+        // Not locally mutated since before the list: the relay payload wins
+        // whatever the two clocks claim — the stamps cannot order them.
         app.drafts.insert(key, local(5_000));
         app.merge_remote_drafts(app.draft_epoch, vec![remote(1_000)]);
-        assert_eq!(app.drafts[&key].body, "local", "an older server copy must not win");
+        assert_eq!(
+            app.drafts[&key].body, "remote",
+            "an unmutated local copy defers to the site's, skew or no skew"
+        );
 
-        app.merge_remote_drafts(app.draft_epoch, vec![remote(9_000)]);
-        assert_eq!(app.drafts[&key].body, "remote", "a newer server copy must win");
-
-        // Equal timestamps are the copy we pushed ourselves; keep ours.
-        app.drafts.insert(key, local(9_000));
-        app.merge_remote_drafts(app.draft_epoch, vec![remote(9_000)]);
-        assert_eq!(app.drafts[&key].body, "local", "a tie keeps the local copy");
+        // Typed here after the list was issued: the epoch, not a timestamp,
+        // keeps the words. A server stamp that only looks newer (its clock
+        // runs ahead) must not overwrite them.
+        app.screens.push(screens::home_state(false));
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        let list_epoch = app.draft_epoch;
+        let snapshot = match app.screens.last_mut() {
+            Some(Screen::Compose(c)) => {
+                c.body = "typed after the list".into();
+                std::mem::take(c)
+            }
+            _ => panic!("expected a composer"),
+        };
+        app.stash_draft(&snapshot, false);
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            *c = snapshot;
+        }
+        app.merge_remote_drafts(list_epoch, vec![remote(9_000)]);
+        assert_eq!(
+            app.drafts[&key].body, "typed after the list",
+            "a local save after the list was issued wins on the epoch"
+        );
     }
 
     /// A kind this build cannot map — a report draft, or one an add-on adds
@@ -6666,6 +6813,134 @@ mod tests {
         });
         tokio::task::yield_now().await;
         assert_eq!(api.drafts_deleted(), vec!["thread-7".to_string()]);
+    }
+
+    /// The submit-time mirror (#815): between ^S and the site's answer the
+    /// words existed nowhere but the wire, so the composer's text is stashed
+    /// into the drafts store the moment the submit leaves — a crash mid-post
+    /// cannot destroy it — and the successful send's `close_sent_composer`
+    /// takes the mirror back out again.
+    #[tokio::test]
+    async fn a_submission_mirrors_its_words_until_the_send_settles() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "words in flight".into();
+        }
+
+        app.execute_action(Action::SubmitReply { thread_id: 7, message: "words in flight".into() });
+        let key = common::drafts::DraftKey::ThreadReply(7);
+        assert_eq!(
+            app.drafts.get(&key).map(|d| d.body.as_str()),
+            Some("words in flight"),
+            "an in-flight submission keeps a local mirror"
+        );
+        let stored = app.draft_store.load(app.draft_owner.as_ref().expect("test owner"));
+        assert_eq!(
+            stored.get(&key).map(|d| d.body.as_str()),
+            Some("words in flight"),
+            "the mirror reaches the on-disk store, not just memory"
+        );
+
+        app.handle_msg(Msg::ReplySent {
+            composer: key,
+            result: Ok(Post { post_id: 1, thread_id: 7, ..Default::default() }),
+        });
+        assert!(!app.drafts.contains_key(&key), "a sent reply's mirror must not survive");
+        let stored = app.draft_store.load(app.draft_owner.as_ref().expect("test owner"));
+        assert!(!stored.contains_key(&key), "...and not on disk either");
+    }
+
+    /// sync_drafts holds every relay-tail mutex across its list call; taking
+    /// them in HashMap order let two overlapping syncs ABBA-deadlock (#815).
+    /// The acquisition order must be a total order over the keys.
+    #[test]
+    fn relay_tails_are_taken_in_a_total_order() {
+        let mut app = test_app();
+        for k in ["thread-9", "thread-3", "forum-1", "conversation-5"] {
+            app.draft_relay_tail
+                .entry(k.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
+        }
+        let keys: Vec<String> = app
+            .sorted_relay_tails()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "conversation-5".to_string(),
+                "forum-1".to_string(),
+                "thread-3".to_string(),
+                "thread-9".to_string(),
+            ]
+        );
+    }
+
+    /// A remote delete that failed (#815) stays owed: the merge refuses to
+    /// let the site's copy of the posted draft resurrect, and the next sync
+    /// retries the delete — only a settled outcome takes the key off the
+    /// books.
+    #[tokio::test]
+    async fn an_owed_remote_delete_blocks_resurrection_until_it_settles() {
+        let api = Arc::new(RecordingApi::default());
+        api.drafts_fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut app = test_app();
+        app.api = api.clone();
+        app.screens.push(screens::home_state(false));
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "posted words".into();
+        }
+
+        // The send succeeded while the composer sat busy (Esc is blocked
+        // mid-write, so it is still on the stack); `close_sent_composer`
+        // discards the draft, and its remote delete fails — the stub answers
+        // NoToken while `drafts_fail` is set.
+        app.handle_msg(Msg::ReplySent {
+            composer: common::drafts::DraftKey::ThreadReply(7),
+            result: Ok(Post { post_id: 1, thread_id: 7, ..Default::default() }),
+        });
+        tokio::task::yield_now().await;
+        let key = common::drafts::DraftKey::ThreadReply(7);
+        assert!(api.drafts_deleted().is_empty(), "the relay is failing; nothing was deleted");
+        assert!(
+            app.pending_remote_deletes.lock().expect("lock").contains(&key),
+            "a failed delete stays owed"
+        );
+
+        // While the delete is owed, the site's stale copy must not come back.
+        app.merge_remote_drafts(
+            app.draft_epoch,
+            vec![common::models::RemoteDraft {
+                key: "thread-7".into(),
+                message: "resurrected".into(),
+                last_update: 9_000,
+                ..Default::default()
+            }],
+        );
+        assert!(
+            !app.drafts.contains_key(&key),
+            "a draft whose remote delete is owed must not resurrect from the site"
+        );
+
+        // The next sync retries the owed delete, and a settled retry takes
+        // the key off the books.
+        api.drafts_fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        app.sync_drafts();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            api.drafts_deleted(),
+            vec!["thread-7".to_string()],
+            "the next sync retries the owed delete"
+        );
+        assert!(
+            app.pending_remote_deletes.lock().expect("lock").is_empty(),
+            "a settled delete comes off the books"
+        );
     }
 
     /// XF has no draft for an edit, so there is nothing to sync to. The
@@ -7168,6 +7443,7 @@ mod tests {
             draft_mutations: std::collections::HashMap::new(),
             draft_deletions: std::collections::HashMap::new(),
             draft_relay_tail: std::collections::HashMap::new(),
+            pending_remote_deletes: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 

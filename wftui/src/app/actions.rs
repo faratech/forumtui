@@ -22,6 +22,24 @@ impl App {
             self.set_status("Still uploading — one moment.");
             return;
         }
+        // Crash durability for the words in flight (#815): before a submit
+        // leaves for the network, mirror its composer into the local drafts
+        // store. `close_sent_composer` discards the mirror on success.
+        match &action {
+            Action::SubmitReply { thread_id, .. } => {
+                self.stash_inflight_submission(common::drafts::DraftKey::ThreadReply(*thread_id));
+            }
+            Action::SubmitThread { node_id, .. } => {
+                self.stash_inflight_submission(common::drafts::DraftKey::NewThread(*node_id));
+            }
+            Action::SubmitEdit { post_id, .. } => {
+                self.stash_inflight_submission(common::drafts::DraftKey::EditPost(*post_id));
+            }
+            Action::SubmitConvoReply { id, .. } => {
+                self.stash_inflight_submission(common::drafts::DraftKey::ConversationReply(*id));
+            }
+            _ => {}
+        }
         match action {
             Action::None => {}
             Action::Notice(msg) => self.set_status(msg),

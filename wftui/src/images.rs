@@ -14,15 +14,17 @@
 //! **Hard rule 1** (never put escape bytes in span content) is kept by never
 //! writing an image escape sequence in this module. Only `ratatui-image`'s
 //! own widget emits them, and it does so through ratatui's sanctioned
-//! diff-option path (as of the ratatui-image 11.x bump, #56): the whole
-//! payload goes into exactly one anchor `Cell`'s symbol, and the anchor
-//! plus every covered cell of the image rect is marked
-//! `CellDiffOption::ForcedWidth(1)` — one column each, so the frame diff
-//! can never re-emit a fragment of the payload out of context. Because
-//! those cells are not text, `App::capture_screen` (mouse selection) and
-//! `App::paint_selection` skip them, and images are not drawn at all while an
-//! overlay is up (`overlay::dim_body` would re-style the anchor cell, and the
-//! overlay's `Clear` erases the rect for that frame anyway).
+//! diff-option path: the protocol payload goes into exactly one anchor
+//! `Cell`'s symbol — the image's first cell — and every cell of the image
+//! rect, anchor and placeholders alike, is flagged
+//! `CellDiffOption::ForcedWidth(1)` (the covered cells carry placeholder
+//! symbols also billed one column, not `Skip`), so the frame diff can never
+//! re-emit a fragment of the payload out of context. Pinned by
+//! `the_kitty_payload_is_transmitted_once_into_width_protected_cells`.
+//! Because those cells are not text, `App::capture_screen` (mouse selection)
+//! and `App::paint_selection` skip them, and images are not drawn at all
+//! while an overlay is up (`overlay::dim_body` would re-style the anchor
+//! cell, and the overlay's `Clear` erases the rect for that frame anyway).
 //!
 //! **Hard rule 3**: the terminal capability query reads stdin directly, so it
 //! runs in `main.rs` before `event::spawn_reader` exists. See `Images::detect`.
@@ -763,10 +765,7 @@ pub struct Images {
     cache: Lru<Decoded>,
     inflight: HashSet<String>,
     queued: VecDeque<Pending>,
-    /// Store key → why it failed, remembered so a dead thumbnail is fetched
-    /// once per session, not once per frame. The viewer's error pane reads
-    /// the message back (#60).
-    failed: HashMap<String, String>,
+    failed: HashSet<String>,
     /// Source pixel size per image key, learned when a load finishes. Grows
     /// only; captions read it for their `W×H` segment.
     sizes: Sizes,
@@ -794,7 +793,7 @@ impl Images {
             cache: Lru::new(LRU_CAP),
             inflight: HashSet::new(),
             queued: VecDeque::new(),
-            failed: HashMap::new(),
+            failed: HashSet::new(),
             sizes: Sizes::new(),
             disk: DiskCache::new(),
             logo: embedded_logo(),
@@ -958,7 +957,7 @@ impl Images {
                 ratatui_image::Image::new(proto).render(req.rect, f.buffer_mut());
                 continue;
             }
-            if self.failed.contains_key(&sk) || self.inflight.contains(&sk) || !seen.insert(sk) {
+            if self.failed.contains(&sk) || self.inflight.contains(&sk) || !seen.insert(sk) {
                 continue;
             }
             if self.queued.len() < QUEUE_CAP {
@@ -997,27 +996,6 @@ impl Images {
         self.sizes.clear();
     }
 
-    /// Whether any size variant of `source` is mid-fetch. The viewer's
-    /// loading pane reads this — its loads complete through `on_loaded`,
-    /// which never touches the screen state (#60).
-    pub fn source_inflight(&self, source: &str) -> bool {
-        self.inflight.iter().any(|k| source_of(k) == source)
-    }
-
-    /// The remembered failure for any size variant of `source` (#60).
-    pub fn source_failure(&self, source: &str) -> Option<String> {
-        self.failed
-            .iter()
-            .find(|(k, _)| source_of(k) == source)
-            .map(|(_, e)| e.clone())
-    }
-
-    /// Forget every size variant's failure for `source`, so the next
-    /// frame's demand re-requests it — `R` in the viewer (#60).
-    pub fn retry_source(&mut self, source: &str) {
-        self.failed.retain(|k, _| source_of(k) != source);
-    }
-
     /// A background load finished (or failed). A failure is remembered so a
     /// dead thumbnail is fetched once per session, not once per frame.
     pub fn on_loaded(&mut self, key: String, result: Result<Loaded, String>) {
@@ -1034,7 +1012,7 @@ impl Images {
             }
             Err(e) => {
                 tracing::warn!("image load failed ({key}): {e}");
-                self.failed.insert(key, e);
+                self.failed.insert(key);
             }
         }
     }
