@@ -765,7 +765,10 @@ pub struct Images {
     cache: Lru<Decoded>,
     inflight: HashSet<String>,
     queued: VecDeque<Pending>,
-    failed: HashSet<String>,
+    /// Store key → why it failed, remembered so a dead thumbnail is fetched
+    /// once per session, not once per frame. The viewer's error pane reads
+    /// the message back (#60).
+    failed: HashMap<String, String>,
     /// Source pixel size per image key, learned when a load finishes. Grows
     /// only; captions read it for their `W×H` segment.
     sizes: Sizes,
@@ -793,7 +796,7 @@ impl Images {
             cache: Lru::new(LRU_CAP),
             inflight: HashSet::new(),
             queued: VecDeque::new(),
-            failed: HashSet::new(),
+            failed: HashMap::new(),
             sizes: Sizes::new(),
             disk: DiskCache::new(),
             logo: embedded_logo(),
@@ -963,7 +966,7 @@ impl Images {
                 ratatui_image::Image::new(proto).render(req.rect, f.buffer_mut());
                 continue;
             }
-            if self.failed.contains(&sk) || self.inflight.contains(&sk) || !seen.insert(sk) {
+            if self.failed.contains_key(&sk) || self.inflight.contains(&sk) || !seen.insert(sk) {
                 continue;
             }
             if self.queued.len() < QUEUE_CAP {
@@ -1045,7 +1048,7 @@ impl Images {
             }
             Err(e) => {
                 tracing::warn!("image load failed ({key}): {e}");
-                self.failed.insert(key);
+                self.failed.insert(key, e);
             }
         }
     }
