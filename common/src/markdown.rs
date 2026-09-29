@@ -159,6 +159,11 @@ fn inline(text: &str, base: Style, out: &mut Vec<Chunk>) {
     let mut plain = String::new();
     let mut i = 0;
     let bytes = text.as_bytes();
+    // Answered once per line instead of by scanning the remaining text at
+    // every position: the contains/closer questions below are all "does X
+    // occur at or after byte k", and re-scanning made alternating `*`/`~`
+    // runs quadratic — on the UI thread, once per streamed frame (#45).
+    let scan = LineScan::of(text);
     let flush = |plain: &mut String, style: &Style, out: &mut Vec<Chunk>| {
         push_text(out, plain, style.clone());
         plain.clear();
@@ -185,14 +190,16 @@ fn inline(text: &str, base: Style, out: &mut Vec<Chunk>) {
             let at_edge = marker == "**"
                 || (!prev.is_some_and(|c| c.is_alphanumeric())
                     || !rest[2..].chars().next().is_some_and(|c| c.is_alphanumeric()));
-            if at_edge && (style.bold != base.bold || rest[2..].contains(marker)) {
+            if at_edge && (style.bold != base.bold || scan.marker_from(i + 2, marker)) {
                 flush(&mut plain, &style, out);
                 style.bold = !style.bold;
                 i += 2;
                 continue;
             }
         }
-        if rest.starts_with("~~") && (style.strikethrough != base.strikethrough || rest[2..].contains("~~")) {
+        if rest.starts_with("~~")
+            && (style.strikethrough != base.strikethrough || scan.marker_from(i + 2, "~~"))
+        {
             flush(&mut plain, &style, out);
             style.strikethrough = !style.strikethrough;
             i += 2;
@@ -202,7 +209,7 @@ fn inline(text: &str, base: Style, out: &mut Vec<Chunk>) {
             let next = rest[1..].chars().next();
             let opens = !style.italic
                 && next.is_some_and(|c| !c.is_whitespace() && c != '*')
-                && closes_later(&rest[1..]);
+                && scan.closer_from(i + 1);
             let closes = style.italic && prev.is_some_and(|c| !c.is_whitespace());
             if opens || closes {
                 flush(&mut plain, &style, out);
@@ -249,8 +256,91 @@ fn inline(text: &str, base: Style, out: &mut Vec<Chunk>) {
     flush(&mut plain, &style, out);
 }
 
+/// The per-line suffix tables behind `inline`'s "does a closer/marker exist
+/// at or after byte k" questions (#45). `closes_later` stays the readable
+/// reference the closer table is tested against.
+struct LineScan {
+    closer_from: Vec<bool>,
+    bold_from: Vec<bool>,
+    underline_from: Vec<bool>,
+    strike_from: Vec<bool>,
+}
+
+impl LineScan {
+    fn of(text: &str) -> Self {
+        let bytes = text.as_bytes();
+        let n = bytes.len();
+        let mut tables = LineScan {
+            closer_from: vec![false; n + 1],
+            bold_from: vec![false; n + 1],
+            underline_from: vec![false; n + 1],
+            strike_from: vec![false; n + 1],
+        };
+        for (table, needle) in [
+            (&mut tables.bold_from, &b"**"[..]),
+            (&mut tables.underline_from, &b"__"[..]),
+            (&mut tables.strike_from, &b"~~"[..]),
+        ] {
+            let mut seen = false;
+            for k in (0..n).rev() {
+                seen = seen || (k + 2 <= n && &bytes[k..k + 2] == needle);
+                table[k] = seen;
+            }
+        }
+        // An italic closer is a star the pair-skipping scan would actually
+        // reach: the LAST star of an odd-length run — the scanner examines
+        // even offsets only, so even-length runs hold none — and it counts
+        // when the character before it is not whitespace (for the run's
+        // first star; a deeper one is preceded by a star, which counts).
+        let mut candidate = vec![false; n];
+        let mut k = 0usize;
+        while k < n {
+            if bytes[k] == b'*' {
+                let run_start = k;
+                while k < n && bytes[k] == b'*' {
+                    k += 1;
+                }
+                let run_len = k - run_start;
+                if run_len % 2 == 1 {
+                    let ok = run_len > 1
+                        || match text[..run_start].chars().next_back() {
+                            Some(prev) => !prev.is_whitespace(),
+                            None => false,
+                        };
+                    if ok {
+                        candidate[k - 1] = true;
+                    }
+                }
+            } else {
+                k += 1;
+            }
+        }
+        let mut seen = false;
+        for k in (0..n).rev() {
+            seen = seen || candidate[k];
+            tables.closer_from[k] = seen;
+        }
+        tables
+    }
+
+    fn marker_from(&self, k: usize, marker: &str) -> bool {
+        let k = k.min(self.bold_from.len() - 1);
+        match marker {
+            "**" => self.bold_from[k],
+            "__" => self.underline_from[k],
+            _ => self.strike_from[k],
+        }
+    }
+
+    fn closer_from(&self, k: usize) -> bool {
+        self.closer_from[k.min(self.closer_from.len() - 1)]
+    }
+}
+
 /// Whether a `*` in `rest` could close an italic run: one that follows a
-/// non-space and is not part of `**`.
+/// non-space and is not part of `**`. The readable reference for what
+/// [`LineScan`]'s table answers — kept and tested against it, like the
+/// editor's reference row model.
 fn closes_later(rest: &str) -> bool {
     let mut prev: Option<char> = None;
     let mut it = rest.char_indices().peekable();
@@ -447,5 +537,83 @@ mod tests {
         );
         let chunks = render("([KB [x] title](https://example.com/p \"T\"))");
         assert_eq!(texts(&chunks), "(<KB [x] title|https://example.com/p>)");
+    }
+
+    /// #45: the precomputed tables must answer exactly what the readable
+    /// reference scan answers, at every offset of every shape of line.
+    #[test]
+    fn the_line_scan_agrees_with_the_reference_closer_scan() {
+        let alphabet = "*_~ab \n";
+        let mut seed = 0xc0ffee_u64;
+        let mut lcg = |s: &mut u64| {
+            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (*s >> 33) as usize
+        };
+        for case in 0..300 {
+            let len = 1 + lcg(&mut seed) % 40;
+            let chars: Vec<char> = alphabet.chars().collect();
+            let line: String = (0..len)
+                .map(|_| chars[lcg(&mut seed) % chars.len()])
+                .collect();
+            let scan = LineScan::of(&line);
+            // Production only ever queries from just after an opener star,
+            // whose next byte is not a star - i.e. from a byte outside any
+            // star run, where the scan enters every run at its first star
+            // and the global run analysis is exact. Query those points.
+            let bytes = line.as_bytes();
+            for k in 0..=line.len() {
+                if k < line.len() && bytes[k] == b'*' {
+                    continue;
+                }
+                assert_eq!(
+                    scan.closer_from(k),
+                    closes_later(&line[k..]),
+                    "closer at {k} of {line:?}"
+                );
+                                        }
+            let q = lcg(&mut seed) % (line.len() + 1);
+            assert_eq!(
+                scan.marker_from(q, "~~"),
+                line[q.min(line.len())..].contains("~~"),
+                "strike at {q} of {line:?}"
+            );
+            assert_eq!(
+                scan.marker_from(q, "**"),
+                line[q.min(line.len())..].contains("**"),
+                "bold at {q} of {line:?}"
+            );
+            assert_eq!(
+                scan.marker_from(q, "__"),
+                line[q.min(line.len())..].contains("__"),
+                "underline at {q} of {line:?}"
+            );
+        }
+    }
+
+    /// #45: alternating emphasis runs used to pay an O(remaining) scan per
+    /// star and per `~~` — quadratic per line, re-run on the UI thread
+    /// every streamed frame. 4x the input must cost about 4x the time.
+    #[test]
+    fn render_is_linear_in_emphasis_marker_count() {
+        fn parse_ms(src: &str) -> f64 {
+            let t = std::time::Instant::now();
+            let out = render(src);
+            assert!(!out.is_empty());
+            t.elapsed().as_secs_f64() * 1000.0
+        }
+
+        let soup_4k = "a*b* ~~c~~ __d__ ".repeat(250);
+        let soup_16k = "a*b* ~~c~~ __d__ ".repeat(1000);
+        let t4 = parse_ms(&soup_4k);
+        assert!(
+            t4 < 400.0,
+            "4 000 chars of emphasis soup took {t4:.1} ms - not linear"
+        );
+        let t16 = parse_ms(&soup_16k);
+        assert!(
+            t16 < 8.0 * t4.max(1.0),
+            "4x the input cost {:.1}x the time ({t4:.1} ms -> {t16:.1} ms): quadratic",
+            t16 / t4.max(0.001)
+        );
     }
 }
