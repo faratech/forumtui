@@ -382,14 +382,25 @@ pub fn render_login(
                 ("\u{256D}", "\u{256E}", "\u{2570}", "\u{256F}")
             };
             let rule = if g.ascii { "-" } else { "\u{2500}" };
-            let url_len = s.url.chars().count();
-            let link_inner = (url_len + 4).max(48);
+            // The box is capped, not sized to the URL: a loopback/paste
+            // authorize URL is 250+ cells, and sizing the box to it wrapped
+            // the rules and URL across ~15 visual rows while every
+            // measurement here (height, url_line, paste_line) counted
+            // logical ones — clipping steps 2/3 and desyncing the caret and
+            // the click target (#33). The drawn URL is a head window, like
+            // every other single-line field; the full URL still rides the
+            // click hit, `c`, and login-url.txt.
+            const LINK_MAX_INNER: usize = 60; // 70 inner − 6 col − 2 vbars − 2 spaces
+            let url_cells = chrome::cell_width(&s.url);
+            let link_inner = (url_cells + 4).clamp(48, LINK_MAX_INNER);
+            let window_w = link_inner - 4;
+            let shown = chrome::take_cells(&s.url, window_w).to_string();
 
             lines.push(Line::from(vec![
                 Span::raw(" ".repeat(STEP_BODY_COL)),
                 Span::styled(format!("{tl}{}{tr}", rule.repeat(link_inner)), theme.faint()),
             ]));
-            let pad_after = link_inner.saturating_sub(2 + url_len);
+            let pad_after = link_inner.saturating_sub(2 + chrome::cell_width(&shown));
             // Which line of the panel carries the link, so the frame can put
             // a click target on it (#701) - measured here rather than
             // recounted later, so the two can never disagree.
@@ -403,7 +414,7 @@ pub fn render_login(
                     // ratatui spans get re-emitted per-cell on diff and
                     // corrupt the screen. Drag-select copies it; c copies it
                     // without selecting.
-                    s.url.clone(),
+                    shown,
                     Style::new()
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD)
@@ -4180,6 +4191,33 @@ mod tests {
             assert!(all.contains("waiting for approval"), "{all}");
             assert!(all.contains("copied to your clipboard"), "{all}");
         }
+    }
+
+    /// #33: a loopback/paste authorize URL is hundreds of cells. The link
+    /// box must cap and window it — sizing the box to the URL wrapped the
+    /// rules and URL across ~15 visual rows while height/url_line/paste_line
+    /// counted logical ones, clipping steps 2/3 and desyncing the paste
+    /// caret and the click target.
+    #[test]
+    fn a_long_authorize_url_is_windowed_not_wrapped() {
+        let theme = Theme::truecolor();
+        let url = "https://forum.example.com/oauth2/authorize?client_id=public-client-id&redirect_uri=http%3A%2F%2F127.0.0.1%3A9420%2Fcallback&response_type=code&scope=node%3Aread&state=st9&code_challenge=111111111111111111111111111111111111111111111111111&code_challenge_method=S256".to_string();
+        assert!(url.chars().count() > 150);
+        let mut s = crate::screens::LoginState {
+            stage: LoginStage::Waiting { mode: LoginMode::Loopback },
+            url,
+            ..Default::default()
+        };
+        let rows = render_rows(100, 30, |f, area| {
+            render_login(&mut s, f, area, &theme, &UNICODE, &mut HitMap::default())
+        });
+        let all = rows.join("\n");
+        // The panel keeps its whole content on screen.
+        assert!(all.contains("copied to your clipboard"), "{all}");
+        assert!(all.contains("waiting for approval"), "{all}");
+        // The drawn link is a window onto the head; no wrapped fragments.
+        assert!(all.contains("https://forum.example.com"), "{all}");
+        assert!(!all.contains("1111111111"), "the URL must not wrap: {all}");
     }
 
     #[test]
