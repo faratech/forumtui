@@ -268,6 +268,38 @@ pub fn read_from_system_clipboard() -> Option<String> {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        // The read half of the paste key on Windows (#38): without this
+        // branch the function was structurally dead and Ctrl+Y/v could
+        // never see text copied in another application. PowerShell prints
+        // its console output in the OEM code page unless told otherwise, so
+        // force UTF-8; stdin is nulled (hard rule 2) so the child can never
+        // eat the reader's keystrokes. Get-Clipboard appends one newline,
+        // which is stripped for parity with wl-paste's --no-newline.
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Clipboard",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output();
+        if let Ok(output) = output
+            && output.status.success()
+            && let Ok(text) = String::from_utf8(output.stdout)
+        {
+            let text = text.strip_suffix('\n').unwrap_or(&text);
+            let text = text.strip_suffix('\r').unwrap_or(text);
+            let text = text.replace("\r\n", "\n");
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+
     if detect_multiplexer() == Multiplexer::Tmux
         && let Ok(output) = std::process::Command::new("tmux")
             .args(["save-buffer", "-"])
