@@ -70,18 +70,34 @@ pub fn inbox_hints(s: &InboxState) -> Hints {
     // advertised while there is one: with `view: None` (a narrow terminal,
     // or the Alerts tab, where nothing auto-primes the pane) the key was a
     // silent no-op (issue class #561/#605 — never advertise a dead key).
-    let mut keys = vec![
-        ("Enter", "open"),
-        ("Tab", "alerts/conversations"),
-        ("n", "new message"),
-    ];
-    let mut short = vec![("Enter", "open"), ("Tab", "tabs"), ("n", "new")];
+    // The same rule now covers Enter/m (#58): they act on the selected row
+    // of the tab's list, so with nothing in it they were advertised and
+    // dead — the catalog screens drop the caps, `profile_key` refuses.
+    let open_label = if s.tab == InboxTab::Alerts { "read" } else { "open" };
+    let empty = match s.tab {
+        InboxTab::Conversations => s.convos.conversations.is_empty(),
+        InboxTab::Alerts => s.alerts.alerts.is_empty(),
+    };
+    let mut keys: Vec<(&str, &str)> = Vec::new();
+    let mut short: Vec<(&str, &str)> = Vec::new();
+    if !empty {
+        keys.push(("Enter", open_label));
+        short.push(("Enter", open_label));
+    }
+    keys.push(("Tab", "alerts/conversations"));
+    short.push(("Tab", "tabs"));
+    keys.push(("n", "new message"));
+    short.push(("n", "new"));
     if s.view.is_some() {
         keys.push(("r", "reply"));
         short.push(("r", "reply"));
     }
-    keys.extend_from_slice(&[("m", "mark read"), ("R", "refresh"), ("Esc", "back")]);
-    short.extend_from_slice(&[("m", "read"), ("R", ""), ("Esc", "back")]);
+    if !empty {
+        keys.push(("m", "mark read"));
+        short.push(("m", "read"));
+    }
+    keys.extend_from_slice(&[("R", "refresh"), ("Esc", "back")]);
+    short.extend_from_slice(&[("R", ""), ("Esc", "back")]);
     Hints::with_short(&keys, &short, 0)
 }
 
@@ -1530,6 +1546,42 @@ pub fn render_new_conversation(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// #58: Enter and m act on the selected row of the tab's list, so an
+    /// empty list must not advertise them - they were caps on the bar that
+    /// answered with silence (the catalog screens drop the caps;
+    /// `profile_key` refuses). Each tab measures its own list, and the
+    /// wording follows the tab (Enter opens a conversation, reads an
+    /// alert).
+    #[test]
+    fn an_empty_inbox_does_not_advertise_the_row_keys() {
+        let mut s = InboxState { tab: InboxTab::Conversations, ..Default::default() };
+        let hints = inbox_hints(&s);
+        assert!(!hints.keys.iter().any(|(k, _)| *k == "Enter"), "{:?}", hints.keys);
+        assert!(!hints.keys.iter().any(|(k, _)| *k == "m"), "{:?}", hints.keys);
+
+        s.convos.conversations.push(Conversation { conversation_id: 1, ..Default::default() });
+        let hints = inbox_hints(&s);
+        assert_eq!(
+            hints.keys.iter().find(|(k, _)| *k == "Enter").map(|(_, l)| *l),
+            Some("open")
+        );
+        assert!(hints.keys.iter().any(|(k, _)| *k == "m"));
+
+        // The alerts tab measures alerts, not conversations.
+        let mut a = InboxState { tab: InboxTab::Alerts, ..Default::default() };
+        a.convos.conversations.push(Conversation { conversation_id: 1, ..Default::default() });
+        let hints = inbox_hints(&a);
+        assert!(!hints.keys.iter().any(|(k, _)| *k == "Enter"), "{:?}", hints.keys);
+        a.alerts.alerts.push(crate::screens::Alert { alert_id: 1, ..Default::default() });
+        let hints = inbox_hints(&a);
+        assert_eq!(
+            hints.keys.iter().find(|(k, _)| *k == "Enter").map(|(_, l)| *l),
+            Some("read")
+        );
+    }
+
     use super::*;
     use common::models::{Alert, Conversation, ConversationMessage, ConversationRecipient};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

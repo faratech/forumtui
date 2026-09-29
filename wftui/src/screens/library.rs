@@ -1254,6 +1254,13 @@ pub fn drafts_hints(s: &super::DraftsState) -> Hints {
 }
 
 pub fn drafts_key(s: &mut super::DraftsState, key: KeyEvent) -> Action {
+    // Back one level works on an empty list too: `q` is the pushed-screen
+    // convention on every other screen here (social.rs's "q goes back one
+    // level"), and an empty drafts list must not trap the reader (#59).
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => return Action::PopScreen,
+        _ => {}
+    }
     if s.rows.is_empty() {
         return Action::None;
     }
@@ -1284,6 +1291,22 @@ pub fn drafts_key(s: &mut super::DraftsState, key: KeyEvent) -> Action {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// #59: the drafts list is a pushed screen like every other, so `q`
+    /// (and h/Left) goes back one level - including on an empty list,
+    /// which used to make Esc the only way out.
+    #[test]
+    fn q_goes_back_from_the_drafts_list_even_when_it_is_empty() {
+        let mut s = super::super::DraftsState::default();
+        assert!(s.rows.is_empty());
+        let key = |code| KeyEvent::new(code, ratatui::crossterm::event::KeyModifiers::NONE);
+        assert!(matches!(drafts_key(&mut s, key(KeyCode::Char('q'))), Action::PopScreen));
+        assert!(matches!(drafts_key(&mut s, key(KeyCode::Left)), Action::PopScreen));
+        // With rows, q still only leaves; j/k still move.
+        assert!(matches!(drafts_key(&mut s, key(KeyCode::Char('j'))), Action::None));
+    }
+
     use super::*;
     use crate::glyph::UNICODE;
     use crate::images::{Policy, Tier};
