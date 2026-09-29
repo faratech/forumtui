@@ -24,20 +24,47 @@ final class LinkStore
 		return \XF::db();
 	}
 
+	/** Above this many live (unexpired) records the endpoint refuses: the
+	 * register action is world-callable and this is the only cap on table
+	 * growth within the TTL (issue #63). Generous against any real traffic —
+	 * one login needs one record — but far below table-flood levels.
+	 */
+	private const LIVE_CAP = 1000;
+
+	/**
+	 * @return string The new link id.
+	 * @throws \WindowsForum\TuiLink\Service\LinkStoreException On a full
+	 *         table (code "full") or a duplicate state (code "duplicate").
+	 */
 	public static function create(string $state, string $challenge): string
 	{
 		$db = self::db();
 		$db->delete(self::TABLE, 'expiry_date < ?', \XF::$time);
+		$live = $db->fetchOne('SELECT COUNT(*) FROM ' . self::TABLE . ' WHERE expiry_date >= ?', [\XF::$time]);
+		if ($live >= self::LIVE_CAP)
+		{
+			throw new LinkStoreException('full');
+		}
 		$id = \XF::generateRandomString(12);
-		$db->insert(self::TABLE, [
-			'link_id' => $id,
-			'state' => $state,
-			'state_hash' => hash('sha256', $state),
-			'challenge' => $challenge,
-			'code' => null,
-			'denied' => 0,
-			'expiry_date' => \XF::$time + Config::TTL,
-		]);
+		try
+		{
+			$db->insert(self::TABLE, [
+				'link_id' => $id,
+				'state' => $state,
+				'state_hash' => hash('sha256', $state),
+				'challenge' => $challenge,
+				'code' => null,
+				'denied' => 0,
+				'expiry_date' => \XF::$time + Config::TTL,
+			]);
+		}
+		catch (\XF\Db\DuplicateKeyException $e)
+		{
+			// A UNIQUE state_hash re-registered inside its TTL is a client
+			// bug or a retry, not a server fault: answer cleanly instead of
+			// surfacing an XF error page (issue #63).
+			throw new LinkStoreException('duplicate');
+		}
 		return $id;
 	}
 

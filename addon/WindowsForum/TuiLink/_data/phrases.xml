@@ -7,6 +7,8 @@
   <phrase title="wf_tuilink.invalid_state" version_id="1010170" version_string="1.1.1"><![CDATA[Invalid login state value.]]></phrase>
   <phrase title="wf_tuilink.invalid_challenge" version_id="1010170" version_string="1.1.1"><![CDATA[Invalid PKCE challenge value.]]></phrase>
   <phrase title="wf_tuilink.invalid_id" version_id="1010170" version_string="1.1.1"><![CDATA[Invalid login id.]]></phrase>
+  <phrase title="wf_tuilink.duplicate_state" version_id="1010270" version_string="1.1.2"><![CDATA[This login is already pending. Start a new one.]]></phrase>
+  <phrase title="wf_tuilink.busy" version_id="1010270" version_string="1.1.2"><![CDATA[Too many pending logins right now. Try again shortly.]]></phrase>
   <phrase title="wf_tuilink.invalid_draft_key" version_id="1010170" version_string="1.1.1"><![CDATA[Invalid draft key.]]></phrase>
   <phrase title="wf_tuilink.draft_takes_no_attachments" version_id="1010170" version_string="1.1.1"><![CDATA[This kind of draft does not carry attachments.]]></phrase>
   <phrase title="option.wfTuiLinkClientId" version_id="1010170" version_string="1.1.1"><![CDATA[OAuth client ID]]></phrase>

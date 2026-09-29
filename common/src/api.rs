@@ -1139,11 +1139,16 @@ impl WfApi for WfApiClient {
 
     async fn delete_draft(&self, xf_key: &str) -> Result<()> {
         let token = self.dispatch_token(&[&self.api_gate]).await?;
-        let url = format!("{}/wf-tui-drafts", self.api_base());
+        // The key rides in the QUERY STRING, not a form body (#62): PHP
+        // never populates $_POST for a DELETE, so XF's `filter('key')` read
+        // an empty string and the addon answered 400 — the already-posted
+        // draft silently survived on the site and the web editor offered it
+        // back. `filter()` reads GET params on every method, which is how
+        // stock XF's own DELETE routes take theirs.
         let resp = self
             .http
-            .delete(url)
-            .form(&[("key", xf_key)])
+            .delete(format!("{}/wf-tui-drafts", self.api_base()))
+            .query(&[("key", xf_key)])
             .bearer_auth(&token)
             .send()
             .await?;
@@ -1828,6 +1833,28 @@ mod tests {
             crate::drafts::DraftKey::from_xf_key(&drafts[0].key),
             Some(crate::drafts::DraftKey::ThreadReply(51465))
         );
+    }
+
+    /// #62: the delete carries `key` in the QUERY STRING — PHP never
+    /// populates $_POST for a DELETE, so the form body the old code sent
+    /// read as an empty key and the relay answered 400, leaving the
+    /// already-posted draft on the site.
+    #[tokio::test]
+    async fn delete_draft_carries_the_key_in_the_query_string() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-draftdel");
+        Mock::given(method("DELETE"))
+            .and(path("/api/wf-tui-drafts"))
+            .and(wiremock::matchers::query_param("key", "thread-51465"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "success": true })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        c.delete_draft("thread-51465").await.expect("the delete");
     }
 
     /// The write half goes out as a form under XF's own key, and — the part

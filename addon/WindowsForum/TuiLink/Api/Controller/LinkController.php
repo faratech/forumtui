@@ -49,7 +49,18 @@ class LinkController extends \XF\Api\Controller\AbstractController
 			return $this->apiError(\XF::phrase('wf_tuilink.invalid_challenge'), 'wf_tuilink_invalid_challenge', null, 400);
 		}
 
-		$id = LinkStore::create($state, $challenge);
+		try
+		{
+			$id = LinkStore::create($state, $challenge);
+		}
+		catch (\WindowsForum\TuiLink\Service\LinkStoreException $e)
+		{
+			if ($e->codeName() === 'duplicate')
+			{
+				return $this->apiError(\XF::phrase('wf_tuilink.duplicate_state'), 'wf_tuilink_duplicate_state', null, 409);
+			}
+			return $this->apiError(\XF::phrase('wf_tuilink.busy'), 'wf_tuilink_busy', null, 503);
+		}
 		return $this->apiResult([
 			'success' => true,
 			'id' => $id,
