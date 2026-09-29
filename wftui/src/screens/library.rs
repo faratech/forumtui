@@ -1030,6 +1030,12 @@ pub fn image_view_key(s: &mut super::ImageViewState, key: KeyEvent) -> Action {
             Some(url) => Action::OpenUrl(url),
             None => Action::Notice("No web address for this image.".into()),
         },
+        // The failure pane's promise, now kept (#60): R forgets the
+        // store's remembered failure so the next frame re-requests.
+        KeyCode::Char('R') => match s.key.clone() {
+            Some(key) => Action::RetryImage(key),
+            None => Action::None,
+        },
         _ => Action::None,
     }
 }
@@ -1110,6 +1116,11 @@ pub fn image_view_hints(s: &super::ImageViewState) -> Hints {
     let mut keys: Vec<(&str, &str)> = Vec::new();
     if s.web_url.is_some() {
         keys.push(("o", "open web"));
+    }
+    // Only while the failure pane is up: a key that cannot work must not
+    // be advertised (#60).
+    if s.error.is_some() {
+        keys.push(("R", "retry"));
     }
     keys.push(("Esc", "back"));
     Hints::new(&keys, 0)

@@ -1067,6 +1067,9 @@ pub enum Action {
     DiscardDraft,
     /// Open the drafts list (#716).
     OpenDrafts,
+    /// Forget an image load's remembered failure so the next frame
+    /// re-requests it — `R` in the viewer's failure pane (#60).
+    RetryImage(String),
     /// Reopen the composer a listed draft belongs to.
     ResumeDraft(common::drafts::DraftKey),
     /// Throw away a listed draft without opening it.

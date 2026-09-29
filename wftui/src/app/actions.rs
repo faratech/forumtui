@@ -189,6 +189,10 @@ impl App {
                 });
             }
             Action::OpenDrafts => self.open_drafts(),
+            Action::RetryImage(key) => {
+                self.images.retry_source(&key);
+                self.set_status("Retrying…");
+            }
             Action::ResumeDraft(key) => self.resume_draft(key),
             Action::DropDraft(key) => {
                 self.discard_draft(key);

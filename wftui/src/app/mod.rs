@@ -1304,6 +1304,17 @@ impl App {
         }
         screen.set_site(&self.site);
         screen.set_image_policy(policy, self.images.sizes());
+        if let Screen::ImageView(v) = screen {
+            // The viewer's loading/error panes read the image store's live
+            // state: a load completes (or fails) through Msg::ImageLoaded →
+            // on_loaded, which never touches this screen — before this,
+            // both panes were unreachable and a failed load rendered as a
+            // silent blank pane (#60).
+            if let Some(key) = &v.key {
+                v.loading = self.images.source_inflight(key);
+                v.error = self.images.source_failure(key);
+            }
+        }
         if let Screen::Login(l) = screen {
             l.has_logo = self.images.has_logo();
         }
@@ -10099,6 +10110,33 @@ mod tests {
                 other.map(|s| s.title())
             ),
         }
+    }
+
+    /// #60: the viewer's panes read the image store's live state - a
+    /// failed load shows the error pane and R actually retries - instead
+    /// of both panes being unreachable and the failure rendering as a
+    /// silent blank pane.
+    #[tokio::test]
+    async fn the_image_viewer_shows_store_failures_and_r_retries() {
+        let mut app = test_app();
+        let src = "https://wf/media/9.png";
+        app.screens.push(Screen::ImageView(screens::ImageViewState {
+            title: "shot".into(),
+            key: Some(src.to_string()),
+            ..Default::default()
+        }));
+        // One size variant of the source failed.
+        app.images
+            .on_loaded(crate::images::store_key(src, 12, 12), Err("http 404".into()));
+        let text = frame_text(&mut app, 80, 24);
+        assert!(text.contains("Error:"), "{text}");
+        assert!(text.contains("R to retry"), "{text}");
+
+        // R forgets the failure: the pane leaves the error state and the
+        // next frame's demand re-requests the source.
+        app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE));
+        let text = frame_text(&mut app, 80, 24);
+        assert!(!text.contains("Error:"), "{text}");
     }
 
     /// Press and release in the same cell: a click.
