@@ -2439,8 +2439,26 @@ fn search_hit_lines(
 
 /// Focus the query (0) or author (1) field and put the caret under the
 /// pointer. Clicking a field is also the way *into* edit mode — the same
-/// thing `i`/`a` do from the browse mode (`Hit::Field`).
-pub(crate) fn search_click_field(s: &mut super::SearchState, field: usize, col: u16) {
+/// thing `i`/`a` do from the browse mode (`Hit::Field`) — so the #548
+/// member-mode guards those keys carry apply to the pointer too (#32).
+pub(crate) fn search_click_field(
+    s: &mut super::SearchState,
+    field: usize,
+    col: u16,
+) -> super::Action {
+    if s.member.is_some() {
+        if field == 1 {
+            // The author field is a keyword filter, and this list is already
+            // one member's — `a` refuses out loud; so does the click.
+            return super::Action::Notice(
+                "This list is already one member's — press i to search instead.".into(),
+            );
+        }
+        // `query` is a display label in member mode, not a search term —
+        // start from an empty field so Enter cannot submit it as one.
+        s.query.clear();
+        s.query_cursor = 0;
+    }
     s.input_mode = true;
     s.active_field = if field == 1 { 1 } else { 0 };
     if field == 1 {
@@ -2456,6 +2474,7 @@ pub(crate) fn search_click_field(s: &mut super::SearchState, field: usize, col: 
         let x = col.saturating_sub(s.query_rect.x).saturating_sub(prompt as u16) as usize;
         s.query_cursor = crate::editor::field_caret_at(&s.query, s.query_cursor, room, x);
     }
+    super::Action::None
 }
 
 pub fn render_search(
@@ -3592,6 +3611,63 @@ mod tests {
             "and the ordinary search keys work again"
         );
     }
+
+    /// #32: the pointer path carries the same #548 member-mode guards the
+    /// keys do — clicking the query field starts from an empty field (the
+    /// label is a display, not a search term), and clicking the author
+    /// field refuses out loud like `a`.
+    #[test]
+    fn member_mode_clicks_honour_the_member_guards() {
+        let mut s = crate::screens::SearchState {
+            query: "by: kemical (thread)".into(),
+            member: Some((42, "thread".into())),
+            content_type: 1,
+            input_mode: false,
+            ..Default::default()
+        };
+        s.query_rect = ratatui::layout::Rect::new(0, 0, 40, 1);
+
+        // Clicking the query field must not leave the label in the field
+        // Enter would submit.
+        let act = search_click_field(&mut s, 0, 10);
+        assert!(matches!(act, Action::None));
+        assert!(s.input_mode);
+        assert!(s.query.is_empty(), "the label must not survive the click");
+        assert_eq!(s.query_cursor, 0);
+
+        // Enter in that state refuses out loud instead of searching for a
+        // label, and member mode survives (#548).
+        let act = search_key(&mut s, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(&act, Action::Notice(n) if n.contains("Type something")), "Enter must refuse an empty field, not search");
+        assert!(s.member.is_some(), "member mode survives");
+
+        // The author field refuses exactly like `a`, and the refused click
+        // does not enter edit mode.
+        s.input_mode = false;
+        let act = search_click_field(&mut s, 1, 10);
+        assert!(
+            matches!(&act, Action::Notice(n) if n.contains("already one member's")),
+            "the author-field click must refuse like a"
+        );
+        assert!(!s.input_mode);
+    }
+
+    /// The browse-mode click path still enters edit mode and places the
+    /// caret — the guards above must not swallow the normal case.
+    #[test]
+    fn browse_mode_click_still_focuses_the_field() {
+        let mut s = crate::screens::SearchState {
+            query: "windows".into(),
+            input_mode: false,
+            ..Default::default()
+        };
+        s.query_rect = ratatui::layout::Rect::new(0, 0, 40, 1);
+        let act = search_click_field(&mut s, 0, 12);
+        assert!(matches!(act, Action::None));
+        assert!(s.input_mode);
+        assert_eq!(s.query, "windows", "a real query is kept, not cleared");
+    }
+
 
     /// A fetch sets `loading` until its reply lands, and the page/toggle
     /// keys must not fire a second request into that window — behind the

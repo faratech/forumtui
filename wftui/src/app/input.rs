@@ -530,8 +530,15 @@ impl App {
                 }
             }
             Hit::Field(field) => {
-                if let Some(screen) = self.screens.last_mut() {
-                    screen.click_field(field, pos.0, pos.1);
+                // A click can be refused, like the key it mirrors; the
+                // returned action is executed the same way a key's would be
+                // (#32), so the notice lands in the status line.
+                let action = self
+                    .screens
+                    .last_mut()
+                    .map(|screen| screen.click_field(field, pos.0, pos.1));
+                if let Some(action) = action {
+                    self.execute_action(action);
                 }
             }
             Hit::Row(i) => {

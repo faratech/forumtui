@@ -1601,13 +1601,24 @@ impl Screen {
     /// Give this screen's field `i` the keyboard and put the caret where the
     /// pointer is (`Hit::Field`). Screen-local field numbering, and the caret
     /// arithmetic lives beside the renderer that stamped the field's rect.
-    pub fn click_field(&mut self, field: usize, col: u16, row: u16) {
+    /// The returned action — a click can be refused, like the key it mirrors
+    /// (#32) — is executed by the caller, exactly as a key's would be.
+    pub fn click_field(&mut self, field: usize, col: u16, row: u16) -> Action {
         match self {
-            Screen::Compose(s) => misc::compose_click_field(s, field, col, row),
-            Screen::NewConversation(s) => social::new_conversation_click_field(s, field, col, row),
+            Screen::Compose(s) => {
+                misc::compose_click_field(s, field, col, row);
+                Action::None
+            }
+            Screen::NewConversation(s) => {
+                social::new_conversation_click_field(s, field, col, row);
+                Action::None
+            }
             Screen::Search(s) => misc::search_click_field(s, field, col),
-            Screen::AskAi(s) => ask::click_field(s, col),
-            _ => {}
+            Screen::AskAi(s) => {
+                ask::click_field(s, col);
+                Action::None
+            }
+            _ => Action::None,
         }
     }
 
