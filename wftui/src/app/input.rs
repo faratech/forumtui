@@ -45,11 +45,11 @@ impl App {
                 PaletteEvent::None => {}
                 PaletteEvent::Close => {
                     self.palette = None;
-                    self.status.clear();
+                    self.clear_status();
                 }
                 PaletteEvent::Run(target) => {
                     self.palette = None;
-                    self.status.clear();
+                    self.clear_status();
                     self.run_palette_target(target);
                 }
             }
@@ -165,7 +165,7 @@ impl App {
                 return;
             }
             if self.pop_screen() {
-                self.status.clear();
+                self.clear_status();
             } else {
                 self.should_quit = true;
             }
@@ -476,7 +476,7 @@ impl App {
                 });
                 if let Some(target) = target {
                     self.palette = None;
-                    self.status.clear();
+                    self.clear_status();
                     self.run_palette_target(target);
                 }
             }
@@ -617,7 +617,7 @@ impl App {
     pub(super) fn close_overlay(&mut self) {
         if self.palette.is_some() {
             self.palette = None;
-            self.status.clear();
+            self.clear_status();
             return;
         }
         if self.show_help {

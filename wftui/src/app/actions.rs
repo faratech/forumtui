@@ -394,7 +394,15 @@ impl App {
             Action::LoginCycleMode => {
                 let (next, restart) = match self.screens.last_mut() {
                     Some(Screen::Login(ls)) => {
-                        let next = ls.login_mode().next();
+                        // Cycle from the mode the screen is actually in: an
+                        // Auto flow that fell back to loopback (or paste)
+                        // displays that mode with no override set, so
+                        // anchoring on `login_mode()` — the site default —
+                        // made `m` from a loopback screen select the relay
+                        // a stock site does not have, a failing flow before
+                        // the one the reader asked for.
+                        let current = ls.stage.mode().unwrap_or_else(|| ls.login_mode());
+                        let next = current.next();
                         ls.mode_override = Some(next);
                         (next, !matches!(ls.stage, screens::LoginStage::Idle))
                     }
