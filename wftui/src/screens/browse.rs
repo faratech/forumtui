@@ -2454,45 +2454,39 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
         // then the attachments it never referenced), so the digit under a
         // caption is the picture above it.
         KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-            let n = c.to_digit(10).unwrap_or(0) as usize;
-            let Some(post) = s.posts.get(s.sel_post) else {
-                return Action::None;
-            };
-            let chunks = common::bbcode::render(&post.message);
-            let imgs = post_images(post, &chunks);
-            match imgs.all.get(n - 1) {
-                Some(img) => match image_open_for_post(post, img) {
-                    Some(open) => Action::OpenImage(open),
-                    // Nothing to paint: the browser is all it ever had.
-                    None => match img.open_url.clone() {
-                        Some(url) => Action::OpenUrl(url),
-                        None => Action::None,
-                    },
-                },
-                None => Action::None,
-            }
+            open_post_image(s, c.to_digit(10).unwrap_or(0) as usize)
         }
         // Enter on a post with pictures opens the first one - the standing
         // "Enter-to-expand an image is not implemented" gap (#693). With no
         // picture it stays what it was: nothing.
-        KeyCode::Enter => {
-            let Some(post) = s.posts.get(s.sel_post) else {
-                return Action::None;
-            };
-            let chunks = common::bbcode::render(&post.message);
-            let imgs = post_images(post, &chunks);
-            match imgs.all.first() {
-                Some(img) => match image_open_for_post(post, img) {
-                    Some(open) => Action::OpenImage(open),
-                    None => match img.open_url.clone() {
-                        Some(url) => Action::OpenUrl(url),
-                        None => Action::None,
-                    },
-                },
-                None => Action::None,
-            }
-        }
+        KeyCode::Enter => open_post_image(s, 1),
         _ => Action::None,
+    }
+}
+
+/// What the nth picture of the selected post opens in (#693's numbering).
+/// Digits reach ordinals 1-9; the click map names any of a post's pictures
+/// through `Screen::open_image`, so a 10th+ caption is not a dead target
+/// (#51).
+pub(crate) fn open_post_image(s: &ThreadViewState, n: usize) -> Action {
+    if n == 0 {
+        return Action::None;
+    }
+    let Some(post) = s.posts.get(s.sel_post) else {
+        return Action::None;
+    };
+    let chunks = common::bbcode::render(&post.message);
+    let imgs = post_images(post, &chunks);
+    match imgs.all.get(n - 1) {
+        Some(img) => match image_open_for_post(post, img) {
+            Some(open) => Action::OpenImage(open),
+            // Nothing to paint: the browser is all it ever had.
+            None => match img.open_url.clone() {
+                Some(url) => Action::OpenUrl(url),
+                None => Action::None,
+            },
+        },
+        None => Action::None,
     }
 }
 

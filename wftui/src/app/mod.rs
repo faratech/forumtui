@@ -10055,6 +10055,52 @@ mod tests {
         }
     }
 
+    /// #51: a post's 10th+ picture had a live, advertised-looking caption
+    /// hit that answered with silence - the click path synthesised a digit
+    /// key, and there is no 10th digit. Every ordinal now opens through the
+    /// same path the digits use.
+    #[tokio::test]
+    async fn clicking_a_post_s_tenth_picture_caption_opens_it() {
+        let mut app = test_app();
+        let mut p = Post {
+            post_id: 1,
+            username: "kemical".into(),
+            message: "twelve shots".into(),
+            ..Default::default()
+        };
+        for i in 1..=12u32 {
+            p.attachments.push(Attachment {
+                attachment_id: i,
+                filename: format!("shot{i}.png"),
+                content_type: "image/png".into(),
+                direct_url: Some(format!("https://wf/full/{i}.png")),
+                ..Default::default()
+            });
+        }
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: thread(9),
+            posts: vec![p],
+            page: 1,
+            last_page: 1,
+            ..Default::default()
+        }));
+        frame(&mut app, 120, 60);
+
+        // The 11th caption is a registered hit, and clicking it opens the
+        // viewer instead of doing nothing.
+        let target = (0..60u16)
+            .find(|y| matches!(app.hits.at(3, *y), Some(Hit::Image(11))))
+            .expect("the 11th caption is registered");
+        click_later(&mut app, 3, target);
+        match app.screens.last() {
+            Some(Screen::ImageView(_)) => {}
+            other => panic!(
+                "the 11th picture must open the viewer, got {:?}",
+                other.map(|s| s.title())
+            ),
+        }
+    }
+
     /// Press and release in the same cell: a click.
     fn click(app: &mut App, x: u16, y: u16) {
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));

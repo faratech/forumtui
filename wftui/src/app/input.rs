@@ -512,21 +512,18 @@ impl App {
                 }
             }
             Hit::Image(n) => {
-                // Select the post the picture belongs to, then press its
-                // digit: `1`-`9` is the one path that opens an attachment,
-                // and it reads the SELECTED post (issue #542's rule).
+                // Select the post the picture belongs to, then open the
+                // picture: the same thing the digit key does, for any
+                // ordinal — a click can name a post's 10th+ caption, which
+                // no digit reaches, and it used to be a dead target (#51).
                 if let Some(post) = self.hits.post_at(pos.0, pos.1)
                     && let Some(screen) = self.screens.last_mut()
                 {
                     screen.select_post(post);
                 }
-                if (1..=9).contains(&n)
-                    && let Some(digit) = char::from_digit(n as u32, 10)
-                {
-                    self.handle_key(KeyEvent::new(
-                        KeyCode::Char(digit),
-                        KeyModifiers::NONE,
-                    ));
+                let action = self.screens.last_mut().map(|screen| screen.open_image(n));
+                if let Some(action) = action {
+                    self.execute_action(action);
                 }
             }
             Hit::Field(field) => {

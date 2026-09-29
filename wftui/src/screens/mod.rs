@@ -1598,6 +1598,16 @@ impl Screen {
         }
     }
 
+    /// Open the selected post's nth picture — the same thing a digit key
+    /// does, for any ordinal: the click map names a post's 10th+ picture,
+    /// which no digit reaches (#51).
+    pub fn open_image(&mut self, ordinal: usize) -> Action {
+        match self {
+            Screen::ThreadView(s) => browse::open_post_image(s, ordinal),
+            _ => Action::None,
+        }
+    }
+
     /// Give this screen's field `i` the keyboard and put the caret where the
     /// pointer is (`Hit::Field`). Screen-local field numbering, and the caret
     /// arithmetic lives beside the renderer that stamped the field's rect.
