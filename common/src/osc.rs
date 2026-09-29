@@ -117,13 +117,26 @@ pub fn deliver_in_mux(seq: &str, mux: Multiplexer) -> String {
             } else {
                 // Chunk on char boundaries (never split a multi-byte char in
                 // two) instead of raw bytes + `from_utf8_lossy`, which turned
-                // a straddling char into replacement characters.
+                // a straddling char into replacement characters. Also never
+                // cut between the two ESCs of a doubled pair: the chunk
+                // separator is itself `\x1b\\` + `\x1bP`, so a chunk ending
+                // on a lone ESC reads to GNU screen as a literal ESC, a
+                // stray backslash and a nested DCS start (#39). Extend over
+                // the pair rather than shrinking, so a pathological run of
+                // bare doubled ESCs cannot walk the boundary into an empty
+                // chunk.
                 let mut chunks: Vec<&str> = Vec::new();
                 let mut start = 0;
                 while start < escaped.len() {
                     let mut end = (start + CHUNK_SIZE).min(escaped.len());
                     while !escaped.is_char_boundary(end) {
                         end -= 1;
+                    }
+                    if end < escaped.len()
+                        && escaped.as_bytes()[end - 1] == b'\x1b'
+                        && escaped.as_bytes()[end] == b'\x1b'
+                    {
+                        end += 1;
                     }
                     chunks.push(&escaped[start..end]);
                     start = end;
@@ -272,6 +285,37 @@ pub fn read_from_system_clipboard() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #39: GNU screen chunking must never cut between the two ESCs of a
+    /// doubled pair — the separator is itself ESC-backed, so a chunk ending
+    /// on a lone ESC reads as a literal ESC, a stray backslash and a nested
+    /// DCS start. URL lengths 67-69 put a doubled pair exactly across the
+    /// 76-byte boundary; the sweep makes sure every multiple of it holds.
+    #[test]
+    fn screen_chunking_never_splits_a_doubled_esc_pair() {
+        for n in 1..=170usize {
+            let seq = format!("\x1b]8;;{}\x1b\\TEXT\x1b]8;;\x1b\\", "u".repeat(n));
+            let out = deliver_in_mux(&seq, Multiplexer::Screen);
+            let body = out
+                .strip_prefix("\x1bP")
+                .and_then(|r| r.strip_suffix("\x1b\\"))
+                .unwrap_or(&out);
+            if !body.contains("\x1b\\\x1bP") {
+                continue; // single chunk, nothing to split
+            }
+            for chunk in body.split("\x1b\\\x1bP") {
+                let trail = chunk.bytes().rev().take_while(|&b| b == 0x1b).count();
+                assert!(
+                    trail % 2 == 0,
+                    "url len {n}: a chunk ends inside a doubled ESC: {chunk:?}"
+                );
+            }
+            // And the chunking is transparent: dropping the separators and
+            // unescaping the pairs rebuilds the original sequence.
+            let rejoined = body.replace("\x1b\\\x1bP", "");
+            assert_eq!(rejoined.replace("\x1b\x1b", "\x1b"), seq, "url len {n}");
+        }
+    }
 
     /// Control characters in user-sourced titles/URLs must be stripped at
     /// the OSC boundary (#649): a BEL/ESC in a thread title could otherwise
