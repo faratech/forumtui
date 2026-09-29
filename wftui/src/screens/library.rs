@@ -1307,7 +1307,6 @@ mod tests {
         assert!(matches!(drafts_key(&mut s, key(KeyCode::Char('j'))), Action::None));
     }
 
-    use super::*;
     use crate::glyph::UNICODE;
     use crate::images::{Policy, Tier};
     use crate::screens::{

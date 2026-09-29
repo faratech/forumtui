@@ -339,8 +339,10 @@ impl LineScan {
 
 /// Whether a `*` in `rest` could close an italic run: one that follows a
 /// non-space and is not part of `**`. The readable reference for what
-/// [`LineScan`]'s table answers — kept and tested against it, like the
+/// [`LineScan`]'s table answers — production reads the table, and this
+/// stays (test-only) as what the agreement test compares against, like the
 /// editor's reference row model.
+#[cfg(test)]
 fn closes_later(rest: &str) -> bool {
     let mut prev: Option<char> = None;
     let mut it = rest.char_indices().peekable();
@@ -545,11 +547,11 @@ mod tests {
     fn the_line_scan_agrees_with_the_reference_closer_scan() {
         let alphabet = "*_~ab \n";
         let mut seed = 0xc0ffee_u64;
-        let mut lcg = |s: &mut u64| {
+        let lcg = |s: &mut u64| {
             *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             (*s >> 33) as usize
         };
-        for case in 0..300 {
+        for _ in 0..300 {
             let len = 1 + lcg(&mut seed) % 40;
             let chars: Vec<char> = alphabet.chars().collect();
             let line: String = (0..len)

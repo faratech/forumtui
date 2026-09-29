@@ -1272,6 +1272,10 @@ fn draw_editor_panel(
         let cur_x = (chunks[0].x + label_w + cur_col)
             .min(chunks[0].x + chunks[0].width.saturating_sub(1));
         f.set_cursor_position((cur_x, chunks[0].y));
+    } else if s.file_prompt.is_some() {
+        // The prompt set the cursor on its own row above; the body's caret
+        // must not take it back — the typist is editing the path, not the
+        // draft (#34; the prompt's caret never showed before this).
     } else {
         let cur_x =
             (body_area.x + caret_col as u16).min(body_area.x + body_area.width.saturating_sub(1));
@@ -4378,6 +4382,10 @@ mod tests {
         assert!(s.file_prompt.is_none());
         assert_eq!(s.body, "draft");
 
+        // One upload at a time.
+        s.uploading = true;
+        assert!(matches!(compose_key(&mut s, ctrl('f')), Action::Notice(_)));
+    }
     /// #34: the file-prompt path is windowed like every other single-line
     /// field — a path wider than the pane shows the caret's neighbourhood
     /// (the tail), and the caret sits inside the pane.
@@ -4390,9 +4398,11 @@ mod tests {
         let w = 60;
         let (rows, pos) = render_compose_probe(&mut s, w, 24);
         let row = rows[pos.1 as usize].as_str();
+        // The caret row IS the prompt row: label plus the windowed tail
+        // (the body's caret must not take the cursor back).
+        assert!(row.contains("Attach file:"), "the caret sits on the prompt row: {row}");
         assert!(row.contains("overflows.png"), "the tail follows the caret: {row}");
-        assert!(!row.contains("Attach"), "the caret row carries the path, not the label: {row}");
-        assert!(row.contains("Temp") || row.contains("upload"), "{row}");
+        assert!(!row.contains("C:"), "the head is scrolled away: {row}");
         assert!(pos.0 < w.saturating_sub(1), "the caret stays inside the pane");
 
         // Mid-string edit: the window moves with the caret.
@@ -4402,10 +4412,6 @@ mod tests {
         assert!(row.contains("someone"), "an early caret shows the head: {row}");
     }
 
-        // One upload at a time.
-        s.uploading = true;
-        assert!(matches!(compose_key(&mut s, ctrl('f')), Action::Notice(_)));
-    }
 
     /// A conversation takes attachments under a content type this client
     /// does not upload to, so the key is neither advertised nor accepted

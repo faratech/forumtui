@@ -8752,7 +8752,7 @@ mod tests {
         assert_eq!(app.screens.len(), 2, "the blocked boundary stops the unwind");
         assert!(app.screens.iter().any(|s| matches!(s, Screen::Compose(_))));
         assert!(
-            app.drafts.get(&common::drafts::DraftKey::ThreadReply(9)).is_none(),
+            !app.drafts.contains_key(&common::drafts::DraftKey::ThreadReply(9)),
             "nothing was stashed behind the write"
         );
         assert!(!app.status.is_empty(), "the boundary says why");

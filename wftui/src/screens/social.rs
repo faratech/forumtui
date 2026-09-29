@@ -1582,7 +1582,6 @@ mod tests {
         );
     }
 
-    use super::*;
     use common::models::{Alert, Conversation, ConversationMessage, ConversationRecipient};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
