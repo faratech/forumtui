@@ -103,7 +103,45 @@ fn startup_events(mut bytes: Vec<u8>) -> Vec<Input> {
         if std::io::stdin().read_exact(&mut byte).is_err() { break; }
         bytes.push(byte[0]);
     }
+    // Complete an escape sequence or bracketed paste cut by the same
+    // deadline (#41): a CSI truncated before its final byte otherwise
+    // decoded as Esc plus the remaining bytes as literal character keys —
+    // junk keystrokes injected into whatever screen came up first. Bounded,
+    // so a terminal that never finishes the sequence degrades to the old
+    // behaviour instead of stalling startup.
+    let mut completed = 0usize;
+    while completed < 64 * 1024 && split_sequence_tail(&bytes) {
+        use std::io::Read;
+        let mut byte = [0];
+        if std::io::stdin().read_exact(&mut byte).is_err() { break; }
+        bytes.push(byte[0]);
+        completed += 1;
+    }
     decode_startup_events(&bytes)
+}
+
+/// True while `bytes` ends inside an escape sequence the decoder would
+/// otherwise mangle: an unterminated CSI/SS3/OSC tail, or a bracketed paste
+/// whose end marker has not arrived yet. A lone trailing ESC is not one —
+/// that is a real Esc press, which the decoder handles.
+#[cfg(all(feature = "images", unix))]
+fn split_sequence_tail(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    if let Some(start) = text.find("\x1b[200~")
+        && !text[start..].contains("\x1b[201~")
+    {
+        return true;
+    }
+    let Some(pos) = text.rfind('\x1b') else { return false };
+    let tail = &text[pos..];
+    if !tail.starts_with("\x1b[")
+        && !tail.starts_with("\x1bO")
+        && !tail.starts_with("\x1b]")
+        && !tail.starts_with("\x1bP")
+    {
+        return false;
+    }
+    crate::images::unix::sequence_len(tail.as_bytes()).is_none()
 }
 
 #[cfg(all(feature = "images", unix))]
@@ -250,6 +288,30 @@ mod tests {
         assert!(matches!(keys[6], Input::Key(k) if k.code == KeyCode::Char('x') && k.modifiers == KeyModifiers::ALT));
         assert!(matches!(keys[7], Input::Key(k) if is_ctrl_c(k)));
         assert!(matches!(&keys[8], Input::Paste(text) if text == "hello"));
+    }
+
+    /// #41: the probe's leftover bytes are an arbitrary cut, so a buffer can
+    /// end mid-sequence. `startup_events` completes those the way it
+    /// completes a split UTF-8 tail; this pins the detector that decides
+    /// when more bytes are needed — and that a lone trailing ESC (a real
+    /// Esc press) is not one.
+    #[cfg(all(feature = "images", unix))]
+    #[test]
+    fn a_sequence_cut_by_the_probe_deadline_is_recognized_as_incomplete() {
+        assert!(split_sequence_tail(b"\x1b[1;5"), "truncated CSI");
+        assert!(split_sequence_tail(b"\x1b["), "bare CSI introducer");
+        assert!(split_sequence_tail(b"\x1bO"), "bare SS3 introducer");
+        assert!(split_sequence_tail(b"\x1b]52;c;abc"), "unterminated OSC");
+        assert!(split_sequence_tail(b"hello\x1b[200~pa"), "unterminated paste");
+        assert!(!split_sequence_tail(b"\x1b[1;5B"), "complete CSI");
+        assert!(!split_sequence_tail(b"\x1b]52;c;abc\x1b\\"), "complete OSC");
+        assert!(!split_sequence_tail(b"hi\x1b[200~pa\x1b[201~"), "complete paste");
+        assert!(!split_sequence_tail(b"\x1b"), "a lone ESC is an Esc press");
+        assert!(!split_sequence_tail(b"\x1bx"), "ALT+x is complete");
+        assert!(!split_sequence_tail(b"plain"), "no escape at all");
+        // And a completed buffer decodes as the key it names, not junk.
+        let keys = decode_startup_events(b"\x1b[1;5B");
+        assert!(matches!(keys[0], Input::Key(k) if k.code == KeyCode::Down && k.modifiers == KeyModifiers::CONTROL));
     }
 
 }
