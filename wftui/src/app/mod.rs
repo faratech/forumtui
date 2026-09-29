@@ -1779,14 +1779,24 @@ impl App {
         // unwind, the submit-time mirror) leave the site holding the old
         // copy, and retiring the guard there is what let a quit resurrect
         // the posted draft over the newer text (#87).
-        if relay
-            && self.pending_remote_deletes.lock().expect("lock").remove(&key)
-            && let Some(owner) = self.draft_owner.clone()
-        {
-            let _ = self.draft_store.clear_owed_delete(&owner, &key);
-        }
+        // #854: only the IN-MEMORY half of the guard comes off here — the
+        // sync's retry must not eat the fresh mirror this stash is about to
+        // queue. The persisted half retires when the mirror provably
+        // settles (push_draft_settling_owed), not before it runs: retiring
+        // up front left the supersede holding neither guard nor mirror when
+        // the upload failed on the same outage that had already failed the
+        // delete, and the next bootstrap's merge preferred the site's
+        // posted v1 over the newer local v2.
+        let owed_superseded = relay
+            && self.pending_remote_deletes.lock().expect("lock").remove(&key);
         let too_big = draft.too_big_to_persist();
-        if relay { self.push_draft(key, &draft); }
+        if relay {
+            if owed_superseded {
+                self.push_draft_settling_owed(key, &draft);
+            } else {
+                self.push_draft(key, &draft);
+            }
+        }
         self.drafts.insert(key, draft);
         let saved = self.persist_draft(key);
         if !feedback {
@@ -2077,6 +2087,71 @@ impl App {
     /// when a post succeeds, but the REST API never touches drafts at all, so
     /// without this every post made from the TUI would leave a stale draft
     /// waiting in the browser's editor.
+    /// push_draft for a stash that supersedes an owed remote delete (#854):
+    /// the same wire behavior as push_draft, but the persisted owed-delete
+    /// record retires only when the mirror PROVABLY settles — Ok, or a
+    /// route-missing error (the precedent drop_remote_draft uses: with the
+    /// relay absent no sync can fetch the stale copy back). Any other
+    /// failure re-arms the guard, so the bootstrap merge keeps skipping the
+    /// stale site copy and the sync's retry loop deletes it with the same
+    /// settlement discipline. The supersede used to retire the record
+    /// before the mirror ran; two transient failures on one outage then let
+    /// the site's posted v1 win the merge over the newer local v2 — the
+    /// resurrection #86/#87 closed, back through the relay arm.
+    fn push_draft_settling_owed(
+        &mut self,
+        key: common::drafts::DraftKey,
+        draft: &common::drafts::Draft,
+    ) {
+        let Some(xf_key) = key.xf_key() else {
+            return;
+        };
+        if !self.draft_relay_enabled() {
+            return;
+        }
+        let api = self.api.clone();
+        let tx = self.tx.clone();
+        let (message, title) = (draft.body.clone(), draft.title.clone());
+        let attachment_key = draft.attachment_key.clone();
+        let relay = self
+            .draft_relay_tail
+            .entry(xf_key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let store = self.draft_store.clone();
+        let owner = self.draft_owner.clone();
+        let pending = self.pending_remote_deletes.clone();
+        self.spawn_session_task(async move {
+            let _guard = relay.lock().await;
+            match api.save_draft(&xf_key, &message, &title, attachment_key.as_deref()).await
+            {
+                Ok(()) => {
+                    // The mirror landed: the site slot belongs to this draft
+                    // and the owed record can finally retire (the in-memory
+                    // half came off at supersede time).
+                    if let Some(owner) = &owner {
+                        let _ = store.clear_owed_delete(owner, &key);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("could not sync draft {xf_key} to the site: {e}");
+                    if relay_route_missing(&e) {
+                        tx.send(Msg::DraftRelayAbsent).ok();
+                        // Settled: the copy is gone or unreachable either way.
+                        if let Some(owner) = &owner {
+                            let _ = store.clear_owed_delete(owner, &key);
+                        }
+                    } else {
+                        // Re-arm: the merge must keep treating the site's
+                        // stale copy as scheduled-for-removal, and the sync's
+                        // retry loop owns the delete from here.
+                        pending.lock().expect("lock").insert(key);
+                    }
+                }
+            }
+        });
+    }
+
     fn drop_remote_draft(&mut self, key: common::drafts::DraftKey) {
         let Some(xf_key) = key.xf_key() else {
             return;
@@ -10493,11 +10568,17 @@ mod tests {
         app.pop_screen();
         assert!(
             !app.pending_remote_deletes.lock().expect("lock").contains(&key),
-            "the new draft supersedes the owed delete"
+            "the new draft supersedes the owed delete (in-memory, at stash time)"
         );
+        // #854: the PERSISTED record retires only when the mirror settles.
+        // The relay task was spawned on this runtime — yield until it runs,
+        // then the successful mirror clears the store.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
         assert!(
             app.draft_store.owed_deletes(&owner).is_empty(),
-            "the persisted record is cleared with the in-memory set"
+            "a settled mirror retires the persisted record"
         );
 
         // The non-relaying stash paths (the shutdown unwind, the
@@ -10528,6 +10609,47 @@ mod tests {
             app.draft_store.owed_deletes(&owner),
             vec![key],
             "and keeps the persisted record the restart's retry reads"
+        );
+    }
+
+    /// #854: the supersede's mirror FAILING must not leave the supersede
+    /// holding neither guard nor record — the exact resurrection through
+    /// the relay arm that 5b97b6f closed for the non-relaying arms. A failed
+    /// mirror re-arms the in-memory set (the sync's retry then deletes the
+    /// stale site copy) and keeps the persisted record, so a restart's
+    /// bootstrap merge keeps skipping the site's copy too.
+    #[tokio::test]
+    async fn a_failed_supersede_mirror_re_arms_the_owed_delete() {
+        let api = Arc::new(RecordingApi::default());
+        api.drafts_fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut app = test_app();
+        app.api = api.clone();
+        let owner = common::drafts::Owner::new(app.client.base_url(), 7);
+        let key = common::drafts::DraftKey::ThreadReply(7);
+
+        app.draft_store.activate(&owner).unwrap();
+        app.draft_store.record_owed_delete(&owner, &key).unwrap();
+        app.select_draft_owner(7);
+        assert!(app.pending_remote_deletes.lock().expect("lock").contains(&key));
+
+        app.screens.push(screens::home_state(false));
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "v2 written while the site is unreachable".into();
+        }
+        app.pop_screen();
+
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            app.pending_remote_deletes.lock().expect("lock").contains(&key),
+            "a failed mirror re-arms the merge guard"
+        );
+        assert_eq!(
+            app.draft_store.owed_deletes(&owner),
+            vec![key],
+            "and keeps the persisted record the restart's merge reads"
         );
     }
 

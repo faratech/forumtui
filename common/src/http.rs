@@ -57,7 +57,11 @@ pub fn build_with_ua(ua: &str) -> Result<reqwest::Client> {
 fn redirect_policy() -> reqwest::redirect::Policy {
     const MAX_HOPS: usize = 4;
     reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= MAX_HOPS {
+        // previous()[0] is the INITIAL url, not a redirect (reqwest's own
+        // Limit policy excludes it and errors only past max) — `>` keeps the
+        // four-hop semantics of the Policy::limited(4) this replaced; `>=`
+        // here followed one hop fewer (#854).
+        if attempt.previous().len() > MAX_HOPS {
             return attempt.error("too many redirects");
         }
         let url = attempt.url();
@@ -125,5 +129,36 @@ mod tests {
         let resp = client.get(hop.uri()).send().await.unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.text().await.unwrap(), "ok");
+    }
+
+    // #854 (follow-up): previous()[0] is the initial URL, not a redirect —
+    // the boundary is `> MAX_HOPS`, exactly like the Policy::limited(4) this
+    // policy replaced. An earlier draft used `>=` and followed one hop fewer
+    // than the stock policy did.
+    #[tokio::test]
+    async fn four_redirect_hops_still_follow() {
+        let client = build().unwrap();
+        let mut servers = Vec::new();
+        for _ in 0..5 {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("end"))
+                .mount(&server)
+                .await;
+            servers.push(server);
+        }
+        // Chain server[i] -> server[i+1]: 4 redirects, 5 servers.
+        for i in 0..4 {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(302)
+                        .insert_header("Location", format!("{}/hop", servers[i + 1].uri())),
+                )
+                .mount(&servers[i])
+                .await;
+        }
+        let resp = client.get(servers[0].uri()).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "end");
     }
 }
