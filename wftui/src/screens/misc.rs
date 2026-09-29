@@ -390,7 +390,8 @@ pub fn render_login(
             // the click target (#33). The drawn URL is a head window, like
             // every other single-line field; the full URL still rides the
             // click hit, `c`, and login-url.txt.
-            const LINK_MAX_INNER: usize = 60; // 70 inner − 6 col − 2 vbars − 2 spaces
+            // Row: 6-col indent + vbar + link_inner + vbar ≤ 70 inner.
+            const LINK_MAX_INNER: usize = 62;
             let url_cells = chrome::cell_width(&s.url);
             let link_inner = (url_cells + 4).clamp(48, LINK_MAX_INNER);
             let window_w = link_inner - 4;
