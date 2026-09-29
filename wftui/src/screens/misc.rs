@@ -1205,17 +1205,24 @@ fn draw_editor_panel(
     // it never covers the draft the writer is looking at.
     if let Some(path) = &s.file_prompt {
         let label = "Attach file: ";
+        // Window the path like every other single-line field (#606's rule;
+        // #34): a deep path is wider than the pane, and drawing it raw
+        // pinned the caret to the border over the wrong character while the
+        // typed tail stayed invisible.
+        let width = (chunks[3].width as usize).saturating_sub(chrome::cell_width(label));
+        let (start, caret) = crate::editor::hwindow(path, s.file_prompt_cursor, width);
+        let tail: String = path.chars().skip(start).collect();
+        let drawn = chrome::take_cells(&tail, width).to_string();
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(label, theme.dim()),
-                Span::styled(path.clone(), theme.base()),
+                Span::styled(drawn, theme.base()),
             ])),
             chunks[3],
         );
-        let caret = chrome::cell_width(label)
-            + crate::editor::prefix_cells(path, s.file_prompt_cursor);
+        let caret_x = chrome::cell_width(label) + caret;
         f.set_cursor_position((
-            chunks[3].x + (caret as u16).min(chunks[3].width.saturating_sub(1)),
+            chunks[3].x + (caret_x as u16).min(chunks[3].width.saturating_sub(1)),
             chunks[3].y,
         ));
     } else if s.uploading {
@@ -4332,6 +4339,30 @@ mod tests {
         assert!(matches!(compose_key(&mut s, KeyEvent::from(KeyCode::Esc)), Action::None));
         assert!(s.file_prompt.is_none());
         assert_eq!(s.body, "draft");
+
+    /// #34: the file-prompt path is windowed like every other single-line
+    /// field — a path wider than the pane shows the caret's neighbourhood
+    /// (the tail), and the caret sits inside the pane.
+    #[test]
+    fn the_file_prompt_windows_a_path_longer_than_the_pane() {
+        let mut s = reply_state("draft");
+        let deep = "C:\\Users\\someone\\AppData\\Local\\Temp\\wftui-upload\\a-very-long-name-that-overflows.png";
+        s.file_prompt = Some(deep.into());
+        s.file_prompt_cursor = deep.chars().count(); // caret at the end
+        let w = 60;
+        let (rows, pos) = render_compose_probe(&mut s, w, 24);
+        let row = rows[pos.1 as usize].as_str();
+        assert!(row.contains("overflows.png"), "the tail follows the caret: {row}");
+        assert!(!row.contains("Attach"), "the caret row carries the path, not the label: {row}");
+        assert!(row.contains("Temp") || row.contains("upload"), "{row}");
+        assert!(pos.0 < w.saturating_sub(1), "the caret stays inside the pane");
+
+        // Mid-string edit: the window moves with the caret.
+        s.file_prompt_cursor = 20;
+        let (rows, pos) = render_compose_probe(&mut s, w, 24);
+        let row = rows[pos.1 as usize].as_str();
+        assert!(row.contains("someone"), "an early caret shows the head: {row}");
+    }
 
         // One upload at a time.
         s.uploading = true;
