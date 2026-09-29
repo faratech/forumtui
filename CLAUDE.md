@@ -857,8 +857,11 @@ The capability query reads stdin, so it runs in `main.rs` before the reader
 thread, only on unix with a terminal on stdin and no `WFTUI_GRAPHICS` override
 (ratatui-image leaks a blocked reader thread on timeout, which `tty.rs`'s termios
 snapshot neutralizes on exit). Image payloads are written only by the crate's
-widget through ratatui's diff-option path (anchor cell `ForcedWidth(1)`, covered
-cells `Skip`; ratatui 0.30 deprecated `Cell::skip`, so read `diff_option`).
+widget through ratatui's diff-option path (since the ratatui-image 11.x
+bump: one anchor `Cell` carries the whole payload, and the anchor plus every
+covered cell is marked `ForcedWidth(1)` — the pre-bump scheme of covered
+cells marked `Skip` is gone; ratatui 0.30 deprecated `Cell::skip`, so read
+`diff_option`).
 `app::is_image_cell` is the shared probe used by `capture_screen`,
 `paint_selection` and the overlays; images are suppressed while an overlay is up.
 Five surfaces draw them: the thread view (post images where the message puts

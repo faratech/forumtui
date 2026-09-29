@@ -14,11 +14,12 @@
 //! **Hard rule 1** (never put escape bytes in span content) is kept by never
 //! writing an image escape sequence in this module. Only `ratatui-image`'s
 //! own widget emits them, and it does so through ratatui's sanctioned
-//! diff-option path: the whole payload goes into exactly one anchor `Cell`'s
-//! symbol (marked `CellDiffOption::ForcedWidth(1)`) and every other cell of
-//! the image rect is marked `CellDiffOption::Skip`, so the frame diff can
-//! never re-emit a fragment of it out of context. Because those
-//! cells are not text, `App::capture_screen` (mouse selection) and
+//! diff-option path (as of the ratatui-image 11.x bump, #56): the whole
+//! payload goes into exactly one anchor `Cell`'s symbol, and the anchor
+//! plus every covered cell of the image rect is marked
+//! `CellDiffOption::ForcedWidth(1)` — one column each, so the frame diff
+//! can never re-emit a fragment of the payload out of context. Because
+//! those cells are not text, `App::capture_screen` (mouse selection) and
 //! `App::paint_selection` skip them, and images are not drawn at all while an
 //! overlay is up (`overlay::dim_body` would re-style the anchor cell, and the
 //! overlay's `Clear` erases the rect for that frame anyway).
