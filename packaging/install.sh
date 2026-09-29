@@ -54,12 +54,11 @@ OS="$(uname -s)"
 ARCH="$(uname -m)"
 case "$OS-$ARCH" in
     Linux-x86_64 | Linux-amd64)  TARGET="linux-x86_64" ;;
-    Linux-aarch64 | Linux-arm64) TARGET="linux-aarch64" ;;
-    Darwin-*) die "macOS is not built yet: releases carry linux-x86_64, \
-linux-aarch64 and windows-x64/x86/arm64. A Darwin build is welcome \
-to file an issue at https://github.com/$REPO/issues" ;;
-    *) die "unsupported platform $OS-$ARCH (releases carry linux-x86_64, \
-linux-aarch64, windows-x64/x86/arm64)" ;;
+    # No linux-aarch64 case: nothing builds that asset, and a case arm here
+    # turned the mismatch into a download 404 instead of a clear refusal
+    # (#77). An arm build is a release decision, not an installer flag.
+    Darwin-*) die "macOS is not built yet: releases carry linux-x86_64 and windows-x64/x86/arm64. A Darwin build is welcome to file an issue at https://github.com/$REPO/issues" ;;
+    *) die "unsupported platform $OS-$ARCH (releases carry linux-x86_64 and windows-x64/x86/arm64)" ;;
 esac
 
 # ---- pick the release ------------------------------------------------------

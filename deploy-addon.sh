@@ -18,5 +18,7 @@ case "$destination_dir" in
 esac
 
 mkdir -p "$destination_dir"
-rsync -a --delete --exclude='.git' "$source_dir" "$destination_dir"
+# --delay-updates lands every change in one flush at the end, so an
+# interrupted run cannot leave the live addon half-old/half-new (#80).
+rsync -a --delete --delay-updates --exclude='.git' "$source_dir" "$destination_dir"
 printf 'Exported XenForo TuiLink add-on to %s\n' "$destination_dir"

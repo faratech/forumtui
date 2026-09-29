@@ -99,6 +99,12 @@ if (-not $Version) {
         throw "Could not read version from wftui\Cargo.toml; pass -Version explicitly."
     }
 }
+# A non-numeric version reaches makeappx as a 5-segment MSIX identity and
+# fails there, far from the cause — and before this guard existed a
+# mismatched tag burned the full signing run (issue #76).
+if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+    throw "-Version must be a bare x.y.z (got '$Version'); the 4th (build) component is appended as .0."
+}
 $MsixVersion = "$Version.0"
 Write-Host "wftui version: $Version (MSIX Identity Version: $MsixVersion)" -ForegroundColor Cyan
 
@@ -165,7 +171,10 @@ foreach ($arch in $Architectures) {
 
     $manifest = Get-Content $ManifestTemplate -Raw
     $manifest = $manifest.Replace("{{VERSION}}", $MsixVersion).Replace("{{ARCH}}", $arch)
-    Set-Content -Path (Join-Path $stage "AppxManifest.xml") -Value $manifest -NoNewline
+    # Pin the encoding: under Windows PowerShell 5.1 the default is the
+    # system ANSI code page, and the template's em dash would produce a
+    # manifest that declares utf-8 but is not (#78).
+    Set-Content -Path (Join-Path $stage "AppxManifest.xml") -Value $manifest -NoNewline -Encoding utf8
 
     $msixPath = Join-Path $OutDir "wftui-$Version-$arch.msix"
     if (Test-Path $msixPath) { Remove-Item $msixPath -Force }
@@ -194,6 +203,30 @@ foreach ($arch in $Architectures) {
     Copy-Item (Join-Path $stage "wftui.exe") $bareExe -Force
     $bareExes += $bareExe
     Write-Host "[OK] $bareExe" -ForegroundColor Green
+
+    # The generic edition (Terminal for XenForo) ships bare exes too: its
+    # self-updater fetches `wftui-xf-<version>-windows-<arch>.exe` and
+    # install.ps1 -Edition xf installs the same asset (#74). No MSIX for
+    # this edition — an MSIX identity for a second edition is a product
+    # decision, not a packaging default.
+    Write-Host "-- cargo build --release --target $triple --no-default-features --features images -p wftui"
+    Push-Location $RepoRoot
+    try {
+        cargo build --release --target $triple --no-default-features --features images -p wftui
+        if ($LASTEXITCODE -ne 0) { throw "cargo build failed for $triple (generic edition)" }
+    } finally {
+        Pop-Location
+    }
+    $xfExe = Join-Path $RepoRoot "target\$triple\release\wftui.exe"
+    if (-not (Test-Path $xfExe)) { throw "Expected generic build output missing: $xfExe" }
+    $xfOut = Join-Path $OutDir "wftui-xf-$Version-windows-$arch.exe"
+    Copy-Item $xfExe $xfOut -Force
+    if (-not $SkipSign) {
+        & $signScript $xfOut -Description 'Terminal for XenForo'
+        if ($LASTEXITCODE -ne 0) { throw "Dual signing failed for $arch generic executable" }
+    }
+    $bareExes += $xfOut
+    Write-Host "[OK] $xfOut" -ForegroundColor Green
 }
 
 # ---------------------------------------------------------------------------

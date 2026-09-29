@@ -88,9 +88,7 @@ jobs:
           subject-path: |
             dist/*.tar.gz
             dist/wftui-*-linux-x86_64
-            dist/wftui-*-linux-aarch64
             dist/wftui-xf-*-linux-x86_64
-            dist/wftui-xf-*-linux-aarch64
 
       - name: Upload tarballs and bare binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -99,9 +97,7 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/wftui-*-linux-x86_64
-            dist/wftui-*-linux-aarch64
             dist/wftui-xf-*-linux-x86_64
-            dist/wftui-xf-*-linux-aarch64
           if-no-files-found: error
 
   build-windows-msix:
@@ -133,6 +129,11 @@ jobs:
           echo "version=$VERSION" >> $env:GITHUB_OUTPUT
           echo "msix_version=$MSIX_VERSION" >> $env:GITHUB_OUTPUT
           Write-Host "Building wftui $VERSION (MSIX: $MSIX_VERSION)"
+          # The tag-vs-Cargo refusal lives in the Linux job; this numeric
+          # guard keeps a stray tag from burning the signing run (#76).
+          if ($VERSION -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Tag version '$VERSION' is not bare x.y.z; refusing to sign."
+          }
         shell: pwsh
 
       - name: Install Rust
@@ -155,9 +156,14 @@ jobs:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          # Via env, never string interpolation: the version comes from the
+          # tag on push, and git refs legally carry quotes, backticks and
+          # $() — interpolated text runs as code in a job that holds the
+          # Azure signing secrets (issue #75).
+          WF_VERSION: ${{ steps.version.outputs.version }}
         run: |
           packaging/msix/build-msix.ps1 `
-              -Version '${{ steps.version.outputs.version }}' `
+              -Version $env:WF_VERSION `
               -OutDir 'dist'
         shell: pwsh
 
@@ -226,6 +232,7 @@ jobs:
             **Terminal for XenForo** (the same client with no built-in site — connects to any XenForo 2.3 forum)
             - `wftui-xf-*-linux-x86_64.tar.gz` — tarball
             - `wftui-xf-*-linux-x86_64` — the bare binary its self-updater fetches
+            - `wftui-xf-*-windows-{x64,x86,arm64}.exe` — the bare dual-signed executables (install with install.ps1 -Edition xf; self-update)
 
             **Windows**
             - `wftui-*.msixbundle` — signed, installable on x64/x86/arm64 (recommended)

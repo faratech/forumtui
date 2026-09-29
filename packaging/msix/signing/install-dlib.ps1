@@ -20,7 +20,12 @@ param(
 $ErrorActionPreference = "Stop"
 $libRoot = Join-Path $PSScriptRoot "lib"
 
-if ((Test-Path (Join-Path $libRoot "x64\Azure.CodeSigning.Dlib.dll")) -and -not $Force) {
+# Both arch dirs must be present: an interrupted first install leaves x64
+# populated and x86 absent, and a x64-only early exit reported "already
+# installed" all the way to a failing 32-bit sign (#81).
+if ((Test-Path (Join-Path $libRoot "x64\Azure.CodeSigning.Dlib.dll")) -and
+    (Test-Path (Join-Path $libRoot "x86\Azure.CodeSigning.Dlib.dll")) -and
+    -not $Force) {
     Write-Host "dlib already installed in $libRoot (use -Force to reinstall)." -ForegroundColor Yellow
     exit 0
 }

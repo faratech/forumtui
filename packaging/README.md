@@ -16,13 +16,15 @@ redistributed under its terms.
 cd /web/wftui_app
 packaging/linux/build-tarball.sh              # default (images) build
 packaging/linux/build-tarball.sh --no-images  # the no-default-features build
+packaging/linux/build-tarball.sh --generic    # Terminal for XenForo (-xf assets)
 ```
 
 Runs entirely on this box: `cargo build --release -p wftui` for the host's
 native target, then stages the binary + a short README into
 `dist/wftui-<version>-linux-<arch>.tar.gz` next to a `.sha256`, and (for the
-default build only) the bare binary `dist/wftui-<version>-linux-<arch>` that
-a running wftui downloads to update itself. No
+default and `--generic` builds — both empty-suffix bare-name shapes) the bare
+binary `dist/wftui[-xf]-<version>-linux-<arch>` that the matching edition's
+running wftui downloads to update itself. No
 cross-compilation — this always builds for whatever target the machine
 running the script is (same as `bin/wftui`, which is built the same way and
 committed separately).
