@@ -100,6 +100,63 @@ final class LinkStore
 		) > 0;
 	}
 
+	/**
+	 * Burns the authorization code on first successful poll (#766a). The
+	 * compare-and-clear means exactly one poll ever observes the code, even
+	 * with concurrent pollers racing the legitimate client. The row itself
+	 * stays alive until TTL so status/denied keep answering; a repeat poll
+	 * after consumption simply finds no code.
+	 */
+	public static function consumeCode(string $id, string $code): bool
+	{
+		return self::db()->update(
+			self::TABLE,
+			['code' => null],
+			'link_id = ? AND code = ? AND expiry_date >= ?',
+			[$id, $code, \XF::$time]
+		) > 0;
+	}
+
+	/** Per-IP register budget (#766b). */
+	public const REGISTER_LIMIT = 10;
+	/** Window in seconds for the register budget. */
+	public const REGISTER_WINDOW = 3600;
+
+	/**
+	 * Reserves one /register slot for this IP (~10/hour, #766b). Best-effort:
+	 * with no Redis backend configured, or on a Redis error, the slot is
+	 * granted — this endpoint only mints a public relay row and PKCE makes
+	 * a flooded record useless, so availability of the login path wins over
+	 * the counter. LIVE_CAP still bounds the table either way. SharedRedis
+	 * exists only on windowsforum.com; other forums skip the counter.
+	 */
+	public static function reserveRegisterSlot(string $ip): bool
+	{
+		if (!class_exists(\WindowsForum\SharedRedis::class))
+		{
+			return true;
+		}
+		$redis = \WindowsForum\SharedRedis::raw();
+		if (!$redis)
+		{
+			return true;
+		}
+		$key = 'wf_tuilink:reg:' . hash_hmac('sha256', $ip, (string) \XF::config('globalSalt'));
+		try
+		{
+			$count = (int) $redis->incr($key);
+			if ($count === 1)
+			{
+				$redis->expire($key, self::REGISTER_WINDOW);
+			}
+			return $count <= self::REGISTER_LIMIT;
+		}
+		catch (\Throwable $e)
+		{
+			return true;
+		}
+	}
+
 	/** The person declined the authorization request. */
 	public static function markDenied(string $id): bool
 	{

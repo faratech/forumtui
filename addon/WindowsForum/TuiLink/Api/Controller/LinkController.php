@@ -37,6 +37,18 @@ class LinkController extends \XF\Api\Controller\AbstractController
 
 	public function actionPostRegister()
 	{
+		// Per-IP budget before any row is minted (#766b); the generic 429 does
+		// not confirm whether the limit or the request shape failed.
+		if (!LinkStore::reserveRegisterSlot($this->request()->getIp()))
+		{
+			return $this->apiError(
+				\XF::phrase('oops_we_ran_into_some_problems'),
+				'wf_tuilink_rate_limited',
+				null,
+				429
+			);
+		}
+
 		$state = $this->filter('state', 'str');
 		$challenge = $this->filter('challenge', 'str');
 
@@ -84,6 +96,15 @@ class LinkController extends \XF\Api\Controller\AbstractController
 		}
 		if (!empty($record['code']))
 		{
+			// Burn on first read (#766a): the compare-and-clear in LinkStore
+			// guarantees exactly one poll ever carries the code. The wftui
+			// client polls until the code appears and stops; if this response
+			// is lost the repeat poll lands in the codeless "waiting" shape
+			// below and the client simply polls until TTL expiry.
+			if (!LinkStore::consumeCode($id, $record['code']))
+			{
+				return $this->apiResult(['success' => true, 'status' => 'waiting']);
+			}
 			return $this->apiResult([
 				'success' => true,
 				'status' => 'authorized',
