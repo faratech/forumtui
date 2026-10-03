@@ -85,7 +85,7 @@ Each `.msix` is signed and verified (`signtool sign` + `signtool verify /pa`)
 before the script moves on; a failure anywhere aborts the run non-zero.
 
 Useful flags: `-Architectures x64` (skip the others for a quick local test),
-`-SkipSign` (unsigned, sideload-only build), `-SkipBundle`, `-Version 0.2.0`
+`-SkipSign` (unsigned, sideload-only build), `-SkipBundle`, `-Version 0.0.3`
 (override the version read from `wftui/Cargo.toml`), `-SignKitRoot` /
 `-OutDir` (relocate either directory).
 
