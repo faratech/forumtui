@@ -135,7 +135,7 @@ pub struct Thread {
     pub discussion_type: String,
     #[serde(default)]
     pub prefix: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_tags")]
     pub tags: Vec<String>,
     #[serde(default, rename = "vote_score")]
     pub vote_score: i64,
@@ -1317,6 +1317,26 @@ mod tests {
         let r: ThreadsReply = serde_json::from_value(body).unwrap();
         assert_eq!(r.threads[0].title, "T");
         assert!(r.threads[0].view_url.is_none());
+    }
+
+    /// One thread with a null or id-keyed-map `tags` must not cost the
+    /// whole reply (issue #89): the Media/Resource siblings already take
+    /// every shape through `deserialize_tags`, and Thread now does too.
+    #[test]
+    fn threads_reply_survives_null_and_map_shaped_tags() {
+        let body = serde_json::json!({
+            "threads": [
+                {"thread_id": 1, "title": "plain", "tags": ["a"]},
+                {"thread_id": 2, "title": "null tags", "tags": null},
+                {"thread_id": 3, "title": "map tags", "tags": {"12": {"tag": "bg3"}}}
+            ],
+            "pagination": {"current_page": 1, "last_page": 1, "total": 3}
+        });
+        let r: ThreadsReply = serde_json::from_value(body).unwrap();
+        assert_eq!(r.threads.len(), 3);
+        assert_eq!(r.threads[0].tags, vec!["a".to_string()]);
+        assert!(r.threads[1].tags.is_empty());
+        assert_eq!(r.threads[2].tags, vec!["bg3".to_string()]);
     }
 
     /// Fixture shaped exactly like `ForumController::getThreadsInForumPaginated`

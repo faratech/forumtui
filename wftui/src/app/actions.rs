@@ -473,23 +473,33 @@ impl App {
         path: &str,
         context: screens::AttachContext,
         key: Option<&str>,
-    ) -> Result<(String, common::models::Attachment), String> {
+    ) -> TaskResult<(String, common::models::Attachment)> {
         use screens::AttachContext;
+        // Local failures (no file, too big) are `Other`: the session is
+        // not implicated. API failures keep their `TaskError::of` shape so
+        // a 401/NoToken reaches the session boundary (issue #88) instead
+        // of dying here as a flattened display string.
+        let local = |message: String| TaskError {
+            message,
+            code: None,
+            max_page: None,
+            kind: TaskErrorKind::Other,
+        };
         let expanded = shellexpand_home(path);
         let meta = std::fs::metadata(&expanded)
-            .map_err(|e| format!("{expanded}: {e}"))?;
+            .map_err(|e| local(format!("{expanded}: {e}")))?;
         if !meta.is_file() {
-            return Err(format!("{expanded} is not a file."));
+            return Err(local(format!("{expanded} is not a file.")));
         }
         if meta.len() > MAX_UPLOAD_BYTES {
-            return Err(format!(
+            return Err(local(format!(
                 "{expanded} is {} MB; the limit here is {} MB.",
                 meta.len() / (1024 * 1024),
                 MAX_UPLOAD_BYTES / (1024 * 1024)
-            ));
+            )));
         }
         let bytes = std::fs::read(&expanded)
-            .map_err(|e| format!("{expanded}: {e}"))?;
+            .map_err(|e| local(format!("{expanded}: {e}")))?;
         let filename = std::path::Path::new(&expanded)
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
@@ -502,7 +512,7 @@ impl App {
         };
         api.upload_attachment("post", &ctx, filename, bytes, mime, key)
             .await
-            .map_err(|e| TaskError::of(&e).message)
+            .map_err(|e| TaskError::of(&e))
     }
 
     /// The attachment key of the composer on top, if it uploaded anything

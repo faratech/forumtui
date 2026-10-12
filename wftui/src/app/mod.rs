@@ -386,10 +386,12 @@ pub enum Msg {
     /// The gallery's category tree, and one resource's page (#697).
     MediaCategoriesLoaded { load_id: u64, result: TaskResult<common::models::MediaCategoriesReply> },
     /// An attachment upload finished (#709): the key it went under and the
-    /// file, or a message saying why not.
+    /// file, or why not. A `TaskResult`, like every other write's (issue
+    /// #88): flattening this one to a display string kept a 401/NoToken
+    /// from ever reaching the session boundary.
     AttachmentUploaded {
         composer: common::drafts::DraftKey,
-        result: std::result::Result<(String, common::models::Attachment), String>,
+        result: TaskResult<(String, common::models::Attachment)>,
     },
     /// Post edits, deletions and solution toggles (#708).
     PostEdited { post_id: u32, result: TaskResult<()> },
@@ -3185,6 +3187,7 @@ fn session_error_of(msg: &Msg) -> Option<&TaskError> {
         | Msg::SolutionMarked { result: Err(e), .. }
         | Msg::PostToggled { result: Err(e), .. }
         | Msg::AskAiDone { result: Err(e), .. }
+        | Msg::AttachmentUploaded { result: Err(e), .. }
         | Msg::AiUsageLoaded(Err(e)) => e,
         _ => return None,
     };
@@ -3236,6 +3239,7 @@ fn mark_retryable(msg: &mut Msg) {
         | Msg::SolutionMarked { result: Err(e), .. }
         | Msg::PostToggled { result: Err(e), .. }
         | Msg::AskAiDone { result: Err(e), .. }
+        | Msg::AttachmentUploaded { result: Err(e), .. }
         | Msg::AiUsageLoaded(Err(e)) => e,
         _ => return,
     };
@@ -3363,6 +3367,13 @@ mod tests {
         assert!(session_error_of(&Msg::SolutionMarked {
             post_id: 1,
             thread_id: 2,
+            result: Err(error()),
+        })
+        .is_some());
+        // Issue #88: an upload's session-ending failure reaches the same
+        // boundary instead of dying as a flattened display string.
+        assert!(session_error_of(&Msg::AttachmentUploaded {
+            composer: common::drafts::DraftKey::ThreadReply(1),
             result: Err(error()),
         })
         .is_some());
@@ -8867,7 +8878,12 @@ mod tests {
         }));
         app.handle_msg(Msg::AttachmentUploaded {
             composer: common::drafts::DraftKey::ThreadReply(9),
-            result: Err("/tmp/nope.png: No such file or directory".into()),
+            result: Err(TaskError {
+                message: "/tmp/nope.png: No such file or directory".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::Other,
+            }),
         });
         match app.screens.last() {
             Some(Screen::Compose(c)) => {

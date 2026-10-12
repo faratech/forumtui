@@ -1159,8 +1159,8 @@ impl App {
                         c.attachments.push(attachment);
                         status = Some(format!("Attached {name}."));
                     }
-                    Err(message) => {
-                        c.error = Some(message);
+                    Err(err) => {
+                        c.error = Some(err.message);
                     }
                 }
                 if let Some(status) = status {

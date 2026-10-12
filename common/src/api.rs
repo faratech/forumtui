@@ -595,7 +595,9 @@ impl WfApiClient {
         // to be right.
         #[derive(serde::Deserialize)]
         struct Uploaded {
-            #[serde(default)]
+            // Required, not defaulted (issue #90): a success body without
+            // the envelope must fail the decode, not manufacture a blank
+            // attachment the composer would insert as `[ATTACH]0[/ATTACH]`.
             attachment: Attachment,
         }
         let out: Result<Uploaded> = decode(resp).await;
@@ -3617,6 +3619,35 @@ mod tests {
             after >= before + Duration::from_secs(29),
             "success must anchor a 30s write cool-down, went {before:?} -> {after:?}"
         );
+    }
+
+    /// Issue #90: a 200 without the `{"attachment": ...}` envelope must
+    /// fail loudly, not decode to a blank attachment (id 0) that the
+    /// composer inserts as `[ATTACH]0[/ATTACH]`.
+    #[tokio::test]
+    async fn upload_without_the_attachment_envelope_is_an_error() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-upload-envelope");
+        Mock::given(method("POST"))
+            .and(path("/api/attachments/new-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "key": "key-1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/attachments/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true
+            })))
+            .mount(&server)
+            .await;
+
+        let c = logged_in_client("tok-1").await;
+        let result = c
+            .upload_attachment("post", &[], "shot.png".into(), vec![1, 2, 3], "image/png", None)
+            .await;
+        assert!(result.is_err(), "a shapeless success must not yield an attachment: {result:?}");
     }
 
     #[tokio::test]
