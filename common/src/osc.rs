@@ -352,9 +352,55 @@ mod tests {
     /// Control characters in user-sourced titles/URLs must be stripped at
     /// the OSC boundary (#649): a BEL/ESC in a thread title could otherwise
     /// terminate or inject sequences inside the terminal itself.
+    /// Runs `f` with the multiplexer env (TMUX/STY/TERM) set as given, under
+    /// ENV_LOCK, restoring the previous values afterwards — even if `f`
+    /// panics — so tests asserting on exact sequences don't depend on
+    /// whether `cargo test` itself runs inside tmux or screen.
+    fn with_mux_env<R>(
+        tmux: Option<&str>,
+        sty: Option<&str>,
+        term: Option<&str>,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        struct Restore([(&'static str, Option<std::ffi::OsString>); 3]);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, prev) in &self.0 {
+                    // SAFETY: env mutation happens only under ENV_LOCK.
+                    unsafe {
+                        match prev {
+                            Some(v) => std::env::set_var(key, v),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+
+        let _g = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let wanted = [("TMUX", tmux), ("STY", sty), ("TERM", term)];
+        let _restore = Restore(wanted.map(|(key, _)| (key, std::env::var_os(key))));
+        for (key, value) in wanted {
+            // SAFETY: env mutation happens only under ENV_LOCK.
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        f()
+    }
+
     #[test]
     fn titles_and_hrefs_carry_no_control_characters() {
-        let t = set_title("Windows \u{1b}]0;pwned\u{7} Forum tabs");
+        // Outside any multiplexer, so both emit their bare OSC sequences.
+        let (t, h) = with_mux_env(None, None, Some("xterm-256color"), || {
+            (
+                set_title("Windows \u{1b}]0;pwned\u{7} Forum tabs"),
+                hyperlink("https://x.test/a\u{7}b", "click\u{1b}me"),
+            )
+        });
         // Exactly the framing escapes remain: OSC open, BEL terminator; the
         // injected sequences' control bytes are gone, leaving plain text.
         assert!(t.starts_with("\x1b]0;"), "{t:?}");
@@ -365,7 +411,6 @@ mod tests {
         // text ("Windows ]0;pwned Forum tabs") is inert, printable text.
         assert!(inner.starts_with("Windows ") && inner.ends_with("Forum tabs"), "{t:?}");
 
-        let h = hyperlink("https://x.test/a\u{7}b", "click\u{1b}me");
         assert!(!h.contains('\u{7}'), "{h:?}");
         let payload = h.trim_start_matches("\x1b]8;;").trim_end_matches("\x1b]8;;\x1b\\");
         assert!(payload.starts_with("https://x.test/ab\x1b\\clickme"), "{h:?}");
@@ -451,34 +496,11 @@ mod tests {
     /// alongside the screen-wrapped DCS (which real screen needs).
     #[test]
     fn screen_like_term_over_ssh_dual_delivers_raw_plus_dcs() {
-        let _g = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_tmux = std::env::var_os("TMUX");
-        let prev_sty = std::env::var_os("STY");
-        let prev_term = std::env::var_os("TERM");
-        unsafe {
-            std::env::remove_var("TMUX");
-            std::env::remove_var("STY");
-            std::env::set_var("TERM", "screen-256color");
-        }
-
-        let out = set_clipboard("https://windowsforum.com/x");
+        let out = with_mux_env(None, None, Some("screen-256color"), || {
+            set_clipboard("https://windowsforum.com/x")
+        });
         assert!(out.starts_with("\x1b]52;c;"), "missing raw OSC 52: {out:?}");
         assert!(out.contains("\x1bP"), "missing screen-wrapped DCS: {out:?}");
-
-        unsafe {
-            match prev_tmux {
-                Some(v) => std::env::set_var("TMUX", v),
-                None => std::env::remove_var("TMUX"),
-            }
-            match prev_sty {
-                Some(v) => std::env::set_var("STY", v),
-                None => std::env::remove_var("STY"),
-            }
-            match prev_term {
-                Some(v) => std::env::set_var("TERM", v),
-                None => std::env::remove_var("TERM"),
-            }
-        }
     }
 
     #[test]
