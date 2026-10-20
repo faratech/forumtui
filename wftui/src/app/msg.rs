@@ -18,6 +18,22 @@ impl App {
             Msg::Session { .. } => return,
             msg => msg,
         };
+        msg = match msg {
+            Msg::RecoveryVerified { generation, verified } => {
+                if generation != self.bootstrap_generation { return; }
+                match verified.commit() {
+                    Ok((client, user)) => {
+                        // No old action may ever acquire this verified grant.
+                        self.cancel_recovered_work();
+                        self.client = Arc::new(client);
+                        self.api = self.client.clone();
+                        Msg::Bootstrap { generation, result: Ok(user) }
+                    }
+                    Err(e) => Msg::Bootstrap { generation, result: Err(TaskError::of(&e)) },
+                }
+            }
+            msg => msg,
+        };
         // A stored-session check from a session that has since ended (the
         // user pressed Ctrl+L while "Restoring session…" was in flight) must
         // not sign anyone back in against an erased token store — issue #557,
@@ -61,7 +77,7 @@ impl App {
             // the refresh call itself produces. Treat the two identically:
             // this cannot mask a genuine revoke, because the recheck's own
             // `/me` (issue #581) verifies identity before anything is
-            // adopted, and `adopt_stored_tokens()` returning false (nothing
+            // adopted, and `stored_session_candidate()` finding nothing
             // new on disk) still reports `Err(NoToken)` and ends the session
             // exactly as before.
             let recheckable = matches!(kind, TaskErrorKind::NoToken | TaskErrorKind::Api(401));
@@ -336,6 +352,7 @@ impl App {
                     // different account would be this comment's own
                     // "Compose draft written as them", one restart later.
                     self.clear_all_drafts();
+                    self.clear_account_navigation();
                 }
                 let username = user.username.clone();
                 self.select_draft_owner(user.user_id);
@@ -370,46 +387,14 @@ impl App {
                 // server 5xx, which must not throw away a token that would
                 // work the moment the network/server recovers (issue #551).
                 if self.me.is_some() {
-                    // Issue #589: `recheck_stored_session` (issue #557/#587)
-                    // reports through this same arm from a LIVE session — a
-                    // sibling instance merely rotated `token.json` and the
-                    // recheck's own `/me` hit a transient failure (a
-                    // timeout, a Cloudflare 5xx). This branch was written
-                    // for the startup restore, where `self.me` is never set;
-                    // here the session is still perfectly usable (the
-                    // pollers are running on whatever token is held), so
-                    // arming `bootstrap_retry_needed` would hijack the next
-                    // plain `r` outside a text field into `restore_session()`
-                    // instead of, say, opening the reply composer in a
-                    // thread view, and `tree.error` would show a "press r to
-                    // retry" banner over a working session. Just say so —
-                    // the pollers (or the next call) will surface a real
-                    // session loss if there is one.
-                    //
-                    // Issue #592: the poller that first noticed the `NoToken`
-                    // and triggered this recheck already sent its
-                    // `SessionLost` and returned (the alerts/conversations
-                    // poller loops `return` right after reporting) — nothing
-                    // else restarts it, so without this the Alerts/Inbox
-                    // badges would freeze for the rest of the session. The
-                    // recheck's `adopt_stored_tokens()` already ran (and
-                    // succeeded — only its later `/me` failed transiently),
-                    // so the adopted token is live and safe to poll on.
-                    // `session_recovery_tried` must also go back to `false`:
-                    // left `true`, the NEXT sibling rotation's `NoToken`
-                    // would skip the recheck gate entirely and fall straight
-                    // to `end_session` with a perfectly good token set on
-                    // disk — re-arming the exact #557/#568 sign-out this
-                    // machinery exists to prevent, off one network blip. This
-                    // is safe against a loop: a recheck whose
-                    // `adopt_stored_tokens()` finds nothing new to adopt
-                    // reports `Err(NoToken)` and ends the session as usual.
-                    self.start_pollers();
+                    // An unverified replacement may belong to another user.
+                    // Cached content and drafts remain, but no authenticated
+                    // traffic resumes until a successful identity check.
+                    self.client.pause_requests();
+                    self.stop_pollers();
                     self.session_recovery_tried = false;
-                    let username = self.me.as_ref().map(|u| u.username.as_str()).unwrap_or("");
-                    self.set_hint(format!(
-                        "Token re-check could not reach the site; still signed in as {username}."
-                    ));
+                    self.bootstrap_retry_needed = true;
+                    self.set_hint("Session identity could not be verified; requests paused. Press r to retry or Ctrl+L to sign out.");
                 } else {
                     self.arm_bootstrap_retry(&e);
                 }
@@ -1452,7 +1437,7 @@ impl App {
                 }
                 }
             }
-            Msg::Session { .. } => unreachable!("session messages are unwrapped at the boundary"),
+            Msg::Session { .. } | Msg::RecoveryVerified { .. } => unreachable!("session messages are unwrapped at the boundary"),
         }
     }
 }

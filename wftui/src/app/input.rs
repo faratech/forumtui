@@ -20,16 +20,10 @@ impl App {
             self.logout();
             return;
         }
-        // A transient bootstrap failure (issue #551) leaves the session
-        // unrestored with no login screen up; `r` re-runs the check instead
-        // of falling through to whatever the Home screen would otherwise do
-        // with it. `self.me.is_none()` is belt-and-braces (issue #589): the
-        // `Msg::Bootstrap { Err }` arm no longer arms `bootstrap_retry_needed`
-        // for a live session in the first place, but a live-session `r`
-        // must never be hijacked into `restore_session()` even if that
-        // invariant is ever broken elsewhere.
+        // Retry a failed bootstrap or a paused identity check outside input
+        // fields; typing in a composer still belongs to its editor.
         if self.bootstrap_retry_needed
-            && self.me.is_none()
+            && (self.me.is_none() || self.client.requests_paused())
             && k.modifiers.is_empty()
             && k.code == KeyCode::Char('r')
             && !self.input_active()

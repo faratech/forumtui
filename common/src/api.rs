@@ -5,6 +5,7 @@
 //! (Single file by necessity: a trait impl cannot be split across modules.)
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -19,10 +20,39 @@ use crate::oauth;
 use crate::ratelimit::Gate;
 use crate::token::{self, TokenSet};
 
+/// A replacement whose identity has been checked, but is not active yet.
+pub struct VerifiedSession {
+    client: WfApiClient,
+    user: User,
+}
+
+impl VerifiedSession {
+    /// The event loop calls this after cancelling the previous request epoch.
+    /// A newer sibling grant makes the verification stale; never overwrite it.
+    pub fn commit(mut self) -> Result<(WfApiClient, User)> {
+        let expected = self.client.recovery_source.take().ok_or(Error::NoToken)?;
+        let mut tokens = self.client.tokens.get_mut().clone().ok_or(Error::NoToken)?;
+        tokens.origin = self.client.base.clone();
+        tokens.client_id = self.client.client_id.clone();
+        if !self.client.store.replace_if_matches(&expected, &tokens)? {
+            return Err(Error::Handshake("token file changed during verification; retry the session check".into()));
+        }
+        *self.client.tokens.get_mut() = Some(tokens);
+        *self.client.recovery_tokens.lock().expect("recovery cache") = None;
+        Ok((self.client, self.user))
+    }
+}
+
 pub struct WfApiClient {
     http: reqwest::Client,
     tokens: Mutex<Option<TokenSet>>,
     store: token::Store,
+    requests_paused: AtomicBool,
+    /// Recovery refreshes stay private until `/me` verifies their identity.
+    recovery_source: Option<TokenSet>,
+    /// A rotated candidate must survive a failed `/me` or a late verdict.
+    /// This cache is never consulted by ordinary request dispatch.
+    recovery_tokens: Arc<std::sync::Mutex<Option<RecoveryTokens>>>,
     /// Site origin, captured at construction rather than read from the
     /// process environment per call (issue #565): a client can then be
     /// pointed somewhere harmless for a whole test regardless of what any
@@ -41,6 +71,12 @@ pub struct WfApiClient {
     /// Ask the AI turns (`ask_ai`): chat.php's own 3 s spacing, kept apart
     /// from `api_gate` so a question never delays the next navigation.
     pub ai_gate: Arc<Gate>,
+}
+
+#[derive(Clone)]
+struct RecoveryTokens {
+    source: TokenSet,
+    current: TokenSet,
 }
 
 impl WfApiClient {
@@ -121,6 +157,9 @@ impl WfApiClient {
             http: crate::http::build_with_ua(user_agent)?,
             tokens: Mutex::new(tokens),
             store,
+            requests_paused: AtomicBool::new(false),
+            recovery_source: None,
+            recovery_tokens: Arc::new(std::sync::Mutex::new(None)),
             base: base_url,
             client_id,
             api_gate: Arc::new(Gate::new(config::GLOBAL_MIN_INTERVAL_MS)),
@@ -161,6 +200,8 @@ impl WfApiClient {
         let mut guard = self.tokens.lock().await;
         self.store.save(&tokens)?;
         *guard = Some(tokens);
+        *self.recovery_tokens.lock().expect("recovery cache") = None;
+        self.requests_paused.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -174,23 +215,20 @@ impl WfApiClient {
         self.tokens.lock().await.clone()
     }
 
-    /// Re-read the token store and adopt a token set some *other* instance
-    /// wrote. XF rotates the refresh token on every refresh, so two clients
-    /// sharing one config dir (a tmux session on the server plus a local
-    /// one) invalidate each other's in-memory grant; the surviving token is
-    /// the one on disk. Returns `true` only when the file genuinely holds
-    /// something this process does not already have — so a caller can use it
-    /// as "is there a session to recover?" without ever looping (issue #557).
-    pub async fn adopt_stored_tokens(&self) -> bool {
+    /// Prepare a private replacement from a sibling's changed token store.
+    /// The current grant stays untouched. The caller verifies `/me` and
+    /// commits the snapshot only after cancelling the previous request epoch.
+    pub async fn stored_session_candidate(&self) -> Result<Option<Self>> {
         // Load under the token lock, so a refresh completing between an
         // earlier load and this lock cannot leave `stored` holding the
         // grant that refresh just rotated out — the comparison would then
         // differ, the dead grant would clobber the fresh one, and the next
         // request would bounce through recovery again (#48).
-        let mut guard = self.tokens.lock().await;
+        let guard = self.tokens.lock().await;
         let stored = match self.store.load() {
             Ok(Some(t)) => t,
-            _ => return false,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(e),
         };
         // The construction-time contract — a grant for another origin or
         // client is never sent from here — applies to adoption too: set it
@@ -204,26 +242,55 @@ impl WfApiClient {
                 self.base
             );
             self.store.quarantine_as("foreign", &self.base, &self.client_id);
-            return false;
+            return Ok(None);
         }
         if guard.as_ref().is_some_and(|cur| {
             cur.refresh_token == stored.refresh_token && cur.access_token == stored.access_token
         }) {
-            return false;
+            return Ok(None);
         }
-        *guard = Some(stored);
-        true
+        let current = {
+            let mut cache = self.recovery_tokens.lock().expect("recovery cache");
+            match cache.as_ref() {
+                Some(cached) if cached.source == stored => cached.current.clone(),
+                _ => {
+                    *cache = Some(RecoveryTokens { source: stored.clone(), current: stored.clone() });
+                    stored.clone()
+                }
+            }
+        };
+        Ok(Some(Self {
+            http: self.http.clone(), tokens: Mutex::new(Some(current)),
+            store: self.store.clone(), requests_paused: AtomicBool::new(false),
+            recovery_source: Some(stored), recovery_tokens: self.recovery_tokens.clone(),
+            base: self.base.clone(), client_id: self.client_id.clone(),
+            api_gate: self.api_gate.clone(), search_gate: self.search_gate.clone(),
+            write_gate: self.write_gate.clone(), image_gate: self.image_gate.clone(), ai_gate: self.ai_gate.clone(),
+        }))
+    }
+
+    pub fn pause_requests(&self) { self.requests_paused.store(true, Ordering::Release); }
+
+    pub fn requests_paused(&self) -> bool { self.requests_paused.load(Ordering::Acquire) }
+
+    /// Only this constructor can create a verified replacement. Neither it nor
+    /// a candidate refresh modifies the active client's credentials or store.
+    pub async fn verify_recovery(self) -> Result<VerifiedSession> {
+        if self.recovery_source.is_none() { return Err(Error::Config("not a recovery candidate".into())); }
+        let user = self.me().await?;
+        Ok(VerifiedSession { client: self, user })
     }
 
     pub async fn forget_tokens(&self) -> Result<()> {
         let mut guard = self.tokens.lock().await;
         let tokens = guard.take();
         if let Some(tokens) = tokens
-            && let Err(e) = self.store.erase_if_refresh_token(&tokens.refresh_token)
+            && let Err(e) = self.store.erase_if_matches(&tokens)
         {
             *guard = Some(tokens);
             return Err(e);
         }
+        *self.recovery_tokens.lock().expect("recovery cache") = None;
         Ok(())
     }
 
@@ -243,11 +310,12 @@ impl WfApiClient {
         let mut guard = self.tokens.lock().await;
         let tokens = guard.take();
         if let Some(snapshot) = tokens.as_ref()
-            && let Err(e) = self.store.erase_if_refresh_token(&snapshot.refresh_token)
+            && let Err(e) = self.store.erase_if_matches(snapshot)
         {
             *guard = tokens;
             return Err(e);
         }
+        *self.recovery_tokens.lock().expect("recovery cache") = None;
         Ok(tokens)
     }
 
@@ -265,7 +333,7 @@ impl WfApiClient {
     /// before its caller's next write goes out. So a different token set on
     /// disk is no longer adopted here: the in-memory session is cleared and
     /// `Error::NoToken` is returned, routing through the app-level boundary
-    /// (`recheck_stored_session` -> `adopt_stored_tokens` -> `/me` ->
+    /// (`recheck_stored_session` -> `stored_session_candidate` -> `/me` ->
     /// `Msg::Bootstrap`) that already exists for exactly this recovery and
     /// always refreshes `App::me` before anything else runs (issue
     /// #568/#557). The store itself is left untouched in that case — it may
@@ -275,6 +343,7 @@ impl WfApiClient {
     /// just rejected, or nothing at all) does the session end outright, with
     /// the original error returned and the dead token erased.
     pub async fn valid_token(&self) -> Result<String> {
+        if self.requests_paused() { return Err(Error::Throttled); }
         let mut guard = self.tokens.lock().await;
         let existing = guard.as_ref().ok_or(Error::NoToken)?.clone();
         if !existing.access_expired(OffsetDateTime::now_utc()) {
@@ -284,7 +353,7 @@ impl WfApiClient {
             *guard = None;
             // A malformed/legacy token set with no refresh grant must not
             // erase a newer sibling session that replaced the store.
-            let _ = self.store.erase_if_refresh_token(&existing.refresh_token);
+            if self.recovery_source.is_none() { let _ = self.store.erase_if_matches(&existing); }
             return Err(Error::NoToken);
         }
         let refresh_token = existing.refresh_token.clone();
@@ -307,7 +376,7 @@ impl WfApiClient {
                 if refreshed.scope.is_empty() {
                     refreshed.scope = existing.scope.clone();
                 }
-                return Ok(self.keep_refreshed(&mut guard, refreshed));
+                return Ok(self.keep_refreshed(&mut guard, &existing, refreshed));
             }
             Err(e) => e,
         };
@@ -345,12 +414,19 @@ impl WfApiClient {
     /// warning avoids stranding the revoked refresh token in the guard/the
     /// store, which would otherwise force a full browser re-login on the
     /// very next call (see issue #513).
-    fn keep_refreshed(&self, guard: &mut Option<TokenSet>, mut refreshed: TokenSet) -> String {
+    fn keep_refreshed(&self, guard: &mut Option<TokenSet>, expected: &TokenSet, mut refreshed: TokenSet) -> String {
         refreshed.origin = self.base.clone();
         refreshed.client_id = self.client_id.clone();
         let access = refreshed.access_token.clone();
         *guard = Some(refreshed.clone());
-        if let Err(e) = self.store.save(&refreshed) {
+        if let Some(source) = &self.recovery_source {
+            let mut cache = self.recovery_tokens.lock().expect("recovery cache");
+            if let Some(cached) = cache.as_mut()
+                && &cached.source == source && &cached.current == expected
+            {
+                cached.current = refreshed;
+            }
+        } else if let Err(e) = self.store.replace_if_matches(expected, &refreshed) {
             tracing::warn!("token refresh persisted in memory but not to disk: {e}");
         }
         access
@@ -360,7 +436,9 @@ impl WfApiClient {
     /// session, and erase the store only if it still holds that very token
     /// (never a set some other code path has since written).
     fn forget_rejected(&self, guard: &mut Option<TokenSet>, rejected: &str) {
-        let _ = self.store.erase_if_refresh_token(rejected);
+        if self.recovery_source.is_none() {
+            let _ = self.store.erase_if_refresh_token(rejected);
+        }
         *guard = None;
     }
 
@@ -390,6 +468,7 @@ impl WfApiClient {
             // it only for this synchronous check avoids both a try_lock retry
             // loop and blocking logout/refresh across a long gate cooldown.
             let guard = self.tokens.lock().await;
+            if self.requests_paused() { return Err(Error::Throttled); }
             let current = guard.as_ref().ok_or(Error::NoToken)?;
             if !current.access_expired(OffsetDateTime::now_utc())
                 && Gate::try_acquire_all(gates)
@@ -1429,6 +1508,119 @@ impl WfApi for WfApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn private_rotated_grant_survives_failed_or_discarded_verification() {
+        for fail_first in [true, false] {
+            let server = MockServer::start().await;
+            let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-recovery-retry-private");
+            let refresh_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls = refresh_calls.clone();
+            Mock::given(method("POST")).and(path("/api/oauth2/token"))
+                .respond_with(move |_: &wiremock::Request| {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "access_token":"rotated-private", "refresh_token":"one-use-r2", "expires_in":7200
+                        }))
+                    } else {
+                        ResponseTemplate::new(400).set_body_json(serde_json::json!({"error":"invalid_grant"}))
+                    }
+                }).mount(&server).await;
+            let me_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls = me_calls.clone();
+            Mock::given(method("GET")).and(path("/api/me"))
+                .respond_with(move |_: &wiremock::Request| {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 && fail_first {
+                        ResponseTemplate::new(503)
+                    } else { ResponseTemplate::new(200).set_body_json(serde_json::json!({"me":{"user_id":99}})) }
+                }).mount(&server).await;
+            let client = logged_in_client("old-access").await;
+            let mut source = client.token_set().await.unwrap();
+            source.access_token = "sibling-expired".into(); source.refresh_token = "one-use-r1".into(); source.expires_at = 1;
+            client.store.save(&source).unwrap();
+            client.pause_requests();
+            let first = client.stored_session_candidate().await.unwrap().unwrap().verify_recovery().await;
+            assert_eq!(first.is_err(), fail_first);
+            drop(first); // Also model a verified verdict arriving after its generation timed out.
+            assert_eq!(client.store.load().unwrap().unwrap(), source);
+            let verified = client.stored_session_candidate().await.unwrap().unwrap().verify_recovery().await.unwrap();
+            let (active, user) = verified.commit().unwrap();
+            assert_eq!(user.user_id, 99);
+            assert_eq!(active.valid_token().await.unwrap(), "rotated-private");
+            assert_eq!(refresh_calls.load(Ordering::SeqCst), 1, "one-use source is never spent twice");
+            assert_eq!(me_calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_refresh_and_identity_stay_private_until_verified_commit() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-recovery-private");
+        Mock::given(method("POST")).and(path("/api/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token":"verified-access", "refresh_token":"verified-refresh", "expires_in":7200
+            }))).mount(&server).await;
+        Mock::given(method("GET")).and(path("/api/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"me":{"user_id":99,"username":"new member"}})))
+            .mount(&server).await;
+        let client = logged_in_client("old-access").await;
+        let mut sibling = client.token_set().await.unwrap();
+        sibling.access_token = "sibling-expired".into(); sibling.refresh_token = "sibling-refresh".into();
+        sibling.expires_at = OffsetDateTime::now_utc().unix_timestamp()-10;
+        client.store.save(&sibling).unwrap();
+        client.pause_requests();
+        let candidate = client.stored_session_candidate().await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&candidate.api_gate, &client.api_gate));
+        let verified = candidate.verify_recovery().await.unwrap();
+        assert_eq!(client.token_set().await.unwrap().access_token, "old-access");
+        assert_eq!(client.store.load().unwrap().unwrap(), sibling, "candidate refresh stays private");
+        assert!(matches!(client.valid_token().await, Err(Error::Throttled)));
+        let (active, user) = verified.commit().unwrap();
+        assert_eq!(user.user_id, 99);
+        assert_eq!(active.valid_token().await.unwrap(), "verified-access");
+        assert_eq!(active.store.load().unwrap().unwrap().refresh_token, "verified-refresh");
+        assert!(client.requests_paused(), "old tasks never inherit the verified grant");
+    }
+
+    #[tokio::test]
+    async fn verified_recovery_does_not_overwrite_a_newer_sibling_login() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-recovery-stale");
+        Mock::given(method("GET")).and(path("/api/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"me":{"user_id":99}})))
+            .mount(&server).await;
+        let client = logged_in_client("old-access").await;
+        let mut sibling = client.token_set().await.unwrap();
+        sibling.access_token = "candidate".into(); sibling.refresh_token = "candidate-refresh".into();
+        client.store.save(&sibling).unwrap();
+        let verified = client.stored_session_candidate().await.unwrap().unwrap().verify_recovery().await.unwrap();
+        sibling.access_token = "newest".into();
+        client.store.save(&sibling).unwrap();
+        assert!(verified.commit().is_err());
+        assert_eq!(client.store.load().unwrap().unwrap(), sibling);
+        assert_eq!(client.token_set().await.unwrap().access_token, "old-access");
+    }
+
+    #[tokio::test]
+    async fn access_only_logout_and_expiry_clear_only_the_matching_store() {
+        let _env = EnvGuard::hold("http://127.0.0.1:1", "/tmp/wftui-access-only");
+        let client = logged_in_client("access-only").await;
+        let mut grant = client.token_set().await.unwrap(); grant.refresh_token.clear();
+        client.set_tokens(grant.clone()).await.unwrap();
+        assert!(client.take_tokens().await.unwrap().is_some());
+        assert!(client.store.load().unwrap().is_none());
+        let restarted = WfApiClient::with_store(client.store.clone(), client.base_url(), client.client_id()).unwrap();
+        assert!(!restarted.has_tokens().await);
+        grant.expires_at = 1;
+        client.set_tokens(grant.clone()).await.unwrap();
+        assert!(matches!(client.valid_token().await, Err(Error::NoToken)));
+        assert!(client.store.load().unwrap().is_none());
+        client.set_tokens(grant.clone()).await.unwrap();
+        let mut newer = grant; newer.access_token = "newer-access-only".into();
+        client.store.save(&newer).unwrap();
+        assert!(matches!(client.valid_token().await, Err(Error::NoToken)));
+        assert_eq!(client.store.load().unwrap().unwrap(), newer);
+    }
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1688,7 +1880,7 @@ mod tests {
     }
 
     /// Issue #557: two instances sharing one config dir rotate each other's
-    /// refresh token out from under themselves. `adopt_stored_tokens` must
+    /// refresh token out from under themselves. `stored_session_candidate` must
     /// pick up what the sibling wrote — and must report `false` (nothing to
     /// recover) when the file is missing or already the token set in memory,
     /// so the caller can end the session instead of looping.
@@ -2183,30 +2375,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adopt_stored_tokens_takes_a_siblings_rotated_token_only_once() {        let _env = EnvGuard::hold("http://127.0.0.1:1", "/tmp/wftui-test-adopt");
+    async fn stored_session_candidate_takes_a_siblings_rotated_token_only_once() {        let _env = EnvGuard::hold("http://127.0.0.1:1", "/tmp/wftui-test-adopt");
         let client = logged_in_client("access-1").await;
 
         // Same token set on disk as in memory: nothing to adopt.
-        assert!(!client.adopt_stored_tokens().await);
+        assert!(client.stored_session_candidate().await.unwrap().is_none());
 
         // A sibling instance refreshes and rewrites the store.
         let store = token::Store::new();
         store
-            .save(&TokenSet { origin: String::new(), client_id: String::new(),
+            .save(&TokenSet { origin: client.base_url().into(), client_id: client.client_id().into(),
                 access_token: "access-2".into(),
                 refresh_token: "refresh-2".into(),
                 expires_at: OffsetDateTime::now_utc().unix_timestamp() + 3600,
                 scope: "test".into(),
             })
             .unwrap();
-        assert!(client.adopt_stored_tokens().await, "the sibling's token must be adopted");
-        assert_eq!(client.valid_token().await.unwrap(), "access-2");
-        // Idempotent: the same file is no longer news.
-        assert!(!client.adopt_stored_tokens().await);
+        let candidate = client.stored_session_candidate().await.unwrap().expect("candidate");
+        assert_eq!(candidate.valid_token().await.unwrap(), "access-2");
+        assert_eq!(client.valid_token().await.unwrap(), "access-1", "candidate is not active");
+        // Preparing again never publishes the replacement.
+        assert!(client.stored_session_candidate().await.unwrap().is_some());
 
         // No store at all is not something to recover from either.
         client.forget_tokens().await.unwrap();
-        assert!(!client.adopt_stored_tokens().await);
+        store.erase().unwrap();
+        assert!(client.stored_session_candidate().await.unwrap().is_none());
     }
 
     /// A grant minted for another origin (or client id) must never be
@@ -2215,7 +2409,7 @@ mod tests {
     /// the token lock, so a refresh racing the adoption cannot clobber the
     /// grant it just rotated in with the one it rotated out (#48).
     #[tokio::test]
-    async fn adopt_stored_tokens_sets_a_foreign_grant_aside() {
+    async fn stored_session_candidate_sets_a_foreign_grant_aside() {
         let _env = EnvGuard::hold("http://127.0.0.1:1", "/tmp/wftui-test-adopt-foreign");
         let client = logged_in_client("access-1").await;
 
@@ -2231,7 +2425,7 @@ mod tests {
             })
             .unwrap();
         assert!(
-            !client.adopt_stored_tokens().await,
+            client.stored_session_candidate().await.unwrap().is_none(),
             "a grant minted for another origin must not be installed"
         );
         // The live session is untouched, and the store was set aside for
@@ -2798,7 +2992,10 @@ mod tests {
         // Legacy: no origin recorded — accepted, and stamped on the next save.
         std::fs::write(&path, r#"{"access_token":"a","refresh_token":"r","expires_at":9999999999,"scope":"s"}"#).unwrap();
         let c = WfApiClient::with_store(token::Store::with_path(path.clone()), "http://127.0.0.1:1", "mine").unwrap();
-        assert!(c.has_tokens().await, "a pre-sites store is the built-in site's");
+        assert!(!c.has_tokens().await, "a legacy grant cannot belong to an arbitrary forum");
+        std::fs::write(&path, r#"{"access_token":"a","refresh_token":"r","expires_at":9999999999,"scope":"s"}"#).unwrap();
+        let c = WfApiClient::with_store(token::Store::with_path(path.clone()), config::BASE_URL, config::DEFAULT_OAUTH_CLIENT_ID).unwrap();
+        assert!(c.has_tokens().await, "the built-in site retains legacy compatibility");
         c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
             access_token: "b".into(),
             refresh_token: "r2".into(),
@@ -2808,7 +3005,7 @@ mod tests {
         .await
         .unwrap();
         let stored = token::Store::with_path(path.clone()).load().unwrap().unwrap();
-        assert_eq!((stored.origin.as_str(), stored.client_id.as_str()), ("http://127.0.0.1:1", "mine"));
+        assert_eq!((stored.origin.as_str(), stored.client_id.as_str()), (config::BASE_URL, config::DEFAULT_OAUTH_CLIENT_ID));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2936,7 +3133,7 @@ mod tests {
     /// the call (and any write after it) went out as whoever's token was on
     /// disk. `valid_token` must instead clear the in-memory session and
     /// return `Error::NoToken` — routing through the app-level boundary
-    /// (`recheck_stored_session` -> `adopt_stored_tokens` -> `/me` ->
+    /// (`recheck_stored_session` -> `stored_session_candidate` -> `/me` ->
     /// `Msg::Bootstrap`) that re-verifies identity before anything else runs.
     /// The store itself is left untouched: it may hold a sibling's — or a
     /// different account's — perfectly good session, and only the app-level
@@ -2983,7 +3180,7 @@ mod tests {
         // shared machine. Either way `valid_token` must not adopt it.
         let store = token::Store::with_path(std::path::PathBuf::from(dir).join("token.json"));
         store
-            .save(&TokenSet { origin: String::new(), client_id: String::new(),
+            .save(&TokenSet { origin: c.base_url().into(), client_id: c.client_id().into(),
                 access_token: "access-2".into(),
                 refresh_token: "refresh-2".into(),
                 expires_at: OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -3043,7 +3240,7 @@ mod tests {
         .unwrap();
         let store = token::Store::with_path(std::path::PathBuf::from(dir).join("token.json"));
         store
-            .save(&TokenSet { origin: String::new(), client_id: String::new(),
+            .save(&TokenSet { origin: c.base_url().into(), client_id: c.client_id().into(),
                 access_token: "access-2".into(),
                 refresh_token: "refresh-2".into(),
                 expires_at: OffsetDateTime::now_utc().unix_timestamp() + 3600,

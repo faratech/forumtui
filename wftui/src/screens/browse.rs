@@ -1431,6 +1431,7 @@ pub(crate) fn wrap_spans_aligned(
 }
 
 pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    use unicode_segmentation::UnicodeSegmentation;
     let width = width.max(1);
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
     let mut line: Vec<Span<'static>> = Vec::new();
@@ -1452,6 +1453,9 @@ pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<
             let is_space = tok.starts_with(char::is_whitespace);
             let mut rest = tok;
             loop {
+                if rest.is_empty() {
+                    break;
+                }
                 let len = cell_width(rest);
                 if is_space {
                     if just_wrapped {
@@ -1501,23 +1505,23 @@ pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<
                     just_wrapped = true;
                     continue;
                 }
-                // Take characters while they still fit in `room` *cells*, so
-                // a double-width character never straddles the last column.
+                // Measure and cut whole graphemes: a variation selector can
+                // make a one-cell scalar into a two-cell cluster, and a ZWJ
+                // family must never be split into separate people.
                 let mut head = String::new();
                 let mut head_w = 0usize;
-                for ch in rest.chars() {
-                    let mut buf = [0u8; 4];
-                    let cw = cell_width(ch.encode_utf8(&mut buf));
+                for grapheme in rest.graphemes(true) {
+                    let cw = cell_width(grapheme);
                     if head_w + cw > room {
                         break;
                     }
-                    head.push(ch);
+                    head.push_str(grapheme);
                     head_w += cw;
                 }
                 if head.is_empty() {
-                    // `room` is narrower than the next character. Flush and
+                    // `room` is narrower than the next grapheme. Flush and
                     // retry on a full-width line; if the line was already
-                    // empty the character is wider than the whole panel, so
+                    // empty the grapheme is wider than the whole panel, so
                     // take it anyway — the loop must make progress.
                     if used > 0 {
                         out.push(std::mem::take(&mut line));
@@ -1525,8 +1529,8 @@ pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<
                         just_wrapped = true;
                         continue;
                     }
-                    match rest.chars().next() {
-                        Some(ch) => head.push(ch),
+                    match rest.graphemes(true).next() {
+                        Some(grapheme) => head.push_str(grapheme),
                         None => break,
                     }
                 }
@@ -1539,7 +1543,9 @@ pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<
             }
         }
     }
-    out.push(line);
+    if !line.is_empty() || out.is_empty() {
+        out.push(line);
+    }
     out
 }
 
@@ -5009,6 +5015,52 @@ mod tests {
             let w: usize = l.iter().map(Span::width).sum();
             assert!(w <= 10);
         }
+        let out = wrap_spans(&[Span::raw("abcdefghij")], 5);
+        assert_eq!(out.iter().map(|r| r.iter().map(|s| s.content.as_ref()).collect::<String>()).collect::<Vec<_>>(), ["abcde", "fghij"]);
+        let out = wrap_spans(&[Span::raw("abcde ")], 5);
+        assert_eq!(out.len(), 1, "wrap runoff does not add an empty row");
+    }
+
+    #[test]
+    fn wrap_spans_keeps_presentation_and_zwj_graphemes_whole() {
+        use unicode_segmentation::UnicodeSegmentation;
+        for src in ["abcd⚠\u{fe0f}e", "👨‍👩‍👧‍👦zzzz", "1234a\u{301}bc", "漢字⚠\u{fe0f}end"] {
+            for width in 2..=10 {
+                let rows = wrap_spans(&[Span::raw(src)], width);
+                let text: Vec<String> = rows.iter().map(|r| r.iter().map(|s| s.content.as_ref()).collect()).collect();
+                assert_eq!(text.concat(), src, "no content is lost at width {width}");
+                let graphemes: Vec<&str> = text.iter().flat_map(|s| s.graphemes(true)).collect();
+                assert_eq!(graphemes, src.graphemes(true).collect::<Vec<_>>(), "cluster split at width {width}: {text:?}");
+                assert!(text.iter().all(|s| cell_width(s) <= width), "overflow at width {width}: {text:?}");
+            }
+        }
+        let rows = wrap_spans(&[Span::raw("⚠\u{fe0f}⚠\u{fe0f}")], 1);
+        assert_eq!(rows.len(), 2, "an oversized final cluster does not add an empty row");
+        assert_eq!(rows.iter().flatten().map(|s| s.content.as_ref()).collect::<String>(), "⚠\u{fe0f}⚠\u{fe0f}");
+        assert!(rows.iter().flatten().all(|s| s.content.is_empty() || s.content == "⚠\u{fe0f}"));
+    }
+
+    #[test]
+    fn wrapped_presentation_graphemes_reach_the_drawn_cells_without_clipping() {
+        let theme = Theme::truecolor();
+        // Two styles exercise the actual span renderer as well as the
+        // wrapper; the first token used to occupy six cells in a five-cell
+        // row and lose the presentation glyph at the Paragraph edge.
+        let spans = [Span::styled("abcd⚠\u{fe0f}e", theme.title()), Span::styled("FG", theme.dim())];
+        let rows = wrap_spans(&spans, 5);
+        let mut term = Terminal::new(TestBackend::new(5, 4)).unwrap();
+        term.draw(|f| {
+            f.render_widget(Paragraph::new(rows.iter().cloned().map(Line::from).collect::<Vec<_>>()), f.area());
+        }).unwrap();
+        let buffer = term.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "a");
+        assert_eq!(buffer[(3, 0)].symbol(), "d");
+        assert_eq!(buffer[(0, 1)].symbol(), "⚠\u{fe0f}");
+        assert_eq!(buffer[(2, 1)].symbol(), "e");
+        assert_eq!(buffer[(3, 1)].symbol(), "F");
+        assert_eq!(buffer[(4, 1)].symbol(), "G");
+        assert_eq!(buffer[(0, 1)].fg, theme.title().fg.unwrap_or(ratatui::style::Color::Reset));
+        assert_eq!(buffer[(3, 1)].fg, theme.dim().fg.unwrap_or(ratatui::style::Color::Reset));
     }
 
     /// The wrap budget is terminal cells, not `char`s. A CJK run billed one

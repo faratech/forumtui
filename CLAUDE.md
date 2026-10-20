@@ -70,9 +70,11 @@ Release packaging (signed Windows MSIX for x64/x86/arm64, Linux tarball) is
 Windows box with the Azure Trusted Signing kit (`/root/.sign` on this
 server, copied to `C:\code\sign` there); the Linux tarball runs here.
 
-The "gates" every change must pass before it is committed: both test invocations,
-both clippy invocations, a release build, and `/usr/bin/grep -rn $'\x1b' wftui/src`
-printing nothing (hard rule 1).
+The gates before committing are the workspace tests, the no-default-features
+`wftui` tests, the no-default-features `common` tests, the generic-edition
+`wftui` tests with images, all three Clippy commands above with zero warnings,
+a release build, and `/usr/bin/grep -rn $'\x1b' wftui/src` printing nothing
+(hard rule 1). Set a scratch `WFTUI_CONFIG_DIR` for every test invocation.
 
 Two harnesses exist for checking this client against the real site rather
 than against a belief about it, and both are worth reaching for:
@@ -87,13 +89,16 @@ cargo run -q -p common --example quote_probe -- <message-file> <username> <post_
 KEY=$(grep -m1 '^XF_API_KEY=' /web/.env | cut -d= -f2-)
 curl -s -H "XF-Api-Key: $KEY" 'https://windowsforum.com/api/<path>' | jq .
 ``` The release binary is committed at `bin/wftui` so
-machines without a toolchain can grab it. Windows is a native `cargo build
---release`; there is no CI and no cross-build (`scripts/` is reserved for one).
+machines without a toolchain can grab it. `.github/workflows/test.yml` runs
+the test and Clippy feature matrix on Linux. `release-binaries.yml` builds
+Linux release assets and builds/signs x64, x86 and arm64 Windows assets on
+a Windows runner; local Windows builds use `cargo build --release`.
 
 ## Git
 
-The repo root is `/web` (a monorepo); this crate is `wftui_app/`. Stage explicit
-paths under `wftui_app/` only — never `git add -A`, never `target/`. Commit messages
+The Git repository root is `/web/wftui_app`, a standalone checkout. Stage
+explicit reviewed paths relative to that root — never `git add -A`, never
+`target/`. Commit messages
 are `feat(wftui): …` / `fix(wftui): …` with a body of plain-word bullets, `Fixes #N`
 lines, the test/clippy result line, and the `Co-Authored-By` trailer. Pushes go
 straight to `origin main`. Bugs are tracked as GitHub issues labelled
@@ -242,11 +247,15 @@ stack cut to Home, Login pushed, overlays cleared, badges zeroed, Home list rese
 message ends the session: only `NoToken`, structured OAuth errors, 401 and the
 bootstrap account-gone codes do; ordinary XF 403 refusals and `"http_error"`
 bodies (Cloudflare 5xx/429 pages) never do. A mid-session `NoToken`/401 first
-runs `recheck_stored_session` (adopt a sibling instance's rotated `token.json`,
-then `/me`); its verdict comes back as `Msg::Bootstrap{generation}` through a
-drop guard, so it can never be lost; errors that arrive inside that window are
+runs `recheck_stored_session` (verify a private candidate from a sibling's
+rotated `token.json` through `/me`, then publish it in the event loop). Success
+arrives as `Msg::RecoveryVerified`; failures use `Msg::Bootstrap{generation}`
+through a drop guard so the verdict cannot be lost; errors that arrive inside that window are
 rewritten by `mark_retryable` and still delivered to their screen so nothing stays
-busy/loading; a 120 s backstop clears the window without ending a live session.
+busy/loading; a 120 s backstop invalidates late verdicts and keeps requests paused until retry.
+Candidate refreshes stay private and remain cached for retries after a failed
+identity check. Publication compares the source grant under the store lock, and
+every successful recovery advances the request generation.
 If `/me` reports a different user, the old identity is torn down and a hint names
 the new one. `logout()` forgets tokens synchronously before the (slow) revoke
 calls. Writes carry the session generation and are aborted by `end_session`.
@@ -418,7 +427,8 @@ say. The flow is **stage now, apply at the next start**, never a relaunch:
 - ~3 s after start, `check_and_stage` asks the feed
   (`https://api.github.com/repos/faratech/forumtui/releases/latest`) with its own
   short-lived `http::build()` client — off-origin, so **no forum gate and
-  never the bearer** — at most once per 6 h (`<config dir>/update/last-check`;
+  never the bearer** — at most once per 6 h per edition/platform
+  (`<config dir>/update/last-check{edition}-<arch>`;
   `g u` and the palette's "Check for updates" row ignore the interval). A
   newer, non-draft, non-prerelease tag downloads the bare binary for this
   platform (`Target::asset_name`: `wftui-<ver>-linux-x86_64`,
@@ -445,8 +455,9 @@ say. The flow is **stage now, apply at the next start**, never a relaunch:
   `WFTUI_NO_UPDATE=1` is the escape.
 - One `fs2` lock (`<config dir>/update/staging.lock`) covers staging, pruning
   and applying across instances; start-up *tries* it and never waits.
-  Generations that are not newer than the running build are pruned, so a
-  deliberate downgrade is never re-applied.
+  This edition/platform's generations that are not newer than the running
+  build are pruned. Valid generations for another edition/platform remain
+  available to their owner and are never installed by this one.
 
 The release side of the contract is `release-binaries.yml`: it refuses a tag
 that differs from `wftui/Cargo.toml` (or a `common` version that differs from
@@ -501,9 +512,15 @@ met. Three things about it are not obvious:
   existing hash (web → TUI does not) — a draft resumed from the website says
   its attachments stay there rather than losing them silently.
 
-The relay is a mirror, not the store: every call is fire-and-forget and a
-failure is only logged. `drafts.json` stays the thing the composer reads, so a
-500, an offline session or the server's 24 h prune cannot cost the words. No
+The relay is a mirror, not the store: calls run in the background and failures
+are logged. A local save atomically records both its words and a revisioned
+Save obligation; deletion records a Delete obligation. Unsynced local words
+win over website copies, including after restart, and sync retries the latest
+obligation before listing remote drafts. Per-key cross-process relay locks and
+revision checks prevent older requests or acknowledgments from replacing newer
+intent. `drafts.json` stays the thing the composer reads, so a 500, an offline
+session or the server's 24 h prune cannot cost durable words. Oversized drafts
+remain memory-only and never advertise durability without a stored body. No
 new OAuth scope was minted for it — a new scope is absent from the 90-day
 tokens already issued and would 403 every live session until re-auth (#695),
 so each draft kind asserts the scope its content type already implies.
@@ -910,11 +927,16 @@ an image past either returns `Err` and falls back to the placeholder.
 
 ## Production readiness corrections (2026-09)
 
-- Draft store version 2 binds entries to the verified origin and user ID. Only
+- Draft store version 3 binds entries to the verified origin and user ID. Only
   successful login/bootstrap selects the owner; expiry retains it. Per-key
-  transactions merge under the file lock. An ownership tombstone rejects stale
-  writes after sign-out. Pre-release unowned drafts are discarded on upgrade, as
-  requested by the operator; a future version is never silently deleted.
+  transactions commit words and desired relay operations under the file lock;
+  revision numbers survive ownership tombstones and are never reused. Settling
+  an operation requires its exact owner, key and revision. Version 2 migrates
+  after a private backup: surviving local drafts become Save obligations even
+  when an older delete was owed; owed keys without local text become Delete.
+  An ownership tombstone rejects stale writes after sign-out. Pre-release
+  unowned drafts are discarded on upgrade, as requested by the operator; a
+  future version is never silently deleted.
 - Every ordinary event-loop exit calls `shutdown`: open supported composers save
   locally before runtime teardown, with at most two seconds for final read marks.
   Session expiry also saves locally, without creating new relay/read tasks after

@@ -302,6 +302,8 @@ pub enum Msg {
     /// never confused with a poller's `SessionLost` landing in the same
     /// recovery window (issue #587).
     Bootstrap { generation: u64, result: Result<User, TaskError> },
+    /// Candidate credentials remain private until this event-loop handoff.
+    RecoveryVerified { generation: u64, verified: Box<common::api::VerifiedSession> },
     /// A background task decided the session itself is over — only the
     /// pollers send this (they otherwise drop their errors); the token-store
     /// recheck deliberately does not (issue #587), so this message shape
@@ -463,6 +465,41 @@ pub(super) fn session_msg(generation: u64, msg: Msg) -> Msg {
     Msg::Session {
         generation,
         msg: Box::new(msg),
+    }
+}
+
+/// Execute one revision while holding a per-key cross-process lock. The
+/// nonblocking filesystem attempt runs off the UI runtime; a busy lock waits
+/// asynchronously and remains cancellable during sign-out or shutdown.
+async fn relay_draft_operation(
+    api: &dyn WfApi,
+    store: &common::drafts::Store,
+    owner: &common::drafts::Owner,
+    key: common::drafts::DraftKey,
+    operation: common::drafts::RelayOperation,
+    transient: Option<&common::drafts::Draft>,
+) -> common::error::Result<bool> {
+    let Some(xf_key) = key.xf_key() else { return Ok(false); };
+    let _relay_lock = loop {
+        let store = store.clone();
+        let attempt = tokio::task::spawn_blocking(move || store.try_relay_lock(key)).await
+            .map_err(|error| common::error::Error::TokenStore(format!("draft relay lock: {error}")))??;
+        if let Some(lock) = attempt { break lock; }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let Some(draft) = store.relay_work(owner, key, operation, transient)? else { return Ok(false); };
+    let result = match operation.kind {
+        common::drafts::RelayKind::Save => api.save_draft(&xf_key, &draft.body, &draft.title, draft.attachment_key.as_deref()).await,
+        common::drafts::RelayKind::Delete => api.delete_draft(&xf_key).await,
+    };
+    match result {
+        Ok(()) => { store.settle(owner, key, operation)?; Ok(false) }
+        Err(error) if relay_route_missing(&error) => {
+            // Missing transport is not an acknowledgment of the desired
+            // state. Retain the obligation if the relay is installed later.
+            Ok(true)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -693,17 +730,11 @@ pub struct App {
     draft_epoch: u64,
     draft_mutations: std::collections::HashMap<common::drafts::DraftKey, u64>,
     draft_deletions: std::collections::HashMap<common::drafts::DraftKey, u64>,
-    /// Same-key relay operations share a FIFO mutex, so a delete cannot beat
-    /// the save that preceded it on the event loop.
-    draft_relay_tail: std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>,
-    /// Remote deletes that were attempted but not proven settled (#815): the
-    /// task failed, or was aborted before the answer came back. Re-tried by
-    /// the next `sync_drafts`; until one settles, the site's copy of that
-    /// draft is scheduled for removal and must not be merged back over the
-    /// deletion — that is how a posted reply's draft resurrects. Shared with
-    /// the delete tasks themselves (they only ever remove a proven-settled
-    /// key), so the outcome needs no message on the event channel.
-    pending_remote_deletes: Arc<std::sync::Mutex<std::collections::HashSet<common::drafts::DraftKey>>>,
+    /// Current desired relay operations, including memory-only oversized or
+    /// temporarily unpersistable drafts. Disk remains authoritative across
+    /// processes; callbacks retire only their exact operation revision.
+    draft_operations: Arc<std::sync::Mutex<std::collections::HashMap<common::drafts::DraftKey, common::drafts::RelayOperation>>>,
+
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -985,8 +1016,7 @@ pub async fn run(
         draft_epoch: 0,
         draft_mutations: std::collections::HashMap::new(),
         draft_deletions: std::collections::HashMap::new(),
-        draft_relay_tail: std::collections::HashMap::new(),
-        pending_remote_deletes: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        draft_operations: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
     if needs_setup {
         app.push_screen(Screen::Setup(screens::setup::SetupState::default()));
@@ -1769,38 +1799,14 @@ impl App {
             self.discard_draft_local(key, relay);
             return;
         }
-        self.draft_epoch = self.draft_epoch.wrapping_add(1);
-        let epoch = self.draft_epoch;
-        self.draft_mutations.insert(key, epoch);
-        self.draft_deletions.remove(&key);
-        // A NEW draft for a key whose remote delete was owed supersedes it:
-        // the site slot now belongs to this draft, so the sync's retry must
-        // not eat its mirror and the merge must treat the site's copy as
-        // news again (#86). Only a stash that actually RE-MIRRORS the site
-        // may retire the record — the non-relaying callers (the shutdown
-        // unwind, the submit-time mirror) leave the site holding the old
-        // copy, and retiring the guard there is what let a quit resurrect
-        // the posted draft over the newer text (#87).
-        // #854: only the IN-MEMORY half of the guard comes off here — the
-        // sync's retry must not eat the fresh mirror this stash is about to
-        // queue. The persisted half retires when the mirror provably
-        // settles (push_draft_settling_owed), not before it runs: retiring
-        // up front left the supersede holding neither guard nor mirror when
-        // the upload failed on the same outage that had already failed the
-        // delete, and the next bootstrap's merge preferred the site's
-        // posted v1 over the newer local v2.
-        let owed_superseded = relay
-            && self.pending_remote_deletes.lock().expect("lock").remove(&key);
         let too_big = draft.too_big_to_persist();
-        if relay {
-            if owed_superseded {
-                self.push_draft_settling_owed(key, &draft);
-            } else {
-                self.push_draft(key, &draft);
-            }
-        }
         self.drafts.insert(key, draft);
+        // The text and Save intent become durable before any network work
+        // starts. Shutdown and submit-time saves follow this same path.
         let saved = self.persist_draft(key);
+        self.draft_mutations.insert(key, self.draft_epoch);
+        self.draft_deletions.remove(&key);
+        if relay { self.relay_draft(key); }
         if !feedback {
             return;
         }
@@ -1867,16 +1873,11 @@ impl App {
     }
 
     fn discard_draft_local(&mut self, key: common::drafts::DraftKey, relay: bool) {
-        self.draft_epoch = self.draft_epoch.wrapping_add(1);
-        let epoch = self.draft_epoch;
-        self.draft_mutations.insert(key, epoch);
-        self.draft_deletions.insert(key, epoch);
         self.drafts.remove(&key);
         self.persist_draft(key);
-        // Unconditionally, not only when a local copy existed: the draft may
-        // have been written in the browser and never resumed here, and the
-        // point of a discard is that it is gone from both.
-        if relay { self.drop_remote_draft(key); }
+        self.draft_mutations.insert(key, self.draft_epoch);
+        self.draft_deletions.insert(key, self.draft_epoch);
+        if relay { self.relay_draft(key); }
     }
 
     /// Forget every draft, in memory and on disk. For the two moments where
@@ -1901,10 +1902,7 @@ impl App {
         self.draft_epoch = self.draft_epoch.wrapping_add(1);
         self.draft_mutations.clear();
         self.draft_deletions.clear();
-        self.draft_relay_tail.clear();
-        // The owed deletes belonged to the signing-out account's mirror
-        // (#815); the relay tail they would ride on is gone with it.
-        self.pending_remote_deletes.lock().expect("lock").clear();
+        self.draft_operations.lock().expect("lock").clear();
     }
 
     /// The drafts list's rows, newest first.
@@ -2039,326 +2037,127 @@ impl App {
         }
     }
 
-    /// Mirror a draft to the website, best effort (#716).
-    ///
-    /// Fire-and-forget on purpose: the local save has already succeeded by
-    /// the time this runs, so a relay failure costs nothing the user can act
-    /// on — and blocking Esc on a network round trip to save something we
-    /// already saved would be the wrong trade. `drafts.json` stays the store
-    /// the composer reads; this only keeps the website in step.
-    fn push_draft(&mut self, key: common::drafts::DraftKey, draft: &common::drafts::Draft) {
-        // `None` means XF has no draft for this kind — an edit. Local only.
-        let Some(xf_key) = key.xf_key() else {
-            return;
-        };
-        if !self.draft_relay_enabled() {
-            return;
-        }
-        let api = self.api.clone();
-        let tx = self.tx.clone();
-        let (message, title) = (draft.body.clone(), draft.title.clone());
-        let attachment_key = draft.attachment_key.clone();
-        let relay = self
-            .draft_relay_tail
-            .entry(xf_key.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        self.spawn_session_task(async move {
-            let _guard = relay.lock().await;
-            if let Err(e) = api
-                .save_draft(&xf_key, &message, &title, attachment_key.as_deref())
-                .await
-            {
-                tracing::warn!("could not sync draft {xf_key} to the site: {e}");
-                if relay_route_missing(&e) {
-                    tx.send(Msg::DraftRelayAbsent).ok();
-                }
-            }
-        });
-    }
-
-    /// Whether draft mirroring to the site is on: the site says it has the
-    /// relay (or has not said), and no call has yet found it missing.
+    /// Whether this site's relay is enabled. A missing route disables only
+    /// network mirroring; local drafts and their dirty guards remain intact.
     fn draft_relay_enabled(&self) -> bool {
         self.site.features.drafts_relay != Some(false) && !self.drafts_relay_absent
     }
 
-    /// Forget a draft on the website too.
-    ///
-    /// Load-bearing on the send path: XF's *web* controller deletes the draft
-    /// when a post succeeds, but the REST API never touches drafts at all, so
-    /// without this every post made from the TUI would leave a stale draft
-    /// waiting in the browser's editor.
-    /// push_draft for a stash that supersedes an owed remote delete (#854):
-    /// the same wire behavior as push_draft, but the persisted owed-delete
-    /// record retires only when the mirror PROVABLY settles — Ok, or a
-    /// route-missing error (the precedent drop_remote_draft uses: with the
-    /// relay absent no sync can fetch the stale copy back). Any other
-    /// failure re-arms the guard, so the bootstrap merge keeps skipping the
-    /// stale site copy and the sync's retry loop deletes it with the same
-    /// settlement discipline. The supersede used to retire the record
-    /// before the mirror ran; two transient failures on one outage then let
-    /// the site's posted v1 win the merge over the newer local v2 — the
-    /// resurrection #86/#87 closed, back through the relay arm.
-    fn push_draft_settling_owed(
-        &mut self,
-        key: common::drafts::DraftKey,
-        draft: &common::drafts::Draft,
-    ) {
-        let Some(xf_key) = key.xf_key() else {
-            return;
-        };
-        if !self.draft_relay_enabled() {
-            return;
-        }
+    fn relay_draft(&mut self, key: common::drafts::DraftKey) {
+        if !self.draft_relay_enabled() { return; }
+        let Some(owner) = self.draft_owner.clone() else { return; };
+        let Some(operation) = self.draft_operations.lock().expect("lock").get(&key).copied() else { return; };
+        // Revision zero is an in-memory save after a disk error. It shields
+        // the words but cannot dispatch without the durable revision fence.
+        if operation.revision == 0 { return; }
         let api = self.api.clone();
-        let tx = self.tx.clone();
-        let (message, title) = (draft.body.clone(), draft.title.clone());
-        let attachment_key = draft.attachment_key.clone();
-        let relay = self
-            .draft_relay_tail
-            .entry(xf_key.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
         let store = self.draft_store.clone();
-        let owner = self.draft_owner.clone();
-        let pending = self.pending_remote_deletes.clone();
+        let operations = self.draft_operations.clone();
+        let transient = self.drafts.get(&key).filter(|draft| draft.too_big_to_persist()).cloned();
+        let tx = self.tx.clone();
+        let generation = self.session_generation;
         self.spawn_session_task(async move {
-            let _guard = relay.lock().await;
-            match api.save_draft(&xf_key, &message, &title, attachment_key.as_deref()).await
-            {
-                Ok(()) => {
-                    // The mirror landed: the site slot belongs to this draft
-                    // and the owed record can finally retire (the in-memory
-                    // half came off at supersede time).
-                    if let Some(owner) = &owner {
-                        let _ = store.clear_owed_delete(owner, &key);
+            match relay_draft_operation(api.as_ref(), &store, &owner, key, operation, transient.as_ref()).await {
+                Ok(missing) => {
+                    if !missing {
+                        let mut pending = operations.lock().expect("lock");
+                        if pending.get(&key) == Some(&operation) { pending.remove(&key); }
                     }
+                    if missing { tx.send(session_msg(generation, Msg::DraftRelayAbsent)).ok(); }
                 }
-                Err(e) => {
-                    tracing::warn!("could not sync draft {xf_key} to the site: {e}");
-                    if relay_route_missing(&e) {
-                        tx.send(Msg::DraftRelayAbsent).ok();
-                        // Settled: the copy is gone or unreachable either way.
-                        if let Some(owner) = &owner {
-                            let _ = store.clear_owed_delete(owner, &key);
-                        }
-                    } else {
-                        // Re-arm: the merge must keep treating the site's
-                        // stale copy as scheduled-for-removal, and the sync's
-                        // retry loop owns the delete from here.
-                        pending.lock().expect("lock").insert(key);
-                    }
-                }
+                Err(error) => tracing::warn!("could not relay draft {key:?}: {error}"),
             }
         });
     }
 
-    fn drop_remote_draft(&mut self, key: common::drafts::DraftKey) {
-        let Some(xf_key) = key.xf_key() else {
-            return;
-        };
-        if !self.draft_relay_enabled() {
-            return;
-        }
-        // Recorded before the task leaves (#815): a failure, a crash or a
-        // session boundary aborting the task would otherwise leave the site's
-        // copy in place with no record that a delete was owed — and the next
-        // sync would resurrect the draft the user already posted. The task
-        // itself takes the key back off only when the delete provably
-        // settled; nothing rides the event channel.
-        self.pending_remote_deletes.lock().expect("lock").insert(key);
-        // And persist it: the guard has to outlive the process, or a
-        // restart's bootstrap merge resurrects the posted draft (#86).
-        if let Some(owner) = self.draft_owner.clone()
-            && let Err(e) = self.draft_store.record_owed_delete(&owner, &key)
-        {
-            tracing::warn!("could not record the owed delete for {key:?}: {e}");
-        }
-        let pending = self.pending_remote_deletes.clone();
-        let store = self.draft_store.clone();
-        let owner = self.draft_owner.clone();
-        let api = self.api.clone();
-        let tx = self.tx.clone();
-        let relay = self
-            .draft_relay_tail
-            .entry(xf_key.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        self.spawn_session_task(async move {
-            let _guard = relay.lock().await;
-            let settled = match api.delete_draft(&xf_key).await {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::warn!("could not clear draft {xf_key} on the site: {e}");
-                    if relay_route_missing(&e) {
-                        tx.send(Msg::DraftRelayAbsent).ok();
-                        // Also settled: either the copy is already gone or the
-                        // relay does not exist — and with the relay absent, no
-                        // sync can fetch the stale copy back.
-                        true
-                    } else {
-                        false
-                    }
-                }
-            };
-            if settled {
-                pending.lock().expect("lock").remove(&key);
-                if let Some(owner) = &owner {
-                    let _ = store.clear_owed_delete(owner, &key);
-                }
-            }
-        });
-    }
-
-    /// Merge the website's drafts into the local store, newest wins (#716).
-    ///
-    /// Runs once when a session goes live rather than when a composer opens,
-    /// so opening a composer stays instant — it reads a map that is already
-    /// in memory.
+    /// Import only clean slots. A pending Save protects local words even
+    /// after restart; a pending Delete prevents discarded text reappearing.
     fn merge_remote_drafts(&mut self, epoch: u64, remote: Vec<common::models::RemoteDraft>) {
+        let Some(owner) = self.draft_owner.clone() else { return; };
         for r in remote {
-            // A kind this build does not know is skipped, not guessed at.
-            let Some(key) = common::drafts::DraftKey::from_xf_key(&r.key) else {
+            let Some(key) = common::drafts::DraftKey::from_xf_key(&r.key) else { continue; };
+            if self.draft_mutations.get(&key).is_some_and(|mutation| *mutation > epoch) {
                 continue;
+            }
+            let transient = self.draft_operations.lock().expect("lock").get(&key).copied()
+                .is_some_and(|operation| operation.revision == 0
+                    || self.drafts.get(&key).is_some_and(|draft| draft.too_big_to_persist()));
+            if transient { continue; }
+            let draft = common::drafts::Draft {
+                title: r.title,
+                body: r.message,
+                attachment_key: self.drafts.get(&key).and_then(|draft| draft.attachment_key.clone()),
+                saved_at: r.last_update,
+                remote_attachments: r.has_attachments,
+                label: self.drafts.get(&key).map(|draft| draft.label.clone()).unwrap_or_default(),
+                ..Default::default()
             };
-            if self
-                .draft_mutations
-                .get(&key)
-                .is_some_and(|mutation| *mutation > epoch)
-            {
-                // This list request started before a local save/delete. Its
-                // copy is stale, even when it returns after the local write.
-                continue;
+            match self.draft_store.merge_remote(&owner, key, &draft, epoch) {
+                Ok(true) => { self.drafts.insert(key, draft); }
+                Ok(false) => {
+                    // A sibling may have changed this slot since our list
+                    // started. Adopt its current local copy, never our stale
+                    // remote response or whole-file snapshot.
+                    if let Ok(snapshot) = self.draft_store.snapshot(&owner) {
+                        match snapshot.drafts.get(&key) {
+                            Some(draft) => { self.drafts.insert(key, draft.clone()); }
+                            None => { self.drafts.remove(&key); }
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!("could not merge website draft {key:?}: {error}"),
             }
-            if self
-                .draft_deletions
-                .get(&key)
-                .is_some_and(|deletion| *deletion > epoch)
-            {
-                continue;
-            }
-            self.draft_deletions.remove(&key);
-            if self.pending_remote_deletes.lock().expect("lock").contains(&key) {
-                // A delete for this draft is still owed (#815): the site's
-                // copy is scheduled for removal, not news.
-                continue;
-            }
-            // The local copy's `saved_at` and the relay's `last_update` come
-            // from two clocks whose skew is unknown, so they are never
-            // compared (#815). A draft mutated after this list was issued
-            // never reaches this line — the mutation-epoch guard above keeps
-            // it. Everything else predates the list, and the site's copy is
-            // what the website's own editor shows, so it wins.
-            self.drafts.insert(
-                key,
-                common::drafts::Draft {
-                    title: r.title,
-                    body: r.message,
-                    // The website's copy cannot hand us a usable attachment
-                    // key, but a key minted in *this* session still works, so
-                    // keep one if we have it rather than dropping it.
-                    attachment_key: self.drafts.get(&key).and_then(|d| d.attachment_key.clone()),
-                    saved_at: r.last_update,
-                    remote_attachments: r.has_attachments,
-                    // The relay sends no name for the target, so keep any
-                    // label we already had rather than blanking the list row.
-                    label: self.drafts.get(&key).map(|d| d.label.clone()).unwrap_or_default(),
-                    edit_thread_id: None,
-                    edit_thread_title: None,
-                    edit_seed_body: None,
-                },
-            );
-            self.persist_draft(key);
         }
         self.draft_mutations.retain(|_, mutation| *mutation > epoch);
         self.draft_deletions.retain(|_, deletion| *deletion > epoch);
     }
 
-    /// The relay-tail mutexes in a total order over their keys (#815).
-    ///
-    /// `sync_drafts` holds every one of these across its list call. Two
-    /// overlapping syncs acquiring them in `HashMap` order — which differs
-    /// between instances and between runs — could interleave into an ABBA
-    /// deadlock, each holding the one the other is waiting on. Sorting the
-    /// keys makes the acquisition order total, so no two takers can cycle.
-    fn sorted_relay_tails(&self) -> Vec<(String, Arc<tokio::sync::Mutex<()>>)> {
-        let mut tails: Vec<_> = self
-            .draft_relay_tail
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        tails.sort_by(|a, b| a.0.cmp(&b.0));
-        tails
-    }
-
-    /// Ask the website for this account's drafts. Errors are logged and
-    /// dropped: nothing about the composer depends on this call succeeding.
+    /// Retry durable desired operations before listing. Each key has a
+    /// cross-process relay lock, and work is re-read after acquiring it.
     fn sync_drafts(&mut self) {
-        if !self.draft_relay_enabled() {
-            return;
-        }
+        if !self.draft_relay_enabled() { return; }
+        let Some(owner) = self.draft_owner.clone() else { return; };
+        // A repaired filesystem can make earlier memory-only failures
+        // durable now; until then the in-memory guards keep their words.
+        let unpersisted: Vec<_> = self.draft_operations.lock().expect("lock").iter()
+            .filter_map(|(key, operation)| (operation.revision == 0).then_some(*key)).collect();
+        for key in unpersisted { self.persist_draft(key); }
         let api = self.api.clone();
-        let tx = self.tx.clone();
-        let session_generation = self.session_generation;
-        let epoch = self.draft_epoch;
-        let relays: Vec<_> = self.sorted_relay_tails().into_iter().map(|(_, m)| m).collect();
-        // Deletes that failed or were aborted earlier go first (#815), inside
-        // the relay locks and before the list — so the list cannot observe a
-        // draft whose delete is mid-flight, and a still-owed key cannot keep
-        // resurrecting its copy.
-        let retries: Vec<(String, common::drafts::DraftKey)> = {
-            let pending = self.pending_remote_deletes.lock().expect("lock");
-            pending
-                .iter()
-                .filter_map(|key| key.xf_key().map(|xf_key| (xf_key, *key)))
-                .collect()
-        };
-        let pending = Arc::clone(&self.pending_remote_deletes);
         let store = self.draft_store.clone();
-        let owner = self.draft_owner.clone();
+        let operations = self.draft_operations.clone();
+        let tx = self.tx.clone();
+        let generation = self.session_generation;
         self.spawn_session_task(async move {
-            // A list taken before a same-key save/delete can be stale even if
-            // the HTTP response arrives later. Wait for all relay operations
-            // already queued at this point before asking the server.
-            let _relay_refs = relays;
-            let mut _guards = Vec::with_capacity(_relay_refs.len());
-            for relay in &_relay_refs {
-                _guards.push(relay.lock().await);
-            }
-            for (xf_key, key) in retries {
-                let settled = match api.delete_draft(&xf_key).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        tracing::warn!("still owed: could not clear draft {xf_key} on the site: {e}");
-                        if relay_route_missing(&e) {
-                            tx.send(Msg::DraftRelayAbsent).ok();
-                            true
-                        } else {
-                            false
+            let snapshot = match store.snapshot(&owner) {
+                Ok(snapshot) => snapshot,
+                Err(error) => { tracing::warn!("could not read draft relay work: {error}"); return; }
+            };
+            let mut retries: Vec<_> = snapshot.operations.into_iter().collect();
+            retries.sort_by_key(|(key, _)| key.as_key());
+            for (key, operation) in retries {
+                match relay_draft_operation(api.as_ref(), &store, &owner, key, operation, None).await {
+                    Ok(missing) => {
+                        if missing {
+                            tx.send(session_msg(generation, Msg::DraftRelayAbsent)).ok();
+                            return;
                         }
+                        let mut pending = operations.lock().expect("lock");
+                        if pending.get(&key) == Some(&operation) { pending.remove(&key); }
                     }
-                };
-                if settled {
-                    pending.lock().expect("lock").remove(&key);
-                    if let Some(owner) = &owner {
-                        let _ = store.clear_owed_delete(owner, &key);
-                    }
+                    Err(error) => tracing::warn!("draft relay work remains owed for {key:?}: {error}"),
                 }
             }
+            // The revision belongs to the ACTUAL list snapshot, after the
+            // retry work. Subsequent mutations in any instance fence it out.
+            let epoch = match store.snapshot(&owner) {
+                Ok(snapshot) => snapshot.revision,
+                Err(error) => { tracing::warn!("could not snapshot drafts: {error}"); return; }
+            };
             match api.list_drafts().await {
-                Ok(drafts) => {
-                    tx.send(session_msg(
-                        session_generation,
-                        Msg::DraftsLoaded { epoch, drafts },
-                    ))
-                    .ok();
-                }
-                Err(e) => {
-                    tracing::warn!("could not read drafts from the site: {e}");
-                    if relay_route_missing(&e) {
-                        tx.send(Msg::DraftRelayAbsent).ok();
-                    }
+                Ok(drafts) => { tx.send(session_msg(generation, Msg::DraftsLoaded { epoch, drafts })).ok(); }
+                Err(error) => {
+                    tracing::warn!("could not read drafts from the site: {error}");
+                    if relay_route_missing(&error) { tx.send(session_msg(generation, Msg::DraftRelayAbsent)).ok(); }
                 }
             }
         });
@@ -2367,42 +2166,49 @@ impl App {
     fn select_draft_owner(&mut self, user_id: u32) {
         let owner = common::drafts::Owner::new(self.client.base_url(), user_id);
         let selected = self.draft_store.activate(&owner);
-        if self.draft_owner.as_ref() == Some(&owner) {
-            if let Err(error) = selected { tracing::warn!("could not select account drafts: {error}"); }
-            return;
+        if self.draft_owner.as_ref() != Some(&owner) {
+            self.drafts.clear();
+            self.draft_mutations.clear();
+            self.draft_deletions.clear();
+            self.draft_operations.lock().expect("lock").clear();
+            match selected {
+                Ok(drafts) => self.drafts = drafts,
+                Err(error) => tracing::warn!("could not select account drafts: {error}"),
+            }
+            self.draft_owner = Some(owner.clone());
+        } else if let Err(error) = selected {
+            tracing::warn!("could not select account drafts: {error}");
         }
-        self.drafts.clear();
-        self.draft_mutations.clear();
-        self.draft_deletions.clear();
-        self.draft_relay_tail.clear();
-        // An owed delete belongs to the previous identity's mirror (#815);
-        // the next account's thread-7 is a different draft entirely.
-        self.pending_remote_deletes.lock().expect("lock").clear();
-        self.draft_epoch = self.draft_epoch.wrapping_add(1);
-        match selected {
-            Ok(drafts) => self.drafts = drafts,
-            Err(e) => tracing::warn!("could not select account drafts: {e}"),
-        }
-        self.draft_owner = Some(owner.clone());
-        // Reseed the owed-delete set from the store: the record outlives
-        // the process, so a restart's bootstrap must restore the guard the
-        // merge and the sync read (#86).
-        let owed = self.draft_store.owed_deletes(&owner);
-        if !owed.is_empty() {
-            self.pending_remote_deletes
-                .lock()
-                .expect("lock")
-                .extend(owed);
+        if let Ok(snapshot) = self.draft_store.snapshot(&owner) {
+            self.draft_epoch = self.draft_epoch.max(snapshot.revision);
+            self.draft_operations.lock().expect("lock").extend(snapshot.operations);
         }
     }
 
-    /// Persist one explicit mutation, never a stale whole-file snapshot.
-    fn persist_draft(&self, key: common::drafts::DraftKey) -> bool {
+    /// Persist only explicit mutations. Text, desired operation, and revision
+    /// are committed together; a failed save remains shielded in memory.
+    fn persist_draft(&mut self, key: common::drafts::DraftKey) -> bool {
         let Some(owner) = &self.draft_owner else { return false; };
-        match self.draft_store.apply(owner, &[(key, self.drafts.get(&key).cloned())]) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!("could not save draft: {e}");
+        let draft = self.drafts.get(&key).cloned();
+        match self.draft_store.apply(owner, &[(key, draft.clone())]) {
+            Ok(changed) => {
+                if let Some(operation) = changed.get(&key) {
+                    self.draft_epoch = self.draft_epoch.max(operation.revision);
+                    self.draft_operations.lock().expect("lock").insert(key, *operation);
+                } else if let Ok(snapshot) = self.draft_store.snapshot(owner) {
+                    self.draft_epoch = self.draft_epoch.max(snapshot.revision);
+                }
+                true
+            }
+            Err(error) => {
+                tracing::warn!("could not save draft: {error}");
+                self.draft_epoch = self.draft_epoch.saturating_add(1);
+                if key.xf_key().is_some() {
+                    self.draft_operations.lock().expect("lock").insert(key, common::drafts::RelayOperation {
+                        revision: 0,
+                        kind: if draft.is_some() { common::drafts::RelayKind::Save } else { common::drafts::RelayKind::Delete },
+                    });
+                }
                 false
             }
         }
@@ -3002,10 +2808,44 @@ async fn run_login_flow(
     browser_opener: BrowserOpener,
     site: Arc<common::site::SiteConfig>,
     mode: common::site::LoginMode,
-    mut paste_rx: mpsc::UnboundedReceiver<String>,
+    paste_rx: mpsc::UnboundedReceiver<String>,
 ) -> Result<(), String> {
+    run_login_flow_with_io(
+        tx,
+        client,
+        generation,
+        LoginFlowIo { browser_opener, bind_loopback: common::oauth::bind_loopback },
+        site,
+        mode,
+        paste_rx,
+    )
+    .await
+}
+
+struct LoginFlowIo<B> {
+    browser_opener: BrowserOpener,
+    bind_loopback: B,
+}
+
+/// Keep binding injectable so restricted hosts can exercise the complete
+/// automatic fallback without changing process networking or real listeners.
+async fn run_login_flow_with_io<B, F>(
+    tx: &mpsc::UnboundedSender<Msg>,
+    client: Arc<WfApiClient>,
+    generation: u64,
+    io: LoginFlowIo<B>,
+    site: Arc<common::site::SiteConfig>,
+    mode: common::site::LoginMode,
+    mut paste_rx: mpsc::UnboundedReceiver<String>,
+) -> Result<(), String>
+where
+    B: FnOnce() -> F,
+    F: std::future::Future<Output = common::error::Result<(tokio::net::TcpListener, String)>>,
+{
     use common::site::LoginMode;
     const LOGIN_TIMEOUT: Duration = Duration::from_secs(600);
+    let LoginFlowIo { browser_opener, bind_loopback } = io;
+    let automatic = mode == LoginMode::Auto;
 
     let client_id = client.client_id().to_string();
     let http = common::http::build_with_ua(&site.user_agent()).map_err(|e| e.to_string())?;
@@ -3074,9 +2914,9 @@ async fn run_login_flow(
 
     // ---- 2. loopback, else 3. paste
     let (listener, redirect_uri, mode) = match mode {
-        LoginMode::Loopback | LoginMode::Auto => match common::oauth::bind_loopback().await {
+        LoginMode::Loopback | LoginMode::Auto => match bind_loopback().await {
             Ok((l, uri)) => (Some(l), uri, LoginMode::Loopback),
-            Err(e) if mode == LoginMode::Auto => {
+            Err(e) if automatic => {
                 tracing::info!("cannot bind a loopback listener ({e}); falling back to paste");
                 (None, common::oauth::PASTE_REDIRECT_URI.to_string(), LoginMode::Paste)
             }
@@ -4034,6 +3874,9 @@ mod tests {
         drafts_deleted: std::sync::Mutex<Vec<String>>,
         drafts_remote: std::sync::Mutex<Vec<common::models::RemoteDraft>>,
         drafts_fail: std::sync::atomic::AtomicBool,
+        draft_delete_delay: Duration,
+        draft_delete_calls: std::sync::atomic::AtomicUsize,
+        draft_delete_fail_after_first: std::sync::atomic::AtomicBool,
         /// Ask the AI: every turn that reached the stub, the frames each one
         /// streams back, refusals answered before any frame (one per call,
         /// oldest first), and whether to hang after the second frame — an
@@ -4124,6 +3967,13 @@ mod tests {
             Ok(())
         }
         async fn delete_draft(&self, xf_key: &str) -> common::error::Result<()> {
+            let ordinal = self.draft_delete_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if ordinal == 0 && !self.draft_delete_delay.is_zero() {
+                tokio::time::sleep(self.draft_delete_delay).await;
+            }
+            if ordinal > 0 && self.draft_delete_fail_after_first.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(common::error::Error::FetchRejected("delete failed".into()));
+            }
             if self.drafts_fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(common::error::Error::NoToken);
             }
@@ -4917,89 +4767,61 @@ mod tests {
         assert!(matches!(sent, Msg::Bootstrap { .. }), "expected a fresh Bootstrap check");
     }
 
-    /// Issue #589: the arm above was written for the startup restore, where
-    /// `self.me` is never set — but `recheck_stored_session` (issues
-    /// #557/#587) reports through this exact same `Msg::Bootstrap { Err }`
-    /// arm from a LIVE session too, whenever its own `/me` call hits a
-    /// transient failure. That must not arm `bootstrap_retry_needed`: doing
-    /// so would hijack the very next plain `r` — the reply key — into
-    /// `restore_session()` instead of opening the composer, over a session
-    /// that is actually still fine.
-    ///
-    /// Issue #592: this arm is also where the poller that first noticed the
-    /// `NoToken` (and so triggered the recheck) needs restarting — it
-    /// already sent its `SessionLost` and returned, and nothing else would
-    /// ever run it again, freezing the Alerts/Inbox badges — and where
-    /// `session_recovery_tried` must go back to `false`, or the next sibling
-    /// rotation's `NoToken` skips the recheck gate entirely and ends the
-    /// session outright with a perfectly good token set on disk.
+    /// A failed identity check preserves the draft and pauses requests.
+    /// Retry remains available outside an editor; inside, r is ordinary text.
     #[tokio::test]
-    async fn bootstrap_transient_error_in_a_live_session_never_hijacks_r_from_the_composer() {
+    async fn bootstrap_transient_error_in_a_live_session_preserves_draft_and_retries_outside_input() {
+        let (server, client) = recovery_client(wiremock::ResponseTemplate::new(503)
+            .set_body_string("fixture temporarily unavailable")).await;
         let mut app = test_app();
+        app.client = client.clone();
+        app.api = client.clone();
         app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.draft_owner = None;
+        app.select_draft_owner(7);
         app.screens.push(screens::home_state(false));
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 42, reply_count: 3, ..Default::default() },
-            ..Default::default()
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply { thread_id: 42, thread_title: "thread".into() }),
+            body: "a draft nobody may lose".into(), ..Default::default()
         }));
-        app.session_recovery_tried = true;
-        assert!(app.poller_handles.is_empty(), "test setup: no pollers running yet");
-
-        app.handle_msg(Msg::Bootstrap {
-            generation: app.bootstrap_generation,
-            result: Err(TaskError {
-                message: "http error: connection reset".into(),
-                code: None,
-                max_page: None,
-                kind: TaskErrorKind::Other,
-            }),
-        });
-
-        assert!(
-            !app.bootstrap_retry_needed,
-            "a transient recheck failure in a live session must not arm the retry hijack"
-        );
-        assert!(app.me.is_some(), "the session must remain live");
-        assert!(
-            app.status.contains("still signed in as kemical"),
-            "status must hint at the live session, not offer a retry: {:?}",
-            app.status
-        );
-        assert!(!app.status.contains("press r to retry"));
-        assert!(
-            !app.poller_handles.is_empty(),
-            "the live session's pollers must be running again (issue #592)"
-        );
-        assert!(
-            !app.session_recovery_tried,
-            "the recheck gate must be re-armed for the next sibling rotation (issue #592)"
-        );
-
-        // The key that would have run `restore_session()` must instead reach
-        // the ThreadView and open the composer.
+        app.recheck_stored_session("old grant rejected".into());
+        let verdict = tokio::time::timeout(Duration::from_secs(2), app.rx.recv()).await.unwrap().unwrap();
+        assert!(matches!(verdict, Msg::Bootstrap { result: Err(_), .. }));
+        app.handle_msg(verdict);
+        assert!(client.requests_paused(), "failed verification must keep active requests paused");
+        assert!(app.bootstrap_retry_needed);
+        assert!(app.poller_handles.is_empty());
+        assert!(!app.session_recovery_pending);
+        assert!(!app.session_recovery_tried);
+        assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(7));
+        assert!(app.status.contains("requests paused"), "{}", app.status);
+        app.execute_action(Action::ReactPost(88));
+        let refused = tokio::time::timeout(Duration::from_secs(2), app.rx.recv()).await.unwrap().unwrap();
+        assert!(match &refused {
+            Msg::Session { msg, .. } => matches!(msg.as_ref(), Msg::PostToggled { result: Err(_), .. }),
+            Msg::PostToggled { result: Err(_), .. } => true,
+            _ => false,
+        }, "the new action must finish with a retryable refusal");
+        app.handle_msg(refused);
+        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"),
+            "a new mutation after failed verification must never reach the server");
+        let Some(Screen::Compose(compose)) = app.screens.last() else { panic!("composer retained") };
+        assert_eq!(compose.body, "a draft nobody may lose");
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        assert!(
-            matches!(app.screens.last(), Some(Screen::Compose(_))),
-            "r in a ThreadView after a transient recheck failure must still open the composer"
-        );
-
-        // A later `NodesLoaded(Err(NoToken))` — the next sibling rotation —
-        // must start a SECOND recheck rather than fall straight to
-        // `end_session` with a perfectly good token set on disk.
-        app.handle_msg(Msg::NodesLoaded {
-            load_id: 0,
-            result: Err(TaskError {
-                message: "not logged in".into(),
-                code: None,
-                max_page: None,
-                kind: TaskErrorKind::NoToken,
-            }),
-        });
-        assert!(
-            app.session_recovery_pending,
-            "a second recheck must have started instead of ending the session"
-        );
-        assert!(app.me.is_some(), "the session must still be alive while the second recheck runs");
+        assert!(app.bootstrap_retry_needed, "typing must not consume the retry");
+        assert!(!app.session_recovery_pending);
+        let Some(Screen::Compose(compose)) = app.screens.last() else { panic!("typing stays in the editor") };
+        let edited = compose.body.clone();
+        assert_eq!(edited.len(), "a draft nobody may lose".len() + 1);
+        app.pop_screen();
+        assert_eq!(app.drafts[&common::drafts::DraftKey::ThreadReply(42)].body, edited);
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(!app.bootstrap_retry_needed, "r outside input starts verification");
+        assert!(app.session_recovery_pending);
+        assert!(client.requests_paused());
+        app.abort_session_tasks();
+        app.abort_writes();
+        app.stop_pollers();
     }
 
     /// Issue #551: the converse — a session-ending error (NoToken, OAuth,
@@ -5505,6 +5327,173 @@ mod tests {
         assert!(!matches!(app.screens.last(), Some(Screen::Login(_))));
     }
 
+    async fn recovery_client(
+        me_response: wiremock::ResponseTemplate,
+    ) -> (wiremock::MockServer, Arc<WfApiClient>) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/me"))
+            .and(wiremock::matchers::header("authorization", "Bearer sibling-access"))
+            .respond_with(me_response).mount(&server).await;
+        let store_path = scratch_config_dir().join(format!(
+            "recovery-{}.json", TEST_DRAFT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let client = Arc::new(WfApiClient::with_store(
+            common::token::Store::with_path(store_path.clone()), server.uri(), "test-client"
+        ).unwrap());
+        let grant = |access: &str, refresh: &str| common::token::TokenSet {
+            access_token: access.into(), refresh_token: refresh.into(),
+            expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+            scope: "test".into(), origin: server.uri(), client_id: "test-client".into(),
+        };
+        client.set_tokens(grant("old-access", "old-refresh")).await.unwrap();
+        common::token::Store::with_path(store_path)
+            .save(&grant("sibling-access", "sibling-refresh")).unwrap();
+        (server, client)
+    }
+
+    fn same_account_recovery_response() -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "me": { "user_id": 7, "username": "kemical" }
+        }))
+    }
+
+    async fn recovery_verdict(app: &mut App) -> Msg {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let msg = app.rx.recv().await.expect("recovery channel remains open");
+                if matches!(msg, Msg::RecoveryVerified { .. } | Msg::Bootstrap { .. }) {
+                    return msg;
+                }
+                app.handle_msg(msg);
+            }
+        }).await.expect("identity verification must report its verdict")
+    }
+
+    #[tokio::test]
+    async fn recovery_verifies_identity_before_any_queued_or_new_mutation_can_use_it() {
+        let (server, client) = recovery_client(wiremock::ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({"me": {"user_id": 99, "username": "NewAccount"}}))
+            .set_delay(Duration::from_millis(300))).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/posts/99/react"))
+            .respond_with(wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"success": true, "action": "insert"})))
+            .mount(&server).await;
+        let mut app = test_app();
+        app.client = client.clone();
+        app.api = client.clone();
+        app.me = Some(User { user_id: 7, username: "OldAccount".into(), ..Default::default() });
+        app.screens.push(screens::home_state(false));
+        client.api_gate.penalize(Duration::from_millis(100));
+        app.execute_action(Action::ReactPost(77));
+        tokio::task::yield_now().await;
+        let old_epoch = app.session_generation;
+        app.recheck_stored_session("old grant rejected".into());
+        app.execute_action(Action::ReactPost(88));
+        let verified = recovery_verdict(&mut app).await;
+        assert!(matches!(verified, Msg::RecoveryVerified { .. }));
+        assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(7));
+        assert!(app.session_recovery_pending);
+        assert_eq!(client.token_set().await.unwrap().access_token, "old-access");
+        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"),
+            "neither a queued nor a new old-account mutation may use the candidate grant");
+        app.handle_msg(verified);
+        assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(99));
+        assert_ne!(app.session_generation, old_epoch);
+        assert!(!app.client.requests_paused());
+        assert!(client.requests_paused(), "old tasks retain a permanently paused client");
+        app.handle_msg(session_msg(old_epoch, Msg::SessionLost(TaskError {
+            message: "late rejection of old grant".into(), code: None, max_page: None,
+            kind: TaskErrorKind::Api(401),
+        })));
+        assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(99));
+        assert!(!app.session_recovery_pending, "an old epoch cannot restart recovery");
+        assert!(!app.client.requests_paused());
+        app.execute_action(Action::ReactPost(99));
+        let requests = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let requests = server.received_requests().await.unwrap();
+                if requests.iter().any(|r| r.url.path() == "/api/posts/99/react") { break requests; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("the verified account must be able to write");
+        let writes: Vec<_> = requests.iter().filter(|r| r.method.as_str() == "POST").collect();
+        assert_eq!(writes.len(), 1, "old-account actions are never replayed");
+        assert_eq!(writes[0].headers.get("authorization").unwrap(), "Bearer sibling-access");
+        app.abort_writes(); app.abort_session_tasks(); app.stop_pollers();
+    }
+
+    #[tokio::test]
+    async fn recovery_account_change_clears_private_forums_before_and_after_a_failed_fetch() {
+        let (_server, client) = recovery_client(wiremock::ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({"me": {"user_id": 99, "username": "NewAccount"}}))).await;
+        let mut app = test_app();
+        app.client = client.clone();
+        app.api = client;
+        app.me = Some(User { user_id: 7, username: "OldAccount".into(), ..Default::default() });
+        let private = Node { node_id: 900, title: "ConfidentialForum".into(), node_type: "Forum".into(), ..Default::default() };
+        let mut home = screens::home_state(false);
+        if let Screen::Home(h) = &mut home { h.tree.nodes = vec![private.clone()]; }
+        app.screens.push(home);
+        app.screens.push(Screen::ForumTree(screens::ForumTreeState { nodes: vec![private], ..Default::default() }));
+        assert!(frame_text(&mut app, 120, 24).contains("ConfidentialForum"), "fixture must draw the old private forum");
+        app.recheck_stored_session("old grant rejected".into());
+        let verified = recovery_verdict(&mut app).await;
+        assert!(matches!(verified, Msg::RecoveryVerified { .. }));
+        app.handle_msg(verified);
+        assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(99));
+        assert!(!frame_text(&mut app, 120, 24).contains("ConfidentialForum"),
+            "the new identity must never draw the previous account's nodes while loading");
+        pump_until(&mut app, |app| app.screens.iter().any(|s| matches!(s,
+            Screen::ForumTree(tree) if tree.error.is_some()
+        ))).await;
+        assert!(!frame_text(&mut app, 120, 24).contains("ConfidentialForum"),
+            "a failed node refresh must not resurrect the old private forums");
+        for screen in &app.screens {
+            match screen {
+                Screen::Home(home) => assert!(home.tree.nodes.is_empty()),
+                Screen::ForumTree(tree) => assert!(tree.nodes.is_empty()),
+                _ => {}
+            }
+        }
+        app.abort_writes(); app.abort_session_tasks(); app.stop_pollers();
+    }
+
+    #[tokio::test]
+    async fn recovery_timeout_preserves_draft_and_rejects_a_late_verified_candidate() {
+        let (_server, client) = recovery_client(wiremock::ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({"me": {"user_id": 99, "username": "NewAccount"}}))).await;
+        let mut app = test_app();
+        app.client = client.clone(); app.api = client.clone();
+        app.me = Some(User { user_id: 7, username: "OldAccount".into(), ..Default::default() });
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::Compose(screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply { thread_id: 42, thread_title: "thread".into() }),
+            body: "unsent local words".into(), busy: true, ..Default::default()
+        }));
+        app.recheck_stored_session("old grant rejected".into());
+        let verified = recovery_verdict(&mut app).await;
+        assert!(matches!(verified, Msg::RecoveryVerified { .. }));
+        // The network result is ready but the UI has not processed it yet.
+        let old_generation = app.bootstrap_generation;
+        app.session_recovery_started_at = Some(std::time::Instant::now()
+            - Duration::from_secs(SESSION_RECOVERY_TIMEOUT_SECS + 1));
+        assert!(app.expire_session_recovery_timeout());
+        assert_ne!(app.bootstrap_generation, old_generation);
+        app.handle_msg(verified);
+        assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(7));
+        assert_eq!(client.token_set().await.unwrap().access_token, "old-access");
+        assert!(app.client.requests_paused());
+        assert!(app.bootstrap_retry_needed);
+        assert!(!app.session_recovery_pending);
+        assert!(app.poller_handles.is_empty());
+        let Some(Screen::Compose(compose)) = app.screens.last() else { panic!("local composer retained") };
+        assert_eq!(compose.body, "unsent local words");
+        assert!(!compose.busy, "cancelled work must release the editor");
+        app.abort_writes(); app.abort_session_tasks(); app.stop_pollers();
+    }
+
     /// Round 7 regression, issue #580: `valid_token()` clearing the
     /// in-memory guard on a rejected refresh (common/src/api.rs) means every
     /// OTHER caller queued behind that same refresh reports `NoToken`, not
@@ -5518,41 +5507,12 @@ mod tests {
     /// client holding a live adopted token in memory under a Login screen.
     #[tokio::test]
     async fn a_second_no_token_mid_recheck_does_not_end_the_session_and_the_recheck_still_wins() {
-        // A client of our own (not `test_app()`'s shared scratch store) so
-        // we can plant a sibling-rotated token set on disk without racing
-        // any other test that also touches `offline_client()`'s file.
-        let store_path = scratch_config_dir().join("token-580.json");
-        let _ = std::fs::remove_file(&store_path);
-        let store = common::token::Store::with_path(store_path.clone());
-        let client = Arc::new(WfApiClient::with_store(store, OFFLINE_BASE, "test-client").expect("client init"));
-        client
-            .set_tokens(common::token::TokenSet { origin: String::new(), client_id: String::new(),
-                access_token: "old-access".into(),
-                refresh_token: "old-refresh".into(),
-                expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
-                scope: "test".into(),
-            })
-            .await
-            .unwrap();
-        // A sibling instance rotated the refresh token on disk without this
-        // process's knowledge — written straight to the store, bypassing
-        // `client`, exactly like a second `wftui` sharing the config dir.
-        common::token::Store::with_path(store_path)
-            .save(&common::token::TokenSet { origin: String::new(), client_id: String::new(),
-                access_token: "sibling-access".into(),
-                refresh_token: "sibling-refresh".into(),
-                expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
-                scope: "test".into(),
-            })
-            .unwrap();
+        let (_server, client) = recovery_client(same_account_recovery_response()).await;
 
         let expected_user = User { user_id: 7, username: "kemical".into(), ..Default::default() };
         let mut app = test_app();
         app.client = client;
-        app.api = Arc::new(RecordingApi {
-            me_ok: std::sync::Mutex::new(Some(expected_user.clone())),
-            ..Default::default()
-        });
+        app.api = app.client.clone();
         app.me = Some(expected_user.clone());
         app.screens.push(screens::home_state(false));
         let generation_before = app.bootstrap_generation;
@@ -5586,13 +5546,13 @@ mod tests {
             "the second NoToken must not bump the generation the recheck is answering under"
         );
 
-        // Drain rx: the recheck adopted the sibling's token and its `/me`
-        // (stubbed to succeed) reports the same identity back.
+        // The candidate verifies the sibling grant over loopback before it
+        // can replace the active session.
         let sent = tokio::time::timeout(std::time::Duration::from_secs(1), app.rx.recv())
             .await
             .expect("the recheck must report back")
             .expect("channel open");
-        assert!(matches!(sent, Msg::Bootstrap { result: Ok(_), .. }), "expected Bootstrap {{ Ok }}");
+        assert!(matches!(sent, Msg::RecoveryVerified { .. }), "expected a verified recovery candidate");
         app.handle_msg(sent);
 
         assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(7), "the recheck's Ok must be honoured");
@@ -5618,37 +5578,12 @@ mod tests {
     #[tokio::test]
     async fn two_poller_session_lost_no_token_messages_do_not_end_the_session_and_the_recheck_still_wins()
      {
-        let store_path = scratch_config_dir().join("token-587-pollers.json");
-        let _ = std::fs::remove_file(&store_path);
-        let store = common::token::Store::with_path(store_path.clone());
-        let client = Arc::new(WfApiClient::with_store(store, OFFLINE_BASE, "test-client").expect("client init"));
-        client
-            .set_tokens(common::token::TokenSet { origin: String::new(), client_id: String::new(),
-                access_token: "old-access".into(),
-                refresh_token: "old-refresh".into(),
-                expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
-                scope: "test".into(),
-            })
-            .await
-            .unwrap();
-        // A sibling instance rotated the refresh token on disk without this
-        // process's knowledge.
-        common::token::Store::with_path(store_path)
-            .save(&common::token::TokenSet { origin: String::new(), client_id: String::new(),
-                access_token: "sibling-access".into(),
-                refresh_token: "sibling-refresh".into(),
-                expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
-                scope: "test".into(),
-            })
-            .unwrap();
+        let (_server, client) = recovery_client(same_account_recovery_response()).await;
 
         let expected_user = User { user_id: 7, username: "kemical".into(), ..Default::default() };
         let mut app = test_app();
         app.client = client;
-        app.api = Arc::new(RecordingApi {
-            me_ok: std::sync::Mutex::new(Some(expected_user.clone())),
-            ..Default::default()
-        });
+        app.api = app.client.clone();
         app.me = Some(expected_user.clone());
         app.screens.push(screens::home_state(false));
         let generation_before = app.bootstrap_generation;
@@ -5686,7 +5621,7 @@ mod tests {
             .await
             .expect("the recheck must report back")
             .expect("channel open");
-        assert!(matches!(sent, Msg::Bootstrap { result: Ok(_), .. }), "expected Bootstrap {{ Ok }}");
+        assert!(matches!(sent, Msg::RecoveryVerified { .. }), "expected a verified recovery candidate");
         app.handle_msg(sent);
 
         assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(7), "the recheck's Ok must be honoured");
@@ -5705,35 +5640,12 @@ mod tests {
     #[tokio::test]
     async fn a_poller_session_lost_oauth_message_mid_recheck_is_swallowed_and_the_recheck_still_wins()
      {
-        let store_path = scratch_config_dir().join("token-587-oauth-poller.json");
-        let _ = std::fs::remove_file(&store_path);
-        let store = common::token::Store::with_path(store_path.clone());
-        let client = Arc::new(WfApiClient::with_store(store, OFFLINE_BASE, "test-client").expect("client init"));
-        client
-            .set_tokens(common::token::TokenSet { origin: String::new(), client_id: String::new(),
-                access_token: "old-access".into(),
-                refresh_token: "old-refresh".into(),
-                expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
-                scope: "test".into(),
-            })
-            .await
-            .unwrap();
-        common::token::Store::with_path(store_path)
-            .save(&common::token::TokenSet { origin: String::new(), client_id: String::new(),
-                access_token: "sibling-access".into(),
-                refresh_token: "sibling-refresh".into(),
-                expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
-                scope: "test".into(),
-            })
-            .unwrap();
+        let (_server, client) = recovery_client(same_account_recovery_response()).await;
 
         let expected_user = User { user_id: 7, username: "kemical".into(), ..Default::default() };
         let mut app = test_app();
         app.client = client;
-        app.api = Arc::new(RecordingApi {
-            me_ok: std::sync::Mutex::new(Some(expected_user.clone())),
-            ..Default::default()
-        });
+        app.api = app.client.clone();
         app.me = Some(expected_user.clone());
         app.screens.push(screens::home_state(false));
         let generation_before = app.bootstrap_generation;
@@ -5764,7 +5676,7 @@ mod tests {
             .await
             .expect("the recheck must report back")
             .expect("channel open");
-        assert!(matches!(sent, Msg::Bootstrap { result: Ok(_), .. }), "expected Bootstrap {{ Ok }}");
+        assert!(matches!(sent, Msg::RecoveryVerified { .. }), "expected a verified recovery candidate");
         app.handle_msg(sent);
 
         assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(7), "the recheck's Ok must be honoured");
@@ -5892,11 +5804,8 @@ mod tests {
     /// the pure backstop for when even that never lands), nothing would
     /// otherwise clear `session_recovery_pending` — leaving every poller's
     /// `SessionLost` swallowed as "stale" forever. The event loop's tick
-    /// bounds the window instead, but it must NOT end the session on its own
-    /// (issue #591): `recheck_stored_session` is only ever started with a
-    /// live session, so the timer firing means a token is still adopted and
-    /// in use, not that the session is over — it falls back to the same
-    /// "still signed in" hint the transient-failure arm uses. Simulated
+    /// bounds the window instead. Keep the local identity and draft, but
+    /// pause traffic until a later verification succeeds. Simulated
     /// clock: the window's start is backdated past
     /// `SESSION_RECOVERY_TIMEOUT_SECS` rather than actually sleeping.
     #[test]
@@ -5923,7 +5832,10 @@ mod tests {
         assert!(!matches!(app.screens.last(), Some(Screen::Login(_))));
         assert!(!app.session_recovery_pending);
         assert!(app.session_recovery_started_at.is_none());
-        assert!(app.status.contains("still signed in"), "status: {:?}", app.status);
+        assert!(app.client.requests_paused());
+        assert!(app.bootstrap_retry_needed);
+        assert!(app.poller_handles.is_empty());
+        assert!(app.status.contains("requests paused"), "status: {:?}", app.status);
     }
 
     /// Issue #591: `SESSION_RECOVERY_TIMEOUT_SECS` used to be 15 s — shorter
@@ -6383,7 +6295,9 @@ mod tests {
         app.screens.push(screens::home_state(false));
         app.handle_msg(Msg::Bootstrap { generation: app.bootstrap_generation, result: Err(err) });
         assert!(app.me.is_some(), "missing_scope must not sign the user out");
-        assert!(!app.poller_handles.is_empty());
+        assert!(app.poller_handles.is_empty(), "a failed identity check must not resume polling");
+        assert!(app.client.requests_paused());
+        assert!(app.bootstrap_retry_needed);
     }
 
     /// Issue #538: XF's react/vote endpoints are toggles, so the notice has to
@@ -6463,7 +6377,12 @@ mod tests {
     /// `login-url.txt` are pinned to. Nothing under `dirs::config_dir()`
     /// (the operator's real `~/.config/wftui`) may ever be opened by a test.
     fn scratch_config_dir() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("wftui-test-app-{}", std::process::id()))
+        static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| {
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_nanos();
+            std::env::temp_dir().join(format!("wftui-test-app-{}-{nonce}", std::process::id()))
+        }).clone()
     }
 
     /// An origin no test can actually reach: port 1 on loopback refuses
@@ -6933,7 +6852,7 @@ mod tests {
             c.body = "shared words".into();
         }
         app.pop_screen();
-        tokio::task::yield_now().await;
+        finish_draft_relays(&app).await;
         assert_eq!(
             api.drafts_saved(),
             vec![("thread-7".to_string(), "shared words".to_string(), String::new())],
@@ -6945,7 +6864,7 @@ mod tests {
             composer: common::drafts::DraftKey::ThreadReply(7),
             result: Ok(Post { post_id: 1, thread_id: 7, ..Default::default() }),
         });
-        tokio::task::yield_now().await;
+        finish_draft_relays(&app).await;
         assert_eq!(api.drafts_deleted(), vec!["thread-7".to_string()]);
     }
 
@@ -6986,31 +6905,12 @@ mod tests {
         assert!(!stored.contains_key(&key), "...and not on disk either");
     }
 
-    /// sync_drafts holds every relay-tail mutex across its list call; taking
-    /// them in HashMap order let two overlapping syncs ABBA-deadlock (#815).
-    /// The acquisition order must be a total order over the keys.
-    #[test]
-    fn relay_tails_are_taken_in_a_total_order() {
-        let mut app = test_app();
-        for k in ["thread-9", "thread-3", "forum-1", "conversation-5"] {
-            app.draft_relay_tail
-                .entry(k.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
-        }
-        let keys: Vec<String> = app
-            .sorted_relay_tails()
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect();
-        assert_eq!(
-            keys,
-            vec![
-                "conversation-5".to_string(),
-                "forum-1".to_string(),
-                "thread-3".to_string(),
-                "thread-9".to_string(),
-            ]
-        );
+    async fn finish_draft_relays(app: &App) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while app.session_handles.iter().any(|handle| !handle.is_finished()) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }).await.expect("draft relay tasks finished");
     }
 
     /// A remote delete that failed (#815) stays owed: the merge refuses to
@@ -7037,11 +6937,11 @@ mod tests {
             composer: common::drafts::DraftKey::ThreadReply(7),
             result: Ok(Post { post_id: 1, thread_id: 7, ..Default::default() }),
         });
-        tokio::task::yield_now().await;
+        finish_draft_relays(&app).await;
         let key = common::drafts::DraftKey::ThreadReply(7);
         assert!(api.drafts_deleted().is_empty(), "the relay is failing; nothing was deleted");
         assert!(
-            app.pending_remote_deletes.lock().expect("lock").contains(&key),
+            app.draft_operations.lock().expect("lock").contains_key(&key),
             "a failed delete stays owed"
         );
 
@@ -7064,15 +6964,15 @@ mod tests {
         // the key off the books.
         api.drafts_fail.store(false, std::sync::atomic::Ordering::SeqCst);
         app.sync_drafts();
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
+        finish_draft_relays(&app).await;
+        finish_draft_relays(&app).await;
         assert_eq!(
             api.drafts_deleted(),
             vec!["thread-7".to_string()],
             "the next sync retries the owed delete"
         );
         assert!(
-            app.pending_remote_deletes.lock().expect("lock").is_empty(),
+            app.draft_operations.lock().expect("lock").is_empty(),
             "a settled delete comes off the books"
         );
     }
@@ -7118,7 +7018,7 @@ mod tests {
             c.body = "survives a broken relay".into();
         }
         app.pop_screen();
-        tokio::task::yield_now().await;
+        finish_draft_relays(&app).await;
 
         app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
         match app.screens.last() {
@@ -7576,8 +7476,7 @@ mod tests {
             draft_epoch: 0,
             draft_mutations: std::collections::HashMap::new(),
             draft_deletions: std::collections::HashMap::new(),
-            draft_relay_tail: std::collections::HashMap::new(),
-            pending_remote_deletes: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            draft_operations: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -8141,11 +8040,11 @@ mod tests {
         app.handle_msg(Msg::DraftRelayAbsent);
         assert!(!app.draft_relay_enabled());
         let before = app.session_handles.len();
-        app.push_draft(
-            common::drafts::DraftKey::ThreadReply(5),
-            &common::drafts::Draft { body: "words".into(), ..Default::default() },
-        );
-        app.drop_remote_draft(common::drafts::DraftKey::ThreadReply(5));
+        let key = common::drafts::DraftKey::ThreadReply(5);
+        app.drafts.insert(key, common::drafts::Draft { body: "words".into(), ..Default::default() });
+        app.persist_draft(key);
+        app.relay_draft(key);
+        app.discard_draft(key);
         app.sync_drafts();
         assert_eq!(app.session_handles.len(), before, "no relay task after a 404");
 
@@ -8328,6 +8227,70 @@ mod tests {
         assert_eq!(tokens.origin, server.uri());
         assert_eq!(tokens.client_id, "test-client");
         app.shutdown().await;
+    }
+
+    async fn refused_login_loopback() -> common::error::Result<(tokio::net::TcpListener, String)> {
+        Err(common::error::Error::Handshake("fixture cannot bind loopback".into()))
+    }
+
+    async fn assert_auto_login_falls_back_to_paste(tuilink: Option<bool>) {
+        let server = oauth_server().await;
+        mount_register(&server, 404).await;
+        let mut app = app_for(&server, None);
+        let mut site = (*app.site).clone();
+        site.features.tuilink = tuilink;
+        let tx = app.tx.clone();
+        let client = app.client.clone();
+        let generation = app.login_generation;
+        let (paste_tx, paste_rx) = mpsc::unbounded_channel();
+        let flow = tokio::spawn(async move {
+            run_login_flow_with_io(
+                &tx, client, generation,
+                LoginFlowIo { browser_opener: test_browser_opener, bind_loopback: refused_login_loopback },
+                Arc::new(site), common::site::LoginMode::Auto, paste_rx,
+            ).await
+        });
+        let ready = tokio::time::timeout(Duration::from_secs(5), app.rx.recv()).await.unwrap().unwrap();
+        let url = match &ready {
+            Msg::LoginReady { mode: common::site::LoginMode::Paste, url, .. } => url.clone(),
+            _ => panic!("automatic login must offer paste after binding fails"),
+        };
+        assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"), "{url}");
+        app.handle_msg(ready);
+        paste_tx.send(format!("http://127.0.0.1/callback?code=thecode&state={}", state_of(&url))).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), flow).await.unwrap().unwrap().unwrap();
+        let events = drain_login(&mut app, Duration::from_secs(5)).await;
+        assert_eq!(events.last(), Some(&LoginEvent::Complete(true)), "{events:?}");
+        let requests = server.received_requests().await.unwrap();
+        let probes = requests.iter().filter(|r| r.url.path() == "/api/wf-tuilink/register").count();
+        assert_eq!(probes, usize::from(tuilink != Some(false)));
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn login_auto_relay_404_and_bind_failure_falls_back_to_paste() {
+        assert_auto_login_falls_back_to_paste(None).await;
+    }
+
+    #[tokio::test]
+    async fn login_auto_without_relay_and_with_bind_failure_falls_back_to_paste() {
+        assert_auto_login_falls_back_to_paste(Some(false)).await;
+    }
+
+    #[tokio::test]
+    async fn login_explicit_loopback_bind_failure_stays_an_error() {
+        let server = oauth_server().await;
+        let mut app = app_for(&server, Some(common::site::LoginMode::Loopback));
+        let (_paste_tx, paste_rx) = mpsc::unbounded_channel();
+        let error = run_login_flow_with_io(
+            &app.tx, app.client.clone(), app.login_generation,
+            LoginFlowIo { browser_opener: test_browser_opener, bind_loopback: refused_login_loopback },
+            app.site.clone(), common::site::LoginMode::Loopback, paste_rx,
+        ).await.unwrap_err();
+        assert!(error.contains("fixture cannot bind loopback"), "{error}");
+        assert!(error.contains("press m for paste mode"), "{error}");
+        assert!(app.rx.try_recv().is_err(), "an explicit failure must not announce another mode");
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     /// Paste mode never listens: the browser lands on a portless loopback
@@ -10552,121 +10515,131 @@ mod tests {
         }
     }
 
-    /// #86: the owed-delete guard survives a restart — the bootstrap
-    /// reseeds the pending set from the store, and a NEW draft stashed for
-    /// an owed key supersedes the delete (its site mirror is not eaten).
     #[tokio::test]
-    async fn the_bootstrap_reseeds_owed_deletes_and_a_new_draft_supersedes() {
+    async fn bootstrap_retries_the_latest_save_instead_of_an_old_delete() {
+        use common::drafts::{DraftKey, RelayKind};
         let mut app = test_app();
-        let owner = common::drafts::Owner::new(app.client.base_url(), 7);
-        let key = common::drafts::DraftKey::ThreadReply(7);
-
-        // The previous process recorded the owed delete and died before it
-        // settled: the store still remembers it, the app set does not.
-        // (The store is activated first, as every bootstrap does.)
-        app.draft_store.activate(&owner).unwrap();
-        app.draft_store.record_owed_delete(&owner, &key).unwrap();
-        assert!(app.pending_remote_deletes.lock().expect("lock").is_empty());
-
+        app.draft_owner = None;
         app.select_draft_owner(7);
-        assert!(
-            app.pending_remote_deletes.lock().expect("lock").contains(&key),
-            "the bootstrap must restore the merge guard from the store"
-        );
-
-        // The reader writes a NEW draft for the same thread and stashes it:
-        // the owed delete is superseded — its mirror is not eaten.
-        app.screens.push(screens::home_state(false));
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
-        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
-            c.body = "a fresh draft".into();
-        }
-        app.pop_screen();
-        assert!(
-            !app.pending_remote_deletes.lock().expect("lock").contains(&key),
-            "the new draft supersedes the owed delete (in-memory, at stash time)"
-        );
-        // #854: the PERSISTED record retires only when the mirror settles.
-        // The relay task was spawned on this runtime — yield until it runs,
-        // then the successful mirror clears the store.
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            app.draft_store.owed_deletes(&owner).is_empty(),
-            "a settled mirror retires the persisted record"
-        );
-
-        // The non-relaying stash paths (the shutdown unwind, the
-        // submit-time mirror) never re-mirror the site slot: their stash
-        // must NOT retire the owed record, or a quit resurrects the posted
-        // draft over the newer text (#87).
-        app.draft_store.record_owed_delete(&owner, &key).unwrap();
-        app.pending_remote_deletes
-            .lock()
-            .expect("lock")
-            .insert(key);
-        app.select_draft_owner(7);
-        assert!(app.pending_remote_deletes.lock().expect("lock").contains(&key));
-        let compose = |body: &str| screens::ComposeState {
-            target: Some(ComposeTarget::ThreadReply {
-                thread_id: 7,
-                thread_title: "A thread".into(),
-            }),
-            body: body.into(),
-            ..Default::default()
-        };
-        app.stash_draft_impl(&compose("v2 written, quitting now"), false, false);
-        assert!(
-            app.pending_remote_deletes.lock().expect("lock").contains(&key),
-            "a non-relaying stash keeps the guard"
-        );
-        assert_eq!(
-            app.draft_store.owed_deletes(&owner),
-            vec![key],
-            "and keeps the persisted record the restart's retry reads"
-        );
+        let owner = app.draft_owner.clone().unwrap();
+        let key = DraftKey::ThreadReply(7);
+        app.discard_draft_local(key, false);
+        let delete = app.draft_store.snapshot(&owner).unwrap().operations[&key];
+        app.stash_draft_impl(&screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply { thread_id: 7, thread_title: "thread".into() }),
+            body: "new words on shutdown".into(), ..Default::default()
+        }, false, false);
+        let save = app.draft_store.snapshot(&owner).unwrap().operations[&key];
+        assert_eq!(save.kind, RelayKind::Save);
+        assert!(save.revision > delete.revision);
+        assert!(!app.draft_store.settle(&owner, key, delete).unwrap());
+        let path = app.draft_store.path().to_owned();
+        let api = Arc::new(RecordingApi::default());
+        let mut restarted = test_app();
+        restarted.api = api.clone();
+        restarted.draft_owner = None;
+        restarted.draft_store = common::drafts::Store::with_path(path);
+        restarted.select_draft_owner(7);
+        assert_eq!(restarted.drafts[&key].body, "new words on shutdown");
+        restarted.sync_drafts();
+        finish_draft_relays(&restarted).await;
+        assert_eq!(api.drafts_saved()[0].1, "new words on shutdown");
+        assert!(api.drafts_deleted().is_empty());
+        assert!(restarted.draft_store.snapshot(&owner).unwrap().operations.is_empty());
     }
 
-    /// #854: the supersede's mirror FAILING must not leave the supersede
-    /// holding neither guard nor record — the exact resurrection through
-    /// the relay arm that 5b97b6f closed for the non-relaying arms. A failed
-    /// mirror re-arms the in-memory set (the sync's retry then deletes the
-    /// stale site copy) and keeps the persisted record, so a restart's
-    /// bootstrap merge keeps skipping the site's copy too.
     #[tokio::test]
-    async fn a_failed_supersede_mirror_re_arms_the_owed_delete() {
+    async fn a_failed_superseding_save_stays_dirty_across_restart() {
+        use common::drafts::{DraftKey, RelayKind};
         let api = Arc::new(RecordingApi::default());
         api.drafts_fail.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut app = test_app();
-        app.api = api.clone();
-        let owner = common::drafts::Owner::new(app.client.base_url(), 7);
-        let key = common::drafts::DraftKey::ThreadReply(7);
-
-        app.draft_store.activate(&owner).unwrap();
-        app.draft_store.record_owed_delete(&owner, &key).unwrap();
+        app.api = api;
+        app.draft_owner = None;
         app.select_draft_owner(7);
-        assert!(app.pending_remote_deletes.lock().expect("lock").contains(&key));
+        let owner = app.draft_owner.clone().unwrap();
+        let key = DraftKey::ThreadReply(7);
+        app.discard_draft_local(key, false);
+        app.stash_draft_impl(&screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply { thread_id: 7, thread_title: "thread".into() }),
+            body: "latest local words".into(), ..Default::default()
+        }, true, false);
+        finish_draft_relays(&app).await;
+        let snapshot = app.draft_store.snapshot(&owner).unwrap();
+        assert_eq!(snapshot.operations[&key].kind, RelayKind::Save);
+        let mut restarted = test_app();
+        restarted.draft_owner = None;
+        restarted.draft_store = app.draft_store.clone();
+        restarted.select_draft_owner(7);
+        restarted.merge_remote_drafts(restarted.draft_epoch, vec![common::models::RemoteDraft {
+            key: "thread-7".into(), message: "stale posted text".into(), ..Default::default()
+        }]);
+        assert_eq!(restarted.drafts[&key].body, "latest local words");
+    }
 
+    #[tokio::test]
+    async fn shutdown_draft_survives_restart_and_a_stale_bootstrap_sync() {
+        use common::drafts::DraftKey;
+        let mut app = test_app();
+        app.draft_owner = None;
+        app.select_draft_owner(7);
+        let owner = app.draft_owner.clone().unwrap();
+        let key = DraftKey::ThreadReply(7);
         app.screens.push(screens::home_state(false));
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
-        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
-            c.body = "v2 written while the site is unreachable".into();
-        }
-        app.pop_screen();
+        app.merge_remote_drafts(0, vec![common::models::RemoteDraft {
+            key: "thread-7".into(), message: "v1 already on the website".into(), ..Default::default()
+        }]);
+        app.reply_to_thread(&Thread { thread_id: 7, title: "thread".into(), ..Default::default() });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() { c.body = "v2 latest local words".into(); }
+        app.shutdown().await;
+        assert_eq!(app.draft_store.load(&owner)[&key].body, "v2 latest local words");
+        let mut restarted = test_app();
+        restarted.draft_store = app.draft_store.clone();
+        restarted.draft_owner = None;
+        restarted.select_draft_owner(7);
+        restarted.merge_remote_drafts(restarted.draft_epoch, vec![common::models::RemoteDraft {
+            key: "thread-7".into(), message: "v1 already on the website".into(), ..Default::default()
+        }]);
+        assert_eq!(restarted.drafts[&key].body, "v2 latest local words");
+        assert_eq!(restarted.draft_store.load(&owner)[&key].body, "v2 latest local words");
+    }
 
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            app.pending_remote_deletes.lock().expect("lock").contains(&key),
-            "a failed mirror re-arms the merge guard"
-        );
-        assert_eq!(
-            app.draft_store.owed_deletes(&owner),
-            vec![key],
-            "and keeps the persisted record the restart's merge reads"
-        );
+    #[tokio::test]
+    async fn an_old_delete_cannot_retire_a_newer_failed_delete() {
+        use common::drafts::{DraftKey, RelayKind};
+        let api = Arc::new(RecordingApi {
+            draft_delete_delay: Duration::from_millis(80),
+            ..Default::default()
+        });
+        api.draft_delete_fail_after_first.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut app = test_app();
+        app.api = api.clone();
+        app.draft_owner = None;
+        app.select_draft_owner(7);
+        let owner = app.draft_owner.clone().unwrap();
+        let key = DraftKey::ThreadReply(7);
+        app.discard_draft(key);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while api.draft_delete_calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }).await.unwrap();
+        app.stash_draft_impl(&screens::ComposeState {
+            target: Some(ComposeTarget::ThreadReply { thread_id: 7, thread_title: "thread".into() }),
+            body: "new version, then discarded".into(), ..Default::default()
+        }, true, false);
+        app.discard_draft(key);
+        let desired = app.draft_store.snapshot(&owner).unwrap().operations[&key];
+        finish_draft_relays(&app).await;
+        assert_eq!(api.draft_delete_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(api.drafts_saved().is_empty(), "the superseded Save skips dispatch after acquiring the lock");
+        assert_eq!(desired.kind, RelayKind::Delete);
+        assert_eq!(app.draft_store.snapshot(&owner).unwrap().operations[&key], desired);
+        assert_eq!(app.draft_operations.lock().expect("lock")[&key], desired);
+        app.merge_remote_drafts(app.draft_epoch, vec![common::models::RemoteDraft {
+            key: "thread-7".into(), message: "new version, then discarded".into(), ..Default::default()
+        }]);
+        assert!(!app.drafts.contains_key(&key));
     }
 
     /// #82: the loading pane is reachable for a keyed viewer - the old

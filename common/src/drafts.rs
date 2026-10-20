@@ -172,29 +172,112 @@ pub struct Owner {
 
 impl Owner {
     pub fn new(origin: &str, user_id: u32) -> Self {
-        Self { origin: origin.trim_end_matches('/').to_owned(), user_id }
+        Self {
+            origin: origin.trim_end_matches('/').to_owned(),
+            user_id,
+        }
     }
 }
 
+/// The latest desired website state for one draft slot. Revisions are minted
+/// under the store lock and never reused, including across account changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayKind {
+    Save,
+    Delete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayOperation {
+    pub revision: u64,
+    pub kind: RelayKind,
+}
+
+#[derive(Default)]
+pub struct Snapshot {
+    pub drafts: HashMap<DraftKey, Draft>,
+    pub operations: HashMap<DraftKey, RelayOperation>,
+    pub revision: u64,
+}
+
 #[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct StoredDrafts {
     version: u32,
     owner: Option<Owner>,
     drafts: HashMap<String, Draft>,
-    /// Remote deletes that were scheduled but never provably settled
-    /// (#86): persisted so a restart's merge cannot resurrect the site's
-    /// copy of an already-posted draft. Sorted, deduplicated.
-    #[serde(default)]
+    /// Retained when the owner is cleared. An old process must never settle
+    /// a new operation after the same account signs in again.
+    revision: u64,
+    revisions: HashMap<String, u64>,
+    operations: HashMap<String, RelayOperation>,
+    /// Version 2 input only. Migration saves a private backup before replacing it.
+    #[serde(skip_serializing)]
     owed_deletes: Vec<String>,
 }
 
 impl StoredDrafts {
-    fn entries(&self) -> HashMap<DraftKey, Draft> {
-        self.drafts.iter().filter_map(|(key, value)| {
-            Some((DraftKey::from_key(key)?, value.clone()))
-        }).collect()
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            drafts: self
+                .drafts
+                .iter()
+                .filter_map(|(key, value)| Some((DraftKey::from_key(key)?, value.clone())))
+                .collect(),
+            operations: self
+                .operations
+                .iter()
+                .filter_map(|(key, value)| Some((DraftKey::from_key(key)?, *value)))
+                .collect(),
+            revision: self.revision,
+        }
+    }
+
+    fn next_revision(&mut self, key: DraftKey) -> Result<u64> {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| Error::TokenStore("draft revision counter exhausted".into()))?;
+        self.revisions.insert(key.as_key(), self.revision);
+        Ok(self.revision)
+    }
+
+    fn require_owner(&self, owner: &Owner) -> Result<()> {
+        if self.owner.as_ref() == Some(owner) {
+            Ok(())
+        } else {
+            Err(Error::TokenStore(
+                "draft account changed; refusing a stale save".into(),
+            ))
+        }
+    }
+
+    fn trim_drafts(&mut self, protect_dirty: bool) {
+        let mut keys: Vec<_> = self
+            .drafts
+            .iter()
+            .map(|(key, draft)| {
+                let dirty = protect_dirty && self.operations.contains_key(key);
+                (key.clone(), draft.saved_at, dirty)
+            })
+            .collect();
+        keys.sort_by(|a, b| {
+            b.2.cmp(&a.2)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        for (key, _, _) in keys.into_iter().skip(MAX_DRAFTS) {
+            self.drafts.remove(&key);
+            self.operations.remove(&key);
+            self.revisions.insert(key, self.revision);
+        }
     }
 }
+
+/// This separate lock is held across a relay request. The store's own lock
+/// is held only while reading or committing a small JSON transaction.
+pub struct RelayLock(#[allow(dead_code)] crate::token::StoreLock);
 
 #[derive(Clone)]
 pub struct Store {
@@ -209,14 +292,9 @@ impl Default for Store {
 
 impl Store {
     pub fn new() -> Self {
-        Store {
-            path: crate::config::drafts_path(),
-        }
+        Self::with_path(crate::config::drafts_path())
     }
 
-    /// The store for a configured site (`config::drafts_path_for`): the
-    /// built-in site's is the flat `<config dir>/drafts.json` every install
-    /// already has, any other site's lives under `sites/<name>/`.
     pub fn for_site(name: &str) -> Self {
         Self::with_path(crate::config::drafts_path_for(name))
     }
@@ -225,16 +303,15 @@ impl Store {
         Store { path }
     }
 
-    /// Where this store reads and writes. Exposed so a caller can prove which
-    /// file it is about to touch, exactly as `token::Store::path` is — both
-    /// test suites assert nothing they build resolves to the operator's real
-    /// config dir (#565).
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
 
     fn ensure_parent(&self) -> Result<()> {
-        let parent = self.path.parent().ok_or_else(|| Error::TokenStore("draft path has no parent".into()))?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| Error::TokenStore("draft path has no parent".into()))?;
         std::fs::create_dir_all(parent)?;
         Ok(())
     }
@@ -242,14 +319,50 @@ impl Store {
     fn read_locked(&self) -> Result<StoredDrafts> {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(StoredDrafts::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(StoredDrafts::default());
+            }
             Err(e) => return Err(e.into()),
         };
         match serde_json::from_slice::<StoredDrafts>(&bytes) {
-            Ok(stored) if stored.version == 2 => Ok(stored),
+            Ok(stored) if stored.version == 3 => Ok(stored),
+            Ok(mut stored) if stored.version == 2 => {
+                // A surviving local draft is the newest local intent even
+                // when v2 still owes deletion of an older website copy.
+                let mut keys: Vec<_> = stored
+                    .drafts
+                    .keys()
+                    .chain(stored.owed_deletes.iter())
+                    .filter_map(|key| DraftKey::from_key(key))
+                    .filter(|key| key.xf_key().is_some())
+                    .collect();
+                keys.sort_by_key(DraftKey::as_key);
+                keys.dedup();
+                stored.operations.clear();
+                for key in keys {
+                    let kind = match stored.drafts.get(&key.as_key()) {
+                        Some(draft) if !draft.is_empty() && !draft.too_big_to_persist() => {
+                            RelayKind::Save
+                        }
+                        _ if stored.owed_deletes.contains(&key.as_key()) => RelayKind::Delete,
+                        _ => continue,
+                    };
+                    let revision = stored.next_revision(key)?;
+                    stored
+                        .operations
+                        .insert(key.as_key(), RelayOperation { revision, kind });
+                }
+                let backup =
+                    crate::token::sibling_with_suffix(&tmp_sibling(&self.path), "v2-backup");
+                Self::write_private(&backup, &bytes)?;
+                stored.version = 3;
+                stored.owed_deletes.clear();
+                self.write_locked(&stored)?;
+                Ok(stored)
+            }
             _ => {
-                // Pre-release unowned drafts are deliberately discarded on
-                // upgrade. Keep genuinely corrupt data available for diagnosis.
+                // Preserve unknown versioned formats, including invalid v3
+                // records. A newer client's words must never be overwritten.
                 if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                     if value.get("version").is_some() {
                         return Err(Error::TokenStore("unsupported draft store format".into()));
@@ -264,119 +377,209 @@ impl Store {
         }
     }
 
-    /// Select the verified account. Replacing an owner clears its drafts in
-    /// the same transaction, so a sibling with the old owner cannot write back.
     pub fn activate(&self, owner: &Owner) -> Result<HashMap<DraftKey, Draft>> {
         self.ensure_parent()?;
         let _lock = crate::token::lock_store(&self.path)?;
         let mut stored = self.read_locked()?;
         if stored.owner.as_ref() != Some(owner) {
-            stored = StoredDrafts {
-                version: 2,
-                owner: Some(owner.clone()),
-                drafts: HashMap::new(),
-                owed_deletes: Vec::new(),
-            };
+            stored.version = 3;
+            stored.owner = Some(owner.clone());
+            stored.drafts.clear();
+            stored.operations.clear();
+            stored.revisions.clear();
             self.write_locked(&stored)?;
         }
-        Ok(stored.entries())
+        Ok(stored.snapshot().drafts)
+    }
+
+    pub fn snapshot(&self, owner: &Owner) -> Result<Snapshot> {
+        self.ensure_parent()?;
+        let _lock = crate::token::lock_store(&self.path)?;
+        let stored = self.read_locked()?;
+        stored.require_owner(owner)?;
+        Ok(stored.snapshot())
     }
 
     pub fn load(&self, owner: &Owner) -> HashMap<DraftKey, Draft> {
-        let Ok(_lock) = crate::token::lock_store(&self.path) else { return HashMap::new() };
-        match self.read_locked() {
-            Ok(stored) if stored.owner.as_ref() == Some(owner) => stored.entries(),
-            _ => HashMap::new(),
-        }
+        self.snapshot(owner)
+            .map(|snapshot| snapshot.drafts)
+            .unwrap_or_default()
     }
 
-    /// Apply only explicit mutations against the freshest snapshot under the
-    /// lock. Untouched keys and deletions from another instance survive.
-    pub fn apply(&self, owner: &Owner, changes: &[(DraftKey, Option<Draft>)]) -> Result<()> {
+    /// Save the local text and its desired relay operation in ONE transaction.
+    /// A relay failure or process exit cannot leave locally durable words
+    /// without the obligation that protects them from a stale remote merge.
+    /// Oversized text remains memory-only: its revision fences old requests,
+    /// but no replayable Save is persisted without its payload.
+    pub fn apply(
+        &self,
+        owner: &Owner,
+        changes: &[(DraftKey, Option<Draft>)],
+    ) -> Result<HashMap<DraftKey, RelayOperation>> {
         self.ensure_parent()?;
         let _lock = crate::token::lock_store(&self.path)?;
         let mut stored = self.read_locked()?;
         if stored.version == 0 {
-            stored.version = 2;
+            stored.version = 3;
             stored.owner = Some(owner.clone());
         }
-        if stored.owner.as_ref() != Some(owner) {
-            return Err(Error::TokenStore("draft account changed; refusing a stale save".into()));
-        }
+        stored.require_owner(owner)?;
+        let mut changed = HashMap::new();
         for (key, draft) in changes {
-            match draft {
-                Some(draft) if !draft.is_empty() && !draft.too_big_to_persist() => {
-                    stored.drafts.insert(key.as_key(), draft.clone());
+            let revision = stored.next_revision(*key)?;
+            let draft = draft.as_ref().filter(|draft| !draft.is_empty());
+            let kind = if draft.is_some() {
+                RelayKind::Save
+            } else {
+                RelayKind::Delete
+            };
+            let op = RelayOperation { revision, kind };
+            if key.xf_key().is_some() {
+                changed.insert(*key, op);
+            }
+            if let Some(draft) = draft.filter(|draft| !draft.too_big_to_persist()) {
+                stored.drafts.insert(key.as_key(), draft.clone());
+                if key.xf_key().is_some() {
+                    stored.operations.insert(key.as_key(), op);
                 }
-                _ => { stored.drafts.remove(&key.as_key()); }
+            } else {
+                stored.drafts.remove(&key.as_key());
+                if key.xf_key().is_some() && kind == RelayKind::Delete {
+                    stored.operations.insert(key.as_key(), op);
+                } else {
+                    stored.operations.remove(&key.as_key());
+                }
             }
         }
-        let mut keys: Vec<_> = stored.drafts.iter().map(|(key, draft)| (key.clone(), draft.saved_at)).collect();
-        keys.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        for (key, _) in keys.into_iter().skip(MAX_DRAFTS) { stored.drafts.remove(&key); }
-        self.write_locked(&stored)
+        // Eviction is local capacity management, not a website delete.
+        stored.trim_drafts(false);
+        self.write_locked(&stored)?;
+        Ok(changed)
     }
 
-    /// Remember that a remote delete for `key` was scheduled but not
-    /// provably settled: the record outlives the process, so a restart's
-    /// merge cannot resurrect the site's copy of an already-posted draft
-    /// (#86). Cleared when the delete settles, or when a new draft for the
-    /// key supersedes it.
-    pub fn record_owed_delete(&self, owner: &Owner, key: &DraftKey) -> Result<()> {
+    /// Read work only AFTER acquiring the key's relay lock. An old waiter
+    /// skips work superseded by this or another process before dispatch.
+    pub fn relay_work(
+        &self,
+        owner: &Owner,
+        key: DraftKey,
+        expected: RelayOperation,
+        transient: Option<&Draft>,
+    ) -> Result<Option<Draft>> {
+        let _lock = crate::token::lock_store(&self.path)?;
+        let stored = self.read_locked()?;
+        stored.require_owner(owner)?;
+        if stored.revisions.get(&key.as_key()) != Some(&expected.revision) {
+            return Ok(None);
+        }
+        match (stored.operations.get(&key.as_key()), expected.kind) {
+            (Some(op), _) if *op != expected => Ok(None),
+            (Some(_), RelayKind::Delete) => Ok(Some(Draft::default())),
+            (Some(_), RelayKind::Save) => Ok(stored.drafts.get(&key.as_key()).cloned()),
+            (None, RelayKind::Save) => Ok(transient
+                .filter(|draft| draft.too_big_to_persist())
+                .cloned()),
+            _ => Ok(None),
+        }
+    }
+
+    /// Only an acknowledgment for the CURRENT operation may retire it.
+    pub fn settle(&self, owner: &Owner, key: DraftKey, expected: RelayOperation) -> Result<bool> {
+        let _lock = crate::token::lock_store(&self.path)?;
+        let mut stored = self.read_locked()?;
+        stored.require_owner(owner)?;
+        if stored.revisions.get(&key.as_key()) != Some(&expected.revision) {
+            return Ok(false);
+        }
+        match stored.operations.get(&key.as_key()) {
+            Some(op) if *op == expected => {
+                stored.operations.remove(&key.as_key());
+                self.write_locked(&stored)?;
+                Ok(true)
+            }
+            None if expected.kind == RelayKind::Save => Ok(true), // memory-only oversized draft
+            _ => Ok(false),
+        }
+    }
+
+    /// Import a website copy only if no local mutation superseded the list's
+    /// snapshot and no unsynced intent owns this slot. Remote imports never
+    /// create Save operations of their own.
+    pub fn merge_remote(
+        &self,
+        owner: &Owner,
+        key: DraftKey,
+        draft: &Draft,
+        observed: u64,
+    ) -> Result<bool> {
         self.ensure_parent()?;
         let _lock = crate::token::lock_store(&self.path)?;
         let mut stored = self.read_locked()?;
-        if stored.owner.as_ref() != Some(owner) {
-            return Err(Error::TokenStore("draft account changed; refusing a stale save".into()));
+        if stored.version == 0 {
+            stored.version = 3;
+            stored.owner = Some(owner.clone());
         }
-        if !stored.owed_deletes.iter().any(|k| k.as_str() == key.as_key()) {
-            stored.owed_deletes.push(key.as_key().to_string());
-            stored.owed_deletes.sort();
-            stored.owed_deletes.dedup();
-            self.write_locked(&stored)?;
+        stored.require_owner(owner)?;
+        if stored.operations.contains_key(&key.as_key())
+            || stored
+                .revisions
+                .get(&key.as_key())
+                .is_some_and(|revision| *revision > observed)
+        {
+            return Ok(false);
         }
-        Ok(())
+        stored.next_revision(key)?;
+        if !draft.is_empty() && !draft.too_big_to_persist() {
+            stored.drafts.insert(key.as_key(), draft.clone());
+        } else {
+            stored.drafts.remove(&key.as_key());
+        }
+        // A remote list must not evict unsynced local words merely because
+        // its unrelated drafts carry newer server timestamps.
+        stored.trim_drafts(true);
+        let accepted = stored.drafts.contains_key(&key.as_key()) || draft.too_big_to_persist();
+        self.write_locked(&stored)?;
+        Ok(accepted)
     }
 
-    /// The delete settled, or a new draft superseded it (#86).
-    pub fn clear_owed_delete(&self, owner: &Owner, key: &DraftKey) -> Result<()> {
-        self.ensure_parent()?;
-        let _lock = crate::token::lock_store(&self.path)?;
-        let mut stored = self.read_locked()?;
-        if stored.owner.as_ref() != Some(owner) {
-            return Err(Error::TokenStore("draft account changed; refusing a stale save".into()));
-        }
-        let before = stored.owed_deletes.len();
-        stored.owed_deletes.retain(|k| k.as_str() != key.as_key());
-        if stored.owed_deletes.len() != before {
-            self.write_locked(&stored)?;
-        }
-        Ok(())
+    /// Nonblocking kernel lock; callers run the filesystem attempt off the
+    /// event loop and wait asynchronously before retrying a busy key.
+    pub fn try_relay_lock(&self, key: DraftKey) -> Result<Option<RelayLock>> {
+        let name = self.path.file_name().unwrap_or_default().to_string_lossy();
+        let anchor = self
+            .path
+            .with_file_name(format!("{name}.relay-{}", key.as_key().replace(':', "-")));
+        crate::token::try_lock_store(&anchor).map(|lock| lock.map(RelayLock))
     }
 
-    /// The owed keys this owner's store remembers — the bootstrap's seed
-    /// for the app's pending-delete set (#86).
-    pub fn owed_deletes(&self, owner: &Owner) -> Vec<DraftKey> {
-        let Ok(_lock) = crate::token::lock_store(&self.path) else { return Vec::new() };
-        match self.read_locked() {
-            Ok(stored) if stored.owner.as_ref() == Some(owner) => stored
-                .owed_deletes
-                .iter()
-                .filter_map(|k| DraftKey::from_key(k))
-                .collect(),
-            _ => Vec::new(),
-        }
-    }
-
-    /// Leave an empty ownership tombstone on sign-out. A stale instance must
-    /// not recreate private drafts after this owner was explicitly cleared.
     pub fn erase(&self, owner: &Owner) -> Result<()> {
         self.ensure_parent()?;
         let _lock = crate::token::lock_store(&self.path)?;
-        let stored = self.read_locked()?;
+        let mut stored = self.read_locked()?;
         if stored.owner.as_ref() == Some(owner) {
-            self.write_locked(&StoredDrafts { version: 2, ..Default::default() })?;
+            stored.owner = None;
+            stored.drafts.clear();
+            stored.operations.clear();
+            stored.revisions.clear();
+            // Keep the global revision even when the account is cleared.
+            self.write_locked(&stored)?;
         }
+        Ok(())
+    }
+
+    fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.write(true).create_new(true).open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        restrict_permissions(path);
         Ok(())
     }
 
@@ -384,26 +587,15 @@ impl Store {
         let body = serde_json::to_vec_pretty(stored)?;
         let tmp = tmp_sibling(&self.path);
         let result = (|| {
-            use std::io::Write;
-            let mut opts = std::fs::OpenOptions::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            let mut f = opts.write(true).create_new(true).open(&tmp)?;
-            f.write_all(&body)?;
-            f.sync_all()?;
-            drop(f);
-            #[cfg(unix)]
-            restrict_permissions(&tmp);
+            Self::write_private(&tmp, &body)?;
             std::fs::rename(&tmp, &self.path)?;
             Ok(())
         })();
-        if result.is_err() { let _ = std::fs::remove_file(&tmp); }
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
         result
     }
-
 }
 
 #[cfg(test)]
@@ -411,44 +603,37 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("wftui-drafts-{name}"));
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "wftui-drafts-{name}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("drafts.json")
     }
 
-    fn owner() -> Owner { Owner::new("http://127.0.0.1:9", 7) }
+    fn owner() -> Owner {
+        Owner::new("http://127.0.0.1:9", 7)
+    }
 
-    /// #86: an owed remote delete outlives the process — the record is
-    /// persisted with the store, survives a reload, and is cleared only
-    /// when it settles or a new draft supersedes it.
     #[test]
-    fn an_owed_delete_survives_a_reload() {
-        let dir = scratch("owed");
-        let path = dir.join("drafts.json");
+    fn a_delete_survives_reload_and_only_its_exact_revision_settles() {
+        let path = scratch("owed");
         let store = Store::with_path(path.clone());
         store.activate(&owner()).unwrap();
         let key = DraftKey::ThreadReply(51465);
-
-        assert!(store.owed_deletes(&owner()).is_empty(), "nothing owed yet");
-        store.record_owed_delete(&owner(), &key).unwrap();
-        assert_eq!(store.owed_deletes(&owner()), vec![key]);
-
-        // A fresh handle over the same file — the restart's view — still
-        // owes the delete.
-        let reopened = Store::with_path(path.clone());
-        assert_eq!(reopened.owed_deletes(&owner()), vec![key]);
-
-        // Another account sees nothing of it.
-        let other = Owner::new("http://127.0.0.1:9", 8);
-        assert!(reopened.owed_deletes(&other).is_empty());
-        assert!(reopened.record_owed_delete(&other, &key).is_err());
-
-        // Settled: gone, for this and every later reload.
-        reopened.clear_owed_delete(&owner(), &key).unwrap();
-        assert!(store.owed_deletes(&owner()).is_empty());
-        // Clearing twice is a no-op, not an error.
-        reopened.clear_owed_delete(&owner(), &key).unwrap();
+        let first = store.apply(&owner(), &[(key, None)]).unwrap()[&key];
+        let reopened = Store::with_path(path);
+        assert_eq!(reopened.snapshot(&owner()).unwrap().operations[&key], first);
+        let second = reopened.apply(&owner(), &[(key, None)]).unwrap()[&key];
+        assert!(!store.settle(&owner(), key, first).unwrap());
+        assert_eq!(store.snapshot(&owner()).unwrap().operations[&key], second);
+        assert!(store.settle(&owner(), key, second).unwrap());
+        assert!(reopened.snapshot(&owner()).unwrap().operations.is_empty());
+        let other = Owner::new(&owner().origin, 8);
+        assert!(reopened.snapshot(&other).is_err());
     }
 
     fn draft(body: &str, saved_at: i64) -> Draft {
@@ -483,8 +668,19 @@ mod tests {
                 edit_seed_body: None,
             },
         );
-        store.apply(&owner(), &map.iter().map(|(k, v)| (*k, Some(v.clone()))).collect::<Vec<_>>()).unwrap();
-        assert_eq!(store.load(&owner()), map, "a draft must survive the round trip byte for byte");
+        store
+            .apply(
+                &owner(),
+                &map.iter()
+                    .map(|(k, v)| (*k, Some(v.clone())))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.load(&owner()),
+            map,
+            "a draft must survive the round trip byte for byte"
+        );
     }
 
     /// Every key kind must survive, or a resumed conversation reply would
@@ -507,7 +703,14 @@ mod tests {
             .enumerate()
             .map(|(i, k)| (*k, draft(&format!("body {i}"), 1)))
             .collect();
-        store.apply(&owner(), &map.iter().map(|(k, v)| (*k, Some(v.clone()))).collect::<Vec<_>>()).unwrap();
+        store
+            .apply(
+                &owner(),
+                &map.iter()
+                    .map(|(k, v)| (*k, Some(v.clone())))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
         assert_eq!(store.load(&owner()), map);
     }
 
@@ -516,9 +719,19 @@ mod tests {
         let store = Store::with_path(scratch("empty"));
         let mut map = HashMap::new();
         map.insert(DraftKey::ThreadReply(1), draft("   \n  ", 1));
-        store.apply(&owner(), &map.iter().map(|(k, v)| (*k, Some(v.clone()))).collect::<Vec<_>>()).unwrap();
+        store
+            .apply(
+                &owner(),
+                &map.iter()
+                    .map(|(k, v)| (*k, Some(v.clone())))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
         assert!(store.load(&owner()).is_empty(), "whitespace is not a draft");
-        assert!(store.load(&owner()).is_empty(), "only ownership metadata remains");
+        assert!(
+            store.load(&owner()).is_empty(),
+            "only ownership metadata remains"
+        );
     }
 
     /// The editor supports very large pastes; `drafts.json` should not have
@@ -528,12 +741,29 @@ mod tests {
     fn an_oversized_draft_is_skipped_not_truncated() {
         let store = Store::with_path(scratch("big"));
         let mut map = HashMap::new();
-        map.insert(DraftKey::ThreadReply(1), draft(&"x".repeat(MAX_DRAFT_BYTES + 1), 2));
+        map.insert(
+            DraftKey::ThreadReply(1),
+            draft(&"x".repeat(MAX_DRAFT_BYTES + 1), 2),
+        );
         map.insert(DraftKey::ThreadReply(2), draft("small", 1));
-        store.apply(&owner(), &map.iter().map(|(k, v)| (*k, Some(v.clone()))).collect::<Vec<_>>()).unwrap();
+        store
+            .apply(
+                &owner(),
+                &map.iter()
+                    .map(|(k, v)| (*k, Some(v.clone())))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
         let back = store.load(&owner());
-        assert!(!back.contains_key(&DraftKey::ThreadReply(1)), "oversized draft skipped");
-        assert_eq!(back[&DraftKey::ThreadReply(2)].body, "small", "the small one still saves");
+        assert!(
+            !back.contains_key(&DraftKey::ThreadReply(1)),
+            "oversized draft skipped"
+        );
+        assert_eq!(
+            back[&DraftKey::ThreadReply(2)].body,
+            "small",
+            "the small one still saves"
+        );
     }
 
     #[test]
@@ -542,11 +772,24 @@ mod tests {
         let map: HashMap<DraftKey, Draft> = (0..MAX_DRAFTS as u32 + 10)
             .map(|i| (DraftKey::ThreadReply(i), draft("b", i as i64)))
             .collect();
-        store.apply(&owner(), &map.iter().map(|(k, v)| (*k, Some(v.clone()))).collect::<Vec<_>>()).unwrap();
+        store
+            .apply(
+                &owner(),
+                &map.iter()
+                    .map(|(k, v)| (*k, Some(v.clone())))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
         let back = store.load(&owner());
         assert_eq!(back.len(), MAX_DRAFTS);
-        assert!(back.contains_key(&DraftKey::ThreadReply(MAX_DRAFTS as u32 + 9)), "newest kept");
-        assert!(!back.contains_key(&DraftKey::ThreadReply(0)), "oldest evicted");
+        assert!(
+            back.contains_key(&DraftKey::ThreadReply(MAX_DRAFTS as u32 + 9)),
+            "newest kept"
+        );
+        assert!(
+            !back.contains_key(&DraftKey::ThreadReply(0)),
+            "oldest evicted"
+        );
     }
 
     /// A corrupt convenience file must never stand between the user and the
@@ -567,7 +810,14 @@ mod tests {
         // The next save must then work rather than fight the old file.
         let mut map = HashMap::new();
         map.insert(DraftKey::NewThread(3), draft("after", 1));
-        store.apply(&owner(), &map.iter().map(|(k, v)| (*k, Some(v.clone()))).collect::<Vec<_>>()).unwrap();
+        store
+            .apply(
+                &owner(),
+                &map.iter()
+                    .map(|(k, v)| (*k, Some(v.clone())))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
         assert_eq!(store.load(&owner()), map);
     }
 
@@ -593,8 +843,14 @@ mod tests {
     /// literally rather than round-tripping through our own formatter.
     #[test]
     fn xf_keys_are_the_ones_xenforo_matches_on() {
-        assert_eq!(DraftKey::ThreadReply(51465).xf_key().as_deref(), Some("thread-51465"));
-        assert_eq!(DraftKey::NewThread(88).xf_key().as_deref(), Some("forum-88"));
+        assert_eq!(
+            DraftKey::ThreadReply(51465).xf_key().as_deref(),
+            Some("thread-51465")
+        );
+        assert_eq!(
+            DraftKey::NewThread(88).xf_key().as_deref(),
+            Some("forum-88")
+        );
         assert_eq!(
             DraftKey::ConversationReply(5).xf_key().as_deref(),
             Some("conversation-reply-5")
@@ -646,8 +902,18 @@ mod tests {
         let store = Store::with_path(scratch("perms"));
         let mut map = HashMap::new();
         map.insert(DraftKey::ThreadReply(1), draft("private words", 1));
-        store.apply(&owner(), &map.iter().map(|(k, v)| (*k, Some(v.clone()))).collect::<Vec<_>>()).unwrap();
-        let mode = std::fs::metadata(store.path()).unwrap().permissions().mode();
+        store
+            .apply(
+                &owner(),
+                &map.iter()
+                    .map(|(k, v)| (*k, Some(v.clone())))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let mode = std::fs::metadata(store.path())
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600, "an unsent post is private");
     }
 
@@ -655,7 +921,9 @@ mod tests {
     /// follows `WFTUI_CONFIG_DIR` exactly as the token store does.
     #[test]
     fn guard_the_draft_store_never_resolves_the_real_config_dir() {
-        let _lock = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("WFTUI_CONFIG_DIR").ok();
         unsafe { std::env::set_var("WFTUI_CONFIG_DIR", "/tmp/wftui-drafts-guard") };
         let path = Store::new().path().to_path_buf();
@@ -682,7 +950,8 @@ mod tests {
         b.apply(&owner, &[(second, Some(draft("two", 2)))]).unwrap();
         assert_eq!(a.load(&owner).len(), 2);
         a.apply(&owner, &[(first, None)]).unwrap();
-        b.apply(&owner, &[(second, Some(draft("new two", 3)))]).unwrap();
+        b.apply(&owner, &[(second, Some(draft("new two", 3)))])
+            .unwrap();
         let read = a.load(&owner);
         assert!(!read.contains_key(&first));
         assert_eq!(read[&second].body, "new two");
@@ -716,10 +985,176 @@ mod tests {
         let store = Store::with_path(path.clone());
         std::fs::write(&path, r#"{"thread:1":{"body":"legacy"}}"#).unwrap();
         assert!(store.activate(&owner()).unwrap().is_empty());
-        let future = r#"{"version":3,"owner":null,"drafts":{}}"#;
+        let future = r#"{"version":4,"owner":null,"drafts":{}}"#;
         std::fs::write(&path, future).unwrap();
         assert!(store.activate(&owner()).is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), future);
     }
 
+    #[test]
+    fn version_two_migration_backs_up_and_prefers_surviving_local_words() {
+        let path = scratch("v2-backup");
+        let original = br#"{"version":2,"owner":{"origin":"http://127.0.0.1:9","user_id":7},"drafts":{"thread:1":{"body":"new local words"},"post:3":{"body":"local edit"}},"owed_deletes":["thread:1","thread:2"]}"#;
+        std::fs::write(&path, original).unwrap();
+        let store = Store::with_path(path.clone());
+        let snapshot = store.snapshot(&owner()).unwrap();
+        assert_eq!(
+            snapshot.drafts[&DraftKey::ThreadReply(1)].body,
+            "new local words"
+        );
+        assert_eq!(
+            snapshot.operations[&DraftKey::ThreadReply(1)].kind,
+            RelayKind::Save
+        );
+        assert_eq!(
+            snapshot.operations[&DraftKey::ThreadReply(2)].kind,
+            RelayKind::Delete
+        );
+        assert!(!snapshot.operations.contains_key(&DraftKey::EditPost(3)));
+        let backups: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with("v2-backup"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(backups[0].path()).unwrap(), original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                backups[0].metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap()).unwrap()["version"],
+            3
+        );
+    }
+
+    #[test]
+    fn revisions_survive_owner_tombstones_and_stale_settlement_cannot_clear_new_intent() {
+        let store = Store::with_path(scratch("revisions"));
+        let key = DraftKey::ThreadReply(7);
+        let first = store
+            .apply(&owner(), &[(key, Some(draft("first", 1)))])
+            .unwrap()[&key];
+        store.erase(&owner()).unwrap();
+        store.activate(&owner()).unwrap();
+        let second = store
+            .apply(&owner(), &[(key, Some(draft("second", 2)))])
+            .unwrap()[&key];
+        assert!(second.revision > first.revision);
+        assert!(!store.settle(&owner(), key, first).unwrap());
+        let third = store.apply(&owner(), &[(key, None)]).unwrap()[&key];
+        assert!(!store.settle(&owner(), key, second).unwrap());
+        assert_eq!(store.snapshot(&owner()).unwrap().operations[&key], third);
+    }
+
+    #[test]
+    fn dirty_and_already_settled_sibling_edits_both_fence_a_stale_remote_list() {
+        let path = scratch("merge-revision");
+        let a = Store::with_path(path.clone());
+        let b = Store::with_path(path);
+        a.activate(&owner()).unwrap();
+        let observed = a.snapshot(&owner()).unwrap().revision;
+        let key = DraftKey::ThreadReply(7);
+        let saved = b
+            .apply(&owner(), &[(key, Some(draft("latest local", 2)))])
+            .unwrap()[&key];
+        assert!(
+            !a.merge_remote(&owner(), key, &draft("stale remote", 1), observed)
+                .unwrap()
+        );
+        b.settle(&owner(), key, saved).unwrap();
+        assert!(
+            !a.merge_remote(&owner(), key, &draft("stale remote", 1), observed)
+                .unwrap()
+        );
+        assert_eq!(a.load(&owner())[&key].body, "latest local");
+    }
+
+    #[test]
+    fn the_first_website_draft_creates_an_absent_store_parent() {
+        let path = scratch("first-import")
+            .parent()
+            .unwrap()
+            .join("new-site")
+            .join("drafts.json");
+        assert!(!path.parent().unwrap().exists());
+        let store = Store::with_path(path);
+        let key = DraftKey::ThreadReply(7);
+        assert!(
+            store
+                .merge_remote(&owner(), key, &draft("typed in the browser", 1), 0)
+                .unwrap()
+        );
+        assert_eq!(store.load(&owner())[&key].body, "typed in the browser");
+        assert!(store.snapshot(&owner()).unwrap().operations.is_empty());
+    }
+
+    #[test]
+    fn oversize_text_has_no_durable_save_without_payload_and_fences_old_work() {
+        let store = Store::with_path(scratch("oversize-intent"));
+        let key = DraftKey::ThreadReply(7);
+        let old = store
+            .apply(&owner(), &[(key, Some(draft("small old", 1)))])
+            .unwrap()[&key];
+        let huge = draft(&"x".repeat(MAX_DRAFT_BYTES + 1), 2);
+        let current = store.apply(&owner(), &[(key, Some(huge.clone()))]).unwrap()[&key];
+        let snapshot = store.snapshot(&owner()).unwrap();
+        assert!(!snapshot.drafts.contains_key(&key));
+        assert!(!snapshot.operations.contains_key(&key));
+        assert!(
+            store
+                .relay_work(&owner(), key, old, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .relay_work(&owner(), key, current, None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .relay_work(&owner(), key, current, Some(&huge))
+                .unwrap(),
+            Some(huge)
+        );
+    }
+
+    #[test]
+    fn relay_file_lock_is_shared_with_another_process() {
+        let path = scratch("process-lock");
+        let store = Store::with_path(path.clone());
+        let key = DraftKey::ThreadReply(7);
+        let held = store.try_relay_lock(key).unwrap().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "drafts::tests::relay_lock_child", "--nocapture"])
+            .env("WFTUI_DRAFT_RELAY_LOCK_TEST", &path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(held);
+        assert!(store.try_relay_lock(key).unwrap().is_some());
+    }
+
+    #[test]
+    fn relay_lock_child() {
+        let Some(path) = std::env::var_os("WFTUI_DRAFT_RELAY_LOCK_TEST") else {
+            return;
+        };
+        assert!(
+            Store::with_path(path.into())
+                .try_relay_lock(DraftKey::ThreadReply(7))
+                .unwrap()
+                .is_none()
+        );
+    }
 }

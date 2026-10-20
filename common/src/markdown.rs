@@ -15,6 +15,21 @@
 
 use crate::bbcode::{Chunk, Style, is_http_url};
 
+#[cfg(test)]
+#[derive(Clone, Copy, Default, Debug)]
+struct RenderWork {
+    index_steps: usize,
+    inline_visits: usize,
+    indexed_queries: usize,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static RENDER_WORK: std::cell::Cell<RenderWork> = const {
+        std::cell::Cell::new(RenderWork { index_steps: 0, inline_visits: 0, indexed_queries: 0 })
+    };
+}
+
 pub fn render(src: &str) -> Vec<Chunk> {
     let mut out = Vec::new();
     let mut fence: Option<String> = None;
@@ -164,23 +179,27 @@ fn inline(text: &str, base: Style, out: &mut Vec<Chunk>) {
     // occur at or after byte k", and re-scanning made alternating `*`/`~`
     // runs quadratic — on the UI thread, once per streamed frame (#45).
     let scan = LineScan::of(text);
+    #[cfg(test)]
+    let mut inline_visits = 0;
     let flush = |plain: &mut String, style: &Style, out: &mut Vec<Chunk>| {
         push_text(out, plain, style.clone());
         plain.clear();
     };
     while i < text.len() {
+        #[cfg(test)]
+        { inline_visits += 1; }
         let rest = &text[i..];
         let prev = text[..i].chars().next_back();
 
         if rest.starts_with('`') {
-            let run = rest.chars().take_while(|c| *c == '`').count();
-            let marker = &rest[..run];
-            if let Some(end) = rest[run..].find(marker) {
+            let run = scan.backtick_end[i] - i;
+            let close = scan.backtick_close[i];
+            if close != usize::MAX {
                 flush(&mut plain, &style, out);
-                let body = &rest[run..run + end];
+                let body = &text[i + run..close];
                 let body = body.strip_prefix(' ').and_then(|b| b.strip_suffix(' ')).unwrap_or(body);
                 push_text(out, body, Style { code: true, ..style.clone() });
-                i += run + end + run;
+                i = close + run;
                 continue;
             }
         }
@@ -219,7 +238,7 @@ fn inline(text: &str, base: Style, out: &mut Vec<Chunk>) {
             }
         }
         if bytes[i] == b'['
-            && let Some((label, url, used)) = link(rest)
+            && let Some((label, url, used)) = scan.link(text, i)
         {
             flush(&mut plain, &style, out);
             let label = strip_inline_markers(label);
@@ -240,13 +259,14 @@ fn inline(text: &str, base: Style, out: &mut Vec<Chunk>) {
             }
         }
         if rest.starts_with("<http")
-            && let Some(end) = rest.find('>')
-            && is_http_url(&rest[1..end])
+            && scan.bracket_close[i] != usize::MAX
+            && has_http_scheme(&text[i + 1..scan.bracket_close[i]])
         {
             flush(&mut plain, &style, out);
-            let url = &rest[1..end];
+            let end = scan.bracket_close[i];
+            let url = &text[i + 1..end];
             out.push(Chunk::Link(url.to_string(), url.to_string(), style.clone()));
-            i += end + 1;
+            i = end + 1;
             continue;
         }
         let ch = rest.chars().next().expect("non-empty rest");
@@ -254,6 +274,14 @@ fn inline(text: &str, base: Style, out: &mut Vec<Chunk>) {
         i += ch.len_utf8();
     }
     flush(&mut plain, &style, out);
+    #[cfg(test)]
+    RENDER_WORK.with(|counter| {
+        let mut work = counter.get();
+        work.index_steps += scan.index_steps;
+        work.inline_visits += inline_visits;
+        work.indexed_queries += scan.indexed_queries.get();
+        counter.set(work);
+    });
 }
 
 /// The per-line suffix tables behind `inline`'s "does a closer/marker exist
@@ -264,18 +292,110 @@ struct LineScan {
     bold_from: Vec<bool>,
     underline_from: Vec<bool>,
     strike_from: Vec<bool>,
+    /// Matching ] / ) by opener offset, independent of the other delimiter.
+    bracket_close: Vec<usize>,
+    /// First space at a parenthesis's own depth (a link's optional title).
+    paren_space: Vec<usize>,
+    backtick_end: Vec<usize>,
+    backtick_close: Vec<usize>,
+    #[cfg(test)]
+    index_steps: usize,
+    #[cfg(test)]
+    indexed_queries: std::cell::Cell<usize>,
 }
 
 impl LineScan {
     fn of(text: &str) -> Self {
         let bytes = text.as_bytes();
         let n = bytes.len();
+        let has_delimiters = bytes.iter().any(|b| matches!(b, b'[' | b'(' | b'<'));
+        let has_ticks = bytes.contains(&b'`');
         let mut tables = LineScan {
             closer_from: vec![false; n + 1],
             bold_from: vec![false; n + 1],
             underline_from: vec![false; n + 1],
             strike_from: vec![false; n + 1],
+            bracket_close: vec![usize::MAX; if has_delimiters { n + 1 } else { 0 }],
+            paren_space: vec![usize::MAX; if has_delimiters { n + 1 } else { 0 }],
+            backtick_end: vec![usize::MAX; if has_ticks { n + 1 } else { 0 }],
+            backtick_close: vec![usize::MAX; if has_ticks { n + 1 } else { 0 }],
+            #[cfg(test)]
+            // Charge the full input for each bounded intrinsic flags scan;
+            // count every variable parser/index loop below at its visits.
+            index_steps: 2 * n,
+            #[cfg(test)]
+            indexed_queries: std::cell::Cell::new(0),
         };
+        // Every opener is visited/popped once. Failed links used to scan
+        // the suffix again at every '['; all-unclosed brackets were O(n²).
+        let mut brackets = Vec::new();
+        let mut parens = Vec::new();
+        let mut angles = Vec::new();
+        let mut ticks = Vec::new();
+        let mut k = 0;
+        while (has_delimiters || has_ticks) && k < n {
+            #[cfg(test)]
+            { tables.index_steps += 1; }
+            match bytes[k] {
+                b'[' => brackets.push(k),
+                b']' => {
+                    if let Some(open) = brackets.pop() {
+                        tables.bracket_close[open] = k;
+                    }
+                }
+                b'(' => parens.push(k),
+                b'<' => angles.push(k),
+                b'>' => {
+                    // Angle autolinks end at the first '>', regardless of
+                    // nested '<' bytes, just as the old suffix find did.
+                    for open in angles.drain(..) {
+                        tables.bracket_close[open] = k;
+                        #[cfg(test)]
+                        { tables.index_steps += 1; }
+                    }
+                }
+                b')' => {
+                    if let Some(open) = parens.pop() {
+                        tables.bracket_close[open] = k;
+                    }
+                }
+                b' ' => {
+                    if let Some(&open) = parens.last()
+                        && tables.paren_space[open] == usize::MAX
+                    {
+                        tables.paren_space[open] = k;
+                    }
+                }
+                b'`' => {
+                    let start = k;
+                    while k < n && bytes[k] == b'`' {
+                        #[cfg(test)]
+                        { tables.index_steps += 1; }
+                        k += 1;
+                    }
+                    ticks.push((start, k));
+                    continue;
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        // The old code accepted the first future run AT LEAST as long as
+        // the opener, even a suffix opener reached after a failed longer
+        // run. Index every such query in two passes over the tick bytes.
+        let longest = ticks.iter().map(|(a, b)| b - a).max().unwrap_or(0);
+        #[cfg(test)]
+        { tables.index_steps += ticks.len(); }
+        let mut next_run = vec![usize::MAX; longest + 1];
+        for &(start, end) in ticks.iter().rev() {
+            for at in start..end {
+                tables.backtick_end[at] = end;
+                tables.backtick_close[at] = next_run[end - at];
+            }
+            next_run[1..=end - start].fill(start);
+            #[cfg(test)]
+            { tables.index_steps += 2 * (end - start); }
+        }
         for (table, needle) in [
             (&mut tables.bold_from, &b"**"[..]),
             (&mut tables.underline_from, &b"__"[..]),
@@ -283,6 +403,8 @@ impl LineScan {
         ] {
             let mut seen = false;
             for k in (0..n).rev() {
+                #[cfg(test)]
+                { tables.index_steps += 1; }
                 seen = seen || (k + 2 <= n && &bytes[k..k + 2] == needle);
                 table[k] = seen;
             }
@@ -295,9 +417,13 @@ impl LineScan {
         let mut candidate = vec![false; n];
         let mut k = 0usize;
         while k < n {
+            #[cfg(test)]
+            { tables.index_steps += 1; }
             if bytes[k] == b'*' {
                 let run_start = k;
                 while k < n && bytes[k] == b'*' {
+                    #[cfg(test)]
+                    { tables.index_steps += 1; }
                     k += 1;
                 }
                 let run_len = k - run_start;
@@ -317,6 +443,8 @@ impl LineScan {
         }
         let mut seen = false;
         for k in (0..n).rev() {
+            #[cfg(test)]
+            { tables.index_steps += 1; }
             seen = seen || candidate[k];
             tables.closer_from[k] = seen;
         }
@@ -324,6 +452,8 @@ impl LineScan {
     }
 
     fn marker_from(&self, k: usize, marker: &str) -> bool {
+        #[cfg(test)]
+        self.indexed_queries.set(self.indexed_queries.get() + 1);
         let k = k.min(self.bold_from.len() - 1);
         match marker {
             "**" => self.bold_from[k],
@@ -333,8 +463,38 @@ impl LineScan {
     }
 
     fn closer_from(&self, k: usize) -> bool {
+        #[cfg(test)]
+        self.indexed_queries.set(self.indexed_queries.get() + 1);
         self.closer_from[k.min(self.closer_from.len() - 1)]
     }
+
+    fn link<'a>(&self, text: &'a str, at: usize) -> Option<(&'a str, &'a str, usize)> {
+        #[cfg(test)]
+        self.indexed_queries.set(self.indexed_queries.get() + 1);
+        let close = self.bracket_close[at];
+        if close == usize::MAX || text.as_bytes().get(close + 1) != Some(&b'(') {
+            return None;
+        }
+        let open_paren = close + 1;
+        let end = self.bracket_close[open_paren];
+        if end == usize::MAX {
+            return None;
+        }
+        let url_end = self.paren_space[open_paren].min(end);
+        let target = text[open_paren + 1..url_end].trim().trim_start_matches('<').trim_end_matches('>');
+        // is_http_url lowercases the entire target; rejected nested links
+        // may overlap, so only inspect the scheme here (the same result).
+        if !has_http_scheme(target) {
+            return None;
+        }
+        Some((&text[at + 1..close], target, end + 1 - at))
+    }
+}
+
+fn has_http_scheme(target: &str) -> bool {
+    let scheme = target.trim_start();
+    scheme.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+        || scheme.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://"))
 }
 
 /// Whether a `*` in `rest` could close an italic run: one that follows a
@@ -362,7 +522,8 @@ fn closes_later(rest: &str) -> bool {
 
 /// `[label](url)` with an http(s) target; returns the bytes consumed. The
 /// label may itself contain brackets (a KB title does), balanced.
-fn link(rest: &str) -> Option<(&str, &str, usize)> {
+#[cfg(test)]
+fn link_reference(rest: &str) -> Option<(&str, &str, usize)> {
     let mut depth = 0usize;
     let mut close = None;
     for (i, c) in rest.char_indices() {
@@ -415,9 +576,12 @@ fn link(rest: &str) -> Option<(&str, &str, usize)> {
 fn bare_url(rest: &str) -> &str {
     let end = rest.find(|c: char| c.is_whitespace() || c == '<' || c == '"').unwrap_or(rest.len());
     let mut url = &rest[..end];
+    let opens = url.bytes().filter(|&b| b == b'(').count();
+    let mut closes = url.bytes().filter(|&b| b == b')').count();
     loop {
         let trimmed = url.trim_end_matches(['.', ',', ';', ':', '!', '?', '*', '_', '\'']);
-        let trimmed = if trimmed.ends_with(')') && trimmed.matches('(').count() < trimmed.matches(')').count() {
+        let trimmed = if trimmed.ends_with(')') && opens < closes {
+            closes -= 1;
             &trimmed[..trimmed.len() - 1]
         } else {
             trimmed
@@ -541,6 +705,56 @@ mod tests {
         assert_eq!(texts(&chunks), "(<KB [x] title|https://example.com/p>)");
     }
 
+    #[test]
+    fn delimiter_indexes_agree_with_the_original_suffix_scans() {
+        let alphabet: Vec<char> = "[]()`<>http:/x é".chars().collect();
+        let mut seed = 0x53a8_u64;
+        let mut sample = |n: usize| {
+            (0..n).map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                alphabet[(seed >> 32) as usize % alphabet.len()]
+            }).collect::<String>()
+        };
+        let mut cases = vec![
+            "[outer [x] title](https://example.test/a_(b) \"title\")".into(),
+            "[a](< https://example.test>) [a](javascript:x)".into(),
+            "x````before```middle``end`".into(),
+            "[a](https://example.test/( nested (title )))".into(),
+            "<http<http<https://example.test> <httpno-scheme>".into(),
+        ];
+        cases.extend((0..2000).map(|n| sample(1 + n % 80)));
+        for text in cases {
+            let scan = LineScan::of(&text);
+            for (at, ch) in text.char_indices() {
+                if ch == '[' {
+                    assert_eq!(scan.link(&text, at), link_reference(&text[at..]), "link at {at} of {text:?}");
+                } else if ch == '`' {
+                    let rest = &text[at..];
+                    let run = rest.bytes().take_while(|&c| c == b'`').count();
+                    let close = rest[run..].find(&rest[..run]).map(|k| at + run + k);
+                    assert_eq!(scan.backtick_end[at], at + run, "run at {at} of {text:?}");
+                    assert_eq!(scan.backtick_close[at], close.unwrap_or(usize::MAX), "close at {at} of {text:?}");
+                } else if ch == '<' {
+                    assert_eq!(scan.bracket_close[at], text[at..].find('>').map_or(usize::MAX, |k| at + k), "angle at {at} of {text:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_brackets_and_backticks_use_linear_index_work() {
+        for n in [10_000, 40_000, 160_000] {
+            for src in ["[".repeat(n), format!("x{}", "`".repeat(n)), "<http".repeat(n / 5)] {
+                let scan = LineScan::of(&src);
+                assert!(scan.index_steps <= 14 * src.len(), "{} full-index steps for {} bytes", scan.index_steps, src.len());
+                assert_eq!(texts(&render(&src)), src, "unclosed input stays literal");
+            }
+            let suffix = ")".repeat(n);
+            let chunks = render(&format!("https://example.test{suffix}"));
+            assert_eq!(texts(&chunks), format!("<https://example.test|https://example.test>{suffix}"));
+        }
+    }
+
     /// #45: the precomputed tables must answer exactly what the readable
     /// reference scan answers, at every offset of every shape of line.
     #[test]
@@ -592,60 +806,51 @@ mod tests {
         }
     }
 
-    /// #45: alternating emphasis runs used to pay an O(remaining) scan per
-    /// star and per `~~` — quadratic per line, re-run on the UI thread
-    /// every streamed frame. 4x the input must cost about 4x the time.
+    /// #45: a suffix scan per unmatched star was quadratic. Count the
+    /// actual indexed render pipeline instead of timing scheduler slices.
     #[test]
     fn render_is_linear_in_emphasis_marker_count() {
-        /// Absolute caps are meaningless on an oversubscribed machine
-        /// (4-40x swings at load 13-16 on this sandbox); the self-relative
-        /// ratio assert below is what pins linearity. Mirrors bbcode's
-        /// `machine_busy`.
-        fn machine_busy() -> bool {
-            std::fs::read_to_string("/proc/loadavg")
-                .ok()
-                .and_then(|s| s.split_whitespace().next().and_then(|f| f.parse::<f64>().ok()))
-                .is_some_and(|load| {
-                    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
-                    load > cpus as f64
-                })
+        fn measured(src: &str) -> (Vec<Chunk>, RenderWork) {
+            RENDER_WORK.with(|counter| counter.set(RenderWork::default()));
+            let chunks = render(src);
+            (chunks, RENDER_WORK.with(|counter| counter.get()))
         }
 
-        fn parse_ms(src: &str) -> f64 {
-            // Best of three: a scheduler star between the two measurements
-            // inflates the larger one and fakes a quadratic on a loaded
-            // host; the minimum approaches the true cost, and a real
-            // quadratic blows every run.
-            (0..3)
-                .map(|_| {
-                    let t = std::time::Instant::now();
-                    let out = render(src);
-                    assert!(!out.is_empty());
-                    t.elapsed().as_secs_f64() * 1000.0
-                })
-                .fold(f64::INFINITY, f64::min)
-        }
+        let mut baseline = None;
+        for scale in [1, 4, 16] {
+            // Every space-preceded star asks whether a closer exists; none
+            // does. A per-opener suffix scan must traverse the whole tail.
+            let stars = 1000 * scale;
+            let strikes = 300 * scale;
+            let literal = " *a".repeat(stars);
+            let src = literal.clone() + &" ~~c~~ ".repeat(strikes);
+            let (chunks, work) = measured(&src);
+            assert_eq!(texts(&chunks), literal + &" c ".repeat(strikes));
+            let struck: String = chunks.iter().filter_map(|chunk| match chunk {
+                Chunk::Text(text, style) if style.strikethrough => Some(text.as_str()),
+                _ => None,
+            }).collect();
+            assert_eq!(struck, "c".repeat(strikes));
+            assert!(chunks.iter().all(|chunk| match chunk {
+                Chunk::Text(_, style) => !style.italic,
+                _ => false,
+            }), "unmatched stars stay literal, not italic");
 
-        // Space-preceded stars are the shape that actually triggers the
-        // old quadratic: each ` *` is an opener, and none of them is a
-        // closer for the ones after it, so the old per-opener scan ran to
-        // the end of the line every time. (An earlier draft used
-        // "a*b* ~~c~~ __d__" soup, whose closers stop every scan early and
-        // which passes even on the old quadratic code.)
-        let soup_4k = " *a".repeat(1000) + &" ~~c~~ ".repeat(300);
-        let soup_16k = " *a".repeat(4000) + &" ~~c~~ ".repeat(1200);
-        let t4 = parse_ms(&soup_4k);
-        if !machine_busy() {
-            assert!(
-                t4 < 400.0,
-                "4 000 chars of emphasis soup took {t4:.1} ms - not linear"
-            );
+            // Four suffix tables, one candidate pass plus its star runs,
+            // and two bounded flags scans take at most eight byte visits.
+            // Each emitted character/marker is visited once; each star and
+            // opening strike pair performs exactly one indexed query.
+            assert!(work.index_steps <= 8 * src.len(), "{work:?} for {} bytes", src.len());
+            assert_eq!(work.inline_visits, 3 * stars + 5 * strikes);
+            assert_eq!(work.indexed_queries, stars + strikes,
+                "every opener must use the precomputed index");
+            let total = work.index_steps + work.inline_visits + work.indexed_queries;
+            assert!(total <= 10 * src.len(), "{work:?} for {} bytes", src.len());
+            if let Some(first) = baseline {
+                assert_eq!(total, first * scale, "operation count must scale with input");
+            } else {
+                baseline = Some(total);
+            }
         }
-        let t16 = parse_ms(&soup_16k);
-        assert!(
-            t16 < 8.0 * t4.max(1.0),
-            "4x the input cost {:.1}x the time ({t4:.1} ms -> {t16:.1} ms): quadratic",
-            t16 / t4.max(0.001)
-        );
     }
 }

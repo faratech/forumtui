@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenSet {
     pub access_token: String,
     pub refresh_token: String,
@@ -33,10 +33,12 @@ pub struct TokenSet {
 
 impl TokenSet {
     /// True when this grant may be used by a client for `origin` /
-    /// `client_id`: a match, or a legacy store that never recorded either.
+    /// `client_id`. Missing legacy fields identify the shipped WindowsForum
+    /// grant; they never act as wildcards for a configured forum.
     pub fn belongs_to(&self, origin: &str, client_id: &str) -> bool {
-        (self.origin.is_empty() || self.origin == origin)
-            && (self.client_id.is_empty() || self.client_id == client_id)
+        let stored_origin = if self.origin.is_empty() { crate::config::BASE_URL } else { &self.origin };
+        let stored_client = if self.client_id.is_empty() { crate::config::DEFAULT_OAUTH_CLIENT_ID } else { &self.client_id };
+        stored_origin == origin && stored_client == client_id
     }
 }
 
@@ -69,6 +71,7 @@ impl TokenSet {
     }
 }
 
+#[derive(Clone)]
 pub struct Store {
     path: PathBuf,
 }
@@ -121,6 +124,10 @@ impl Store {
         std::fs::create_dir_all(dir)
             .map_err(|e| Error::TokenStore(format!("cannot create {}: {e}", dir.display())))?;
         let _lock = lock_store(&self.path)?;
+        self.write_locked(tokens)
+    }
+
+    fn write_locked(&self, tokens: &TokenSet) -> Result<()> {
         let body = serde_json::to_vec_pretty(tokens)?;
 
         let tmp = tmp_sibling(&self.path);
@@ -144,6 +151,35 @@ impl Store {
         restrict_permissions(&tmp);
         std::fs::rename(&tmp, &self.path)
             .map_err(|e| Error::TokenStore(format!("cannot finalize {}: {e}", self.path.display())))
+    }
+
+    /// Publish a verified recovery snapshot only if a sibling has not replaced
+    /// its source grant while verification was in flight.
+    pub fn replace_if_matches(&self, expected: &TokenSet, replacement: &TokenSet) -> Result<bool> {
+        let _lock = lock_store(&self.path)?;
+        let current = match std::fs::read(&self.path) {
+            Ok(bytes) => serde_json::from_slice::<TokenSet>(&bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        if &current != expected { return Ok(false); }
+        self.write_locked(replacement)?;
+        Ok(true)
+    }
+
+    /// Sign-out also supports access-only grants. Comparing the complete grant
+    /// prevents removal of a sibling's newer token, even without a refresh token.
+    pub fn erase_if_matches(&self, expected: &TokenSet) -> Result<bool> {
+        if self.path.parent().is_some_and(|dir| !dir.exists()) { return Ok(false); }
+        let _lock = lock_store(&self.path)?;
+        let current = match std::fs::read(&self.path) {
+            Ok(bytes) => serde_json::from_slice::<TokenSet>(&bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        if &current != expected { return Ok(false); }
+        std::fs::remove_file(&self.path)?;
+        Ok(true)
     }
 
     pub fn erase(&self) -> Result<()> {
@@ -333,6 +369,35 @@ pub(crate) fn restrict_permissions(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_identity_fields_are_bound_to_the_shipped_site() {
+        let mut token = sample();
+        assert!(token.belongs_to(crate::config::BASE_URL, crate::config::DEFAULT_OAUTH_CLIENT_ID));
+        assert!(!token.belongs_to("https://another.example", crate::config::DEFAULT_OAUTH_CLIENT_ID));
+        assert!(!token.belongs_to(crate::config::BASE_URL, "another-client"));
+        token.origin = crate::config::BASE_URL.into();
+        assert!(!token.belongs_to(crate::config::BASE_URL, "another-client"));
+        token.origin.clear(); token.client_id = crate::config::DEFAULT_OAUTH_CLIENT_ID.into();
+        assert!(!token.belongs_to("https://another.example", crate::config::DEFAULT_OAUTH_CLIENT_ID));
+    }
+
+    #[test]
+    fn access_only_erasure_and_recovery_publish_preserve_newer_grants() {
+        let dir = std::env::temp_dir().join(format!("wftui-token-cas-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::with_path(dir.join("token.json"));
+        let mut old = sample(); old.refresh_token.clear();
+        store.save(&old).unwrap();
+        let mut newer = old.clone(); newer.access_token = "newer".into();
+        assert!(store.replace_if_matches(&old, &newer).unwrap());
+        assert!(!store.erase_if_matches(&old).unwrap());
+        assert!(!store.replace_if_matches(&old, &old).unwrap());
+        assert_eq!(store.load().unwrap().unwrap(), newer);
+        assert!(store.erase_if_matches(&newer).unwrap());
+        assert!(store.load().unwrap().is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn sample() -> TokenSet {
         TokenSet { origin: String::new(), client_id: String::new(),

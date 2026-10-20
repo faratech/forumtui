@@ -1279,22 +1279,34 @@ pub fn strip_quote_blocks(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let mut i = 0usize;
     let mut depth = 0usize;
+    let mut plain_tag: Option<String> = None;
     while i < bytes.len() {
         if bytes[i] == b'['
             && let Some((end, closing, name)) = tag_at(src, i, &closes)
-            && name == "quote"
         {
-            if closing {
+            let mut keep = depth == 0;
+            if let Some(plain) = &plain_tag {
+                // XF's parser does not recognize children of a plain tag.
+                // In particular a BBCode sample containing [QUOTE] is text,
+                // not a quote to remove (or an outer quote's closing tag).
+                if closing && name == *plain && src[i + name.len() + 2..end - 1].is_empty() {
+                    plain_tag = None;
+                }
+            } else if !closing && quote_plain_tag(&src[i..end], &name) {
+                plain_tag = Some(name);
+            } else if name == "quote" && closing {
                 // An unmatched closer is literal text, as XF's parser treats
                 // it — dropping it would delete characters the integrity
                 // check's substring rule still needs (#43).
-                if depth == 0 {
-                    out.push_str(&src[i..end]);
-                } else {
-                    depth -= 1;
-                }
-            } else {
+                depth = depth.saturating_sub(1);
+            } else if name == "quote" {
                 depth += 1;
+                keep = false;
+            }
+            // A plain tag (including its opener and closer) is preserved in
+            // the quote. Its children are never reconsidered as BBCode.
+            if keep {
+                out.push_str(&src[i..end]);
             }
             i = end;
             continue;
@@ -1311,6 +1323,23 @@ pub fn strip_quote_blocks(src: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// The stock XF rule set's verbatim regions. CODE/ICODE=rich explicitly
+/// permit BBCode children; ordinary code and plain tags do not. Invalid
+/// option shapes must remain literal rather than hiding a real quote.
+fn quote_plain_tag(tag: &str, name: &str) -> bool {
+    let option = &tag[name.len() + 1..tag.len() - 1];
+    match name {
+        "code" | "icode" => option.is_empty()
+            || option.strip_prefix('=').is_some_and(|v| !strip_quotes(v).eq_ignore_ascii_case("rich")),
+        "plain" | "php" | "html" => option.is_empty(),
+        "url" | "email" => option.is_empty(),
+        "img" => option.is_empty() || option.starts_with(char::is_whitespace),
+        "media" | "user" => option.starts_with('='),
+        "attach" => true,
+        _ => false,
+    }
 }
 
 /// The tag starting at `at`, as `(end_offset, is_closing, lowercase_name)`.
@@ -3019,6 +3048,41 @@ mod tests {
         assert_eq!(strip_quote_blocks(kept), kept);
         // An unclosed quote swallows the rest, as the parser does.
         assert_eq!(strip_quote_blocks("before [QUOTE]after"), "before");
+    }
+
+    /// Captured against XF's stock Parser/RuleSet + StripQuotes processor:
+    /// a quote in a code sample is text, not a nested quote. Losing it also
+    /// makes ContentIntegrity report our automatically generated quote as
+    /// altered content.
+    #[test]
+    fn stripping_quotes_preserves_verbatim_samples_and_their_quote_closers() {
+        for tag in ["CODE", "CODE=php", "ICODE", "PLAIN", "PHP", "HTML"] {
+            let name = tag.split('=').next().unwrap();
+            for literal in ["[QUOTE]literal[/QUOTE]", "unmatched [/QUOTE] then [QUOTE]open"] {
+                let sample = format!("[{tag}]before {literal} after[/{name}]");
+                assert_eq!(strip_quote_blocks(&sample), sample, "{tag}");
+                let nested = format!("keep[QUOTE]remove {sample} all[/QUOTE]tail");
+                assert_eq!(strip_quote_blocks(&nested), "keeptail", "{tag}");
+            }
+        }
+        assert_eq!(
+            strip_quote_blocks("[CODE=rich][QUOTE]remove[/QUOTE]keep[/CODE]"),
+            "[CODE=rich]keep[/CODE]"
+        );
+        assert_eq!(
+            strip_quote_blocks("[ICODE=\"RiCh\"][QUOTE]remove[/QUOTE]keep[/ICODE]"),
+            "[ICODE=\"RiCh\"]keep[/ICODE]"
+        );
+        let unclosed = "[CODE]before [QUOTE]literal[/QUOTE] after";
+        assert_eq!(strip_quote_blocks(unclosed), unclosed);
+        // An invalid option on a no-option plain tag does not make a real
+        // quote opaque to XF's parser.
+        assert_eq!(strip_quote_blocks("[PLAIN=x][QUOTE]remove[/QUOTE]keep[/PLAIN]"), "[PLAIN=x]keep[/PLAIN]");
+        let src = "[CODE]before [QUOTE]literal[/QUOTE] after[/CODE]";
+        assert_eq!(
+            quote_block("Alice", 7, 2, src),
+            format!("[QUOTE=\"Alice, post: 7, member: 2\"]\n{src}\n[/QUOTE]\n\n")
+        );
     }
 
     /// The strip pass must agree with the parser about where a quoted value

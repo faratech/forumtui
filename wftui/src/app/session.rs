@@ -6,6 +6,65 @@
 use super::*;
 
 impl App {
+    pub(super) fn clear_account_navigation(&mut self) {
+        for screen in &mut self.screens {
+            match screen {
+                Screen::Home(home) => {
+                    home.tree = screens::ForumTreeState::default();
+                    home.list = screens::ThreadListState::default();
+                    home.focus = screens::Pane::Tree;
+                }
+                Screen::ForumTree(tree) => *tree = screens::ForumTreeState::default(),
+                _ => {}
+            }
+        }
+        self.palette = None;
+    }
+
+    /// Cancelling a request epoch also releases the screen that awaited it.
+    /// Drafts and loaded content survive a same-account credential rotation.
+    pub(super) fn cancel_recovered_work(&mut self) {
+        self.stop_pollers();
+        self.abort_writes();
+        self.stop_ask_task();
+        self.begin_session();
+        fn cancel(loading: &mut bool, error: &mut Option<String>) {
+            if *loading {
+                *loading = false;
+                *error = Some("Session rechecked; retry the request.".into());
+            }
+        }
+        for screen in &mut self.screens {
+            match screen {
+                Screen::Home(h) => { cancel(&mut h.tree.loading, &mut h.tree.error); cancel(&mut h.list.loading, &mut h.list.error); }
+                Screen::ForumTree(s) => cancel(&mut s.loading, &mut s.error),
+                Screen::ThreadList(s) => cancel(&mut s.loading, &mut s.error),
+                Screen::ThreadView(s) => cancel(&mut s.loading, &mut s.error),
+                Screen::ConversationView(s) => cancel(&mut s.loading, &mut s.error),
+                Screen::Search(s) => cancel(&mut s.loading, &mut s.error),
+                Screen::MediaGallery(s) => cancel(&mut s.loading, &mut s.error),
+                Screen::Resources(s) => cancel(&mut s.loading, &mut s.error),
+                Screen::ResourceView(s) => cancel(&mut s.loading, &mut s.error),
+                Screen::Profile(s) => cancel(&mut s.loading, &mut s.error),
+                Screen::Inbox(s) => {
+                    cancel(&mut s.convos.loading, &mut s.convos.error);
+                    cancel(&mut s.alerts.loading, &mut s.alerts.error);
+                    s.alerts_view_pending = false;
+                    if let Some(view) = &mut s.view { cancel(&mut view.loading, &mut view.error); }
+                }
+                Screen::Compose(s) => {
+                    if s.busy || s.uploading { s.error = Some("Session rechecked; review before retrying.".into()); }
+                    s.busy = false; s.uploading = false;
+                }
+                Screen::NewConversation(s) => {
+                    if s.busy { s.errors = vec!["Session rechecked; review before retrying.".into()]; }
+                    s.busy = false; s.sending = false;
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Spawn work tied to the current authenticated session and retain an
     /// abort handle for the session boundary. Message-producing callers must
     /// also wrap their result with `session_msg`; aborting alone cannot remove
@@ -120,6 +179,10 @@ impl App {
     /// to retry" (issue #551) can re-run exactly this step without pushing a
     /// second Home screen.
     pub(super) fn restore_session(&mut self) {
+        if self.me.is_some() && self.client.requests_paused() {
+            self.recheck_stored_session("session verification required".into());
+            return;
+        }
         self.set_hint("Restoring session…");
         let api = self.api.clone();
         let tx = self.tx.clone();
@@ -147,12 +210,13 @@ impl App {
     /// what lets that swallow apply to a poller's report without also
     /// swallowing this recheck's own verdict.
     pub(super) fn recheck_stored_session(&mut self, reason: String) {
+        self.client.pause_requests();
+        self.stop_pollers();
         self.session_recovery_tried = true;
         self.session_recovery_pending = true;
         self.session_recovery_started_at = Some(std::time::Instant::now());
         self.set_hint("Session token changed elsewhere — re-checking…");
         let client = self.client.clone();
-        let api = self.api.clone();
         let tx = self.tx.clone();
         let generation = self.bootstrap_generation;
         self.spawn_session_task(async move {
@@ -185,23 +249,16 @@ impl App {
                 }
             }
             let mut guard = ReportGuard { tx: tx.clone(), generation, reported: false };
-            if client.adopt_stored_tokens().await {
-                let result = api.me().await.map_err(|e| TaskError::of(&e));
-                guard.reported = true;
-                tx.send(Msg::Bootstrap { generation, result }).ok();
-            } else {
-                guard.reported = true;
-                tx.send(Msg::Bootstrap {
-                    generation,
-                    result: Err(TaskError {
-                        message: reason,
-                        code: None,
-                        max_page: None,
-                        kind: TaskErrorKind::NoToken,
-                    }),
-                })
-                .ok();
-            }
+            let result = match client.stored_session_candidate().await {
+                Ok(Some(candidate)) => candidate.verify_recovery().await.map_err(|e| TaskError::of(&e)),
+                Ok(None) => Err(TaskError { message: reason, code: None, max_page: None, kind: TaskErrorKind::NoToken }),
+                Err(e) => Err(TaskError::of(&e)),
+            };
+            guard.reported = true;
+            tx.send(match result {
+                Ok(verified) => Msg::RecoveryVerified { generation, verified: Box::new(verified) },
+                Err(e) => Msg::Bootstrap { generation, result: Err(e) },
+            }).ok();
         });
     }
 
@@ -262,20 +319,14 @@ impl App {
         {
             self.session_recovery_pending = false;
             self.session_recovery_started_at = None;
-            // Issue #591: `recheck_stored_session` is only ever started with
-            // a live session (`self.me.is_some()` — the boundary that calls
-            // it checks this), so a token is still adopted and in use even
-            // though this backstop never heard back from the recheck. Ending
-            // the session here would be exactly the bug this fix closes —
-            // a working session torn down by a timer. Prefer the same
-            // "still signed in" hint the transient-failure arm uses and
-            // leave the pollers (or the next call) to decide if the session
-            // is really gone.
-            if let Some(user) = self.me.as_ref() {
-                let username = user.username.clone();
-                self.set_hint(format!(
-                    "Token re-check could not reach the site; still signed in as {username}."
-                ));
+            self.bootstrap_generation = self.bootstrap_generation.wrapping_add(1);
+            self.client.pause_requests();
+            self.cancel_recovered_work();
+            // A deadline cannot turn an unverified grant into a session.
+            // Keep local work, invalidate the late verdict, and offer retry.
+            if self.me.is_some() {
+                self.bootstrap_retry_needed = true;
+                self.set_hint("Session verification timed out; requests paused. Press r to retry or Ctrl+L to sign out.");
             } else {
                 self.end_session("Session check timed out; log in again.");
             }
@@ -346,10 +397,7 @@ impl App {
         // boundary's `mark_retryable` fallthrough below). Resetting to
         // default also puts `prime_home_list`'s gate back to "empty, not
         // loading, node 0", so the next sign-in reloads Latest.
-        if let Some(Screen::Home(h)) = self.screens.first_mut() {
-            h.list = screens::ThreadListState::default();
-            h.focus = screens::Pane::Tree;
-        }
+        self.clear_account_navigation();
         self.set_hint(reason);
     }
 

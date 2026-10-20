@@ -229,6 +229,17 @@ impl Target {
         }
     }
 
+    fn from_arch_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "linux-x86_64" => Some(Self::LinuxX86_64),
+            "linux-aarch64" => Some(Self::LinuxAarch64),
+            "windows-x64" => Some(Self::WindowsX64),
+            "windows-x86" => Some(Self::WindowsX86),
+            "windows-arm64" => Some(Self::WindowsArm64),
+            _ => None,
+        }
+    }
+
     pub fn is_windows(self) -> bool {
         matches!(
             self,
@@ -462,11 +473,9 @@ pub fn stage_pending_in(
 }
 
 /// Every complete generation under `root` that is still worth applying over
-/// `current`. Anything else is removed here: abandoned `.stage-*` dirs, a
-/// `pending-*` whose meta is unreadable, is for another platform, whose
-/// bytes no longer match their recorded digest, or whose version is not
-/// newer than the running one (a downgrade must never be re-applied after
-/// the reader installed an older build on purpose).
+/// `current`. Valid generations for another edition or platform stay for
+/// their owner. Remove abandoned `.stage-*` dirs, invalid generations and
+/// this edition/platform's generations that are no longer newer.
 pub fn load_pending(root: &Path, target: Target, current: &str) -> Result<Vec<Pending>> {
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
@@ -496,8 +505,9 @@ pub fn load_pending(root: &Path, target: Target, current: &str) -> Result<Vec<Pe
             continue;
         }
         match read_generation(&path, target, current) {
-            Some(p) => out.push(p),
-            None => {
+            Generation::Pending(p) => out.push(p),
+            Generation::OtherOwner => {}
+            Generation::Invalid => {
                 let _ = std::fs::remove_dir_all(&path);
             }
         }
@@ -505,32 +515,44 @@ pub fn load_pending(root: &Path, target: Target, current: &str) -> Result<Vec<Pe
     Ok(out)
 }
 
-fn read_generation(dir: &Path, target: Target, current: &str) -> Option<Pending> {
-    let meta = std::fs::read_to_string(dir.join(META_NAME)).ok()?;
-    let version = meta_field(&meta, "version")?;
-    if meta_field(&meta, "arch")? != target.arch_tag() || !is_newer(version, current) {
-        return None;
-    }
-    // The edition is part of the binary's identity, like the architecture:
-    // both editions share one update root, and `-xf` is decided at asset
-    // *pick* time only — a staged generation carries no other mark, so
-    // without this check each edition would adopt and install the other's
-    // binary (issue #31). A missing line is a pre-split staging by the
-    // built-in edition, which recorded "" implicitly.
-    if meta_field(&meta, "edition").unwrap_or("") != crate::site::EDITION_SUFFIX {
-        return None;
-    }
-    let want = meta_field(&meta, "sha256")?;
-    let path = dir.join(target.binary_name());
-    let bytes = std::fs::read(&path).ok()?;
-    if sniff_binary(&bytes, target).is_err() || sha256_hex(&bytes) != want {
-        return None;
-    }
-    Some(Pending {
-        version: version.to_string(),
-        path,
-        dir: dir.to_path_buf(),
-    })
+enum Generation {
+    Pending(Pending),
+    OtherOwner,
+    Invalid,
+}
+
+fn read_generation(dir: &Path, target: Target, current: &str) -> Generation {
+    let inspect = || -> Option<Generation> {
+        let meta = std::fs::read_to_string(dir.join(META_NAME)).ok()?;
+        let version = meta_field(&meta, "version")?;
+        parse_version(version)?;
+        let staged_target = Target::from_arch_tag(meta_field(&meta, "arch")?)?;
+        // A missing edition line is legacy staging by the built-in edition.
+        let edition = meta_field(&meta, "edition").unwrap_or("");
+        if !matches!(edition, "" | "-xf") {
+            return None;
+        }
+        let ours = staged_target == target && edition == crate::site::EDITION_SUFFIX;
+        if ours && !is_newer(version, current) {
+            return None;
+        }
+        let want = meta_field(&meta, "sha256")?;
+        let path = dir.join(staged_target.binary_name());
+        let bytes = std::fs::read(&path).ok()?;
+        if sniff_binary(&bytes, staged_target).is_err() || sha256_hex(&bytes) != want {
+            return None;
+        }
+        Some(if ours {
+            Generation::Pending(Pending {
+                version: version.to_string(),
+                path,
+                dir: dir.to_path_buf(),
+            })
+        } else {
+            Generation::OtherOwner
+        })
+    };
+    inspect().unwrap_or(Generation::Invalid)
 }
 
 /// The highest version staged; ties go to whichever was listed first.
@@ -839,23 +861,29 @@ pub enum Outcome {
     ManualInstall { version: String, staged: PathBuf, command: String },
 }
 
-fn last_check_path(root: &Path) -> PathBuf {
-    root.join(LAST_CHECK_NAME)
+fn last_check_path_for(root: &Path, target: Target, edition: &str) -> PathBuf {
+    root.join(format!("{LAST_CHECK_NAME}{edition}-{}", target.arch_tag()))
+}
+
+fn last_check_path(root: &Path, target: Target) -> PathBuf {
+    last_check_path_for(root, target, crate::site::EDITION_SUFFIX)
 }
 
 /// Seconds since the last completed feed request, if any.
-fn since_last_check(root: &Path) -> Option<Duration> {
-    let text = std::fs::read_to_string(last_check_path(root)).ok()?;
+fn since_last_check(root: &Path, target: Target) -> Option<Duration> {
+    // The old shared `last-check` is deliberately ignored: a check by the
+    // other edition cannot stand in for staging this edition's asset.
+    let text = std::fs::read_to_string(last_check_path(root, target)).ok()?;
     let then = text.trim().parse::<u64>().ok()?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
     Some(Duration::from_secs(now.saturating_sub(then)))
 }
 
-fn note_check(root: &Path) {
+fn note_check(root: &Path, target: Target) {
     if std::fs::create_dir_all(root).is_ok()
         && let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH)
     {
-        let _ = std::fs::write(last_check_path(root), now.as_secs().to_string());
+        let _ = std::fs::write(last_check_path(root, target), now.as_secs().to_string());
     }
 }
 
@@ -966,7 +994,7 @@ pub async fn check_and_stage(cfg: &UpdateConfig, force: bool) -> Result<Outcome>
     if strategy == Err(Refusal::CargoTarget) {
         return Ok(Outcome::Skipped(Refusal::CargoTarget.to_string()));
     }
-    if !force && since_last_check(&cfg.root).is_some_and(|age| age < MIN_CHECK_INTERVAL) {
+    if !force && since_last_check(&cfg.root, target).is_some_and(|age| age < MIN_CHECK_INTERVAL) {
         return Ok(Outcome::Throttled);
     }
 
@@ -978,7 +1006,7 @@ pub async fn check_and_stage(cfg: &UpdateConfig, force: bool) -> Result<Outcome>
         .send()
         .await?;
     // Any completed request spends quota; count it whatever it said.
-    note_check(&cfg.root);
+    note_check(&cfg.root, target);
     if !resp.status().is_success() {
         return Err(feed_error(resp, "release feed").await);
     }
@@ -1249,11 +1277,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// #31: both editions share one update root, and the `-xf` split exists
-    /// only at asset-*pick* time. A staged generation therefore records
-    /// which edition it belongs to, and this build prunes the other's —
-    /// otherwise each edition would adopt (skip the download) and then
-    /// install the other's binary at the next start.
     /// #68: the http exemption is an EXACT loopback-host match — lookalike
     /// hosts, userinfo tricks and ports do not slip through, and the three
     /// real loopback spellings do.
@@ -1283,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    fn a_generation_of_the_other_edition_is_pruned_not_adopted() {
+    fn a_generation_of_the_other_edition_is_preserved_not_adopted() {
         let root = scratch("edition");
         let target = host();
         let current = env!("CARGO_PKG_VERSION");
@@ -1297,7 +1320,7 @@ mod tests {
         let foreign_body = synthetic_binary(target, 3);
         let foreign = stage_pending_in(
             &root,
-            "9.9.8",
+            "0.0.1",
             target,
             &sha256_hex(&foreign_body),
             &foreign_body,
@@ -1306,7 +1329,7 @@ mod tests {
         std::fs::write(
             foreign.dir.join(META_NAME),
             format!(
-                "version=9.9.8\narch={}\nsha256={}\nedition={other_suffix}\n",
+                "version=0.0.1\narch={}\nsha256={}\nedition={other_suffix}\n",
                 target.arch_tag(),
                 sha256_hex(&foreign_body)
             ),
@@ -1319,11 +1342,30 @@ mod tests {
             "our own staged generation is adopted"
         );
         assert!(
-            !pending.iter().any(|p| p.version == "9.9.8"),
+            !pending.iter().any(|p| p.version == "0.0.1"),
             "the other edition's generation is never adopted"
         );
-        assert!(!foreign.dir.exists(), "it is pruned, not left for the next start");
+        assert!(foreign.dir.exists(), "the other edition still needs its staged update");
+        assert_eq!(std::fs::read(&foreign.path).unwrap(), foreign_body);
         assert!(ours.dir.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_generation_of_another_platform_is_preserved_for_its_owner() {
+        let root = scratch("other-platform");
+        let target = if host() == Target::LinuxX86_64 {
+            Target::WindowsArm64
+        } else {
+            Target::LinuxX86_64
+        };
+        let body = synthetic_binary(target, 3);
+        let staged = stage_pending_in(&root, "0.0.2", target, &sha256_hex(&body), &body).unwrap();
+        assert!(load_pending(&root, host(), "9.9.9").unwrap().is_empty());
+        assert!(staged.dir.exists(), "another platform's version is not ours to prune");
+        assert_eq!(std::fs::read(&staged.path).unwrap(), body);
+        assert_eq!(load_pending(&root, target, "0.0.1").unwrap(), vec![staged]);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1366,7 +1408,21 @@ mod tests {
         std::fs::create_dir(&fresh_stage).unwrap();
         // Back-date the stale one past the abandonment age.
         let old = SystemTime::now() - ABANDONED_STAGE_AGE - Duration::from_secs(60);
-        std::fs::File::open(&stale_stage).unwrap().set_modified(old).unwrap();
+        #[cfg(windows)]
+        let stage_handle = {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Directory handles require BACKUP_SEMANTICS; SetFileTime needs
+            // FILE_WRITE_ATTRIBUTES, rather than permission to write contents.
+            // https://learn.microsoft.com/windows/win32/fileio/obtaining-a-handle-to-a-directory
+            const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            std::fs::OpenOptions::new().access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(&stale_stage).unwrap()
+        };
+        #[cfg(not(windows))]
+        let stage_handle = std::fs::File::open(&stale_stage).unwrap();
+        stage_handle.set_modified(old).unwrap();
+        drop(stage_handle);
 
         let pending = load_pending(&root, host(), "0.0.2").unwrap();
         assert_eq!(pending, vec![good.clone()]);
@@ -1500,6 +1556,26 @@ mod tests {
     }
 
     #[test]
+    fn apply_installs_only_our_edition_and_preserves_the_other_update() {
+        let root = scratch("apply-edition");
+        let exe = root.join(host().binary_name());
+        std::fs::write(&exe, b"old install").unwrap();
+        let cfg = cfg_at(&root.join("update"), &exe, "http://127.0.0.1:1/");
+        let ours = synthetic_binary(host(), 4);
+        stage_pending_in(&cfg.root, "0.0.2", host(), &sha256_hex(&ours), &ours).unwrap();
+        let theirs = synthetic_binary(host(), 5);
+        let foreign = stage_pending_in(&cfg.root, "9.9.9", host(), &sha256_hex(&theirs), &theirs).unwrap();
+        let other_edition = if crate::site::EDITION_SUFFIX == "-xf" { "" } else { "-xf" };
+        let meta = meta_text("9.9.9", host(), &sha256_hex(&theirs))
+            .replace(&format!("edition={}\n", crate::site::EDITION_SUFFIX), &format!("edition={other_edition}\n"));
+        std::fs::write(foreign.dir.join(META_NAME), meta).unwrap();
+        assert_eq!(apply_pending_update(&cfg), ApplyOutcome::Applied("0.0.2".into()));
+        assert_eq!(std::fs::read(exe).unwrap(), ours);
+        assert_eq!(std::fs::read(foreign.path).unwrap(), theirs);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn apply_refuses_a_cargo_target_binary_and_discards_the_generation() {
         let root = scratch("refuse");
         let checkout = root.join("checkout");
@@ -1535,9 +1611,9 @@ mod tests {
     #[test]
     fn last_check_throttle_blocks_auto_checks_but_not_forced_ones() {
         let root = scratch("throttle");
-        assert!(since_last_check(&root).is_none());
-        note_check(&root);
-        let age = since_last_check(&root).unwrap();
+        assert!(since_last_check(&root, host()).is_none());
+        note_check(&root, host());
+        let age = since_last_check(&root, host()).unwrap();
         assert!(age < MIN_CHECK_INTERVAL);
         let exe = root.join("wftui");
         std::fs::write(&exe, b"x").unwrap();
@@ -1549,6 +1625,29 @@ mod tests {
         let disabled = UpdateConfig { disabled: true, ..cfg.clone() };
         assert!(matches!(rt.block_on(check_and_stage(&disabled, true)).unwrap(), Outcome::Skipped(_)));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn last_check_is_scoped_to_edition_and_platform() {
+        let root = scratch("throttle-owner");
+        let target = host();
+        let other_edition = if crate::site::EDITION_SUFFIX == "-xf" { "" } else { "-xf" };
+        let other_target = if target == Target::LinuxX86_64 {
+            Target::WindowsArm64
+        } else {
+            Target::LinuxX86_64
+        };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string();
+        std::fs::write(root.join(LAST_CHECK_NAME), &now).unwrap();
+        let foreign = last_check_path_for(&root, target, other_edition);
+        std::fs::write(&foreign, &now).unwrap();
+        note_check(&root, other_target);
+        assert!(since_last_check(&root, target).is_none(), "other owners cannot suppress our check");
+        note_check(&root, target);
+        assert!(since_last_check(&root, target).is_some_and(|age| age < MIN_CHECK_INTERVAL));
+        assert_eq!(std::fs::read_to_string(foreign).unwrap(), now);
+        assert!(since_last_check(&root, other_target).is_some());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     // ------------------------------------------------------------ wiremock
@@ -1614,6 +1713,11 @@ mod tests {
     async fn check_and_stage_downloads_verifies_and_stages() {
         let f = feed("v0.0.2", synthetic_binary(host(), 5), None, |_| {}).await;
         let cfg = f.cfg();
+        std::fs::create_dir_all(&cfg.root).unwrap();
+        let other_edition = if crate::site::EDITION_SUFFIX == "-xf" { "" } else { "-xf" };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string();
+        std::fs::write(cfg.root.join(LAST_CHECK_NAME), &now).unwrap();
+        std::fs::write(last_check_path_for(&cfg.root, host(), other_edition), &now).unwrap();
         let out = check_and_stage(&cfg, false).await.unwrap();
         let Outcome::Staged { version, path } = out else {
             panic!("{out:?}");
@@ -1622,7 +1726,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), f.body);
         assert!(path.starts_with(&cfg.root));
         assert_eq!(std::fs::read(&f.exe).unwrap(), synthetic_binary(host(), 0), "nothing is swapped until the next start");
-        assert!(cfg.root.join(LAST_CHECK_NAME).exists());
+        assert!(last_check_path(&cfg.root, host()).exists());
 
         // A second check reuses the staged generation without another download.
         let before = f.requests().await.len();
@@ -1679,7 +1783,7 @@ mod tests {
                 Err(Error::RateLimited { retry_after }) => assert_eq!(retry_after, Some(Duration::from_secs(120))),
                 other => panic!("{status}: {other:?}"),
             }
-            assert!(cfg.root.join(LAST_CHECK_NAME).exists(), "a refused request still spent quota");
+            assert!(last_check_path(&cfg.root, host()).exists(), "a refused request still spent quota");
             let _ = std::fs::remove_dir_all(&root);
         }
     }
@@ -1724,6 +1828,7 @@ mod tests {
         }
         let f = feed("v0.0.2", synthetic_binary(host(), 5), None, |_| {}).await;
         let cfg = f.cfg();
+        #[cfg(unix)]
         let dir = f.exe.parent().unwrap();
         #[cfg(unix)]
         {

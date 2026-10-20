@@ -1,9 +1,8 @@
 //! Terminal escape-sequence helpers: OSC 8 hyperlinks and OSC 52 clipboard.
 //!
 //! Both travel as plain bytes over SSH, so they act on the user's LOCAL
-//! terminal/clipboard — exactly what a remote TUI needs. Control characters
-//! are zero-width in unicode-width, so embedding these in ratatui spans does
-//! not skew layout (keep each sequence inside one span and off wrapped lines).
+//! terminal/clipboard — exactly what a remote TUI needs. Emit these bytes
+//! through `App::emit_raw` between frames, never inside ratatui spans.
 
 use base64ct::{Base64, Encoding};
 
@@ -16,11 +15,17 @@ pub enum Multiplexer {
 
 /// Detect whether wftui is running inside tmux or GNU screen.
 pub fn detect_multiplexer() -> Multiplexer {
-    if std::env::var_os("TMUX").is_some() {
+    multiplexer_for(
+        std::env::var_os("TMUX").is_some(),
+        std::env::var_os("STY").is_some(),
+        std::env::var("TERM").ok().as_deref(),
+    )
+}
+
+fn multiplexer_for(tmux: bool, screen: bool, term: Option<&str>) -> Multiplexer {
+    if tmux {
         Multiplexer::Tmux
-    } else if std::env::var_os("STY").is_some()
-        || std::env::var("TERM").is_ok_and(|t| t.starts_with("screen"))
-    {
+    } else if screen || term.is_some_and(|t| t.starts_with("screen")) {
         Multiplexer::Screen
     } else {
         Multiplexer::None
@@ -44,8 +49,8 @@ pub fn is_remote_session() -> bool {
 /// unrecognized raw OSC through harmlessly, and a tmux-behind-ssh instance,
 /// which forwards a raw OSC to the outer terminal, both need the raw
 /// sequence; only real screen also needs the DCS wrapper.
-fn deliver_dual_for_screen(seq: &str) -> String {
-    match detect_multiplexer() {
+fn deliver_dual_for_screen(seq: &str, mux: Multiplexer) -> String {
+    match mux {
         Multiplexer::Screen => format!("{seq}{}", deliver_in_mux(seq, Multiplexer::Screen)),
         mux => deliver_in_mux(seq, mux),
     }
@@ -61,18 +66,26 @@ fn strip_controls(s: &str) -> String {
 
 /// Wrap `label` in an OSC 8 hyperlink pointing at `url`.
 pub fn hyperlink(url: &str, label: &str) -> String {
+    hyperlink_in_mux(url, label, detect_multiplexer())
+}
+
+fn hyperlink_in_mux(url: &str, label: &str, mux: Multiplexer) -> String {
     let seq = format!(
         "\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\",
         strip_controls(url),
         strip_controls(label)
     );
-    deliver_dual_for_screen(&seq)
+    deliver_dual_for_screen(&seq, mux)
 }
 
 /// Set terminal window and tab title via OSC 0.
 pub fn set_title(title: &str) -> String {
+    title_in_mux(title, detect_multiplexer())
+}
+
+fn title_in_mux(title: &str, mux: Multiplexer) -> String {
     let seq = format!("\x1b]0;{}\x07", strip_controls(title));
-    deliver_dual_for_screen(&seq)
+    deliver_dual_for_screen(&seq, mux)
 }
 
 /// Largest OSC 52 payload source we will base64 (#648): a megabyte-scale
@@ -85,19 +98,23 @@ pub const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
 /// OSC 52 clipboard write (base64 payload, BEL terminator). Empty output
 /// means "over the cap — not sent".
 pub fn set_clipboard(value: &str) -> String {
+    clipboard_in_mux(value, detect_multiplexer())
+}
+
+fn clipboard_in_mux(value: &str, mux: Multiplexer) -> String {
     if value.len() > MAX_CLIPBOARD_BYTES {
         return String::new();
     }
     let b64 = Base64::encode_string(value.as_bytes());
     let raw = format!("\x1b]52;c;{b64}\x07");
-    match detect_multiplexer() {
+    match mux {
         Multiplexer::Tmux => {
             // Dual-delivery: send raw OSC 52 (for tmux native set-clipboard)
             // PLUS DCS-wrapped OSC 52 (for tmux allow-passthrough outer terminal).
             let dcs = deliver_in_mux(&raw, Multiplexer::Tmux);
             format!("{raw}{dcs}")
         }
-        Multiplexer::Screen => deliver_dual_for_screen(&raw),
+        Multiplexer::Screen => deliver_dual_for_screen(&raw, mux),
         Multiplexer::None => raw,
     }
 }
@@ -354,7 +371,7 @@ mod tests {
     /// terminate or inject sequences inside the terminal itself.
     #[test]
     fn titles_and_hrefs_carry_no_control_characters() {
-        let t = set_title("Windows \u{1b}]0;pwned\u{7} Forum tabs");
+        let t = title_in_mux("Windows \u{1b}]0;pwned\u{7} Forum tabs", Multiplexer::None);
         // Exactly the framing escapes remain: OSC open, BEL terminator; the
         // injected sequences' control bytes are gone, leaving plain text.
         assert!(t.starts_with("\x1b]0;"), "{t:?}");
@@ -365,7 +382,7 @@ mod tests {
         // text ("Windows ]0;pwned Forum tabs") is inert, printable text.
         assert!(inner.starts_with("Windows ") && inner.ends_with("Forum tabs"), "{t:?}");
 
-        let h = hyperlink("https://x.test/a\u{7}b", "click\u{1b}me");
+        let h = hyperlink_in_mux("https://x.test/a\u{7}b", "click\u{1b}me", Multiplexer::None);
         assert!(!h.contains('\u{7}'), "{h:?}");
         let payload = h.trim_start_matches("\x1b]8;;").trim_end_matches("\x1b]8;;\x1b\\");
         assert!(payload.starts_with("https://x.test/ab\x1b\\clickme"), "{h:?}");
@@ -375,11 +392,13 @@ mod tests {
     /// emitted at all (empty output = "not sent"); small values still are.
     #[test]
     fn clipboard_over_the_cap_is_not_emitted() {
-        assert!(set_clipboard("small").starts_with("\x1b]52;c;"));
+        assert!(clipboard_in_mux("small", Multiplexer::None).starts_with("\x1b]52;c;"));
         let huge = "x".repeat(MAX_CLIPBOARD_BYTES + 1);
-        assert!(set_clipboard(&huge).is_empty(), "over-cap payload must not be emitted");
+        for mux in [Multiplexer::None, Multiplexer::Tmux, Multiplexer::Screen] {
+            assert!(clipboard_in_mux(&huge, mux).is_empty(), "over-cap payload must not be emitted");
+        }
         let at_cap = "x".repeat(MAX_CLIPBOARD_BYTES);
-        assert!(!set_clipboard(&at_cap).is_empty(), "at-cap is fine");
+        assert!(!clipboard_in_mux(&at_cap, Multiplexer::None).is_empty(), "at-cap is fine");
     }
 
     #[test]
@@ -451,44 +470,20 @@ mod tests {
     /// alongside the screen-wrapped DCS (which real screen needs).
     #[test]
     fn screen_like_term_over_ssh_dual_delivers_raw_plus_dcs() {
-        let _g = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_tmux = std::env::var_os("TMUX");
-        let prev_sty = std::env::var_os("STY");
-        let prev_term = std::env::var_os("TERM");
-        unsafe {
-            std::env::remove_var("TMUX");
-            std::env::remove_var("STY");
-            std::env::set_var("TERM", "screen-256color");
-        }
-
-        let out = set_clipboard("https://windowsforum.com/x");
+        let mux = multiplexer_for(false, false, Some("screen-256color"));
+        assert_eq!(mux, Multiplexer::Screen);
+        let out = clipboard_in_mux("https://windowsforum.com/x", mux);
         assert!(out.starts_with("\x1b]52;c;"), "missing raw OSC 52: {out:?}");
         assert!(out.contains("\x1bP"), "missing screen-wrapped DCS: {out:?}");
-
-        unsafe {
-            match prev_tmux {
-                Some(v) => std::env::set_var("TMUX", v),
-                None => std::env::remove_var("TMUX"),
-            }
-            match prev_sty {
-                Some(v) => std::env::set_var("STY", v),
-                None => std::env::remove_var("STY"),
-            }
-            match prev_term {
-                Some(v) => std::env::set_var("TERM", v),
-                None => std::env::remove_var("TERM"),
-            }
-        }
+        assert_eq!(multiplexer_for(true, true, Some("screen")), Multiplexer::Tmux);
+        assert_eq!(multiplexer_for(false, true, Some("xterm")), Multiplexer::Screen);
+        assert_eq!(multiplexer_for(false, false, Some("xterm")), Multiplexer::None);
+        assert_eq!(multiplexer_for(false, false, None), Multiplexer::None);
     }
 
     #[test]
     fn terminal_title_generation() {
-        // `set_title` consults TMUX/STY/TERM (detect_multiplexer). The env is
-        // process-global and sibling tests mutate it under ENV_LOCK, so this
-        // read takes the same lock — a bare read alongside a set_var is a
-        // race, not just a flake (#660).
-        let _lock = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let title_seq = set_title("wftui - Windows Forums");
+        let title_seq = title_in_mux("wftui - Windows Forums", Multiplexer::None);
         assert!(title_seq.contains("wftui - Windows Forums"));
     }
 }
