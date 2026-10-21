@@ -275,7 +275,7 @@ jobs:
 
             `SHA256SUMS.txt` covers every asset above; a running wftui verifies its own update against it.
 
-            Proprietary software — in development.
+            MIT-licensed — see LICENSE in the repository.
           files: artifacts/*
           draft: false
           prerelease: false
