@@ -522,6 +522,9 @@ pub(crate) struct PostImage {
     /// an image attachment with no usable URL at all: it still earns its
     /// caption row and its number, there is simply nothing to draw.
     pub key: Option<String>,
+    /// API-user bytes for a same-site attachment that needs browser auth.
+    /// Public image/CDN URLs continue to use `open_url` in the viewer.
+    pub full_key: Option<String>,
     /// Caption text: an attachment's filename, or a URL's last path segment.
     pub label: String,
     pub px: Option<(u32, u32)>,
@@ -545,10 +548,21 @@ impl PostImages {
     }
 }
 
+/// Public thumbnails keep their cacheable URL; a full attachment fallback
+/// uses the authenticated API route when its browser link needs a cookie.
+pub(crate) fn attachment_image_key(att: &common::models::Attachment, origin: &str) -> Option<String> {
+    let fallback = images::attachment_url(att)?;
+    if att.thumbnail_url.as_deref().is_some_and(|url| !url.trim().is_empty()) {
+        Some(fallback.to_string())
+    } else {
+        att.data_url(origin).or_else(|| Some(fallback.to_string()))
+    }
+}
+
 /// Resolve a post's pictures: every image reference its message makes that
 /// this client can actually show, then the image attachments it carries that
 /// the message never referenced.
-pub(crate) fn post_images(post: &Post, chunks: &[Chunk]) -> PostImages {
+pub(crate) fn post_images(post: &Post, chunks: &[Chunk], origin: &str) -> PostImages {
     let mut all: Vec<PostImage> = Vec::new();
     let mut inline_at: Vec<usize> = Vec::new();
     let mut used: Vec<u32> = Vec::new();
@@ -559,6 +573,7 @@ pub(crate) fn post_images(post: &Post, chunks: &[Chunk]) -> PostImages {
                 all.push(PostImage {
                     label: super::misc::url_label(&url),
                     key: Some(url.clone()),
+                    full_key: None,
                     px: None,
                     open_url: Some(url),
                 });
@@ -577,7 +592,8 @@ pub(crate) fn post_images(post: &Post, chunks: &[Chunk]) -> PostImages {
                 };
                 used.push(id);
                 all.push(PostImage {
-                    key: images::attachment_url(att).map(str::to_string),
+                    key: attachment_image_key(att, origin),
+                    full_key: att.data_url(origin),
                     label: att.filename.clone(),
                     px: attachment_px(att),
                     open_url: att.open_url().map(str::to_string),
@@ -592,7 +608,8 @@ pub(crate) fn post_images(post: &Post, chunks: &[Chunk]) -> PostImages {
         .filter(|a| a.is_image() && !used.contains(&a.attachment_id))
     {
         all.push(PostImage {
-            key: images::attachment_url(att).map(str::to_string),
+            key: attachment_image_key(att, origin),
+            full_key: att.data_url(origin),
             label: att.filename.clone(),
             px: attachment_px(att),
             open_url: att.open_url().map(str::to_string),
@@ -638,7 +655,7 @@ pub(crate) fn post_videos(post: Option<&Post>) -> Vec<(String, &'static str)> {
 /// `None` when the API gave nothing to paint — the caller then falls back to
 /// the browser, which is all that picture ever had.
 pub(crate) fn image_open_for_post(post: &Post, img: &PostImage) -> Option<Box<super::ImageOpen>> {
-    let key = img.open_url.clone().or_else(|| img.key.clone())?;
+    let key = img.full_key.clone().or_else(|| img.open_url.clone()).or_else(|| img.key.clone())?;
     let mut meta = post.username.clone();
     if post.post_date > 0 {
         if !meta.is_empty() {
@@ -832,7 +849,7 @@ pub fn home_hints(s: &HomeState) -> Hints {
             0,
         );
     }
-    Hints::with_short(
+    let hints = Hints::with_short(
         &[
             ("Enter", "open"),
             ("j/k", "move"),
@@ -856,7 +873,11 @@ pub fn home_hints(s: &HomeState) -> Hints {
             ("?", "more"),
         ],
         0,
-    )
+    );
+    creation_hints(hints, match s.focus {
+        Pane::Tree => forum_tree_creation_target(&s.tree).is_some_and(|node| node.thread_creation_permission() != Some(false)),
+        Pane::List => s.list.can_create_thread(),
+    })
 }
 
 pub fn home_key(s: &mut HomeState, key: KeyEvent) -> Action {
@@ -1001,12 +1022,7 @@ pub fn forum_tree_key(s: &mut ForumTreeState, key: KeyEvent) -> Action {
             // Path into category: jump to first child node
             if let Some(node) = s.nodes.get(s.sel)
                 && node.node_type == "Category"
-                && let Some((child_idx, _)) = s
-                    .nodes
-                    .iter()
-                    .enumerate()
-                    .skip(s.sel + 1)
-                    .find(|(_, c)| c.parent_node_id == node.node_id || c.depth > node.depth)
+                && let Some((child_idx, _)) = category_descendants(&s.nodes, s.sel).next()
             {
                 s.sel = child_idx;
             }
@@ -1017,21 +1033,15 @@ pub fn forum_tree_key(s: &mut ForumTreeState, key: KeyEvent) -> Action {
                 "Category" => {
                     // Categories do not have threads (/forums/{category_id} 404s).
                     // Path down into the first child forum of this category.
-                    if let Some((child_idx, _)) = s.nodes.iter().enumerate().skip(s.sel + 1).find(
-                        |(_, c)| {
-                            (c.parent_node_id == node.node_id || c.depth > node.depth)
-                                && c.node_type == "Forum"
-                        },
-                    ) {
-                        s.sel = child_idx;
-                    } else if let Some((child_idx, _)) = s
-                        .nodes
-                        .iter()
-                        .enumerate()
-                        .skip(s.sel + 1)
-                        .find(|(_, c)| c.parent_node_id == node.node_id || c.depth > node.depth)
+                    if let Some((child_idx, _)) = category_descendants(&s.nodes, s.sel)
+                        .find(|(_, child)| child.node_type == "Forum")
                     {
                         s.sel = child_idx;
+                    } else if let Some((child_idx, _)) = category_descendants(&s.nodes, s.sel).next()
+                    {
+                        s.sel = child_idx;
+                    } else {
+                        return Action::Notice("Nothing to open in this category.".into());
                     }
                     Action::None
                 }
@@ -1059,19 +1069,10 @@ pub fn forum_tree_key(s: &mut ForumTreeState, key: KeyEvent) -> Action {
             s.loading = true;
             Action::LoadNodes
         }
-        KeyCode::Char('N') => match s.nodes.get(s.sel) {
-            Some(node) if node.node_type == "Forum" => Action::StartNewThread(node.node_id),
-            Some(node) if node.node_type == "Category" => {
-                if let Some(child) = s.nodes.iter().skip(s.sel + 1).find(|c| {
-                    (c.parent_node_id == node.node_id || c.depth > node.depth)
-                        && c.node_type == "Forum"
-                }) {
-                    Action::StartNewThread(child.node_id)
-                } else {
-                    Action::Notice("Pick a forum first.".into())
-                }
-            }
-            _ => Action::Notice("Pick a forum first.".into()),
+        KeyCode::Char('N') => match forum_tree_creation_target(s) {
+            Some(node) if node.thread_creation_permission() != Some(false) => Action::StartNewThread(node.node_id),
+            Some(_) => Action::Notice("You cannot create a thread in this forum.".into()),
+            None => Action::Notice("Pick a forum first.".into()),
         },
         KeyCode::Char('q') => Action::Quit,
         _ => Action::None,
@@ -1081,12 +1082,10 @@ pub fn forum_tree_key(s: &mut ForumTreeState, key: KeyEvent) -> Action {
 pub(crate) fn open_node_action(nodes: &[Node], id: u32, fallback_title: &str) -> Action {
     if let Some(node) = nodes.iter().find(|n| n.node_id == id) {
         if node.node_type == "Category" {
-            if let Some(child) = nodes.iter().find(|c| {
-                (c.parent_node_id == node.node_id || c.depth > node.depth)
-                    && c.node_type == "Forum"
-            }) {
+            if let Some(child) = category_forum(nodes, node.node_id) {
                 return Action::OpenThreadList(child.node_id, child.title.clone());
             }
+            return Action::Notice("This category has no forum to open.".into());
         } else if matches!(node.node_type.as_str(), "LinkForum" | "Page")
             && let Some(url) = &node.view_url
         {
@@ -1113,13 +1112,69 @@ pub(crate) fn quick_hint(site: &SiteConfig) -> Option<(&'static str, &'static st
     }
 }
 
-pub fn forum_tree_hints(site: &SiteConfig) -> Hints {
+/// `/nodes` is ordered by lft, but does not carry depth. Follow parent IDs
+/// within this contiguous subtree and stop at the first peer/root, even if
+/// a caller has not derived depths or a parent outside the subtree is absent.
+fn category_descendants(nodes: &[Node], index: usize) -> impl Iterator<Item = (usize, &Node)> {
+    let id = nodes.get(index).map_or(0, |node| node.node_id);
+    let mut members = std::collections::HashSet::from([id]);
+    let mut rest = nodes.iter().enumerate().skip(index.saturating_add(1));
+    let mut ended = id == 0;
+    std::iter::from_fn(move || {
+        if ended { return None; }
+        let (index, node) = rest.next()?;
+        if !members.contains(&node.parent_node_id) {
+            ended = true;
+            return None;
+        }
+        members.insert(node.node_id);
+        Some((index, node))
+    })
+}
+
+pub(crate) fn category_forum(nodes: &[Node], id: u32) -> Option<&Node> {
+    let index = nodes.iter().position(|node| node.node_id == id)?;
+    category_forum_at(nodes, index)
+}
+
+fn category_forum_at(nodes: &[Node], index: usize) -> Option<&Node> {
+    let id = nodes.get(index)?.node_id;
+    if id == 0 { return None; }
+    // Most categories begin with a forum; keep the per-frame hint lookup
+    // allocation-free for that common shape.
+    if let Some(child) = nodes.get(index + 1)
+        && child.parent_node_id == id && child.node_type == "Forum" && child.node_id != 0
+    {
+        return Some(child);
+    }
+    category_descendants(nodes, index)
+        .find_map(|(_, child)| (child.node_type == "Forum" && child.node_id != 0).then_some(child))
+}
+
+fn forum_tree_creation_target(s: &ForumTreeState) -> Option<&Node> {
+    let node = s.nodes.get(s.sel)?;
+    match node.node_type.as_str() {
+        "Forum" if node.node_id != 0 => Some(node),
+        "Category" => category_forum_at(&s.nodes, s.sel),
+        _ => None,
+    }
+}
+
+fn creation_hints(mut hints: Hints, allowed: bool) -> Hints {
+    if !allowed {
+        hints.keys.retain(|(key, _)| *key != "N");
+        hints.short.retain(|(key, _)| *key != "N");
+    }
+    hints
+}
+
+pub fn forum_tree_hints(s: &ForumTreeState) -> Hints {
     let mut keys: Vec<(&'static str, &'static str)> = vec![
         ("Enter", "open"),
         ("j/k", "move"),
         ("h/l", "tree in/out"),
     ];
-    keys.extend(quick_hint(site));
+    keys.extend(quick_hint(&s.site));
     keys.extend([
         ("N", "new thread"),
         ("r", "refresh"),
@@ -1128,7 +1183,7 @@ pub fn forum_tree_hints(site: &SiteConfig) -> Hints {
         ("s", "search"),
         ("q", "quit"),
     ]);
-    Hints::with_short(
+    let hints = Hints::with_short(
         &keys,
         &[
             ("Enter", "open"),
@@ -1139,7 +1194,8 @@ pub fn forum_tree_hints(site: &SiteConfig) -> Hints {
             ("q", "quit"),
         ],
         0,
-    )
+    );
+    creation_hints(hints, forum_tree_creation_target(s).is_some_and(|node| node.thread_creation_permission() != Some(false)))
 }
 
 pub fn render_forum_tree(
@@ -1223,6 +1279,9 @@ pub fn thread_list_key(s: &mut ThreadListState, key: KeyEvent) -> Action {
         KeyCode::Char('N') if s.node_id == 0 => {
             Action::Notice("Pick a forum first.".into())
         }
+        KeyCode::Char('N') if !s.can_create_thread() => {
+            Action::Notice("You cannot create a thread in this forum.".into())
+        }
         KeyCode::Char('N') => Action::StartNewThread(s.node_id),
         KeyCode::Char('r') => {
             if s.loading {
@@ -1238,8 +1297,8 @@ pub fn thread_list_key(s: &mut ThreadListState, key: KeyEvent) -> Action {
 /// `node_id` is the list's forum: 0 is the synthetic "Latest posts" list,
 /// which has no real forum to post into or mark read, so `N`/`m` are hidden
 /// there rather than advertised and then refused (issue #552).
-pub fn thread_list_hints(node_id: u32) -> Hints {
-    if node_id == 0 {
+pub fn thread_list_hints(s: &ThreadListState) -> Hints {
+    if s.node_id == 0 {
         return Hints::with_short(
             &[
                 ("Enter", "read"),
@@ -1260,7 +1319,7 @@ pub fn thread_list_hints(node_id: u32) -> Hints {
             0,
         );
     }
-    Hints::with_short(
+    let hints = Hints::with_short(
         &[
             ("Enter", "read"),
             ("j/k", "move"),
@@ -1282,7 +1341,8 @@ pub fn thread_list_hints(node_id: u32) -> Hints {
             ("Esc", "back"),
         ],
         0,
-    )
+    );
+    creation_hints(hints, s.can_create_thread())
 }
 
 pub fn thread_list_crumb(s: &ThreadListState) -> String {
@@ -1350,11 +1410,12 @@ fn thousands(n: u64) -> String {
 /// Split a string into alternating whitespace / non-whitespace runs, so a
 /// greedy wrapper can keep styles attached to the text they came with.
 fn tokens(s: &str) -> Vec<&str> {
+    use unicode_segmentation::UnicodeSegmentation;
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut prev: Option<bool> = None;
-    for (i, c) in s.char_indices() {
-        let ws = c.is_whitespace();
+    for (i, cluster) in s.grapheme_indices(true) {
+        let ws = cluster.chars().all(char::is_whitespace);
         match prev {
             Some(p) if p == ws => {}
             Some(_) => {
@@ -1432,6 +1493,41 @@ pub(crate) fn wrap_spans_aligned(
 
 pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
     use unicode_segmentation::UnicodeSegmentation;
+    // A style boundary is not a Unicode boundary. Segment the complete text
+    // so a selector/combining mark/ZWJ cannot be detached from its base. A
+    // terminal cell has one style; the cluster's first scalar owns it.
+    let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+    let mut ends = Vec::new();
+    let mut end = 0;
+    for span in spans {
+        end += span.content.len();
+        if !span.content.is_empty() { ends.push((end, span.style)); }
+    }
+    let mut span_index = 0;
+    let mut logical = Vec::<Span<'static>>::new();
+    let mut out = Vec::new();
+    for (at, grapheme) in text.grapheme_indices(true) {
+        while ends[span_index].0 <= at { span_index += 1; }
+        if matches!(grapheme, "\n" | "\r\n" | "\r") {
+            out.extend(wrap_logical_spans(&logical, width));
+            logical.clear();
+            continue;
+        }
+        let style = ends[span_index].1;
+        if let Some(last) = logical.last_mut()
+            && last.style == style
+        {
+            last.content.to_mut().push_str(grapheme);
+        } else {
+            logical.push(Span::styled(grapheme.to_string(), style));
+        }
+    }
+    out.extend(wrap_logical_spans(&logical, width));
+    out
+}
+
+fn wrap_logical_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    use unicode_segmentation::UnicodeSegmentation;
     let width = width.max(1);
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
     let mut line: Vec<Span<'static>> = Vec::new();
@@ -1450,13 +1546,17 @@ pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<
     for sp in spans {
         let style = sp.style;
         for tok in tokens(sp.content.as_ref()) {
-            let is_space = tok.starts_with(char::is_whitespace);
+            let is_space = tok.chars().all(char::is_whitespace);
             let mut rest = tok;
+            // Consume widths with the run: measuring the remaining suffix
+            // again at every hard break made one long token quadratic.
+            let mut cluster_cells: usize = tok.graphemes(true).map(cell_width).sum();
+            let mut len = cell_width(tok);
+            let mut non_additive = len != cluster_cells;
             loop {
                 if rest.is_empty() {
                     break;
                 }
-                let len = cell_width(rest);
                 if is_space {
                     if just_wrapped {
                         break; // swallow the run that wrap runoff already dropped
@@ -1530,7 +1630,10 @@ pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<
                         continue;
                     }
                     match rest.graphemes(true).next() {
-                        Some(grapheme) => head.push_str(grapheme),
+                        Some(grapheme) => {
+                            head.push_str(grapheme);
+                            head_w = cell_width(grapheme);
+                        }
                         None => break,
                     }
                 }
@@ -1540,6 +1643,17 @@ pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<
                 used = 0;
                 just_wrapped = true;
                 rest = &rest[bytes..];
+                cluster_cells = cluster_cells.saturating_sub(head_w);
+                if non_additive {
+                    // Unicode-width also joins some *distinct* graphemes,
+                    // e.g. Arabic Lam+Alef and Lisu tone pairs. Preserve its
+                    // whole-span metric on these rare runs; ordinary text
+                    // only subtracts consumed widths and remains linear.
+                    len = cell_width(rest);
+                    non_additive = len != cluster_cells;
+                } else {
+                    len = len.saturating_sub(head_w);
+                }
             }
         }
     }
@@ -1866,7 +1980,7 @@ impl ThreadViewState {
             // bottom, so a post that alternates text and screenshots read as
             // a wall of text followed by unlabelled images.
             let chunks = common::bbcode::render_at(&post.message, &self.site.origin);
-            let imgs = post_images(post, &chunks);
+            let imgs = post_images(post, &chunks, &self.site.origin);
             let videos = post_videos(Some(post));
             let image_count = imgs.all.len();
             let mut ord = 0usize;
@@ -2297,7 +2411,8 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
                 Action::None
             }
         }
-        KeyCode::Char('r') => Action::StartReply(s.thread.clone()),
+        KeyCode::Char('r') if s.thread.can_reply() => Action::StartReply(s.thread.clone()),
+        KeyCode::Char('r') => Action::Notice("You cannot reply to this thread.".into()),
         // #708: edit, delete and mark-solution, each offered only where the
         // API said this reader may — the server enforces regardless, so
         // these gates are about not advertising a key that will 403.
@@ -2346,6 +2461,9 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
             },
             None => Action::Notice("No video in this post.".into()),
         },
+        KeyCode::Char('Q') if !s.thread.can_reply() => {
+            Action::Notice("You cannot reply to this thread.".into())
+        }
         KeyCode::Char('Q') => match s.posts.get(s.sel_post) {
             Some(post) => {
                 Action::StartReplyQuoting(s.thread.clone(), Box::new(post.clone()))
@@ -2390,26 +2508,24 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
         }
         KeyCode::Char('P') => Action::OpenProfile(s.thread.user_id, s.thread.username.clone()),
         KeyCode::Char('l') => {
-            if let Some(post) = s.posts.get(s.sel_post) {
-                Action::ReactPost(post.post_id)
-            } else if let Some(first) = s.posts.first() {
-                Action::ReactPost(first.post_id)
-            } else {
-                Action::None
+            match s.posts.get(s.sel_post).or_else(|| s.posts.first()) {
+                Some(post) if post.can_react() => Action::ReactPost(post.post_id),
+                Some(_) => Action::Notice("You cannot react to this post.".into()),
+                None => Action::None,
             }
         }
         KeyCode::Char('v') => {
-            if let Some(post) = s.posts.get(s.sel_post) {
-                Action::VotePost(post.post_id, "up".into())
-            } else {
-                Action::None
+            match s.posts.get(s.sel_post) {
+                Some(post) if post.can_vote("up") => Action::VotePost(post.post_id, "up".into()),
+                Some(_) => Action::Notice("You cannot upvote this post.".into()),
+                None => Action::None,
             }
         }
         KeyCode::Char('V') => {
-            if let Some(post) = s.posts.get(s.sel_post) {
-                Action::VotePost(post.post_id, "down".into())
-            } else {
-                Action::None
+            match s.posts.get(s.sel_post) {
+                Some(post) if post.can_vote("down") => Action::VotePost(post.post_id, "down".into()),
+                Some(_) => Action::Notice("You cannot downvote this post.".into()),
+                None => Action::None,
             }
         }
         KeyCode::Char('n') => {
@@ -2485,7 +2601,7 @@ pub(crate) fn open_post_image(s: &ThreadViewState, n: usize) -> Action {
         return Action::None;
     };
     let chunks = common::bbcode::render(&post.message);
-    let imgs = post_images(post, &chunks);
+    let imgs = post_images(post, &chunks, &s.site.origin);
     match imgs.all.get(n - 1) {
         Some(img) => match image_open_for_post(post, img) {
             Some(open) => Action::OpenImage(open),
@@ -2548,10 +2664,17 @@ pub fn thread_view_hints(s: &ThreadViewState) -> Hints {
     let sel = s.posts.get(s.sel_post);
     let can_edit = sel.is_some_and(|p| p.can_edit);
     let can_delete = sel.is_some_and(|p| p.can_soft_delete);
+    let can_reply = s.thread.can_reply();
+    let can_react = sel.is_some_and(|p| p.can_react());
+    let can_upvote = sel.is_some_and(|p| p.can_vote("up"));
+    let can_downvote = sel.is_some_and(|p| p.can_vote("down"));
     // #716: say so where the reader would look. A draft they forgot about is
     // otherwise reachable only by pressing `r` and being surprised.
     let reply_cap = if s.has_draft { "resume draft" } else { "reply" };
-    let mut keys: Vec<(&str, &str)> = vec![("r", reply_cap), ("Q", "quote")];
+    let mut keys: Vec<(&str, &str)> = Vec::with_capacity(16);
+    if can_reply {
+        keys.extend_from_slice(&[("r", reply_cap), ("Q", "quote")]);
+    }
     // #710: only where there is something to play — a cap for a post with no
     // video is a cap that does nothing.
     if !post_videos(sel).is_empty() {
@@ -2570,29 +2693,31 @@ pub fn thread_view_hints(s: &ThreadViewState) -> Hints {
             },
         ));
     }
+    keys.extend_from_slice(&[("j/k", "scroll"), ("n/N", "post")]);
+    if can_react { keys.push(("l", "like")); }
+    if can_upvote { keys.push(("v", "vote")); }
+    if can_downvote && !can_upvote { keys.push(("V", "downvote")); }
     keys.extend_from_slice(&[
-        ("j/k", "scroll"),
-        ("n/N", "post"),
-        ("l", "like"),
-        ("v", "vote"),
         ("o", "links"),
         ("x", if s.reveal_spoilers { "hide" } else { "reveal" }),
         ("u", "web"),
         ("Esc", "back"),
     ]);
-    Hints::with_short(
-        &keys,
-        &[
-            ("r", "reply"),
-            ("j/k", ""),
-            ("n/N", "post"),
-            ("l", "like"),
-            ("o", "links"),
-            ("x", if s.reveal_spoilers { "hide" } else { "reveal" }),
-            ("Esc", "back"),
-        ],
-        0,
-    )
+    let mut short = Vec::with_capacity(8);
+    if can_reply { short.push(("r", "reply")); }
+    short.extend_from_slice(&[("j/k", ""), ("n/N", "post")]);
+    if can_react { short.push(("l", "like")); }
+    short.extend_from_slice(&[
+        ("o", "links"), ("x", if s.reveal_spoilers { "hide" } else { "reveal" }), ("Esc", "back"),
+    ]);
+    // A permission change may make edit/delete/video the primary action.
+    // Keep that same primary cap first in both width variants.
+    if short.first().map(|(key, _)| key) != keys.first().map(|(key, _)| key)
+        && let Some(primary) = keys.first()
+    {
+        short.insert(0, *primary);
+    }
+    Hints { keys, short, primary: 0 }
 }
 
 pub fn thread_view_crumb(s: &ThreadViewState) -> String {
@@ -3662,7 +3787,7 @@ mod tests {
         assert!(matches!(thread_list_key(&mut list, key('N')), Action::Notice(msg) if msg.contains("forum")));
         assert!(matches!(thread_list_key(&mut list, key('m')), Action::Notice(msg) if msg.contains("forum")));
 
-        let hints = thread_list_hints(0);
+        let hints = thread_list_hints(&list);
         assert!(!hints.keys.iter().any(|(k, _)| *k == "N" || *k == "m"), "{:?}", hints.keys);
         assert!(!hints.short.iter().any(|(k, _)| *k == "N" || *k == "m"), "{:?}", hints.short);
 
@@ -3670,7 +3795,7 @@ mod tests {
         let mut real = ThreadListState { node_id: 302, ..Default::default() };
         assert!(matches!(thread_list_key(&mut real, key('N')), Action::StartNewThread(302)));
         assert!(matches!(thread_list_key(&mut real, key('m')), Action::MarkForumRead(302)));
-        let hints = thread_list_hints(302);
+        let hints = thread_list_hints(&real);
         assert!(hints.keys.iter().any(|(k, _)| *k == "N"));
         assert!(hints.keys.iter().any(|(k, _)| *k == "m"));
 
@@ -4352,6 +4477,215 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn new_thread_caps_and_keys_follow_node_and_forum_permissions() {
+        let captured: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../common/src/testdata/thread_permissions.json"
+        )).unwrap();
+        let original: Node = serde_json::from_value(captured["thread"]["Forum"].clone()).unwrap();
+        let offers = |hints: Hints, allowed: bool| {
+            assert_eq!(hints.keys.iter().any(|(key, _)| *key == "N"), allowed);
+            assert_eq!(hints.short.iter().any(|(key, _)| *key == "N"), allowed);
+        };
+        for permission in [Some(false), Some(true), None] {
+            let allowed = permission != Some(false);
+            let mut node = original.clone();
+            node.parent_node_id = 1; node.depth = 1;
+            node.type_data = Some(common::models::NodeTypeData { can_create_thread: permission });
+            let nodes = vec![Node { node_id: 1, node_type: "Category".into(), ..Default::default() }, node];
+            for selected in [0, 1] {
+                let mut tree = ForumTreeState { nodes: nodes.clone(), sel: selected, ..Default::default() };
+                offers(forum_tree_hints(&tree), allowed);
+                assert_eq!(matches!(forum_tree_key(&mut tree, key('N')), Action::StartNewThread(id) if id == original.node_id), allowed);
+                let mut home = HomeState { tree, focus: Pane::Tree, ..Default::default() };
+                offers(home_hints(&home), allowed);
+                assert_eq!(matches!(home_key(&mut home, key('N')), Action::StartNewThread(id) if id == original.node_id), allowed);
+            }
+            let mut list = ThreadListState { node_id: original.node_id, can_create_thread: permission, ..Default::default() };
+            offers(thread_list_hints(&list), allowed);
+            assert_eq!(matches!(thread_list_key(&mut list, key('N')), Action::StartNewThread(_)), allowed);
+            let mut home = HomeState { list, focus: Pane::List, ..Default::default() };
+            offers(home_hints(&home), allowed);
+            assert_eq!(matches!(home_key(&mut home, key('N')), Action::StartNewThread(_)), allowed);
+        }
+        let mut latest = ThreadListState { can_create_thread: Some(true), ..Default::default() };
+        offers(thread_list_hints(&latest), false);
+        assert!(matches!(thread_list_key(&mut latest, key('N')), Action::Notice(_)));
+    }
+
+    fn disjoint_category_nodes() -> Vec<Node> {
+        vec![
+            Node { node_id: 1, node_type: "Category".into(), ..Default::default() },
+            Node { node_id: 2, node_type: "Category".into(), ..Default::default() },
+            Node { node_id: 3, parent_node_id: 2, depth: 1, node_type: "Forum".into(), ..Default::default() },
+        ]
+    }
+
+    #[test]
+    fn empty_category_new_thread_does_not_cross_subtrees() {
+        let mut tree = ForumTreeState { nodes: disjoint_category_nodes(), ..Default::default() };
+        assert!(matches!(forum_tree_key(&mut tree, key('N')), Action::Notice(_)));
+        assert!(!forum_tree_hints(&tree).keys.iter().any(|(key, _)| *key == "N"));
+    }
+
+    #[test]
+    fn empty_category_enter_and_right_do_not_cross_subtrees() {
+        let mut tree = ForumTreeState { nodes: disjoint_category_nodes(), ..Default::default() };
+        assert!(matches!(forum_tree_key(&mut tree, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Action::Notice(_)));
+        assert_eq!(tree.sel, 0);
+        forum_tree_key(&mut tree, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(tree.sel, 0);
+    }
+
+    #[test]
+    fn category_quick_open_stays_within_the_selected_subtree() {
+        let mut nodes = disjoint_category_nodes();
+        assert!(matches!(open_node_action(&nodes, 1, "empty"), Action::Notice(_)));
+        nodes.insert(1, Node { node_id: 4, parent_node_id: 1, depth: 1, node_type: "Forum".into(), ..Default::default() });
+        assert!(matches!(open_node_action(&nodes, 1, "first"), Action::OpenThreadList(4, _)));
+        assert!(matches!(open_node_action(&nodes, 2, "second"), Action::OpenThreadList(3, _)),
+            "an earlier category's forum is not the selected category's child");
+    }
+
+    #[test]
+    fn nested_category_resolution_uses_parent_links_even_without_depths() {
+        for zero_depths in [false, true] {
+            let mut nodes = vec![
+                Node { node_id: 1, node_type: "Category".into(), ..Default::default() },
+                Node { node_id: 2, parent_node_id: 1, depth: 1, node_type: "Category".into(), ..Default::default() },
+                Node { node_id: 3, parent_node_id: 2, depth: 2, node_type: "Forum".into(), ..Default::default() },
+                Node { node_id: 4, node_type: "Category".into(), ..Default::default() },
+                Node { node_id: 5, parent_node_id: 4, depth: 1, node_type: "Forum".into(), ..Default::default() },
+            ];
+            if zero_depths { for node in &mut nodes { node.depth = 0; } }
+            assert_eq!(category_forum(&nodes, 1).map(|node| node.node_id), Some(3));
+            nodes.remove(2);
+            assert!(category_forum(&nodes, 1).is_none(), "nested empty category cannot borrow the next root's child");
+            let mut tree = ForumTreeState { nodes, sel: 1, ..Default::default() };
+            assert!(matches!(forum_tree_key(&mut tree, key('N')), Action::Notice(_)));
+            assert!(matches!(open_node_action(&tree.nodes, 1, "nested"), Action::Notice(_)));
+            assert!(matches!(forum_tree_key(&mut tree, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Action::Notice(_)));
+            assert_eq!(tree.sel, 1);
+        }
+    }
+
+    #[test]
+    fn reply_reaction_and_vote_keys_follow_captured_api_permissions() {
+        let reply: common::models::ThreadReply = serde_json::from_str(include_str!(
+            "../../../common/src/testdata/thread_permissions.json"
+        )).unwrap();
+        let mut s = thread_view_fixture();
+        s.thread = reply.thread;
+        s.posts = reply.posts;
+        s.sel_post = 0;
+        let hints = thread_view_hints(&s);
+        for (cap, input) in [("r", 'r'), ("Q", 'Q'), ("l", 'l'), ("v", 'v'), ("V", 'V')] {
+            assert!(!hints.keys.iter().any(|(key, _)| *key == cap), "forbidden full cap {cap}");
+            assert!(!hints.short.iter().any(|(key, _)| *key == cap), "forbidden short cap {cap}");
+            assert!(matches!(thread_view_key(&mut s, key(input)), Action::Notice(_)), "forbidden key {cap}");
+        }
+
+        s.thread.discussion_open = false;
+        s.thread.can_reply = Some(true);
+        s.posts[0].can_react = Some(true);
+        s.posts[0].can_content_vote = Some(true);
+        s.posts[0].allowed_content_vote_types = Some(vec!["up".into()]);
+        let hints = thread_view_hints(&s);
+        for cap in ["r", "Q", "l", "v"] {
+            assert!(hints.keys.iter().any(|(key, _)| *key == cap), "permitted cap {cap}");
+        }
+        assert!(matches!(thread_view_key(&mut s, key('r')), Action::StartReply(_)), "moderators can reply when the server says so");
+        assert!(matches!(thread_view_key(&mut s, key('Q')), Action::StartReplyQuoting(..)));
+        assert!(matches!(thread_view_key(&mut s, key('l')), Action::ReactPost(_)));
+        assert!(matches!(thread_view_key(&mut s, key('v')), Action::VotePost(_, direction) if direction == "up"));
+        assert!(matches!(thread_view_key(&mut s, key('V')), Action::Notice(_)));
+
+        s.posts[0].allowed_content_vote_types = Some(vec!["down".into()]);
+        assert!(thread_view_hints(&s).keys.iter().any(|(key, _)| *key == "V"));
+        assert!(matches!(thread_view_key(&mut s, key('v')), Action::Notice(_)));
+        assert!(matches!(thread_view_key(&mut s, key('V')), Action::VotePost(_, direction) if direction == "down"));
+    }
+
+    #[test]
+    fn missing_optional_permissions_keep_existing_thread_actions() {
+        let mut s = thread_view_fixture();
+        s.thread.can_reply = None;
+        s.posts[0].can_react = None;
+        s.posts[0].can_content_vote = None;
+        s.posts[0].allowed_content_vote_types = None;
+        for input in ['r', 'Q', 'l', 'v', 'V'] {
+            assert!(!matches!(thread_view_key(&mut s, key(input)), Action::Notice(_)), "legacy key {input}");
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_attachment_viewer_fetches_api_bytes_and_preserves_browser_url() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path, header, query_param};
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/attachments/private-png.7/"))
+            .respond_with(ResponseTemplate::new(403)).mount(&server).await;
+        Mock::given(method("GET")).and(path("/api/attachments/7/data"))
+            .and(header("authorization", "Bearer test-image-access"))
+            .and(query_param("hash", "temporary+hash"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-type", "image/png")
+                .set_body_bytes(vec![1, 2, 3])).mount(&server).await;
+        let root = std::env::temp_dir().join(format!(
+            "wftui-viewer-attachment-{}-{}", std::process::id(), server.address().port()
+        ));
+        let client = common::api::WfApiClient::with_store(
+            common::token::Store::with_path(root.join("token.json")), server.uri(), "test-client"
+        ).unwrap();
+        client.set_tokens(common::token::TokenSet {
+            access_token: "test-image-access".into(), refresh_token: "test-refresh".into(),
+            expires_at: 9_999_999_999, scope: "attachment:read".into(),
+            origin: server.uri(), client_id: "test-client".into(),
+        }).await.unwrap();
+        let direct = format!("{}/attachments/private-png.7/?hash=temporary%2Bhash", server.uri());
+        let post = Post { post_id: 1, message: "[ATTACH]7[/ATTACH]".into(), attachments: vec![
+            common::models::Attachment { attachment_id: 7, filename: "private.png".into(),
+                direct_url: Some(direct.clone()), ..Default::default() }
+        ], ..Default::default() };
+        let chunks = common::bbcode::render(&post.message);
+        let images = post_images(&post, &chunks, &server.uri());
+        let open = image_open_for_post(&post, &images.all[0]).unwrap();
+        assert_eq!(images.all[0].key.as_deref(), Some(open.key.as_str()), "inline full-file fallback uses the same API bytes");
+        assert!(client.image_uses_bearer(&open.key));
+        assert_eq!(open.web_url.as_deref(), Some(direct.as_str()));
+        assert_eq!(client.fetch_bytes(&open.key, 1024).await.unwrap(), vec![1, 2, 3]);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/api/attachments/7/data", "no doomed browser-route request");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn attachment_thumbnail_and_public_cdn_image_urls_stay_cacheable() {
+        let mut post = Post { post_id: 1, message: "[ATTACH]7[/ATTACH]".into(), attachments: vec![
+            common::models::Attachment { attachment_id: 7, filename: "picture.png".into(),
+                thumbnail_url: Some("https://cdn.example/thumb.png".into()),
+                direct_url: Some("https://forum.example/attachments/picture-png.7/".into()),
+                ..Default::default() }
+        ], ..Default::default() };
+        let chunks = common::bbcode::render(&post.message);
+        let images = post_images(&post, &chunks, "https://forum.example");
+        assert_eq!(images.all[0].key.as_deref(), Some("https://cdn.example/thumb.png"));
+        let open = image_open_for_post(&post, &images.all[0]).unwrap();
+        assert_eq!(open.key, "https://forum.example/api/attachments/7/data");
+        assert_eq!(open.web_url.as_deref(), Some("https://forum.example/attachments/picture-png.7/"));
+        post.attachments[0].direct_url = Some("https://cdn.example/full.png?hash=public-data-hash".into());
+        let images = post_images(&post, &chunks, "https://forum.example");
+        assert_eq!(image_open_for_post(&post, &images.all[0]).unwrap().key,
+            "https://cdn.example/full.png?hash=public-data-hash");
+
+        post.message = "[IMG]https://forum.example/attachments/picture-png.7/[/IMG]".into();
+        post.attachments.clear();
+        let images = post_images(&post, &common::bbcode::render(&post.message), "https://forum.example");
+        assert!(images.all[0].full_key.is_none(), "untrusted IMG links are not attachment metadata");
+        assert_eq!(image_open_for_post(&post, &images.all[0]).unwrap().key,
+            "https://forum.example/attachments/picture-png.7/");
+    }
+
     /// Deleting takes two presses, and anything else disarms it — a stray
     /// `D` must not remove a post.
     #[test]
@@ -5024,7 +5358,7 @@ mod tests {
     #[test]
     fn wrap_spans_keeps_presentation_and_zwj_graphemes_whole() {
         use unicode_segmentation::UnicodeSegmentation;
-        for src in ["abcd⚠\u{fe0f}e", "👨‍👩‍👧‍👦zzzz", "1234a\u{301}bc", "漢字⚠\u{fe0f}end"] {
+        for src in ["abcd⚠\u{fe0f}e", "👨‍👩‍👧‍👦zzzz", "1234a\u{301}bc", "漢字⚠\u{fe0f}end", "abcd \u{301}e"] {
             for width in 2..=10 {
                 let rows = wrap_spans(&[Span::raw(src)], width);
                 let text: Vec<String> = rows.iter().map(|r| r.iter().map(|s| s.content.as_ref()).collect()).collect();
@@ -5061,6 +5395,52 @@ mod tests {
         assert_eq!(buffer[(4, 1)].symbol(), "G");
         assert_eq!(buffer[(0, 1)].fg, theme.title().fg.unwrap_or(ratatui::style::Color::Reset));
         assert_eq!(buffer[(3, 1)].fg, theme.dim().fg.unwrap_or(ratatui::style::Color::Reset));
+    }
+
+    #[test]
+    fn wrapping_joins_a_grapheme_across_styles_using_its_base_style() {
+        let theme = Theme::truecolor();
+        for parts in [
+            ("abcd⚠", "\u{fe0f}e", "⚠\u{fe0f}", 5),
+            ("abcd👨", "\u{200d}👩\u{200d}👧\u{200d}👦e", "👨\u{200d}👩\u{200d}👧\u{200d}👦", 5),
+            ("abcda", "\u{301}e", "a\u{301}", 4),
+        ] {
+            let spans = [Span::styled(parts.0, theme.title()), Span::styled(parts.1, theme.dim())];
+            let rows = wrap_spans(&spans, parts.3);
+            let mut terminal = Terminal::new(TestBackend::new(parts.3 as u16, 4)).unwrap();
+            terminal.draw(|f| f.render_widget(Paragraph::new(rows.into_iter().map(Line::from).collect::<Vec<_>>()), f.area())).unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(0, 1)].symbol(), parts.2);
+            assert_eq!(buffer[(0, 1)].fg, theme.title().fg.unwrap_or(ratatui::style::Color::Reset));
+        }
+    }
+
+    #[test]
+    fn wrapping_preserves_explicit_newlines_and_blank_lines() {
+        for (source, expected) in [
+            ("first\nsecond", vec!["first", "second"]),
+            ("first\n\nsecond\n", vec!["first", "", "second", ""]),
+            ("first\r\nsecond", vec!["first", "second"]),
+            ("\n", vec!["", ""]),
+            ("", vec![""]),
+        ] {
+            let rows = wrap_spans(&[Span::raw(source)], 40);
+            let text: Vec<String> = rows.iter().map(|r| r.iter().map(|s| s.content.as_ref()).collect()).collect();
+            assert_eq!(text, expected, "{source:?}");
+        }
+        let rows = wrap_spans(&[Span::raw("first\r"), Span::raw("\nsecond")], 40);
+        assert_eq!(rows.len(), 2, "a CRLF spanning two styles is one newline");
+    }
+
+    #[test]
+    fn wrapping_preserves_nonadditive_whole_span_widths() {
+        for token in ["\u{644}\u{627}", "\u{a4f8}\u{a4fc}", "א\u{200d}ל"] {
+            let source = format!("xx {token}");
+            let width = cell_width(&source);
+            let rows = wrap_spans(&[Span::raw(source.clone())], width);
+            let text: Vec<String> = rows.iter().map(|r| r.iter().map(|s| s.content.as_ref()).collect()).collect();
+            assert_eq!(text, [source], "a whole-span fit must not be wrapped early");
+        }
     }
 
     /// The wrap budget is terminal cells, not `char`s. A CJK run billed one
@@ -5210,6 +5590,7 @@ mod tests {
                 node_id: 301,
                 title: "Windows Forums".into(),
                 description: "Category root".into(),
+                type_data: None,
                 node_type: "Category".into(),
                 parent_node_id: 0,
                 depth: 0,
@@ -5219,6 +5600,7 @@ mod tests {
                 node_id: 302,
                 title: "Windows Help and Support".into(),
                 description: "Help forum".into(),
+                type_data: None,
                 node_type: "Forum".into(),
                 parent_node_id: 301,
                 depth: 1,
@@ -5228,6 +5610,7 @@ mod tests {
                 node_id: 400,
                 title: "Documentation Link".into(),
                 description: "External docs".into(),
+                type_data: None,
                 node_type: "LinkForum".into(),
                 parent_node_id: 301,
                 depth: 1,

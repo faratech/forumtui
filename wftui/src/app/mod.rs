@@ -415,8 +415,8 @@ pub enum Msg {
     LoggedOut { generation: u64, result: Result<(), String> },
     /// A thumbnail / avatar / the sign-in logo finished loading off-thread.
     /// Only sent by the `images` feature's loader.
-    /// `key` is `images::store_key(url, cols, rows)` — decoded payloads are
-    /// sized for one exact rect, so a resize re-encodes rather than stretches.
+    /// `key` is `images::Pending::store_key()` — size and fetch budget identify
+    /// the work, while successful decoded payloads can serve either budget.
     #[cfg_attr(not(feature = "images"), allow(dead_code))]
     ImageLoaded {
         key: String,
@@ -1357,22 +1357,12 @@ impl App {
         screen.set_site(&self.site);
         screen.set_image_policy(policy, self.images.sizes());
         if let Screen::ImageView(v) = screen {
-            // The viewer's loading/error panes read the image store's live
-            // state: a load completes (or fails) through Msg::ImageLoaded →
-            // on_loaded, which never touches this screen — before this,
-            // both panes were unreachable and a failed load rendered as a
-            // silent blank pane (#60).
-            if let Some(key) = &v.key {
-                v.loading = self.images.source_inflight(key);
-                // A failure of a smaller variant (a 2 MiB thumbnail cap)
-                // must not pre-empt the viewer whose own fetch succeeds:
-                // a source with a learned size has a working variant (#83).
-                v.error = if self.images.source_known(key) {
-                    None
-                } else {
-                    self.images.source_failure(key)
-                };
-            }
+            // Status belongs to this viewer's current size and byte budget.
+            // A thumbnail failure cannot block it, and a previous thumbnail
+            // success cannot conceal a failed full-size request.
+            (v.loading, v.error) = v.image_request(body, &self.theme, &self.glyphs)
+                .map(|request| self.images.request_state(&request))
+                .unwrap_or((false, None));
         }
         if let Screen::Login(l) = screen {
             l.has_logo = self.images.has_logo();
@@ -1602,6 +1592,21 @@ impl App {
             .map(|n| (n.node_id, n.title.clone()))
     }
 
+    fn forum_thread_creation_permission(&self, node_id: u32) -> Option<bool> {
+        for screen in self.screens.iter().rev() {
+            let list = match screen {
+                Screen::ThreadList(list) if list.node_id == node_id => Some(list),
+                Screen::Home(home) if home.list.node_id == node_id => Some(&home.list),
+                _ => None,
+            };
+            if let Some(permission) = list.and_then(|list| list.can_create_thread) {
+                return Some(permission);
+            }
+        }
+        self.tree().and_then(|tree| tree.nodes.iter().find(|node| node.node_id == node_id))
+            .and_then(Node::thread_creation_permission)
+    }
+
     /// Build the palette: actions first (so the unfiltered list is a list of
     /// verbs), then every forum the cached tree knows. Members arrive later,
     /// from `poll_palette_member`.
@@ -1609,11 +1614,11 @@ impl App {
         use overlay::{Item, Target};
         let mut items = Vec::new();
         if let Some((node_id, title)) = self.current_forum() {
-            items.push(Item::action(
-                format!("New thread in {title}"),
-                "N",
-                Target::NewThread(node_id),
-            ));
+            if self.forum_thread_creation_permission(node_id) != Some(false) {
+                items.push(Item::action(
+                    format!("New thread in {title}"), "N", Target::NewThread(node_id),
+                ));
+            }
             items.push(Item::action(
                 "Mark forum read".to_string(),
                 "m",
@@ -1702,17 +1707,16 @@ impl App {
     /// a row still marks that one read.
     ///
     fn mark_alerts_viewed(&mut self) {
+        if self.client.requests_paused() { return; }
         let view_id = self.next_load_id();
         let Some(inbox) = self.inbox_mut() else {
             return;
         };
-        if inbox.alerts_viewed {
+        if inbox.alerts_viewed || inbox.alerts_view_pending {
             return;
         }
-        inbox.alerts_viewed = true;
         inbox.alerts_view_pending = true;
         inbox.alerts_view_id = view_id;
-        self.alerts_unread = 0;
         let api = self.api.clone();
         let tx = self.tx.clone();
         let session_generation = self.session_generation;
@@ -1720,6 +1724,16 @@ impl App {
             let result = api.mark_alerts_viewed().await.map_err(|e| TaskError::of(&e));
             tx.send(session_msg(session_generation, Msg::AlertsViewed { view_id, result })).ok();
         });
+    }
+
+    /// A recovered session may still show Alerts after its old acknowledgment
+    /// was cancelled. Retry only once requests use a verified grant again.
+    pub(super) fn retry_visible_alerts_view(&mut self) {
+        if matches!(self.screens.last(), Some(Screen::Inbox(inbox))
+            if inbox.tab == screens::InboxTab::Alerts)
+        {
+            self.mark_alerts_viewed();
+        }
     }
 
     /// The one way a screen leaves the stack. Whatever it owes on the way
@@ -2349,6 +2363,34 @@ impl App {
 
     pub fn push_screen(&mut self, mut screen: Screen) {
         screen.set_site(&self.site);
+        if let Screen::Compose(incoming) = &mut screen
+            && let Some(key) = incoming.target.as_ref().map(|target| target.draft_key())
+            && let Some(index) = self.screens.iter().rposition(|screen| matches!(screen,
+                Screen::Compose(existing)
+                    if existing.target.as_ref().is_some_and(|target| target.draft_key() == key)))
+        {
+            if let Screen::Compose(existing) = &self.screens[index]
+                && (existing.busy || existing.uploading)
+            {
+                self.set_hint(if existing.uploading {
+                    "Uploading in this composer — wait before opening it again."
+                } else {
+                    "Sending from this composer — wait for the result."
+                });
+                return;
+            }
+            // Header navigation can bury an idle editor. Its live words are
+            // newer than the saved draft, so replace that one editor before
+            // the ordinary restoration below applies a fresh quote or seed.
+            let Screen::Compose(existing) = self.screens.remove(index) else { unreachable!() };
+            self.stash_draft_quiet(&existing);
+            incoming.attachments = existing.attachments;
+            if matches!(incoming.target, Some(ComposeTarget::EditPost { .. }))
+                && incoming.body.is_empty()
+            {
+                incoming.body = existing.seed_body;
+            }
+        }
         // Restore here rather than at each opener (#715): all four composers
         // — reply, quote-reply, edit, new thread, conversation reply — reach
         // the stack through this one call, so a fifth cannot forget to.
@@ -2405,11 +2447,12 @@ impl App {
         }
         if let Some(Screen::Inbox(inbox)) = self.screens.last_mut() {
             let entering_alerts = tab == screens::InboxTab::Alerts
-                && inbox.tab != screens::InboxTab::Alerts;
+                && (inbox.tab != screens::InboxTab::Alerts || !inbox.alerts_viewed);
             inbox.tab = tab;
             if tab != screens::InboxTab::Alerts {
                 inbox.alerts_viewed = false;
                 inbox.alerts_view_pending = false;
+                inbox.alerts_view_id = 0;
             }
             if entering_alerts {
                 // Release the mutable screen borrow before the helper walks
@@ -2564,10 +2607,12 @@ impl App {
     /// Open a forum: into Home's right-hand pane when the two-pane layout is
     /// up, otherwise as a pushed screen exactly as before.
     fn open_list(&mut self, node_id: u32, title: String) {
+        let can_create_thread = self.forum_thread_creation_permission(node_id);
         if let Some(Screen::Home(h)) = self.screens.last_mut()
             && h.dual
         {
             h.list.node_id = node_id;
+            h.list.can_create_thread = can_create_thread;
             h.list.title = title;
             h.list.page = 1;
             h.list.last_page = 1;
@@ -2584,6 +2629,7 @@ impl App {
         }
         self.push_screen(Screen::ThreadList(screens::ThreadListState {
             node_id,
+            can_create_thread,
             title,
             page: 1,
             pages_loaded: 1,
@@ -2687,6 +2733,14 @@ impl App {
     }
 
     pub fn new_thread(&mut self, node_id: u32) {
+        if node_id == 0 {
+            self.set_status("Pick a forum first.");
+            return;
+        }
+        if self.forum_thread_creation_permission(node_id) == Some(false) {
+            self.set_status("You cannot create a thread in this forum.");
+            return;
+        }
         self.push_screen(Screen::Compose(screens::ComposeState {
             target: Some(ComposeTarget::NewThread { node_id }),
             title_field: true,
@@ -6462,6 +6516,183 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn thread_creation_permission_tracks_current_forum_and_preserves_local_draft_access() {
+        let mut app = test_app();
+        let node = |node_id, permission| Node { node_id, node_type: "Forum".into(),
+            type_data: Some(common::models::NodeTypeData { can_create_thread: permission }), ..Default::default() };
+        let mut home = screens::home_state(false);
+        if let Screen::Home(h) = &mut home {
+            h.dual = true;
+            h.tree.nodes = vec![node(7, Some(false)), node(8, None)];
+        }
+        app.screens.push(home);
+        app.open_list(7, "read only".into());
+        assert_eq!(app.list_mut().unwrap().can_create_thread, Some(false), "node permission applies before forum load");
+        let stale = app.list_mut().unwrap().load_seq;
+        app.new_thread(7);
+        assert!(!app.screens.iter().any(|s| matches!(s, Screen::Compose(_))));
+        app.open_palette();
+        assert!(!app.palette.as_ref().unwrap().titles().iter().any(|title| title.starts_with("New thread")));
+        app.palette = None;
+        app.open_list(8, "legacy".into());
+        assert_eq!(app.list_mut().unwrap().can_create_thread, None, "another forum cannot inherit the previous refusal");
+        let current = app.list_mut().unwrap().load_seq;
+        let reply = |id, permission| ForumReply { forum: common::models::Forum { node_id: id,
+            type_data: Some(common::models::NodeTypeData { can_create_thread: permission }), ..Default::default() },
+            ..Default::default() };
+        app.handle_msg(Msg::ForumLoaded { node_id: 7, page: 1, append: false, seq: stale,
+            result: Ok(reply(7, Some(false))) });
+        assert_eq!(app.list_mut().unwrap().can_create_thread, None);
+        app.handle_msg(Msg::ForumLoaded { node_id: 8, page: 1, append: false, seq: current,
+            result: Ok(reply(8, Some(false))) });
+        assert_eq!(app.list_mut().unwrap().can_create_thread, Some(false));
+        app.load_forum(8, 1);
+        let refreshed = app.list_mut().unwrap().load_seq;
+        app.handle_msg(Msg::ForumLoaded { node_id: 8, page: 1, append: false, seq: current,
+            result: Ok(reply(8, Some(true))) });
+        assert_eq!(app.list_mut().unwrap().can_create_thread, Some(false), "stale response cannot re-enable N");
+        app.handle_msg(Msg::ForumLoaded { node_id: 8, page: 1, append: false, seq: refreshed,
+            result: Ok(reply(8, Some(true))) });
+        assert_eq!(app.list_mut().unwrap().can_create_thread, Some(true));
+        let tree_load = app.tree().unwrap().load_id;
+        app.handle_msg(Msg::NodesLoaded { load_id: tree_load + 1, result: Ok(vec![node(8, Some(false))]) });
+        assert_eq!(app.list_mut().unwrap().can_create_thread, Some(true), "stale node metadata is ignored");
+        app.handle_msg(Msg::NodesLoaded { load_id: tree_load, result: Ok(vec![node(8, Some(false))]) });
+        assert_eq!(app.list_mut().unwrap().can_create_thread, Some(false), "fresh node metadata updates the visible list");
+        app.open_list(0, "Latest".into());
+        assert_eq!(app.list_mut().unwrap().can_create_thread, None);
+        app.new_thread(0);
+        assert!(!app.screens.iter().any(|s| matches!(s, Screen::Compose(_))));
+        let key = common::drafts::DraftKey::NewThread(7);
+        app.drafts.insert(key, common::drafts::Draft { title: "local subject".into(), body: "unsent words".into(), ..Default::default() });
+        app.resume_draft(key);
+        assert!(matches!(app.screens.last(), Some(Screen::Compose(c)) if c.body == "unsent words"),
+            "posting restrictions do not hide saved local writing");
+        app.abort_session_tasks(); app.abort_writes();
+    }
+
+    #[tokio::test]
+    async fn opening_an_empty_category_never_queues_a_forum_request() {
+        let mut app = test_app();
+        let mut home = screens::home_state(false);
+        if let Screen::Home(h) = &mut home {
+            h.dual = true;
+            h.tree.nodes = vec![
+                Node { node_id: 1, node_type: "Category".into(), ..Default::default() },
+                Node { node_id: 2, node_type: "Category".into(), ..Default::default() },
+                Node { node_id: 3, parent_node_id: 2, depth: 1, node_type: "Forum".into(), ..Default::default() },
+            ];
+        }
+        app.screens.push(home);
+        app.execute_action(Action::OpenThreadList(1, "empty".into()));
+        assert_eq!(app.screens.len(), 1);
+        assert_eq!(app.list_mut().unwrap().node_id, 0);
+        assert!(app.session_handles.is_empty(), "no category 404 or foreign-forum request is spawned");
+        assert!(app.status.contains("no forum"));
+        app.execute_action(Action::OpenThreadList(2, "second".into()));
+        assert_eq!(app.list_mut().unwrap().node_id, 3, "a populated category still opens its own child");
+        app.abort_session_tasks();
+    }
+
+    #[tokio::test]
+    async fn reopening_a_buried_composer_preserves_one_latest_draft_for_every_target() {
+        let targets = [
+            ComposeTarget::ThreadReply { thread_id: 7, thread_title: "thread".into() },
+            ComposeTarget::NewThread { node_id: 7 },
+            ComposeTarget::EditPost { post_id: 7, thread_id: 9, thread_title: "edit".into() },
+            ComposeTarget::ConversationReply { conversation_id: 7, conversation_title: "DM".into(), participants: "member".into() },
+        ];
+        for target in targets {
+            for exit in ["shutdown", "home", "expiry"] {
+                let mut app = test_app();
+                app.draft_owner = None;
+                app.select_draft_owner(7);
+                app.me = Some(User { user_id: 7, ..Default::default() });
+                let owner = app.draft_owner.clone().unwrap();
+                let key = target.draft_key();
+                app.screens.push(screens::home_state(false));
+                app.push_screen(Screen::Compose(screens::ComposeState {
+                    target: Some(target.clone()), body: "live words not saved yet".into(),
+                    title: "live subject".into(), seed_body: "original post".into(),
+                    attachment_key: Some("uploads-key".into()),
+                    attachments: vec![Attachment { attachment_id: 5, filename: "photo.png".into(), ..Default::default() }],
+                    ..Default::default()
+                }));
+                // This is the header navigation that can bury a live editor.
+                app.open_inbox(screens::InboxTab::Conversations);
+                assert!(matches!(app.screens.last(), Some(Screen::Inbox(_))));
+                let is_edit = matches!(target, ComposeTarget::EditPost { .. });
+                app.push_screen(Screen::Compose(screens::ComposeState {
+                    target: Some(target.clone()),
+                    body: if is_edit { "current server post".into() } else { String::new() },
+                    ..Default::default()
+                }));
+                assert_eq!(app.screens.iter().filter(|screen| matches!(screen,
+                    Screen::Compose(c) if c.target.as_ref().is_some_and(|t| t.draft_key() == key))).count(), 1);
+                let Some(Screen::Compose(c)) = app.screens.last_mut() else { panic!("composer"); };
+                assert_eq!(c.body, "live words not saved yet");
+                assert_eq!(c.title, "live subject");
+                assert_eq!(c.attachment_key.as_deref(), Some("uploads-key"));
+                assert_eq!(c.attachments[0].attachment_id, 5);
+                if is_edit { assert_eq!(c.seed_body, "current server post"); }
+                c.body = "latest words from reopened editor".into();
+                match exit {
+                    "shutdown" => app.shutdown().await,
+                    "home" => app.go(GoTarget::Home),
+                    _ => app.end_session("expired"),
+                }
+                let draft = &app.draft_store.load(&owner)[&key];
+                assert_eq!(draft.body, "latest words from reopened editor", "{target:?} via {exit}");
+                assert_eq!(draft.attachment_key.as_deref(), Some("uploads-key"));
+                if is_edit { assert_eq!(draft.edit_seed_body.as_deref(), Some("current server post")); }
+                app.stop_pollers(); app.abort_session_tasks();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quoting_into_a_buried_composer_keeps_the_live_words_under_the_fresh_quote() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        let thread = Thread { thread_id: 7, title: "thread".into(), ..Default::default() };
+        app.reply_to_thread(&thread);
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() { c.body = "live reply".into(); }
+        app.open_inbox(screens::InboxTab::Conversations);
+        let post = Post { post_id: 5, user_id: 8, username: "member".into(), message: "quoted text".into(), ..Default::default() };
+        let quote = common::bbcode::quote_block(&post.username, post.post_id, post.user_id, &post.message);
+        app.execute_action(Action::StartReplyQuoting(thread, Box::new(post)));
+        assert_eq!(app.screens.iter().filter(|screen| matches!(screen, Screen::Compose(_))).count(), 1);
+        let Some(Screen::Compose(c)) = app.screens.last() else { panic!("composer"); };
+        assert_eq!(c.body, format!("{}\n\nlive reply", quote.trim_end()));
+        assert_eq!(c.seed_body, quote);
+        app.abort_session_tasks();
+    }
+
+    #[tokio::test]
+    async fn reopening_a_busy_or_uploading_composer_cannot_replace_its_live_state() {
+        for uploading in [false, true] {
+            let mut app = test_app();
+            let target = ComposeTarget::ThreadReply { thread_id: 7, thread_title: "thread".into() };
+            app.screens.push(screens::home_state(false));
+            app.push_screen(Screen::Compose(screens::ComposeState {
+                target: Some(target.clone()), body: "submitted words".into(),
+                busy: !uploading, uploading, ..Default::default()
+            }));
+            // A previously opened screen may cover the composer when an
+            // asynchronous send/upload begins; duplicate protection is local.
+            app.screens.push(screens::search_state());
+            let depth = app.screens.len();
+            app.push_screen(Screen::Compose(screens::ComposeState {
+                target: Some(target), body: "replacement".into(), ..Default::default()
+            }));
+            assert_eq!(app.screens.len(), depth);
+            assert!(matches!(app.screens.get(1), Some(Screen::Compose(c))
+                if c.body == "submitted words" && (c.busy || c.uploading)));
+            assert!(app.status.contains(if uploading { "Uploading" } else { "Sending" }));
+        }
+    }
+
     /// #716's promise, worded cleanly (#54): resuming a draft that came
     /// from the website says its attachments stay there — one space after
     /// the dash, so the ^X instruction survives the status line's clip.
@@ -9236,10 +9467,12 @@ mod tests {
         app.screens.push(screens::home_state(false));
         app.alerts_unread = 3;
         app.open_inbox(screens::InboxTab::Alerts);
-        assert_eq!(app.alerts_unread, 0, "the badge clears immediately");
+        assert_eq!(app.alerts_unread, 3, "an unacknowledged mark cannot clear the badge");
         tokio::task::yield_now().await;
         let viewed = || api.alerts_viewed.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(viewed(), 1);
+        while let Ok(msg) = app.rx.try_recv() { app.handle_msg(msg); }
+        assert_eq!(app.alerts_unread, 0, "the successful acknowledgment clears the badge");
 
         // Revisiting with nothing to clear sends nothing.
         app.open_inbox(screens::InboxTab::Alerts);
@@ -9298,6 +9531,117 @@ mod tests {
             1,
             "opening Alerts must acknowledge server-side alerts even before the first poll fills the badge"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_or_stale_alert_acknowledgments_do_not_hide_unviewed_alerts() {
+        let api = Arc::new(RecordingApi::default());
+        let mut app = test_app();
+        app.api = api;
+        app.next_load_id = 20;
+        app.alerts_unread = 3;
+        app.screens.push(Screen::Inbox(screens::InboxState {
+            tab: screens::InboxTab::Alerts,
+            alerts: screens::AlertsState { load_id: 10, ..Default::default() },
+            alerts_view_pending: true, alerts_view_id: 11,
+            ..Default::default()
+        }));
+        let page = || AlertsReply { alerts: (1..=3).map(|alert_id| Alert { alert_id, ..Default::default() }).collect(), ..Default::default() };
+        app.handle_msg(Msg::AlertsLoaded { load_id: 10, result: Ok(page()) });
+        assert_eq!(app.alerts_unread, 3, "a list arriving before mark success keeps its real unread count");
+        app.handle_msg(Msg::AlertsViewed { view_id: 9, result: Ok(()) });
+        assert_eq!(app.alerts_unread, 3, "a stale mark cannot clear the badge");
+        app.handle_msg(Msg::AlertsViewed { view_id: 11,
+            result: Err(TaskError::of(&common::error::Error::FetchRejected("offline".into()))) });
+        assert_eq!(app.alerts_unread, 3);
+        assert!(matches!(app.screens.last(), Some(Screen::Inbox(s)) if !s.alerts_viewed && !s.alerts_view_pending));
+        app.open_inbox(screens::InboxTab::Alerts);
+        let view_id = app.inbox_mut().unwrap().alerts_view_id;
+        assert!(view_id > 11, "the failed mark can be retried without leaving Alerts");
+        app.handle_msg(Msg::AlertsViewed { view_id, result: Ok(()) });
+        assert_eq!(app.alerts_unread, 0);
+        app.handle_msg(Msg::AlertsLoaded { load_id: 10, result: Ok(page()) });
+        assert_eq!(app.alerts_unread, 0, "the acknowledged mark supersedes its older list snapshot");
+        app.handle_msg(Msg::AlertsLoaded { load_id: 8, result: Ok(page()) });
+        assert_eq!(app.alerts_unread, 0, "a stale list ID is ignored");
+        app.abort_session_tasks();
+    }
+
+    #[tokio::test]
+    async fn a_newer_alert_snapshot_invalidates_a_pending_older_mark() {
+        let mut app = test_app();
+        app.next_load_id = 30;
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::Inbox(screens::InboxState {
+            tab: screens::InboxTab::Alerts,
+            alerts: screens::AlertsState { load_id: 12, ..Default::default() },
+            alerts_view_id: 11, alerts_view_pending: true, ..Default::default()
+        }));
+        app.alerts_unread = 1;
+        // Mark 11 executed before this alert arrived, but its response is
+        // delayed behind a newer GET snapshot. XF's mark-all transaction
+        // cannot mark an alert that did not exist when it executed.
+        app.handle_msg(session_msg(app.session_generation, Msg::AlertsLoaded {
+            load_id: 12, result: Ok(AlertsReply {
+                alerts: vec![Alert { alert_id: 500, event_date: 200, view_date: 0, ..Default::default() }],
+                ..Default::default()
+            }),
+        }));
+        let fresh_id = app.inbox_mut().unwrap().alerts_view_id;
+        assert!(fresh_id > 12, "the newer visible snapshot needs a fresh mark");
+        assert!(app.inbox_mut().unwrap().alerts_view_pending);
+        app.handle_msg(session_msg(app.session_generation, Msg::AlertsViewed { view_id: 11, result: Ok(()) }));
+        assert_eq!(app.alerts_unread, 1, "the older acknowledgment cannot clear the newer alert");
+        assert!(!app.inbox_mut().unwrap().alerts_viewed);
+        assert!(app.inbox_mut().unwrap().alerts_view_pending);
+        app.handle_msg(session_msg(app.session_generation, Msg::AlertsViewed { view_id: fresh_id, result: Ok(()) }));
+        assert_eq!(app.alerts_unread, 0, "the fresh mark's acknowledgment covers the snapshot");
+        app.abort_session_tasks();
+    }
+
+    #[tokio::test]
+    async fn recovery_retries_visible_alerts_only_after_the_candidate_is_verified() {
+        use wiremock::matchers::{method, path, header};
+        let (server, client) = recovery_client(same_account_recovery_response()).await;
+        wiremock::Mock::given(method("POST")).and(path("/api/alerts/mark-all"))
+            .and(header("authorization", "Bearer sibling-access"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"success":true})))
+            .expect(1).mount(&server).await;
+        let mut app = test_app();
+        app.client = client.clone(); app.api = client;
+        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.screens.push(screens::home_state(false));
+        app.screens.push(Screen::Inbox(screens::InboxState {
+            tab: screens::InboxTab::Alerts, alerts_view_pending: true, alerts_view_id: 42,
+            ..Default::default()
+        }));
+        app.alerts_unread = 3;
+        let old_epoch = app.session_generation;
+        app.recheck_stored_session("rotated".into());
+        let verdict = recovery_verdict(&mut app).await;
+        assert!(matches!(verdict, Msg::RecoveryVerified { .. }));
+        assert!(server.received_requests().await.unwrap().iter()
+            .all(|request| request.url.path() != "/api/alerts/mark-all"), "no mark may use an unverified candidate");
+        app.handle_msg(verdict);
+        let fresh_id = app.inbox_mut().unwrap().alerts_view_id;
+        assert_ne!(fresh_id, 42);
+        assert!(app.inbox_mut().unwrap().alerts_view_pending);
+        app.handle_msg(session_msg(old_epoch, Msg::AlertsViewed { view_id: 42, result: Ok(()) }));
+        assert_eq!(app.alerts_unread, 3, "the cancelled epoch's success cannot clear the new badge");
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while !app.inbox_mut().unwrap().alerts_viewed {
+                let message = app.rx.recv().await.expect("message");
+                app.handle_msg(message);
+            }
+        }).await.expect("verified session retries its cancelled mark");
+        assert_eq!(app.alerts_unread, 0);
+        let acknowledged_id = app.inbox_mut().unwrap().alerts_view_id;
+        app.cancel_recovered_work();
+        app.retry_visible_alerts_view();
+        assert!(matches!(app.screens.last(), Some(Screen::Inbox(s))
+            if s.alerts_viewed && !s.alerts_view_pending && s.alerts_view_id == acknowledged_id),
+            "an already acknowledged mark survives cancellation without another request");
+        app.stop_pollers(); app.abort_session_tasks();
     }
 
     /// #700: clicking a breadcrumb goes back to the place it names — a pop,
@@ -10673,6 +11017,7 @@ mod tests {
     #[cfg(feature = "images")]
     async fn the_viewer_ignores_a_small_variant_failure_once_a_variant_loads() {
         let mut app = test_app();
+        app.images.set_policy(crate::images::Policy { tier: crate::images::Tier::Halfblocks, font: (10, 20) });
         let src = "https://wf/media/9.png";
         app.screens.push(Screen::ImageView(screens::ImageViewState {
             title: "shot".into(),
@@ -10683,19 +11028,23 @@ mod tests {
         app.images
             .on_loaded(crate::images::store_key(src, 12, 12), Err("http 404".into()));
         let text = frame_text(&mut app, 80, 24);
-        assert!(text.contains("Error:"), "{text}");
+        assert!(!text.contains("Error:"), "a thumbnail cannot block the viewer: {text}");
+        let request = match app.screens.last() {
+            Some(Screen::ImageView(view)) => view.image_requests[0].clone(),
+            _ => panic!("viewer"),
+        };
 
         // ...then the viewer's own (larger-budget) variant loaded.
         let picker = ratatui_image::picker::Picker::halfblocks();
         let loaded = crate::images::decode(
             &picker,
             include_bytes!("../../assets/wf-logo.png"),
-            80,
-            40,
+            request.rect.width,
+            request.rect.height,
         )
         .expect("decode the sample");
         app.images
-            .on_loaded(crate::images::store_key(src, 80, 40), Ok(loaded));
+            .on_loaded(request.store_key(), Ok(loaded));
         let text = frame_text(&mut app, 80, 24);
         assert!(!text.contains("Error:"), "the stale failure must yield: {text}");
     }
@@ -10707,15 +11056,19 @@ mod tests {
     #[tokio::test]
     async fn the_image_viewer_shows_store_failures_and_r_retries() {
         let mut app = test_app();
+        app.images.set_policy(crate::images::Policy { tier: crate::images::Tier::Halfblocks, font: (10, 20) });
         let src = "https://wf/media/9.png";
         app.screens.push(Screen::ImageView(screens::ImageViewState {
             title: "shot".into(),
             key: Some(src.to_string()),
             ..Default::default()
         }));
-        // One size variant of the source failed.
-        app.images
-            .on_loaded(crate::images::store_key(src, 12, 12), Err("http 404".into()));
+        frame(&mut app, 80, 24);
+        let request = match app.screens.last() {
+            Some(Screen::ImageView(view)) => view.image_requests[0].clone(),
+            _ => panic!("viewer"),
+        };
+        app.images.on_loaded(request.store_key(), Err("http 404".into()));
         let text = frame_text(&mut app, 80, 24);
         assert!(text.contains("Error:"), "{text}");
         assert!(text.contains("R to retry"), "{text}");
@@ -10725,6 +11078,83 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE));
         let text = frame_text(&mut app, 80, 24);
         assert!(!text.contains("Error:"), "{text}");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "images")]
+    async fn a_known_thumbnail_does_not_hide_a_full_viewer_failure() {
+        let mut app = test_app();
+        app.images.set_policy(crate::images::Policy { tier: crate::images::Tier::Halfblocks, font: (10, 20) });
+        let src = "https://wf/media/known.png";
+        let thumbnail = crate::images::decode(&ratatui_image::picker::Picker::halfblocks(),
+            include_bytes!("../../assets/wf-logo.png"), 12, 4).unwrap();
+        app.images.on_loaded(crate::images::store_key(src, 12, 4), Ok(thumbnail));
+        app.screens.push(Screen::ImageView(screens::ImageViewState { key: Some(src.into()), ..Default::default() }));
+        frame(&mut app, 80, 24);
+        let request = match app.screens.last() {
+            Some(Screen::ImageView(view)) => view.image_requests[0].clone(),
+            _ => panic!("viewer"),
+        };
+        app.images.on_loaded(request.store_key(), Err("full image refused".into()));
+        let text = frame_text(&mut app, 80, 24);
+        assert!(text.contains("full image refused") && text.contains("R to retry"), "{text}");
+        assert!(!app.images.request_state(&request).0, "a failed request is not queued again every frame");
+    }
+
+    #[tokio::test]
+    async fn a_viewer_waiting_for_a_thumbnail_keeps_its_queued_demand() {
+        let mut app = test_app();
+        app.images.set_policy(crate::images::Policy { tier: crate::images::Tier::Halfblocks, font: (10, 20) });
+        let src = "https://wf/media/queued.png";
+        let thumbnail = crate::images::Request { key: src.into(), rect: ratatui::layout::Rect::new(0, 0, 12, 4), full: false };
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut pending = Vec::new();
+        terminal.draw(|f| pending = app.images.paint(f, &[thumbnail])).unwrap();
+        app.screens.push(Screen::ImageView(screens::ImageViewState { key: Some(src.into()), ..Default::default() }));
+        frame(&mut app, 80, 24);
+        for _ in 0..2 {
+            assert!(frame_text(&mut app, 80, 24).contains("Loading"), "the queued request stays visible to the loader");
+        }
+        app.images.on_loaded(pending[0].store_key(), Err("thumbnail rejected".into()));
+        let text = frame_text(&mut app, 80, 24);
+        assert!(!text.contains("Error:"), "a thumbnail failure cannot replace the viewer: {text}");
+        let request = match app.screens.last() {
+            Some(Screen::ImageView(view)) => view.image_requests[0].clone(),
+            _ => panic!("viewer"),
+        };
+        assert!(app.images.request_state(&request).0, "the viewer takes the freed worker slot");
+    }
+
+    #[tokio::test]
+    #[cfg(feature="images")]
+    async fn viewer_gets_its_own_eight_mib_budget_after_thumbnail_rejection() {
+        use wiremock::{Mock,MockServer,ResponseTemplate};
+        use wiremock::matchers::{method,path};
+        let server=MockServer::start().await;
+        let mut body=include_bytes!("../../assets/wf-logo.png").to_vec();
+        body.resize(crate::images::MAX_IMAGE_BYTES+1024,0);
+        Mock::given(method("GET")).and(path("/large.png"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type","image/png").set_body_bytes(body))
+            .mount(&server).await;
+        let dir=std::env::temp_dir().join(format!("wftui-ui-audit-image-budget-{}",std::process::id()));
+        let client=common::api::WfApiClient::with_store(common::token::Store::with_path(dir.join("token.json")),server.uri(),"fixture-client").unwrap();
+        let disk=crate::images::DiskCache::with_dir(dir.join("cache"),32*1024*1024);
+        let slots=Arc::new(tokio::sync::Semaphore::new(1));
+        let src=format!("{}/large.png",server.uri());
+        let small=crate::images::Pending{key:src.clone(),cols:12,rows:4,full:false};
+        let thumb_result=crate::images::load(&client,&disk,ratatui_image::picker::Picker::halfblocks(),&small,slots.clone().acquire_owned().await.unwrap(),None).await;
+        let reason=thumb_result.err().expect("thumbnail must exceed its 2MiB cap");
+        let full=crate::images::Pending{key:src.clone(),cols:70,rows:18,full:true};
+        let full_result=crate::images::load(&client,&disk,ratatui_image::picker::Picker::halfblocks(),&full,slots.acquire_owned().await.unwrap(),None).await;
+        assert!(full_result.is_ok(),"the same image is valid under the full viewer's 8MiB budget");
+        let mut app=test_app();
+        app.images.set_policy(crate::images::Policy{tier:crate::images::Tier::Halfblocks,font:(10,20)});
+        app.images.on_loaded(small.store_key(),Err(reason.clone()));
+        app.screens.push(Screen::ImageView(screens::ImageViewState{title:"large inline image".into(),key:Some(src),..Default::default()}));
+        frame(&mut app,80,24);
+        let Some(Screen::ImageView(view))=app.screens.last() else {panic!("viewer")};
+        assert!(view.error.is_none(), "thumbnail failure must not become the viewer error");
+        assert!(view.image_requests.iter().any(|r|r.full),"a thumbnail budget failure must not prevent the full-size request");
     }
 
     /// Press and release in the same cell: a click.

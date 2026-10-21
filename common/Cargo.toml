@@ -1,8 +1,8 @@
 [package]
 name = "common"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.99.1"
 publish = false
 license = "MIT"
 description = "Core library for Forum Terminal (TUI) (wftui): OAuth login, API client, throttling, BBCode rendering"

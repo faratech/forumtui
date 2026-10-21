@@ -377,6 +377,7 @@ impl App {
                 }
                 self.load_nodes();
                 self.prime_home_list();
+                self.retry_visible_alerts_view();
             }
             Msg::Bootstrap { result: Err(e), .. } => {
                 // Only a failure that means the stored session itself is
@@ -400,6 +401,7 @@ impl App {
                 }
             }
             Msg::NodesLoaded { load_id, result } => {
+                let mut permissions = Vec::new();
                 let tree = self.screens.iter_mut().rev().find_map(|s| match s {
                     Screen::ForumTree(tree) if tree.load_id == load_id => Some(tree),
                     Screen::Home(home) if home.tree.load_id == load_id => Some(&mut home.tree),
@@ -408,6 +410,9 @@ impl App {
                 if let Some(tree) = tree {
                     match result {
                         Ok(nodes) => {
+                            permissions.extend(nodes.iter().filter_map(|node| {
+                                node.thread_creation_permission().map(|permission| (node.node_id, permission))
+                            }));
                             // See ForumLoaded (issue #537).
                             tree.error = None;
                             if tree.sel == 0
@@ -424,6 +429,18 @@ impl App {
                             tree.loading = false;
                             tree.error = Some(e.message);
                         }
+                    }
+                }
+                for screen in &mut self.screens {
+                    let list = match screen {
+                        Screen::ThreadList(list) => Some(list),
+                        Screen::Home(home) => Some(&mut home.list),
+                        _ => None,
+                    };
+                    if let Some(list) = list
+                        && let Some((_, permission)) = permissions.iter().find(|(id, _)| *id == list.node_id)
+                    {
+                        list.can_create_thread = Some(*permission);
                     }
                 }
             }
@@ -444,6 +461,9 @@ impl App {
                             // "Error: ... Press r to retry" forever once a
                             // later load succeeds (issue #537).
                             list.error = None;
+                            if let Some(permission) = reply.forum.thread_creation_permission() {
+                                list.can_create_thread = Some(permission);
+                            }
                             if !reply.forum.title.is_empty() {
                                 list.title = reply.forum.title;
                             }
@@ -993,6 +1013,7 @@ impl App {
             },
             Msg::AlertsLoaded { load_id, result } => {
                 let mut new_unread: Option<u32> = None;
+                let mut accepted = false;
                 if let Some(inbox) = self
                     .screens
                     .iter_mut()
@@ -1007,14 +1028,28 @@ impl App {
                         Ok(page) => {
                             // See ForumLoaded (issue #537).
                             alerts.error = None;
-                            new_unread = Some(if inbox.alerts_viewed {
+                            let unread = page.alerts.iter().filter(|alert| !alert.viewed()).count() as u32;
+                            // Only an acknowledged mark can supersede a list
+                            // that began before that mark. A later refresh
+                            // may contain newly arrived, unviewed alerts.
+                            new_unread = Some(if inbox.alerts_viewed && load_id < inbox.alerts_view_id {
                                 0
                             } else {
-                                page.alerts.iter().filter(|a| !a.viewed()).count() as u32
+                                unread
                             });
+                            if load_id > inbox.alerts_view_id && unread > 0 {
+                                inbox.alerts_viewed = false;
+                                // A mark that began before this newer snapshot
+                                // may already have executed before these alerts
+                                // arrived. Its delayed acknowledgment cannot
+                                // cover them; the visible tab needs a fresh mark.
+                                inbox.alerts_view_pending = false;
+                                inbox.alerts_view_id = 0;
+                            }
                             alerts.alerts = page.alerts;
                             alerts.loading = false;
                             alerts.sel = alerts.sel.min(alerts.alerts.len().saturating_sub(1));
+                            accepted = true;
                         }
                         Err(e) => {
                             alerts.loading = false;
@@ -1025,34 +1060,29 @@ impl App {
                 if let Some(n) = new_unread {
                     self.alerts_unread = n;
                 }
+                if accepted { self.retry_visible_alerts_view(); }
             }
             Msg::AlertsViewed { view_id, result } => {
                 let mut failed = None;
+                let mut acknowledged = false;
                 if let Some(inbox) = self
                     .screens
                     .iter_mut()
                     .rev()
                     .find_map(|s| match s {
-                        Screen::Inbox(inbox) if inbox.alerts_view_id == view_id => Some(inbox),
+                        Screen::Inbox(inbox) if inbox.alerts_view_id == view_id && inbox.alerts_view_pending => Some(inbox),
                         _ => None,
                     })
                 {
                     inbox.alerts_view_pending = false;
-                    if let Err(e) = result {
-                        inbox.alerts_viewed = false;
-                        failed = Some(e.message);
+                    match result {
+                        Ok(()) => { inbox.alerts_viewed = true; acknowledged = true; }
+                        Err(e) => { inbox.alerts_viewed = false; failed = Some(e.message); }
                     }
                 }
+                if acknowledged { self.alerts_unread = 0; }
                 if let Some(message) = failed {
                     self.set_status(format!("Alerts could not be marked viewed: {message}"));
-                    if let Some(inbox) = self.inbox_mut() {
-                        self.alerts_unread = inbox
-                            .alerts
-                            .alerts
-                            .iter()
-                            .filter(|alert| !alert.viewed())
-                            .count() as u32;
-                    }
                 }
             }
             Msg::MediaLoaded { page, load_id, result } => {

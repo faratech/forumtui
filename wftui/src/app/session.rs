@@ -49,6 +49,10 @@ impl App {
                 Screen::Inbox(s) => {
                     cancel(&mut s.convos.loading, &mut s.convos.error);
                     cancel(&mut s.alerts.loading, &mut s.alerts.error);
+                    if s.alerts_view_pending {
+                        s.alerts_viewed = false;
+                        s.alerts_view_id = 0;
+                    }
                     s.alerts_view_pending = false;
                     if let Some(view) = &mut s.view { cancel(&mut view.loading, &mut view.error); }
                 }

@@ -700,6 +700,47 @@ pub fn render_resource_view(
 
 // ================= the image viewer =================
 
+fn image_caption(s: &super::ImageViewState, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+    let mut caption = Vec::new();
+    if !s.meta.is_empty() {
+        caption.push(Line::from(Span::styled(truncate(&s.meta, width as usize), theme.dim())));
+    }
+    if !s.description.is_empty() {
+        caption.extend(wrap_spans(
+            &[Span::styled(s.description.clone(), theme.base())], width as usize,
+        ).into_iter().take(3).map(Line::from));
+    }
+    caption
+}
+
+fn picture_request(s: &super::ImageViewState, inner: Rect, caption_rows: usize) -> Option<Request> {
+    if !s.images.inline() || inner.width == 0 || inner.height == 0 { return None; }
+    let cap_rows = (caption_rows as u16).min(inner.height.saturating_sub(1));
+    let pic_rows = inner.height.saturating_sub(cap_rows);
+    let key = s.key.clone()?;
+    let (cols, rows) = images::fit_within(
+        inner.width, pic_rows, s.px.unwrap_or((16, 9)), s.images.font,
+    );
+    Some(Request {
+        key,
+        rect: Rect::new(inner.x + inner.width.saturating_sub(cols) / 2, inner.y, cols, rows),
+        full: true,
+    })
+}
+
+impl super::ImageViewState {
+    /// The exact demand used by both the app's status lookup and renderer.
+    pub(crate) fn image_request(&mut self, area: Rect, theme: &Theme, g: &Glyphs) -> Option<Request> {
+        let inner = chrome::panel(theme, g, &self.title, true, None, None).inner(area);
+        self.prepared_caption = None;
+        if !self.images.inline() || inner.width == 0 || inner.height == 0 { return None; }
+        let caption = image_caption(self, theme, inner.width);
+        let request = picture_request(self, inner, caption.len());
+        self.prepared_caption = Some((inner.width, caption));
+        request
+    }
+}
+
 /// One picture, as large as the pane allows, with its caption underneath —
 /// the "open it here, not in a browser" screen (#697, and CLAUDE.md's
 /// long-standing "Enter-to-expand an image is not implemented" gap).
@@ -720,8 +761,17 @@ pub fn render_image_view(
     }
     hits.push(inner, Hit::Pane(HitPane::List));
 
-    // Stamped from the store each frame (#60): a keyed viewer spins while
-    // any size variant of its source is in flight — the old
+    let caption = s.prepared_caption.take().filter(|(width, _)| *width == inner.width)
+        .map(|(_, caption)| caption).unwrap_or_else(|| image_caption(s, theme, inner.width));
+    if let Some(request) = picture_request(s, inner, caption.len()) {
+        // Keep demand stable while queued/loading or failed. The image store
+        // suppresses duplicate workers and remembered failures; dropping this
+        // request would otherwise discard a queued viewer every other frame.
+        s.image_requests.push(request);
+    }
+
+    // Stamped from the store each frame: this viewer spins while its own
+    // size and byte-budget request is queued or in flight — the old
     // `&& s.key.is_none()` half made the pane unreachable, since every
     // viewer carries a key (#82).
     if s.loading {
@@ -744,27 +794,7 @@ pub fn render_image_view(
         return;
     }
 
-    // Caption first: it is the part that must never be pushed off screen.
-    let mut caption: Vec<Line<'static>> = Vec::new();
-    if !s.meta.is_empty() {
-        caption.push(Line::from(Span::styled(
-            truncate(&s.meta, inner.width as usize),
-            theme.dim(),
-        )));
-    }
-    if !s.description.is_empty() {
-        for wrapped in wrap_spans(
-            &[Span::styled(s.description.clone(), theme.base())],
-            inner.width as usize,
-        )
-        .into_iter()
-        .take(3)
-        {
-            caption.push(Line::from(wrapped));
-        }
-    }
     let cap_rows = (caption.len() as u16).min(inner.height.saturating_sub(1));
-    let pic_rows = inner.height.saturating_sub(cap_rows);
 
     if !s.images.inline() {
         let mut lines = vec![Line::from(Span::styled(
@@ -776,25 +806,6 @@ pub fn render_image_view(
         return;
     }
 
-    if let Some(key) = s.key.clone()
-        && pic_rows > 0
-    {
-        let (cols, rows) = images::fit_within(
-            inner.width,
-            pic_rows,
-            s.px.unwrap_or((16, 9)),
-            s.images.font,
-        );
-        // Centred horizontally: a picture pinned left in a wide pane reads
-        // as a mistake rather than a viewer.
-        let x = inner.x + (inner.width.saturating_sub(cols)) / 2;
-        s.image_requests.push(Request {
-            key,
-            rect: Rect::new(x, inner.y, cols, rows),
-            // The viewer's picture, not a thumbnail: the larger byte budget.
-            full: true,
-        });
-    }
     if cap_rows > 0 {
         f.render_widget(
             Paragraph::new(caption),
@@ -1632,6 +1643,17 @@ mod tests {
         });
         assert!(s.image_requests.is_empty());
         assert!(rows.join("\n").contains("press o"), "{rows:?}");
+    }
+
+    #[test]
+    fn image_viewer_preserves_description_line_breaks() {
+        let mut s=ImageViewState{title:"photo".into(),description:"first line\nsecond line".into(),key:Some("https://example.invalid/photo.png".into()),images:inline_policy(),..Default::default()};
+        assert!(s.image_request(Rect::new(0, 0, 40, 12), &Theme::truecolor(), &UNICODE).is_some());
+        assert!(s.prepared_caption.is_some(), "status lookup prepares the shared layout once");
+        let rows=render_rows(40,12,|f,a,t,g,h|render_image_view(&mut s,f,a,t,g,h));
+        assert!(s.prepared_caption.is_none(), "render consumes the prepared caption");
+        assert!(rows.iter().any(|r|r.contains("first line")&&!r.contains("second line")),"description lines should stay separate");
+        assert!(rows.iter().any(|r|r.contains("second line")&&!r.contains("first line")));
     }
 
     /// #701: the resource page's link rows are click targets, wherever the

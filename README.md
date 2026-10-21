@@ -42,7 +42,7 @@ WFTUI_INSTALL_DIR=/opt/bin sh install.sh  # where to put the binary
 Other ways in:
 
 - **Manual**: grab `wftui-<version>-<platform>` (or the `.tar.gz`) from [Releases](https://github.com/faratech/forumtui/releases) and check its sha256 against `SHA256SUMS.txt`.
-- **From source**: `cargo install --path wftui` (Rust 1.98+; no C toolchain needed anywhere).
+- **From source**: `cargo install --path wftui` (Rust 1.99.1+; no C toolchain needed anywhere).
 - **macOS**: no build ships yet — `sh install.sh` will say so.
 
 ## Sign in

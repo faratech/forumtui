@@ -42,18 +42,24 @@ cd "$REPO_ROOT"
 VERSION="$(grep -m1 '^version = ' wftui/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
 TARGET_TRIPLE="$(rustc -vV | sed -n 's/host: //p')"
 ARCH_TAG="${TARGET_TRIPLE%%-*}"
+TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+if [[ "$TARGET_DIR" != /* ]]; then
+    TARGET_DIR="$REPO_ROOT/$TARGET_DIR"
+fi
+BINARY="$TARGET_DIR/$TARGET_TRIPLE/release/wftui"
 
 echo "wftui version: $VERSION"
 echo "host target:   $TARGET_TRIPLE"
+echo "target dir:    $TARGET_DIR"
 
-cargo build --release -p wftui "${FEATURES_FLAG[@]}"
+cargo build --release -p wftui --target "$TARGET_TRIPLE" --target-dir "$TARGET_DIR" "${FEATURES_FLAG[@]}"
 
 PKG_NAME="wftui${EDITION}-${VERSION}-linux-${ARCH_TAG}${SUFFIX}"
 STAGE_DIR="dist/${PKG_NAME}"
 rm -rf "$STAGE_DIR"
 mkdir -p "$STAGE_DIR"
 
-cp "target/release/wftui" "$STAGE_DIR/wftui"
+cp "$BINARY" "$STAGE_DIR/wftui"
 chmod 755 "$STAGE_DIR/wftui"
 
 cat > "$STAGE_DIR/README.txt" <<EOF
@@ -82,7 +88,7 @@ echo "       ${TARBALL}.sha256"
 # a deliberate choice, not something an update should swap someone into.
 if [[ -z "$SUFFIX" ]]; then
     BARE="dist/wftui${EDITION}-${VERSION}-linux-${ARCH_TAG}"
-    install -m755 "target/release/wftui" "$BARE"
+    install -m755 "$BINARY" "$BARE"
     ( cd dist && sha256sum "$(basename "$BARE")" > "$(basename "$BARE").sha256" )
     echo "       $BARE"
 fi

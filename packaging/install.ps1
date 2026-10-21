@@ -95,12 +95,14 @@ try {
     if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null }
     $target = Join-Path $InstallDir 'wftui.exe'
     $staged = Join-Path $InstallDir '.wftui.new'
+    # A failed staging move (for example, a locked staging file or a full
+    # destination volume) must leave the installed executable in place.
+    Move-Item $exePath $staged -Force
     if (Test-Path $target) {
         $old = Join-Path $InstallDir 'wftui.exe.old'
         if (Test-Path $old) { Remove-Item $old -Force }
         Move-Item $target $old -Force
     }
-    Move-Item $exePath $staged -Force
     try {
         Move-Item $staged $target -Force
     } catch {

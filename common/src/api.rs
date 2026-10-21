@@ -764,7 +764,7 @@ impl WfApiClient {
         // — an image URL is attacker-influenced (a post can carry any
         // `[IMG]`), so a looser rule would hand the grant to whoever asked.
         let mut req = self.http.get(url);
-        if url.starts_with(&format!("{}/", self.api_base())) {
+        if self.image_uses_bearer(url) {
             req = req.bearer_auth(self.dispatch_token(&[&self.image_gate]).await?);
         } else {
             self.image_gate.wait().await;
@@ -811,6 +811,19 @@ impl WfApiClient {
             }
         }
         Ok(buf)
+    }
+
+    /// The exact image authentication boundary, also used by the image
+    /// cache: protected API bytes must not be reused across forum accounts.
+    /// URL parsing normalizes host/scheme case, default ports and dot paths.
+    pub fn image_uses_bearer(&self, url: &str) -> bool {
+        let Ok(api) = reqwest::Url::parse(&format!("{}/", self.api_base())) else { return false; };
+        let Ok(target) = reqwest::Url::parse(url) else { return false; };
+        target.username().is_empty() && target.password().is_none()
+            && target.scheme() == api.scheme()
+            && target.host_str() == api.host_str()
+            && target.port_or_known_default() == api.port_or_known_default()
+            && target.path().starts_with(api.path())
     }
 }
 
@@ -1979,6 +1992,48 @@ mod tests {
             c.fetch_bytes(&other, 1024).await.is_ok(),
             "a non-API image URL must be fetched WITHOUT the token"
         );
+    }
+
+    #[test]
+    fn image_authentication_matches_canonical_origin_and_api_path() {
+        let _env = EnvGuard::hold("http://127.0.0.1:1", "/tmp/wftui-image-auth-scope");
+        let mut client = WfApiClient::with_store(
+            token::Store::with_path(std::env::temp_dir().join("wftui-image-auth-scope/token.json")),
+            "https://forum.example", "fixture-client",
+        ).unwrap();
+        client.base = "HTTPS://FORUM.EXAMPLE:443".into();
+        for url in ["https://forum.example/api/media/7/data", "HTTPS://FORUM.EXAMPLE:443/api/media/7/data"] {
+            assert!(client.image_uses_bearer(url), "equivalent origin: {url}");
+        }
+        for url in [
+            "https://forum.example:444/api/media/7/data", "http://forum.example/api/media/7/data",
+            "https://forum.example.evil/api/media/7/data", "https://forum.example@evil.example/api/media/7/data",
+            "https://user@forum.example/api/media/7/data", "https://forum.example/api-elsewhere/media/7/data",
+            "https://forum.example/api/../public/7.png", "https://forum.example/api/%2e%2e/public/7.png",
+        ] {
+            assert!(!client.image_uses_bearer(url), "outside API authentication scope: {url}");
+        }
+        // Configuration currently accepts origins only. Keep this helper's
+        // path boundary correct without broadening that configuration policy.
+        client.base = "https://forum.example/community".into();
+        assert!(client.image_uses_bearer("https://forum.example/community/api/media/7/data"));
+        assert!(!client.image_uses_bearer("https://forum.example/api/media/7/data"));
+        assert!(!client.image_uses_bearer("https://forum.example/community/api/../public/7.png"));
+        client.base = "HTTP://FORUM.EXAMPLE:80".into();
+        assert!(client.image_uses_bearer("http://forum.example/api/media/7/data"));
+    }
+
+    #[tokio::test]
+    async fn fetch_bytes_authenticates_equivalent_origin_spelling() {
+        let server = MockServer::start().await;
+        let origin = server.uri().replacen("http://", "HTTP://", 1);
+        let _env = EnvGuard::hold(&origin, "/tmp/wftui-image-auth-case");
+        Mock::given(method("GET")).and(path("/api/media/7/data"))
+            .and(wiremock::matchers::header("authorization", "Bearer tok-case"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(vec![0x89u8, b'P', b'N', b'G'], "image/png"))
+            .mount(&server).await;
+        let client = logged_in_client("tok-case").await;
+        assert!(client.fetch_bytes(&format!("{}/api/media/7/data", server.uri()), 1024).await.is_ok());
     }
 
     /// #680/#696/#697: both catalog envelopes, against **captured live

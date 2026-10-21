@@ -200,6 +200,12 @@ pub struct Request {
     pub full: bool,
 }
 
+impl Request {
+    pub fn store_key(&self) -> String {
+        request_key(&self.key, self.rect.width, self.rect.height, self.full)
+    }
+}
+
 /// An image the store does not hold yet, handed to the app to load off-thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
@@ -211,7 +217,7 @@ pub struct Pending {
 
 impl Pending {
     pub fn store_key(&self) -> String {
-        store_key(&self.key, self.cols, self.rows)
+        request_key(&self.key, self.cols, self.rows, self.full)
     }
 }
 
@@ -219,6 +225,19 @@ impl Pending {
 /// size as well as source — a resize re-encodes rather than stretching.
 pub fn store_key(key: &str, cols: u16, rows: u16) -> String {
     format!("{cols}x{rows}|{key}")
+}
+
+/// Fetch failures and workers belong to a byte budget as well as a size.
+/// A rejected thumbnail must not poison the viewer, even at the same size.
+fn request_key(key: &str, cols: u16, rows: u16, full: bool) -> String {
+    let size = store_key(key, cols, rows);
+    if full { format!("full:{size}") } else { size }
+}
+
+/// A successful decoded image can serve either budget at the same size.
+/// Disk bytes likewise stay keyed by their source URL alone.
+fn decoded_key(key: &str) -> &str {
+    key.strip_prefix("full:").unwrap_or(key)
 }
 
 /// The decoded, terminal-ready payload. `()` without the `images` feature, so
@@ -448,7 +467,9 @@ impl DiskCache {
     }
 
     fn path_for(&self, url: &str) -> PathBuf {
-        self.dir.join(format!("{}.img", digest(url)))
+        // Older URL-only entries may contain authenticated API bytes from
+        // any forum/account. Only the public-only loader can populate v2.
+        self.dir.join(format!("{}.img", digest(&format!("public-v2|{url}"))))
     }
 
     pub fn get(&self, url: &str) -> Option<Vec<u8>> {
@@ -958,9 +979,9 @@ impl Images {
             if req.rect.width == 0 || req.rect.height == 0 {
                 continue;
             }
-            let sk = store_key(&req.key, req.rect.width, req.rect.height);
+            let sk = req.store_key();
             #[cfg(feature = "images")]
-            if let Some(proto) = self.cache.get(&sk) {
+            if let Some(proto) = self.cache.get(decoded_key(&sk)) {
                 // The crate's own widget is the ONLY thing that writes image
                 // escapes, and it does it through the skip-cell path.
                 ratatui_image::Image::new(proto).render(req.rect, f.buffer_mut());
@@ -1005,26 +1026,18 @@ impl Images {
         self.sizes.clear();
     }
 
-    /// Whether any size variant of `source` is mid-fetch. The viewer's
-    /// loading pane reads this — its loads complete through `on_loaded`,
-    /// which never touches the screen state (#60).
-    pub fn source_inflight(&self, source: &str) -> bool {
-        self.inflight.iter().any(|k| source_of(k) == source)
-    }
-
-    /// Whether any size variant of `source` has ever loaded: a known size
-    /// is a working variant, so a failure of a *smaller* variant must not
-    /// pre-empt a viewer whose own (larger-budget) fetch succeeds (#83).
-    pub fn source_known(&self, source: &str) -> bool {
-        self.sizes.contains_key(source)
-    }
-
-    /// The remembered failure for any size variant of `source` (#60).
-    pub fn source_failure(&self, source: &str) -> Option<String> {
-        self.failed
-            .iter()
-            .find(|(k, _)| source_of(k) == source)
-            .map(|(_, e)| e.clone())
+    /// State of the exact request the viewer will draw. Other sizes or
+    /// byte budgets cannot strand it in an unrelated error/loading pane.
+    pub fn request_state(&self, request: &Request) -> (bool, Option<String>) {
+        let key = request.store_key();
+        if self.cache.contains(decoded_key(&key)) {
+            return (false, None);
+        }
+        let loading = self.inflight.contains(&key)
+            || self.queued.iter().any(|pending| pending.key == request.key
+                && pending.cols == request.rect.width && pending.rows == request.rect.height
+                && pending.full == request.full);
+        (loading, self.failed.get(&key).cloned())
     }
 
     /// Forget every size variant's failure for `source`, so the next
@@ -1039,8 +1052,9 @@ impl Images {
         match result {
             Ok(loaded) => {
                 self.sizes.insert(source_of(&key).to_string(), loaded.px);
+                self.failed.remove(&key);
                 #[cfg(feature = "images")]
-                self.cache.insert(key, loaded.decoded);
+                self.cache.insert(decoded_key(&key).to_string(), loaded.decoded);
                 #[cfg(not(feature = "images"))]
                 {
                     let _ = (key, loaded);
@@ -1098,9 +1112,13 @@ pub async fn load(
     permit: tokio::sync::OwnedSemaphorePermit,
     logo: Option<Arc<[u8]>>,
 ) -> Result<Loaded, String> {
+    // Only public bytes persist between forum sessions. A URL-only API cache
+    // would let a second signed-in account bypass its own permission check;
+    // ignore even legacy unscoped entries for the exact bearer-auth boundary.
+    let cacheable = !client.image_uses_bearer(&pending.key);
     let bytes = if pending.key == LOGO_KEY {
         logo.ok_or_else(|| "this site has no logo".to_string())?.to_vec()
-    } else if let Some(cached) = disk.get(&pending.key) {
+    } else if let Some(cached) = cacheable.then(|| disk.get(&pending.key)).flatten() {
         cached
     } else {
         let fetched = client
@@ -1110,7 +1128,7 @@ pub async fn load(
             )
             .await
             .map_err(|e| e.to_string())?;
-        disk.put(&pending.key, &fetched);
+        if cacheable { disk.put(&pending.key, &fetched); }
         fetched
     };
     let (cols, rows) = (pending.cols, pending.rows);
@@ -1553,6 +1571,104 @@ mod tests {
         let mut third = Vec::new();
         terminal.draw(|f| third = images.paint(f, &reqs)).unwrap();
         assert!(third.is_empty(), "a failed image must not be retried every frame");
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn thumbnail_failure_does_not_block_the_same_size_viewer_budget() {
+        let mut images = Images::text_only();
+        images.policy = Policy { tier: Tier::Halfblocks, font: (10, 20) };
+        let thumbnail = Request { key: "https://wf/large.png".into(), rect: Rect::new(0, 0, 8, 4), full: false };
+        let viewer = Request { full: true, ..thumbnail.clone() };
+        assert_ne!(thumbnail.store_key(), viewer.store_key());
+        assert_eq!(source_of(&viewer.store_key()), thumbnail.key);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        let mut pending = Vec::new();
+        terminal.draw(|f| pending = images.paint(f, std::slice::from_ref(&thumbnail))).unwrap();
+        images.on_loaded(pending[0].store_key(), Err("thumbnail byte cap".into()));
+        terminal.draw(|f| pending = images.paint(f, std::slice::from_ref(&viewer))).unwrap();
+        assert_eq!(pending.len(), 1, "the viewer has its own fetch budget");
+        assert!(pending[0].full);
+        images.on_loaded(pending[0].store_key(), Err("viewer failure".into()));
+        assert_eq!(images.request_state(&viewer), (false, Some("viewer failure".into())));
+        terminal.draw(|f| pending = images.paint(f, std::slice::from_ref(&viewer))).unwrap();
+        assert!(pending.is_empty(), "failure is not retried on every frame");
+        images.retry_source(&viewer.key);
+        terminal.draw(|f| pending = images.paint(f, &[viewer])).unwrap();
+        assert_eq!(pending.len(), 1, "explicit retry reopens the current request");
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn decoded_images_are_shared_between_budgets_but_not_other_sizes() {
+        let mut images = Images::text_only();
+        images.policy = Policy { tier: Tier::Halfblocks, font: (10, 20) };
+        let thumbnail = Request { key: "https://wf/shot.png".into(), rect: Rect::new(0, 0, 8, 4), full: false };
+        let viewer = Request { full: true, ..thumbnail.clone() };
+        let loaded = decode(&ratatui_image::picker::Picker::halfblocks(), include_bytes!("../assets/wf-logo.png"), 8, 4).unwrap();
+        images.on_loaded(thumbnail.store_key(), Ok(loaded));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        let mut pending = Vec::new();
+        terminal.draw(|f| pending = images.paint(f, std::slice::from_ref(&viewer))).unwrap();
+        assert!(pending.is_empty(), "a decoded image needs no second fetch for a different budget");
+        assert_eq!(images.request_state(&viewer), (false, None));
+        let larger = Request { rect: Rect::new(0, 0, 12, 6), ..viewer };
+        terminal.draw(|f| pending = images.paint(f, std::slice::from_ref(&larger))).unwrap();
+        images.on_loaded(pending[0].store_key(), Err("full-size refused".into()));
+        assert_eq!(images.request_state(&larger), (false, Some("full-size refused".into())), "a known thumbnail cannot mask this failure");
+    }
+
+    #[tokio::test]
+    #[cfg(feature="images")]
+    async fn protected_disk_cache_never_bypasses_a_second_users_denial() {
+        use wiremock::{Mock,MockServer,ResponseTemplate};
+        use wiremock::matchers::{method,path,header};
+        let server=MockServer::start().await;
+        Mock::given(method("GET")).and(path("/api/media/7/data")).and(header("Authorization","Bearer account-a"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type","image/png").set_body_bytes(include_bytes!("../assets/wf-logo.png").to_vec())).mount(&server).await;
+        Mock::given(method("GET")).and(path("/api/media/7/data")).and(header("Authorization","Bearer account-b"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({"errors":[{"code":"no_permission","message":"Denied"}]}))).mount(&server).await;
+        let dir=std::env::temp_dir().join(format!("wftui-ui-audit-private-cache-{}",std::process::id()));
+        let a=common::api::WfApiClient::with_store(common::token::Store::with_path(dir.join("a-token.json")),server.uri(),"fixture-client").unwrap();
+        let b=common::api::WfApiClient::with_store(common::token::Store::with_path(dir.join("b-token.json")),server.uri(),"fixture-client").unwrap();
+        for (client,access) in [(&a,"account-a"),(&b,"account-b")] {
+            client.set_tokens(common::token::TokenSet{access_token:access.into(),refresh_token:"unused".into(),expires_at:time::OffsetDateTime::now_utc().unix_timestamp()+3600,scope:"media:read".into(),origin:String::new(),client_id:String::new()}).await.unwrap();
+        }
+        let url=format!("{}/api/media/7/data",server.uri());
+        let disk=DiskCache::with_dir(dir.join("cache"),DISK_CAP_BYTES);
+        let request=Pending{key:url.clone(),cols:10,rows:4,full:true};
+        let permits=Arc::new(tokio::sync::Semaphore::new(1));
+        let first=load(&a,&disk,ratatui_image::picker::Picker::halfblocks(),&request,permits.clone().acquire_owned().await.unwrap(),None).await;
+        assert!(first.is_ok(),"owner A can view its protected image");
+        assert!(disk.get(&url).is_none(), "authenticated API bytes are not persisted");
+        // A pre-fix entry must also be ignored after upgrading.
+        std::fs::create_dir_all(disk.dir()).unwrap();
+        std::fs::write(disk.dir().join(format!("{}.img", digest(&url))), include_bytes!("../assets/wf-logo.png")).unwrap();
+        assert!(disk.get(&url).is_none(), "unscoped legacy entries are not known to be public");
+        assert!(b.fetch_bytes(&url,MAX_VIEW_BYTES).await.is_err(),"the server denies B the same source");
+        let second=load(&b,&disk,ratatui_image::picker::Picker::halfblocks(),&request,permits.clone().acquire_owned().await.unwrap(),None).await;
+        assert!(second.is_err(),"account A's disk cache must not bypass B's server permission check");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3, "both B reads reach its permission gate");
+        let foreign = common::api::WfApiClient::with_store(
+            common::token::Store::with_path(dir.join("foreign-token.json")), "http://127.0.0.1:1", "fixture-client",
+        ).unwrap();
+        let denied = load(&foreign, &disk, ratatui_image::picker::Picker::halfblocks(), &request,
+            permits.clone().acquire_owned().await.unwrap(), None).await;
+        assert!(denied.is_err(), "a different forum must not read A's legacy private entry either");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(!requests.last().unwrap().headers.contains_key("authorization"));
+        Mock::given(method("GET")).and(path("/thumb.png"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png")
+                .set_body_bytes(include_bytes!("../assets/wf-logo.png").to_vec())).mount(&server).await;
+        let public = Pending { key: format!("{}/thumb.png", server.uri()), ..request };
+        for client in [&a, &foreign] {
+            assert!(load(client, &disk, ratatui_image::picker::Picker::halfblocks(), &public,
+                permits.clone().acquire_owned().await.unwrap(), None).await.is_ok());
+        }
+        assert!(disk.get(&public.key).is_some());
+        assert_eq!(server.received_requests().await.unwrap().len(), 5, "public bytes remain shared across clients");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // ---------- end to end, no terminal involved ----------

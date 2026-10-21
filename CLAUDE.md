@@ -45,6 +45,9 @@ renderer.
 
 ## Commands
 
+`rust-toolchain.toml` pins Rust 1.99.1 for local commands; CI and release
+workflows use the same version.
+
 ```bash
 cd /web/wftui_app
 export WFTUI_CONFIG_DIR=/tmp/wftui-test-cfg          # ALWAYS before cargo test (see Testing)
@@ -109,7 +112,7 @@ and the name of the test that pins it.
 
 Two-crate workspace (house style from `services/mirror`: resolver 2, edition 2024,
 plain-enum errors, no anyhow/thiserror, inline `#[cfg(test)]` tests, `rust-version
-1.98` = the toolchain it is released against, nothing in the graph needs it).
+1.99.1` = the toolchain it is released against, nothing in the graph needs it).
 
 ### `common/` — everything testable without a terminal
 
@@ -295,6 +298,11 @@ the media page.
 - **Enter expands a picture** into `Screen::ImageView` (the standing
   "Enter-to-expand" gap). An image attachment the API gave no usable URL for
   still earns its caption row and its number; it simply has nothing to draw.
+- Same-site browser attachment links use `/api/attachments/{id}/data` for
+  pixels, with a temporary upload hash when present; opening on the website
+  keeps the browser URL. Public thumbnails and CDN URLs keep their cache.
+  Image failures belong to the requested size and byte budget, so a rejected
+  thumbnail does not prevent the full-size viewer from trying its larger cap.
 - **Reading marks read** (#694). A thread is marked read up to the newest
   post that was actually on screen (`seen_date`, stamped by the renderer),
   sent once when the view leaves the stack — never to "now" on open, so a
@@ -490,6 +498,10 @@ The thread view's write keys are `r` reply, `Q` quote (see below), `e` edit,
   a resumed draft, and puts back whatever the composer would have shown
   without one: for an edit that is the post's current text, so discarding a
   draft must never empty the post.
+
+Only one live composer owns a draft key. Reopening a buried idle composer
+preserves its latest words and attachments; a send or upload must finish
+before that composer can be reopened.
 
 **Drafts are shared with the website** through the TuiLink relay
 (`/api/wf-tui-drafts`, #716). Stock XF has no draft endpoint — `xf_draft` is
@@ -889,8 +901,11 @@ and the full-size viewer. `images::fit` is the inline case and hard-codes the
 thumbnail caps; `fit_within` fits an arbitrary box and is what the viewer and
 the gallery rows use. Inline thumbnails ≤ 40 % of the panel and ≤ 12 rows;
 fetches stream through `fetch_bytes` with a hard byte cap — 2 MiB for
-thumbnails, 8 MiB for the viewer (`Request::full`) — then the disk cache under
-`<config dir>/cache/img/` (32 MiB, 0600, atomic). `fetch_bytes` sends the
+thumbnails, 8 MiB for the viewer (`Request::full`). Public bytes use the disk
+cache under `<config dir>/cache/img/` (32 MiB, 0600, atomic); authenticated API
+bytes bypass it and remain only in session-scoped decoded memory. Public cache
+keys are versioned so older, unscoped entries cannot bypass permission checks.
+`fetch_bytes` sends the
 bearer token **only** to our own API base, which the gallery's
 `/api/media/{id}/data` needs and no third-party `[IMG]` host may ever see.
 Decoding is capped at 4096 px per axis and a 64 MiB allocation budget (#679);

@@ -223,6 +223,9 @@ pub struct ForumTreeState {
 pub struct ThreadListState {
     pub site: Arc<SiteConfig>,
     pub node_id: u32,
+    /// Explicit server permission for this forum; absent/null retains the
+    /// previous client behavior. Node 0 is never a real posting target.
+    pub can_create_thread: Option<bool>,
     pub title: String,
     pub threads: Vec<Thread>,
     /// How many of the leading rows in `threads` are pinned/sticky threads
@@ -265,6 +268,10 @@ pub struct ThreadListState {
 }
 
 impl ThreadListState {
+    pub fn can_create_thread(&self) -> bool {
+        self.node_id != 0 && self.can_create_thread != Some(false)
+    }
+
     /// Everything a fresh forum invalidates about the loaded window (#705).
     /// `load_forum` mints the generation; this is the part that must be
     /// forgotten the moment the reader picks a different forum.
@@ -673,9 +680,8 @@ pub struct InboxState {
     /// The panes' last-drawn rects — see `HomeState::tree_rect` (issue #549).
     pub list_rect: Rect,
     pub view_rect: Rect,
-    /// True after the Alerts tab has been entered for this Inbox instance.
-    /// The pending bit handles cold starts where the badge was zero before
-    /// the first alerts response arrived.
+    /// True after the server acknowledges marking this Inbox's alerts viewed.
+    /// Pending work is separate so cancellation or failure can be retried.
     pub alerts_viewed: bool,
     pub alerts_view_pending: bool,
     pub alerts_view_id: u64,
@@ -960,6 +966,9 @@ pub struct ImageViewState {
     pub error: Option<String>,
     pub images: crate::images::Policy,
     pub image_requests: Vec<crate::images::Request>,
+    /// One frame's layout, prepared for the image-store status lookup and
+    /// consumed by the renderer without wrapping the description twice.
+    pub(crate) prepared_caption: Option<(u16, Vec<ratatui::text::Line<'static>>)>,
 }
 
 impl ImageViewState {
@@ -1314,8 +1323,8 @@ impl Screen {
             Screen::Login(s) => misc::login_hints(s),
             Screen::Setup(s) => setup::setup_hints(s),
             Screen::Home(s) => browse::home_hints(s),
-            Screen::ForumTree(s) => browse::forum_tree_hints(&s.site),
-            Screen::ThreadList(s) => browse::thread_list_hints(s.node_id),
+            Screen::ForumTree(s) => browse::forum_tree_hints(s),
+            Screen::ThreadList(s) => browse::thread_list_hints(s),
             Screen::ThreadView(s) => browse::thread_view_hints(s),
             Screen::Compose(s) => misc::compose_hints(s),
             Screen::Inbox(s) => social::inbox_hints(s),

@@ -1410,7 +1410,7 @@ pub(crate) fn url_label(url: &str) -> String {
 /// `None` means "not an image this client can show" — an `[ATTACH]` id the
 /// draft does not carry, or an attachment that is not an image — and the
 /// reference then renders as the plain text placeholder it always did.
-fn resolve_image(r: &bbcode::ImageRef, attachments: &[Attachment]) -> Option<PreviewImage> {
+fn resolve_image(r: &bbcode::ImageRef, attachments: &[Attachment], origin: &str) -> Option<PreviewImage> {
     match r {
         bbcode::ImageRef::Url(url) => Some(PreviewImage {
             key: url.clone(),
@@ -1419,13 +1419,13 @@ fn resolve_image(r: &bbcode::ImageRef, attachments: &[Attachment]) -> Option<Pre
         }),
         bbcode::ImageRef::Attachment(id) => {
             let att = attachments.iter().find(|a| a.attachment_id == *id)?;
-            let url = images::attachment_url(att)?;
+            let key = super::browse::attachment_image_key(att, origin)?;
             let px = match (att.width, att.height) {
                 (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
                 _ => None,
             };
             Some(PreviewImage {
-                key: url.to_string(),
+                key,
                 label: att.filename.clone(),
                 px,
             })
@@ -1459,7 +1459,7 @@ fn build_preview(
     let mut run_start = 0usize;
 
     for (i, chunk) in chunks.iter().enumerate() {
-        let Some(img) = chunk.image_ref().and_then(|r| resolve_image(&r, attachments)) else {
+        let Some(img) = chunk.image_ref().and_then(|r| resolve_image(&r, attachments, origin)) else {
             continue;
         };
         push_wrapped(&mut lines, &chunks[run_start..i], &mut links, theme, w);
@@ -3942,16 +3942,30 @@ mod tests {
         let refs = bbcode::image_refs(r#"[ATTACH type="full"]77[/ATTACH] [ATTACH]78[/ATTACH]"#);
         assert_eq!(refs.len(), 2);
 
-        let resolved = resolve_image(&refs[0], std::slice::from_ref(&att)).expect("77 resolves");
+        let resolved = resolve_image(&refs[0], std::slice::from_ref(&att), "https://windowsforum.com").expect("77 resolves");
         assert_eq!(resolved.key, "https://wf/attachments/77/thumb");
         assert_eq!(resolved.label, "screenshot.png");
         assert_eq!(resolved.px, Some((1200, 800)));
 
         // An id the draft does not carry stays a text placeholder.
-        assert!(resolve_image(&refs[1], std::slice::from_ref(&att)).is_none());
+        assert!(resolve_image(&refs[1], std::slice::from_ref(&att), "https://windowsforum.com").is_none());
         // …and with no attachment list at all (today's compose screen),
         // nothing but `[IMG]` URLs can resolve.
-        assert!(resolve_image(&refs[0], &[]).is_none());
+        assert!(resolve_image(&refs[0], &[], "https://windowsforum.com").is_none());
+    }
+
+    #[test]
+    fn a_fresh_attachment_preview_uses_api_bytes_and_preserves_its_upload_hash() {
+        let mut attachment = Attachment { attachment_id: 77, filename: "screenshot.png".into(),
+            direct_url: Some("https://forum.example/attachments/screenshot-png.77/?hash=upload-hash".into()),
+            ..Default::default()
+        };
+        let reference = bbcode::ImageRef::Attachment(77);
+        let image = resolve_image(&reference, std::slice::from_ref(&attachment), "https://forum.example").unwrap();
+        assert_eq!(image.key, "https://forum.example/api/attachments/77/data?hash=upload-hash");
+        attachment.thumbnail_url = Some("https://cdn.example/thumb.png".into());
+        let image = resolve_image(&reference, std::slice::from_ref(&attachment), "https://forum.example").unwrap();
+        assert_eq!(image.key, "https://cdn.example/thumb.png", "a public thumbnail stays cacheable");
     }
 
     #[test]

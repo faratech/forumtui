@@ -11,6 +11,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  WFTUI_NO_UPDATE: "1"
 
 jobs:
   test:
@@ -24,13 +25,13 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1482605baf5e54c3a4a81144c8575711b97477ef # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: 1.98
+          toolchain: 1.99.1
           components: clippy
 
       - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@82a92a6e3519e677e0ddc7726a767aea594a9a53 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: test
 
@@ -59,6 +60,9 @@ jobs:
         run: |
           cargo test -p common --no-default-features
           cargo test -p wftui --no-default-features --features images
+
+      - name: Packaging output paths
+        run: bash packaging/tests/build-tarball-smoke.sh
 
       - name: No embedded escapes
         run: /usr/bin/grep -rn $'\x1b' wftui/src && exit 1 || exit 0

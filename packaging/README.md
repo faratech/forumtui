@@ -17,6 +17,7 @@ cd /web/wftui_app
 packaging/linux/build-tarball.sh              # default (images) build
 packaging/linux/build-tarball.sh --no-images  # the no-default-features build
 packaging/linux/build-tarball.sh --generic    # Terminal for XenForo (-xf assets)
+bash packaging/tests/build-tarball-smoke.sh   # disposable output-path regression checks
 ```
 
 Runs entirely on this box: `cargo build --release -p wftui` for the host's
@@ -25,9 +26,11 @@ native target, then stages the binary + a short README into
 default and `--generic` builds — both empty-suffix bare-name shapes) the bare
 binary `dist/wftui[-xf]-<version>-linux-<arch>` that the matching edition's
 running wftui downloads to update itself. No
-cross-compilation — this always builds for whatever target the machine
-running the script is (same as `bin/wftui`, which is built the same way and
-committed separately).
+cross-compilation — the script explicitly selects the Rust host target.
+It uses `CARGO_TARGET_DIR` when provided, otherwise the repository's `target`
+directory, and reads the binary from that same directory and target triple.
+The smoke check uses controlled compiler outputs to verify that an old binary
+in the default directory cannot enter a package built elsewhere.
 
 ## Windows (MSIX, signed)
 
@@ -95,6 +98,27 @@ Useful flags: `-Architectures x64` (skip the others for a quick local test),
 Add-AppxPackage -Path .\wftui-<version>.msixbundle
 wftui.exe   # from any new shell, via the execution alias
 ```
+
+Run the portable installer's smoke check on Windows from the repository root:
+
+```powershell
+powershell -NoProfile -File packaging/tests/install-smoke.ps1
+```
+
+It mocks downloads and uses disposable directories to check a successful
+replacement and that a locked staging file leaves the installed executable
+intact. It does not modify an existing installation or contact the release feed.
+
+With the Windows SDK installed, check MSIX output selection using an existing
+executable of the selected architecture:
+
+```powershell
+powershell -NoProfile -File packaging/tests/build-msix-smoke.ps1 -Architecture x64 -FixtureExe target/x86_64-pc-windows-msvc/release/wftui.exe
+```
+
+The check uses controlled Cargo outputs and the SDK packer in disposable
+directories. It checks both editions with default, absolute, relative, and
+drive-relative output directories, and signs or installs nothing.
 
 A signed package installs without a Developer Mode toggle or an extra
 trusted-root import, because Azure Trusted Signing issues a publicly

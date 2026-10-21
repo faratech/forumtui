@@ -51,6 +51,18 @@ param(
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
+$TargetDir = $env:CARGO_TARGET_DIR
+if (-not $TargetDir) {
+    $TargetDir = Join-Path $RepoRoot 'target'
+}
+# Drive-relative paths such as C:build also depend on the current location.
+# Resolve once where Cargo runs so readback after Pop-Location uses the same path.
+Push-Location $RepoRoot
+try {
+    $TargetDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($TargetDir)
+} finally {
+    Pop-Location
+}
 $PackagingRoot = $PSScriptRoot
 $ManifestTemplate = Join-Path $PackagingRoot "AppxManifest.template.xml"
 $AssetsDir = Join-Path $PackagingRoot "assets"
@@ -107,6 +119,7 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') {
 }
 $MsixVersion = "$Version.0"
 Write-Host "wftui version: $Version (MSIX Identity Version: $MsixVersion)" -ForegroundColor Cyan
+Write-Host "Cargo target directory: $TargetDir"
 
 # ---------------------------------------------------------------------------
 # Prerequisites
@@ -149,13 +162,13 @@ foreach ($arch in $Architectures) {
     Write-Host "-- cargo build --release --target $triple -p wftui"
     Push-Location $RepoRoot
     try {
-        cargo build --release --target $triple -p wftui
+        cargo build --release --target $triple --target-dir $TargetDir -p wftui
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed for $triple" }
     } finally {
         Pop-Location
     }
 
-    $exe = Join-Path $RepoRoot "target\$triple\release\wftui.exe"
+    $exe = Join-Path $TargetDir "$triple\release\wftui.exe"
     if (-not (Test-Path $exe)) { throw "Expected build output missing: $exe" }
 
     $stage = Join-Path $Work $arch
@@ -212,12 +225,12 @@ foreach ($arch in $Architectures) {
     Write-Host "-- cargo build --release --target $triple --no-default-features --features images -p wftui"
     Push-Location $RepoRoot
     try {
-        cargo build --release --target $triple --no-default-features --features images -p wftui
+        cargo build --release --target $triple --target-dir $TargetDir --no-default-features --features images -p wftui
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed for $triple (generic edition)" }
     } finally {
         Pop-Location
     }
-    $xfExe = Join-Path $RepoRoot "target\$triple\release\wftui.exe"
+    $xfExe = Join-Path $TargetDir "$triple\release\wftui.exe"
     if (-not (Test-Path $xfExe)) { throw "Expected generic build output missing: $xfExe" }
     $xfOut = Join-Path $OutDir "wftui-xf-$Version-windows-$arch.exe"
     Copy-Item $xfExe $xfOut -Force

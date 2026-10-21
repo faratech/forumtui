@@ -60,12 +60,12 @@ impl App {
                     && let Some(node) = tree.nodes.iter().find(|n| n.node_id == node_id)
                 {
                     if node.node_type == "Category" {
-                        if let Some(child) = tree.nodes.iter().find(|c| {
-                            (c.parent_node_id == node.node_id || c.depth > node.depth)
-                                && c.node_type == "Forum"
-                        }) {
+                        if let Some(child) = screens::browse::category_forum(&tree.nodes, node.node_id) {
                             node_id = child.node_id;
                             title = child.title.clone();
+                        } else {
+                            self.set_status("This category has no forum to open.");
+                            return;
                         }
                     } else if matches!(node.node_type.as_str(), "LinkForum" | "Page") {
                         target_url = node.view_url.clone();
