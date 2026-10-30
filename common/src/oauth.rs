@@ -408,10 +408,43 @@ pub async fn register_link(
         });
     }
     let reg: Reg = serde_json::from_slice(&body)?;
+    if !link_is_valid(&reg.id, &reg.url, base) {
+        return Err(Error::OAuth {
+            code: "invalid_login_link".into(),
+            message: "the site returned a login link that is not its own /tui-start/ page".into(),
+            status,
+        });
+    }
     Ok(LoginLink {
         id: reg.id,
         url: reg.url,
     })
+}
+
+/// A relay login link is opened in the system browser with no keypress, so it
+/// must be the site's own `/tui-start/<id>` page: same scheme, host and port as
+/// `base`, and the id the server's poll route accepts. Anything else (a
+/// `file:` path, a protocol handler, another host) is refused rather than
+/// handed to the opener, which ShellExecutes on Windows.
+pub fn link_is_valid(id: &str, url: &str, base: &str) -> bool {
+    let id_ok = (6..=32).contains(&id.len())
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    let (Ok(link), Ok(site)) = (reqwest::Url::parse(url), reqwest::Url::parse(base)) else {
+        return false;
+    };
+    let path = link.path();
+    id_ok
+        && matches!(link.scheme(), "https" | "http")
+        && link.scheme() == site.scheme()
+        && link.host_str().is_some()
+        && link.host_str() == site.host_str()
+        && link.port_or_known_default() == site.port_or_known_default()
+        && link.username().is_empty()
+        && link.password().is_none()
+        && link.query().is_none()
+        && link.fragment().is_none()
+        && (path.strip_prefix(site.path().trim_end_matches('/')) == Some(&format!("/tui-start/{id}"))
+            || path.strip_prefix(site.path().trim_end_matches('/')) == Some(&format!("/tui-start/{id}/")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -672,6 +705,30 @@ pub fn open_browser(url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_login_link_must_be_the_sites_own_tui_start_page() {
+        let base = "https://windowsforum.com";
+        assert!(link_is_valid("abc123", "https://windowsforum.com/tui-start/abc123", base));
+        assert!(link_is_valid("k7Qx2p-_", "https://windowsforum.com/tui-start/k7Qx2p-_/", base));
+        assert!(link_is_valid("abc123", "https://example.com/forum/tui-start/abc123", "https://example.com/forum"));
+        for url in [
+            "file:///C:/Windows/System32/calc.exe",
+            "search-ms:query=x",
+            r"\\host\share\x.exe",
+            "https://evil.example/tui-start/abc123",
+            "http://windowsforum.com/tui-start/abc123",
+            "https://windowsforum.com:8443/tui-start/abc123",
+            "https://user@windowsforum.com/tui-start/abc123",
+            "https://windowsforum.com/tui-start/abc123?next=https://evil.example",
+            "https://windowsforum.com/tui-start/other1",
+            "https://windowsforum.com/login/",
+        ] {
+            assert!(!link_is_valid("abc123", url, base), "{url} must be refused");
+        }
+        assert!(!link_is_valid("abc", "https://windowsforum.com/tui-start/abc", base), "id too short");
+        assert!(!link_is_valid("abc12$", "https://windowsforum.com/tui-start/abc12$", base), "id charset");
+    }
 
     #[test]
     fn pkce_pair_matches_and_verifier_is_legal() {

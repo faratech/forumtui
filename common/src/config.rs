@@ -40,6 +40,17 @@ pub fn validate_base_url(raw: &str) -> Result<String, Error> {
             "site origin must be an http(s) origin without credentials, path, query, or fragment: {raw:?}"
         )));
     }
+    // The PKCE code and verifier, the bearer and the refresh token all go to
+    // this origin, so cleartext is accepted only for a loopback test forum:
+    // the same exact-loopback rule the redirect policy and updater apply.
+    // host_str() is the parser's normalised form: lowercase, dotted IPv4,
+    // bracketed compressed IPv6.
+    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if url.scheme() == "http" && !loopback {
+        return Err(Error::Config(format!(
+            "plain http:// is only accepted for a loopback test forum; use https:// for {raw:?}"
+        )));
+    }
     Ok(normalized.to_string())
 }
 
@@ -278,6 +289,18 @@ mod tests {
             "https://example.test/#fragment",
         ] {
             assert!(validate_base_url(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn plain_http_is_only_accepted_for_a_loopback_forum() {
+        // The token exchange and every bearer call go to this origin.
+        for ok in ["http://127.0.0.1:8080", "http://localhost:9000", "http://LOCALHOST", "http://[::1]:8080", "https://forum.example.com"] {
+            assert!(validate_base_url(ok).is_ok(), "refused {ok:?}");
+        }
+        for refused in ["http://forum.example.com", "http://127.0.0.2", "http://10.0.0.5", "http://localhost.example.com"] {
+            let err = validate_base_url(refused).expect_err(refused);
+            assert!(format!("{err:?}").contains("loopback"), "{refused:?}: {err:?}");
         }
     }
 

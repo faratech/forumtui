@@ -6,7 +6,7 @@
     "src/addons/WindowsForum/TuiLink/Config.php": "72276323a51ccaa06934df1bedb0c6cf9b2f61ae4bb405e2a5519e9a3cc516b1",
     "src/addons/WindowsForum/TuiLink/Pub/Controller/DoneController.php": "d7267b27beb40df9ceb72082c17bae6c7695afdd18882548e4a754238fad4e20",
     "src/addons/WindowsForum/TuiLink/Pub/Controller/StartController.php": "b32deb0230965fc0d7a901465591ecf890dc1486bc62aa8cb9c3bc940a61fa4f",
-    "src/addons/WindowsForum/TuiLink/Service/LinkStore.php": "e64efe6905a871b54a9593b979b3a2c484be25a5c4e03efac7e46cf7334dfbcf",
+    "src/addons/WindowsForum/TuiLink/Service/LinkStore.php": "ca0b645b463bca68d3172807859571be75eadba35c6ce335b38f0775f4ae856a",
     "src/addons/WindowsForum/TuiLink/Service/LinkStoreException.php": "baed5b0117332bfa177334069d79da977aaecd65fc808e1cbe53227f9454f241",
     "src/addons/WindowsForum/TuiLink/Setup.php": "db996b0f366f294bfd6a000f23cded00c33825c495df5843a51c6611d2b5feaa",
     "src/addons/WindowsForum/TuiLink/_data/options.xml": "02e076e9958c8b93150cb417fec973397f7fe33bff2846400e58acebca8be4d8",

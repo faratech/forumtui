@@ -141,7 +141,7 @@ final class LinkStore
 		{
 			return true;
 		}
-		$key = 'wf_tuilink:reg:' . hash_hmac('sha256', $ip, (string) \XF::config('globalSalt'));
+		$key = 'wf_tuilink:reg:' . hash_hmac('sha256', self::budgetPrefix($ip), (string) \XF::config('globalSalt'));
 		try
 		{
 			$count = (int) $redis->incr($key);
@@ -155,6 +155,22 @@ final class LinkStore
 		{
 			return true;
 		}
+	}
+
+	/**
+	 * What one registration budget covers: an IPv4 address, or an IPv6 /64.
+	 * One client controls a whole /64, so a per-address IPv6 budget let a single
+	 * network fill LIVE_CAP and turn every sign-in into wf_tuilink_busy. An
+	 * address that does not parse shares one bucket instead of getting a fresh key.
+	 */
+	public static function budgetPrefix(string $ip): string
+	{
+		$bin = @inet_pton(trim($ip));
+		if ($bin === false)
+		{
+			return 'unparsed';
+		}
+		return strlen($bin) === 16 ? 'v6:' . bin2hex(substr($bin, 0, 8)) : 'v4:' . bin2hex($bin);
 	}
 
 	/** The person declined the authorization request. */
