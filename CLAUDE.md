@@ -99,9 +99,14 @@ a Windows runner; local Windows builds use `cargo build --release`.
 
 ## Git
 
-The Git repository root is `/web/wftui_app`, a standalone checkout. Stage
-explicit reviewed paths relative to that root — never `git add -A`, never
-`target/`. Commit messages
+The Git repository root is `/web/wftui_app`, a **git submodule of `/web`** whose origin is
+`faratech/forumtui` (issues live there too; `/web/.gitmodules` still names the old
+`faratech/wftui.git`). Run `git fetch -q origin` and check ahead/behind before starting. Never
+`pull`/`checkout`/`stash` in this live tree. After pushing here, bump the pointer in `/web` with
+the pathspec form `git commit -m … -- wftui_app`, because other sessions commit to `/web` at the
+same time. Builds stay on disk under `target/`: `/tmp` is tmpfs (RAM), and a 13 GB cargo target
+there OOM'd the server on 2026-10-20. Stage explicit reviewed paths relative to the repo root —
+never `git add -A`, never `target/`. Commit messages
 are `feat(wftui): …` / `fix(wftui): …` with a body of plain-word bullets, `Fixes #N`
 lines, the test/clippy result line, and the `Co-Authored-By` trailer. Pushes go
 straight to `origin main`. Bugs are tracked as GitHub issues labelled
