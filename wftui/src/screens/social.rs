@@ -1307,6 +1307,17 @@ pub fn new_conversation_key(s: &mut super::NewConversationState, key: KeyEvent) 
                 .move_vertical(&mut s.body_cursor, &mut s.body_desired_col, delta);
             Action::None
         }
+        // The single-line fields: Up/Down step between them, as the comment
+        // above always said they did (#123) — the arm was never written, so
+        // both keys were dead in To and Title.
+        KeyCode::Up => {
+            s.field = s.field.saturating_sub(1);
+            Action::None
+        }
+        KeyCode::Down => {
+            s.field = (s.field + 1).min(2);
+            Action::None
+        }
         KeyCode::Char(c)
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
@@ -1692,6 +1703,29 @@ mod tests {
             text_start + 3,
             "caret must land right after the typed text, not one cell short"
         );
+    }
+
+    /// #123: Up/Down in the single-line To and Title fields step between
+    /// the fields; in the message they still move by visual row.
+    #[test]
+    fn up_and_down_step_between_the_new_conversation_fields() {
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        let mut s = super::super::NewConversationState::default();
+        assert_eq!(s.field, 0);
+        new_conversation_key(&mut s, key(KeyCode::Up));
+        assert_eq!(s.field, 0, "Up in To stays put");
+        new_conversation_key(&mut s, key(KeyCode::Down));
+        assert_eq!(s.field, 1, "Down in To reaches Title");
+        new_conversation_key(&mut s, key(KeyCode::Up));
+        assert_eq!(s.field, 0, "Up in Title reaches To");
+        new_conversation_key(&mut s, key(KeyCode::Down));
+        new_conversation_key(&mut s, key(KeyCode::Down));
+        assert_eq!(s.field, 2, "Down in Title reaches the message");
+        s.body = "one\ntwo".into();
+        s.body_cursor = 0;
+        s.body_width = 40;
+        new_conversation_key(&mut s, key(KeyCode::Down));
+        assert_eq!((s.field, s.body_cursor), (2, 4), "in the message Down moves a row, not a field");
     }
 
     /// Issue #569: both single-line fields on this screen placed their

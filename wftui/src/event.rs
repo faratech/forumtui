@@ -90,34 +90,77 @@ pub fn spawn_reader_with_prefix(prefix: Vec<u8>) -> Receiver<Input> {
     rx
 }
 
+/// How long the sole reader may wait for the rest of a sequence the probe
+/// deadline cut (#137). A terminal finishing its own escape sequence sends
+/// the remaining bytes within milliseconds; past this the tail is decoded as
+/// it stands, and the next byte — a real keypress — is left for
+/// `event::read` to deliver as itself.
+#[cfg(all(feature = "images", unix))]
+const COMPLETION_WINDOW: Duration = Duration::from_millis(250);
+
 /// Replay user input consumed before the normal terminal reader existed.
 /// This runs on that sole reader, after the application entered raw mode.
 #[cfg(all(feature = "images", unix))]
-fn startup_events(mut bytes: Vec<u8>) -> Vec<Input> {
-    // Complete a UTF-8 character split by the probe deadline. This is an
-    // ordinary blocking input read on the sole reader, never a probe worker.
+fn startup_events(bytes: Vec<u8>) -> Vec<Input> {
+    let deadline = std::time::Instant::now() + COMPLETION_WINDOW;
+    complete_and_decode(bytes, || read_byte_before(libc::STDIN_FILENO, deadline))
+}
+
+/// Complete a UTF-8 character, escape sequence or bracketed paste split by
+/// the probe deadline (#41), taking bytes from `next_byte` until it has no
+/// more to give, then decode. `next_byte` is bounded by a deadline (#137):
+/// the old blocking `read_exact` waited forever on a peer that never sent
+/// the rest, with every key dead until some unrelated byte arrived — and
+/// that byte was then eaten into the old sequence.
+#[cfg(all(feature = "images", unix))]
+fn complete_and_decode(mut bytes: Vec<u8>, mut next_byte: impl FnMut() -> Option<u8>) -> Vec<Input> {
     while let Err(error) = std::str::from_utf8(&bytes) {
         if error.error_len().is_some() { break; }
-        use std::io::Read;
-        let mut byte = [0];
-        if std::io::stdin().read_exact(&mut byte).is_err() { break; }
-        bytes.push(byte[0]);
+        let Some(byte) = next_byte() else { break };
+        bytes.push(byte);
     }
-    // Complete an escape sequence or bracketed paste cut by the same
-    // deadline (#41): a CSI truncated before its final byte otherwise
-    // decoded as Esc plus the remaining bytes as literal character keys —
-    // junk keystrokes injected into whatever screen came up first. Bounded,
-    // so a terminal that never finishes the sequence degrades to the old
-    // behaviour instead of stalling startup.
+    // A CSI truncated before its final byte otherwise decoded as Esc plus
+    // the remaining bytes as literal character keys — junk keystrokes
+    // injected into whatever screen came up first. Bounded in bytes too.
     let mut completed = 0usize;
     while completed < 64 * 1024 && split_sequence_tail(&bytes) {
-        use std::io::Read;
-        let mut byte = [0];
-        if std::io::stdin().read_exact(&mut byte).is_err() { break; }
-        bytes.push(byte[0]);
+        let Some(byte) = next_byte() else { break };
+        bytes.push(byte);
         completed += 1;
     }
     decode_startup_events(&bytes)
+}
+
+/// One byte from `fd` if it arrives before `deadline`. `poll` first, then a
+/// one-byte `read(2)` — never `std::io::stdin()`, whose internal buffer
+/// would keep bytes past the sequence (the user's next keys) where the
+/// terminal reader can never see them.
+#[cfg(all(feature = "images", unix))]
+fn read_byte_before(fd: std::os::fd::RawFd, deadline: std::time::Instant) -> Option<u8> {
+    loop {
+        let left = deadline.checked_duration_since(std::time::Instant::now())?;
+        let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one initialized entry.
+        let ready = unsafe { libc::poll(&mut poll, 1, left.as_millis().clamp(1, i32::MAX as u128) as i32) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return None;
+        }
+        if ready == 0 || poll.revents & libc::POLLIN == 0 {
+            return None;
+        }
+        let mut byte = 0u8;
+        // SAFETY: one-byte writable buffer; the descriptor reported readable.
+        let read = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+        match read {
+            1 => return Some(byte),
+            0 => return None,
+            _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => continue,
+            _ => return None,
+        }
+    }
 }
 
 /// True while `bytes` ends inside an escape sequence the decoder would
@@ -150,15 +193,26 @@ fn decode_startup_events(bytes: &[u8]) -> Vec<Input> {
     let mut remaining = text.as_ref();
     let mut events = Vec::new();
     while !remaining.is_empty() {
-        if let Some(paste) = remaining.strip_prefix("\x1b[200~")
-            && let Some(end) = paste.find("\x1b[201~")
-        {
-            events.push(Input::Paste(paste[..end].to_owned()));
-            remaining = &paste[end + 6..];
+        if let Some(paste) = remaining.strip_prefix("\x1b[200~") {
+            // A paste whose end marker never came is still a paste: decoded
+            // as keystrokes, its text would drive the first screen (#138).
+            let end = paste.find("\x1b[201~");
+            events.push(Input::Paste(paste[..end.unwrap_or(paste.len())].to_owned()));
+            remaining = end.map_or("", |end| &paste[end + 6..]);
             continue;
         }
         let mut modifiers = KeyModifiers::NONE;
         if remaining.starts_with('\x1b') && remaining.len() > 1 {
+            // A complete OSC, DCS or APC string is a terminal reply the probe
+            // did not ask for, never a key: drop it whole (#138) instead of
+            // reading it as Alt+`]` and a run of literal keys.
+            if (remaining.starts_with("\x1b]") || remaining.starts_with("\x1bP") || remaining.starts_with("\x1b_"))
+                && let Some(len) = crate::images::unix::sequence_len(remaining.as_bytes())
+                && len > 2
+            {
+                remaining = &remaining[len..];
+                continue;
+            }
             if let Some(len) = crate::images::unix::sequence_len(remaining.as_bytes())
                 && (remaining.starts_with("\x1b[") || remaining.starts_with("\x1bO"))
             {
@@ -196,6 +250,13 @@ fn decode_startup_events(bytes: &[u8]) -> Vec<Input> {
                     remaining = &remaining[len..];
                     continue;
                 }
+                // A complete sequence this table does not name — an SGR
+                // mouse report, focus in/out, a CSI-u key, some reply — is
+                // dropped whole (#138). Falling through exploded it into Esc,
+                // `[` and a run of digits and letters, which could fire quick
+                // destinations or screen keys before the user typed a thing.
+                remaining = &remaining[len..];
+                continue;
             } else if !remaining.starts_with("\x1b[") && !remaining.starts_with("\x1bO") {
                 modifiers |= KeyModifiers::ALT;
                 remaining = &remaining[1..];
@@ -312,6 +373,48 @@ mod tests {
         // And a completed buffer decodes as the key it names, not junk.
         let keys = decode_startup_events(b"\x1b[1;5B");
         assert!(matches!(keys[0], Input::Key(k) if k.code == KeyCode::Down && k.modifiers == KeyModifiers::CONTROL));
+    }
+
+    /// #138: a complete sequence the decoder does not name (SGR mouse,
+    /// focus, CSI-u, an unrequested OSC/DCS reply) is dropped whole, never
+    /// exploded into Esc plus literal keys; the keys around it survive, and
+    /// a paste whose end never came is a paste, not keystrokes.
+    #[cfg(all(feature = "images", unix))]
+    #[test]
+    fn unknown_startup_sequences_are_dropped_whole() {
+        let keys = decode_startup_events(b"a\x1b[<0;12;5M\x1b[I\x1b[97;5u\x1b]11;rgb:0/0/0\x1b\\\x1bP1$r0m\x1b\\b\x1b[O\x1b[A");
+        let codes: Vec<KeyCode> = keys.iter().map(|k| match k { Input::Key(k) => k.code, other => panic!("{other:?}") }).collect();
+        assert_eq!(codes, vec![KeyCode::Char('a'), KeyCode::Char('b'), KeyCode::Up], "{keys:?}");
+        let keys = decode_startup_events(b"x\x1b[200~rm -rf ~/j");
+        assert!(matches!(&keys[0], Input::Key(k) if k.code == KeyCode::Char('x')));
+        assert!(matches!(&keys[1], Input::Paste(text) if text == "rm -rf ~/j"), "{keys:?}");
+        assert_eq!(keys.len(), 2);
+    }
+
+    /// #137: completing a cut sequence is bounded in time. A source with no
+    /// more bytes ends the completion at once — the old blocking read
+    /// waited for a byte that might never come — and the real reader gives
+    /// up on an idle descriptor at its deadline instead of blocking.
+    #[cfg(all(feature = "images", unix))]
+    #[test]
+    fn completing_a_cut_sequence_never_blocks_on_a_silent_peer() {
+        let started = std::time::Instant::now();
+        let keys = complete_and_decode(b"j\x1b[1;5".to_vec(), || None);
+        assert!(matches!(keys.first(), Some(Input::Key(k)) if k.code == KeyCode::Char('j')), "{keys:?}");
+        let mut more = b"B".to_vec().into_iter();
+        let keys = complete_and_decode(b"\x1b[1;5".to_vec(), || more.next());
+        assert!(matches!(keys.as_slice(), [Input::Key(k)] if k.code == KeyCode::Down && k.modifiers == KeyModifiers::CONTROL), "{keys:?}");
+
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let deadline = std::time::Instant::now() + Duration::from_millis(80);
+        assert_eq!(read_byte_before(fds[0], deadline), None, "an idle peer times out");
+        assert_eq!(unsafe { libc::write(fds[1], b"zq".as_ptr().cast(), 2) }, 2);
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        assert_eq!(read_byte_before(fds[0], deadline), Some(b'z'));
+        assert_eq!(read_byte_before(fds[0], deadline), Some(b'q'), "one byte per read: nothing is buffered away");
+        unsafe { libc::close(fds[0]); libc::close(fds[1]); }
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     }
 
 }

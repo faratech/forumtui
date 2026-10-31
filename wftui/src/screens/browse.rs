@@ -2423,11 +2423,18 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
             Some(_) => Action::Notice("You cannot edit that post.".into()),
             None => Action::None,
         },
+        // #122: `S` was offered nowhere and gated by nothing, and the API
+        // call is a TOGGLE — a stray press un-marked a real solution, and a
+        // reader with no right to it fired a doomed write.
         KeyCode::Char('S') => match s.posts.get(s.sel_post) {
-            Some(post) => Action::MarkSolution {
+            Some(post) if can_mark_solution(s, post) => Action::MarkSolution {
                 post_id: post.post_id,
                 thread_id: s.thread.thread_id,
             },
+            Some(_) if !s.thread.allows_question_actions() => {
+                Action::Notice("Only a question thread has a solution to mark.".into())
+            }
+            Some(_) => Action::Notice("You cannot mark the solution here.".into()),
             None => Action::None,
         },
         // Two presses: the first arms, the second deletes. Any other key
@@ -2645,6 +2652,18 @@ fn link_popup_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
     }
 }
 
+/// The reader may mark (or unmark) `post` as the solution — the parts of
+/// `QuestionHandler::canMarkPostAsSolution` the client can know: signed in,
+/// a question thread whose forum allows question actions, a visible post,
+/// and the thread's own author or a moderator. The server still decides;
+/// this keeps the key off the bar where it would only 403 (#122).
+fn can_mark_solution(s: &ThreadViewState, post: &Post) -> bool {
+    s.viewer_id != 0
+        && s.thread.allows_question_actions()
+        && post.state().is_visible()
+        && (s.thread.user_id == s.viewer_id || s.viewer_moderates)
+}
+
 pub fn thread_view_hints(s: &ThreadViewState) -> Hints {
     // Issue #604: while an error is showing, the ordinary key bar (Reply,
     // like/vote, page keys that may not even be live yet) describes actions
@@ -2692,6 +2711,10 @@ pub fn thread_view_hints(s: &ThreadViewState) -> Hints {
                 "delete"
             },
         ));
+    }
+    if let Some(post) = sel.filter(|p| can_mark_solution(s, p)) {
+        // The call toggles, so the cap says which way this press goes.
+        keys.push(("S", if s.thread.solution_post_id() == Some(post.post_id) { "unmark solution" } else { "solution" }));
     }
     keys.extend_from_slice(&[("j/k", "scroll"), ("n/N", "post")]);
     if can_react { keys.push(("l", "like")); }
@@ -4475,6 +4498,52 @@ mod tests {
             thread_view_key(&mut s, key('e')),
             Action::StartEditPost(_, _)
         ));
+    }
+
+    /// #122: `S` is a toggling write. It is offered — and sent — only on a
+    /// question thread that allows question actions, on a visible post, to
+    /// the thread's author or a moderator; everyone else gets a refusal, not
+    /// a request. The cap says which way the toggle goes.
+    #[test]
+    fn mark_solution_is_gated_and_advertised() {
+        let caps = |s: &ThreadViewState| -> Vec<(String, String)> {
+            thread_view_hints(s).keys.iter().map(|(k, l)| (k.to_string(), l.to_string())).collect()
+        };
+        let has_s = |s: &ThreadViewState| caps(s).iter().any(|(k, _)| k == "S");
+        let mut s = thread_view_fixture();
+        s.sel_post = 0;
+        s.thread.user_id = 10;
+        s.thread.discussion_type = "discussion".into();
+        s.viewer_id = 10;
+        assert!(!has_s(&s), "not a question thread");
+        assert!(matches!(thread_view_key(&mut s, key('S')), Action::Notice(_)));
+
+        s.thread.discussion_type = "question".into();
+        s.thread.question = Some(common::models::QuestionData { allow_question_actions: "no".into(), ..Default::default() });
+        assert!(!has_s(&s), "the forum disallows question actions");
+        assert!(matches!(thread_view_key(&mut s, key('S')), Action::Notice(_)));
+
+        s.thread.question.as_mut().unwrap().allow_question_actions = "yes".into();
+        s.viewer_id = 99;
+        assert!(!has_s(&s), "a reader who neither asked nor moderates");
+        assert!(matches!(thread_view_key(&mut s, key('S')), Action::Notice(_)));
+        s.viewer_id = 0;
+        assert!(matches!(thread_view_key(&mut s, key('S')), Action::Notice(_)), "signed out");
+
+        s.viewer_id = 10;
+        assert!(caps(&s).contains(&("S".into(), "solution".into())), "{:?}", caps(&s));
+        let post_id = s.posts[0].post_id;
+        assert!(matches!(thread_view_key(&mut s, key('S')), Action::MarkSolution { post_id: p, .. } if p == post_id));
+        s.thread.question.as_mut().unwrap().solution_post_id = post_id;
+        s.thread.highlighted_post_ids.clear();
+        assert!(caps(&s).contains(&("S".into(), "unmark solution".into())), "the toggle says it un-marks");
+
+        s.viewer_id = 99;
+        s.viewer_moderates = true;
+        assert!(has_s(&s), "a moderator may mark any thread's solution");
+        s.posts[0].message_state = "deleted".into();
+        assert!(!has_s(&s), "a deleted post cannot be the solution");
+        assert!(matches!(thread_view_key(&mut s, key('S')), Action::Notice(_)));
     }
 
     #[test]

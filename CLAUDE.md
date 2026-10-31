@@ -440,7 +440,8 @@ say. The flow is **stage now, apply at the next start**, never a relaunch:
   `g u` and the palette's "Check for updates" row ignore the interval). A
   newer, non-draft, non-prerelease tag downloads the bare binary for this
   platform (`Target::asset_name`: `wftui-<ver>-linux-x86_64`,
-  `wftui-<ver>-windows-x64.exe`, …) and the release's `SHA256SUMS.txt`, and
+  `wftui-<ver>-windows-x64.exe`, …; `Target::released_for` lists exactly
+  the platforms the workflow builds, so Linux aarch64 skips, #131) and the release's `SHA256SUMS.txt`, and
   refuses anything whose digest is not in it or whose PE/ELF header is not
   this architecture's. The verified bytes are staged as
   `<config dir>/update/pending-<id>/{wftui[.exe],meta}` — written into
@@ -486,6 +487,12 @@ The thread view's write keys are `r` reply, `Q` quote (see below), `e` edit,
   `can_edit` / `can_soft_delete` / `can_hard_delete`; a key absent from the
   bar is a key the server would refuse. The server enforces regardless — the
   flags are for the key bar, never for safety.
+- **`S` is a toggle with no API flag** (#122): marking a solution un-marks
+  an existing one, and XF sends no per-post permission for it. The key is
+  offered (as "solution" or "unmark solution") only on a question thread
+  whose `question.allow_question_actions` is `yes`, on a visible post, to
+  the thread's author or a staff/moderator reader (`viewer_id` /
+  `viewer_moderates`, stamped per frame); everyone else gets a notice.
 - **Delete is soft and takes two presses.** Soft is what XF's own UI does and
   leaves the post recoverable; the first `D` arms, the second deletes, and
   any other key disarms (`ThreadViewState::confirm_delete`). No hard delete
@@ -821,7 +828,9 @@ sign-in screen cycles auto → relay → loopback → paste and restarts):
   `https://<site>/tui-start/<id>` — also on the clipboard (OSC 52) and in
   the site's `login-url.txt` — approve on the site (Turnstile, 2FA), the
   redirect to `/tui-done` captures the code, the TUI polls every 2 s and
-  exchanges it. `denied` from the poll (the generalised add-on) fails the
+  exchanges it. A refused poll keeps XF's envelope: a 429's Retry-After sets
+  the next wait, other failures back off to 30 s (`oauth::next_poll_delay`,
+  #112). `denied` from the poll (the generalised add-on) fails the
   flow instead of waiting out the link.
 - **Loopback** (stock XenForo): bind 127.0.0.1 (9420, else any port), open
   `/oauth2/authorize` with that redirect; the browser on this machine comes
@@ -908,6 +917,13 @@ keys are versioned so older, unscoped entries cannot bypass permission checks.
 `fetch_bytes` sends the
 bearer token **only** to our own API base, which the gallery's
 `/api/media/{id}/data` needs and no third-party `[IMG]` host may ever see.
+Everything else goes through `http::build_public_with_ua` (#130): a post's
+`[IMG]` is fetched unasked as it scrolls into view, so its URL, every redirect
+hop and every address its host resolves to must be public — loopback, RFC
+1918, CGNAT, link-local (cloud metadata) and the rest are refused as
+`FetchRejected` before a byte is sent. The forum's own host is the one
+exemption. The disk cache stores fetched bytes only once they decoded, and
+evicts a cached entry that no longer does (#139).
 Decoding is capped at 4096 px per axis and a 64 MiB allocation budget (#679);
 an image past either returns `Err` and falls back to the placeholder.
 

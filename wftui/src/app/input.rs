@@ -17,6 +17,14 @@ impl App {
             if self.me.is_none() && matches!(self.screens.last(), Some(Screen::Login(_))) {
                 return;
             }
+            // The first-run Setup screen has no site yet, let alone a
+            // session (#120): `logout()` pushed a Login for the placeholder
+            // `setup.invalid` over it — a gate that can never succeed and
+            // that Esc cannot leave — and the typed fields were lost to `q`.
+            if self.me.is_none() && matches!(self.screens.last(), Some(Screen::Setup(_))) {
+                self.set_status("Not signed in yet \u{2014} finish the setup first.");
+                return;
+            }
             self.logout();
             return;
         }
@@ -766,6 +774,23 @@ impl App {
         }
         let max_col = (offsets.len().saturating_sub(2)) as u16;
         Some((0, max_col))
+    }
+
+    /// The terminal changed size (#136). Everything measured off the last
+    /// frame — the hit map, the body rect, a half-made click, the selection
+    /// band and the text mirror it copies from — describes a layout that no
+    /// longer exists: input drained in the same batch must not act on it,
+    /// and a band must not be repainted over, or copied out of, unrelated
+    /// cells of the new one. The next draw rebuilds all of it.
+    pub(super) fn handle_resize(&mut self) {
+        self.hits.clear();
+        self.body_rect = ratatui::layout::Rect::default();
+        self.press_pos = None;
+        self.screen_rows.clear();
+        self.screen_cols.clear();
+        if self.selection.take().is_some() {
+            self.set_status("Selection cleared: the terminal was resized.");
+        }
     }
 
     pub(super) fn extract_selection_text(&self, x0: u16, y0: u16, x1: u16, y1: u16) -> String {

@@ -547,23 +547,30 @@ fn hit_style(theme: &Theme) -> Style {
 /// width (issue #516). `positions` are char indices into `title`, matching
 /// `chars` below.
 fn highlight(theme: &Theme, title: &str, positions: &[usize], max: usize) -> Vec<Span<'static>> {
+    use unicode_segmentation::UnicodeSegmentation;
     let hit = hit_style(theme);
     let base = theme.base();
-    let chars: Vec<char> = title.chars().collect();
     let truncated = chrome::cell_width(title) > max && max > 0;
     let budget = if truncated { max - 1 } else { max };
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut buf = String::new();
     let mut buf_hit = false;
     let mut used = 0usize;
-    for (i, c) in chars.iter().enumerate() {
-        let mut char_buf = [0u8; 4];
-        let cw = chrome::cell_width(c.encode_utf8(&mut char_buf));
+    // Measured and cut per grapheme cluster, like `chrome::take_cells`
+    // (#124): unicode-width bills a ZWJ or presentation sequence whole but
+    // per char differently, so a per-char walk mis-measured the row and
+    // could cut a family emoji in half at the ellipsis. `positions` are the
+    // matcher's char indices; a cluster is a hit if any of its chars is.
+    let mut char_index = 0usize;
+    for cluster in title.graphemes(true) {
+        let chars = cluster.chars().count();
+        let cw = chrome::cell_width(cluster);
         if used + cw > budget {
             break;
         }
         used += cw;
-        let is_hit = positions.contains(&i);
+        let is_hit = (char_index..char_index + chars).any(|i| positions.contains(&i));
+        char_index += chars;
         if is_hit != buf_hit && !buf.is_empty() {
             spans.push(Span::styled(
                 std::mem::take(&mut buf),
@@ -571,7 +578,7 @@ fn highlight(theme: &Theme, title: &str, positions: &[usize], max: usize) -> Vec
             ));
         }
         buf_hit = is_hit;
-        buf.push(*c);
+        buf.push_str(cluster);
     }
     if !buf.is_empty() {
         spans.push(Span::styled(buf, if buf_hit { hit } else { base }));
@@ -1082,6 +1089,29 @@ fn clip(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #124: the palette title is measured and cut per grapheme cluster. A
+    /// family emoji (ZWJ sequence) at the truncation point is either drawn
+    /// whole or not at all, the row never overflows `max`, and a matched
+    /// char inside a cluster highlights the whole cluster.
+    #[test]
+    fn palette_titles_cut_on_grapheme_clusters() {
+        let theme = Theme::truecolor();
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        let title = format!("ab{family}cd\u{26a0}\u{fe0f}ef");
+        for max in 1..=12usize {
+            let spans = highlight(&theme, &title, &[], max);
+            let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(chrome::cell_width(&text) <= max, "max {max}: {text:?} is {} cells", chrome::cell_width(&text));
+            let body = text.trim_end_matches(ELLIPSIS);
+            assert!(title.starts_with(body), "max {max}: {body:?} is not a cluster-aligned prefix");
+            assert!(!body.ends_with('\u{200d}') && !body.ends_with("\u{1f468}") && !body.ends_with("\u{26a0}"), "max {max}: half a cluster: {body:?}");
+        }
+        // positions are char indices: index 3 is the ZWJ inside the family.
+        let spans = highlight(&theme, &title, &[3], 40);
+        let lit: Vec<&str> = spans.iter().filter(|s| s.style == hit_style(&theme)).map(|s| s.content.as_ref()).collect();
+        assert_eq!(lit, vec![family], "{spans:?}");
+    }
     use crate::glyph::{ASCII, UNICODE};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;

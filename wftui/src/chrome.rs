@@ -262,9 +262,10 @@ pub fn header_line_hits(
     // One leading space before the mark, one minimum gap before the right side.
     const LEAD: usize = 1;
     const GAP: usize = 1;
+    // Measured in place (#28): this used to clone every crumb into a fresh
+    // Vec<String> on each of its three or four calls per frame.
     let needed = |crumbs: &[(String, Option<usize>)], right_w: usize| {
-        let texts: Vec<String> = crumbs.iter().map(|(c, _)| c.clone()).collect();
-        LEAD + brand_w + crumbs_width(g, &texts) + right_w + GAP
+        LEAD + brand_w + crumbs_width(g, crumbs.iter().map(|(c, _)| c.as_str())) + right_w + GAP
     };
 
     let (mut right, mut marks) = right_spans(theme, user, inbox, alerts, online, update);
@@ -707,12 +708,9 @@ pub(crate) fn field_window(text: &str, cursor: usize, room: usize) -> (String, u
     (take_cells(&tail, room), caret as u16)
 }
 
-fn crumbs_width(g: &Glyphs, crumbs: &[String]) -> usize {
+fn crumbs_width<'a>(g: &Glyphs, crumbs: impl Iterator<Item = &'a str>) -> usize {
     // Each crumb is " > " plus its text.
-    crumbs
-        .iter()
-        .map(|c| cell_width(c) + 2 + cell_width(g.crumb))
-        .sum()
+    crumbs.map(|c| cell_width(c) + 2 + cell_width(g.crumb)).sum()
 }
 
 /// Truncate to `max` cells, spending the last cell on `…` when it cuts.

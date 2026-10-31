@@ -575,14 +575,19 @@ impl App {
                         }
                         Err(e) => {
                             view.loading = false;
-                            // Clamp to the server-reported max page.
-                            if let Some(max) = e.max_page {
-                                view.last_page = max;
-                                let id = view.thread.thread_id;
-                                view.loading = true;
-                                self.load_thread(id, max);
-                            } else {
-                                view.error = Some(e.message);
+                            // Clamp to the server-reported max page — but
+                            // only when that is progress (#121): a refusal of
+                            // the very page it names (or a max of 0) would
+                            // otherwise reload it forever, each reply minting
+                            // a fresh load_id, and the error never showed.
+                            match e.max_page {
+                                Some(max) if max >= 1 && max != page => {
+                                    view.last_page = max;
+                                    let id = view.thread.thread_id;
+                                    view.loading = true;
+                                    self.load_thread(id, max);
+                                }
+                                _ => view.error = Some(e.message),
                             }
                         }
                     }
@@ -803,12 +808,14 @@ impl App {
                             // as `Msg::ThreadLoaded` does (issue #550) — a
                             // reply-triggered reload asking for "known last
                             // page + 1" lands here when that guess overshot.
-                            if let Some(max) = e.max_page {
-                                view.last_page = max;
-                                view.loading = true;
-                                self.load_conversation(id, max, user_opened);
-                            } else {
-                                view.error = Some(e.message);
+                            // Only when it is progress (#121), as there.
+                            match e.max_page {
+                                Some(max) if max >= 1 && max != page => {
+                                    view.last_page = max;
+                                    view.loading = true;
+                                    self.load_conversation(id, max, user_opened);
+                                }
+                                _ => view.error = Some(e.message),
                             }
                         }
                     }
@@ -1439,6 +1446,15 @@ impl App {
             }
             Msg::LoggedOut { generation, result } => {
                 if generation != self.session_generation {
+                    // A sign-in completed while the slow revokes were in
+                    // flight (#128). The new session owns the screen and the
+                    // pending flag, but the old grant's fate is still news:
+                    // a refresh token that outlived its sign-out is the one
+                    // thing #527 says must never go unsaid.
+                    if let Err(e) = result {
+                        tracing::warn!("earlier logout error: {e}");
+                        self.set_hint(format!("The earlier sign-out was local only: {e}."));
+                    }
                     return;
                 }
                 self.logout_pending = false;

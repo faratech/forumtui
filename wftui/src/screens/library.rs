@@ -23,7 +23,7 @@ use crate::glyph::Glyphs;
 use crate::images::{self, Request, Slot};
 use crate::theme::{fmt_age, Theme};
 use common::bbcode;
-use common::models::MediaCategory;
+use common::models::{ContentState, MediaCategory};
 
 /// Cells reserved for a gallery thumbnail. Small enough that four or five
 /// items still fit a short pane, big enough to tell screenshots apart.
@@ -57,15 +57,49 @@ fn page_range(page: u32, last_page: u32, total: u64, len: usize) -> Option<Strin
 /// the whole line exactly `w` cells wide (cells, never chars — CJK titles
 /// broke the naive form, issue #511/#595).
 fn catalog_line(theme: &Theme, title: &str, right_text: &str, w: usize) -> Line<'static> {
+    stated_catalog_line(theme, ContentState::Visible, title, right_text, w)
+}
+
+/// `catalog_line` for an item that has a content state (#127): a deleted or
+/// awaiting-approval item wears the same chip and title style a thread row
+/// does (#704), so a moderator can tell it from public content.
+fn stated_catalog_line(theme: &Theme, state: ContentState, title: &str, right_text: &str, w: usize) -> Line<'static> {
     // The metadata is untrusted too (for example, a long resource author or
     // title).  Truncate it before reserving the title column; otherwise a
     // narrow panel can overflow even though the left side is cell-aware.
     let right = Span::styled(truncate(right_text, w), theme.dim());
     let right_w = right.width();
-    let title_w = w.saturating_sub(right_w + 1);
-    let left = Span::styled(truncate(title, title_w), theme.base());
-    let pad = w.saturating_sub(left.width() + right_w);
-    Line::from(vec![left, Span::raw(" ".repeat(pad)), right])
+    let mut title_w = w.saturating_sub(right_w + 1);
+    let mut spans = Vec::new();
+    if let Some(chip) = state_chip(theme, state)
+        && chip.width() + 4 < title_w
+    {
+        title_w -= chip.width() + 1;
+        spans.push(chip);
+        spans.push(Span::raw(" "));
+    }
+    let left = Span::styled(truncate(title, title_w), state_title_style(theme, state, theme.base()));
+    let used: usize = spans.iter().map(Span::width).sum::<usize>() + left.width();
+    let pad = w.saturating_sub(used + right_w);
+    spans.extend([left, Span::raw(" ".repeat(pad)), right]);
+    Line::from(spans)
+}
+
+/// The state chip a thread row carries ahead of its prefix (#704).
+fn state_chip(theme: &Theme, state: ContentState) -> Option<Span<'static>> {
+    state.label().map(|label| {
+        Span::styled(format!(" {label} "), Style::new().fg(theme.error).add_modifier(Modifier::REVERSED))
+    })
+}
+
+/// Struck through and dimmed when deleted, italic when awaiting approval —
+/// `browse::thread_row`'s title rule.
+fn state_title_style(theme: &Theme, state: ContentState, base: Style) -> Style {
+    match state {
+        ContentState::Deleted => base.patch(theme.dim()).add_modifier(Modifier::CROSSED_OUT),
+        ContentState::Moderated => base.add_modifier(Modifier::ITALIC),
+        ContentState::Visible => base,
+    }
 }
 
 /// The panel a catalog draws into, plus the "nothing to draw yet" states
@@ -288,10 +322,18 @@ fn render_media_items(
         );
 
         let x = inner.x + text_x;
-        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
-            truncate(&item.title, text_w),
-            title_style,
-        ))];
+        let state = item.state();
+        let mut title_spans = Vec::new();
+        let mut title_w = text_w;
+        if let Some(chip) = state_chip(theme, state)
+            && chip.width() + 4 < text_w
+        {
+            title_w -= chip.width() + 1;
+            title_spans.push(chip);
+            title_spans.push(Span::raw(" "));
+        }
+        title_spans.push(Span::styled(truncate(&item.title, title_w), state_title_style(theme, state, title_style)));
+        let mut lines: Vec<Line<'static>> = vec![Line::from(title_spans)];
         let mut meta = item.username.clone();
         if item.media_date > 0 {
             if !meta.is_empty() {
@@ -450,7 +492,7 @@ pub fn render_resources(
                 }
                 meta.push_str(&fmt_age(r.resource_date));
             }
-            let mut lines = vec![catalog_line(theme, &title, &meta, w)];
+            let mut lines = vec![stated_catalog_line(theme, r.state(), &title, &meta, w)];
             if !r.tag_line.is_empty() {
                 lines.push(Line::from(Span::styled(
                     format!("   {}", truncate(&r.tag_line, w.saturating_sub(3))),
@@ -1701,6 +1743,67 @@ mod tests {
         let mut s = gallery();
         let act = media_list_key(&mut s, KeyEvent::from(KeyCode::Char('[')));
         assert!(matches!(act, Action::None), "page 1 has no previous page");
+    }
+
+    /// #127: a deleted or awaiting-approval gallery item or resource is
+    /// labelled the way a thread row is (#704) — the chip names the state
+    /// and the title is struck through (deleted) or italic (moderated) —
+    /// while a visible one carries neither.
+    #[test]
+    fn deleted_and_moderated_library_items_are_labelled() {
+        let theme = Theme::truecolor();
+        let draw = |f: &mut ratatui::Frame, which: u8| {
+            let mut hits = HitMap::default();
+            let area = f.area();
+            if which == 0 {
+                let mut s = gallery();
+                s.items[0].media_state = "deleted".into();
+                s.items[1].media_state = "moderated".into();
+                s.items.push(media(3, "Third shot"));
+                render_media_gallery(&mut s, f, area, &theme, &UNICODE, &mut hits);
+            } else {
+                let mut s = ResourceListState {
+                    items: vec![resource(1), resource(2), resource(3)],
+                    page: 1,
+                    last_page: 1,
+                    total: 3,
+                    ..Default::default()
+                };
+                s.items[0].resource_state = "deleted".into();
+                s.items[1].resource_state = "moderated".into();
+                render_resources(&mut s, f, area, &theme, &UNICODE, &mut hits);
+            }
+        };
+        for which in [0u8, 1] {
+            let mut term = Terminal::new(TestBackend::new(70, 24)).expect("terminal");
+            term.draw(|f| draw(f, which)).expect("draw");
+            let buf = term.backend().buffer().clone();
+            let row_of = |needle: &str| -> Option<u16> {
+                (0..24u16).find(|&y| (0..70u16).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().contains(needle))
+            };
+            let style_at = |needle: &str, nth: usize| -> Modifier {
+                let mut seen = 0;
+                for y in 0..24u16 {
+                    let row: String = (0..70u16).map(|x| buf[(x, y)].symbol().to_string()).collect();
+                    if let Some(col) = row.find(needle) {
+                        if seen == nth {
+                            let x = chrome::cell_width(&row[..col]) as u16;
+                            return buf[(x, y)].modifier;
+                        }
+                        seen += 1;
+                    }
+                }
+                panic!("{needle:?} #{nth} not drawn (view {which})");
+            };
+            let (first, second, third) = if which == 0 { ("First shot", "Second shot", "Third shot") } else { ("Handy tool", "Handy tool", "Handy tool") };
+            assert!(row_of(" deleted ").is_some(), "view {which}: no deleted chip");
+            assert!(row_of(" awaiting approval ").is_some(), "view {which}: no moderated chip");
+            assert_eq!(row_of(" deleted "), row_of(first), "view {which}: chip on the deleted item's row");
+            assert!(style_at(first, 0).contains(Modifier::CROSSED_OUT), "view {which}: deleted title struck");
+            assert!(style_at(second, if which == 0 { 0 } else { 1 }).contains(Modifier::ITALIC), "view {which}: moderated title italic");
+            let plain = style_at(third, if which == 0 { 0 } else { 2 });
+            assert!(!plain.contains(Modifier::CROSSED_OUT) && !plain.contains(Modifier::ITALIC), "view {which}: visible item unmarked");
+        }
     }
 
     /// The title never runs into the meta run and the row is exactly the

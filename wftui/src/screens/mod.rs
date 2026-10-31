@@ -295,6 +295,12 @@ pub struct ThreadViewState {
     /// "reply" — otherwise a draft is invisible from the one screen where you
     /// would look for it.
     pub has_draft: bool,
+    /// Who is reading (0 = nobody signed in) and whether they are staff, a
+    /// moderator or an admin — stamped each frame like `has_draft`. The API
+    /// sends no per-post solution flag, so the `S` gate (#122) is the thread
+    /// author or a moderator on a question thread that allows it.
+    pub viewer_id: u32,
+    pub viewer_moderates: bool,
     pub thread: Thread,
     /// Name of the forum the thread lives in, for the first line of the card
     /// stack. `Thread` carries only `node_id`, so the app resolves it from the

@@ -494,6 +494,13 @@ async fn relay_draft_operation(
     };
     match result {
         Ok(()) => { store.settle(owner, key, operation)?; Ok(false) }
+        // The relay will never mirror a draft for a target this member
+        // cannot see (forumtui#126): settle the obligation instead of
+        // retrying it every sync. The words stay in the local store.
+        Err(common::error::Error::Api { status: 403, code, .. }) if code == "wf_tuilink_draft_target_unavailable" => {
+            store.settle(owner, key, operation)?;
+            Ok(false)
+        }
         Err(error) if relay_route_missing(&error) => {
             // Missing transport is not an acknowledgment of the desired
             // state. Retain the obligation if the relay is installed later.
@@ -1223,6 +1230,7 @@ impl App {
                 for input in inputs {
                     match input {
                         crate::event::Input::Resize => {
+                            self.handle_resize();
                             let _ = terminal.clear();
                         }
                         crate::event::Input::Mouse(me) => {
@@ -1350,9 +1358,15 @@ impl App {
                 .contains_key(&common::drafts::DraftKey::ThreadReply(v.thread.thread_id)),
             _ => false,
         };
+        let viewer = self
+            .me
+            .as_ref()
+            .map(|me| (me.user_id, me.is_staff || me.is_moderator || me.is_admin))
+            .unwrap_or_default();
         let screen = self.screens.last_mut().expect("screen stack never empty");
         if let Screen::ThreadView(v) = screen {
             v.has_draft = draft_here;
+            (v.viewer_id, v.viewer_moderates) = viewer;
         }
         screen.set_site(&self.site);
         screen.set_image_policy(policy, self.images.sizes());
@@ -1540,6 +1554,18 @@ impl App {
                     continuation -= 1;
                     continue;
                 }
+                // The common cell (#28): one ASCII byte is one column and
+                // can be neither an image anchor nor a wide character, so
+                // it skips the unicode-width lookup — most of this pass's
+                // cost on a text-heavy frame.
+                let symbol = cell.symbol();
+                if symbol.len() == 1
+                    && symbol != "\u{1b}"
+                    && matches!(cell.diff_option, ratatui::buffer::CellDiffOption::None)
+                {
+                    row.push_str(symbol);
+                    continue;
+                }
                 // Image cells are not text: `ratatui-image` puts a whole
                 // escape payload in one anchor cell's symbol and marks the
                 // rest of the rect `Skip`. Copying either into the selection
@@ -1548,7 +1574,6 @@ impl App {
                 if is_image_cell(cell) {
                     row.push(' ');
                 } else {
-                    let symbol = cell.symbol();
                     row.push_str(symbol);
                     continuation = crate::chrome::cell_width(symbol).saturating_sub(1);
                 }
@@ -1749,6 +1774,18 @@ impl App {
         let gone = self.screens.pop();
         if relay && let Some(Screen::ThreadView(view)) = &gone {
             self.report_read(view);
+        }
+        // The keep-position hint belongs to the view that asked for it. If
+        // that view is gone before its reload landed, the next fresh open of
+        // the same thread and page would match it and jump to the old post
+        // instead of the top (#129).
+        if let Some(Screen::ThreadView(view)) = &gone {
+            let id = view.thread.thread_id;
+            if self.keep_thread_position.is_some_and(|(kid, ..)| kid == id)
+                && !self.screens.iter().any(|s| matches!(s, Screen::ThreadView(v) if v.thread.thread_id == id))
+            {
+                self.keep_thread_position = None;
+            }
         }
         // Esc used to destroy an unsent post outright (#715). Keep it instead
         // — Esc still closes instantly, so the ordinary empty-composer case
@@ -2920,9 +2957,20 @@ where
             Ok(link) => {
                 tx.send(Msg::LoginReady { generation, url: link.url.clone(), mode: LoginMode::TuiLink }).ok();
                 let _ = browser_opener(&link.url);
-                for _ in 0..300 {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    match common::oauth::poll_link(&http, &base, &link.id).await {
+                // The link lives 600 s on the server; poll until then, at
+                // the spacing `next_poll_delay` picks from the last answer
+                // — a 429's Retry-After or a doubling back-off, not a fixed
+                // 2 s straight through a rate limit (#112).
+                let poll_deadline = tokio::time::Instant::now() + LOGIN_TIMEOUT;
+                let mut delay = Duration::from_secs(2);
+                loop {
+                    if tokio::time::Instant::now() + delay > poll_deadline {
+                        break;
+                    }
+                    tokio::time::sleep(delay).await;
+                    let outcome = common::oauth::poll_link(&http, &base, &link.id).await;
+                    delay = common::oauth::next_poll_delay(delay, &outcome);
+                    match outcome {
                         Ok(common::oauth::PollStatus::Authorized(code)) => {
                             let tokens = common::oauth::exchange_code(
                                 &http,
@@ -3428,6 +3476,30 @@ mod tests {
         assert_eq!(app.status, "Logged out.");
     }
 
+    /// #128: a sign-in that completes while the sign-out's revokes are in
+    /// flight bumps the session generation; the revoke failure that lands
+    /// afterwards must still be said (persistently), not dropped as stale —
+    /// while a clean stale result stays silent and nothing else changes.
+    #[test]
+    fn a_revoke_failure_survives_a_quick_re_sign_in() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        let old_generation = app.session_generation;
+        app.session_generation = old_generation.wrapping_add(2); // end_session, then begin_session
+        app.logout_pending = false;
+        app.status = "Signed in as alice.".into();
+        app.handle_msg(Msg::LoggedOut { generation: old_generation, result: Ok(()) });
+        assert_eq!(app.status, "Signed in as alice.", "a clean stale result says nothing");
+        app.handle_msg(Msg::LoggedOut {
+            generation: old_generation,
+            result: Err("the server kept refresh token valid".into()),
+        });
+        assert!(app.status.contains("refresh token") && app.status.contains("local only"), "{:?}", app.status);
+        assert!(app.status_set_at.is_none(), "a persistent hint, not a toast");
+        assert!(!app.logout_pending, "the new session's state is untouched");
+        assert!(matches!(app.screens.last(), Some(Screen::Home(_))), "no screen is changed");
+    }
+
     /// Issue #537: a transient load failure must not be permanent. Once a
     /// later `ForumLoaded`/`ThreadLoaded` succeeds, `error` must clear so the
     /// panel goes back to drawing real content instead of the frozen
@@ -3928,6 +4000,9 @@ mod tests {
         drafts_deleted: std::sync::Mutex<Vec<String>>,
         drafts_remote: std::sync::Mutex<Vec<common::models::RemoteDraft>>,
         drafts_fail: std::sync::atomic::AtomicBool,
+        /// `save_draft` answers the relay's refusal for a target the
+        /// member cannot see (forumtui#126).
+        drafts_refuse_target: std::sync::atomic::AtomicBool,
         draft_delete_delay: Duration,
         draft_delete_calls: std::sync::atomic::AtomicUsize,
         draft_delete_fail_after_first: std::sync::atomic::AtomicBool,
@@ -4012,6 +4087,14 @@ mod tests {
         ) -> common::error::Result<()> {
             if self.drafts_fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(common::error::Error::NoToken);
+            }
+            if self.drafts_refuse_target.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(common::error::Error::Api {
+                    code: "wf_tuilink_draft_target_unavailable".into(),
+                    message: "You do not have permission to view this page or perform this action.".into(),
+                    status: 403,
+                    max_page: None,
+                });
             }
             self.drafts_saved.lock().expect("lock").push((
                 xf_key.to_string(),
@@ -4695,6 +4778,107 @@ mod tests {
                 assert!(mark_read, "the original mark_read intent must survive the retry");
             }
             _ => panic!("expected ConversationLoaded"),
+        }
+    }
+
+    /// #120: Ctrl+L on the first-run Setup screen has no session to end; it
+    /// must not bury Setup (and its typed fields) under a Login screen for
+    /// the placeholder site.
+    #[tokio::test]
+    async fn ctrl_l_on_the_setup_screen_keeps_setup() {
+        let mut app = test_app();
+        app.me = None;
+        app.push_screen(Screen::Setup(screens::setup::SetupState::default()));
+        if let Some(Screen::Setup(s)) = app.screens.last_mut() {
+            s.origin = "forum.example".into();
+        }
+        let before = app.screens.len();
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(app.screens.len(), before, "nothing pushed over Setup");
+        assert!(matches!(app.screens.last(), Some(Screen::Setup(_))), "Setup stays on top");
+        assert!(!app.screens.iter().any(|s| matches!(s, Screen::Login(_))));
+        let Some(Screen::Setup(s)) = app.screens.last() else { unreachable!() };
+        assert_eq!(s.origin, "forum.example", "typed fields survive");
+        assert!(app.status.contains("setup"), "{}", app.status);
+    }
+
+    /// #129: a keep-position hint whose thread view was popped before its
+    /// reload landed must not move a later, fresh open of the same thread
+    /// and page off the top.
+    #[tokio::test]
+    async fn a_popped_thread_views_position_hint_does_not_reach_the_next_open() {
+        let mut app = test_app();
+        let posts = |n: u32| (1..=n).map(|i| common::models::Post { post_id: i, ..Default::default() }).collect::<Vec<_>>();
+        let view = || Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 42, ..Default::default() },
+            page: 2,
+            posts: posts(5),
+            ..Default::default()
+        });
+        app.screens.push(screens::home_state(false));
+        app.push_screen(view());
+        app.keep_thread_position = Some((42, 2, 3, 12));
+        assert!(app.pop_screen());
+        assert!(app.keep_thread_position.is_none(), "the hint left with its view");
+
+        app.push_screen(view());
+        app.handle_msg(Msg::ThreadLoaded {
+            id: 42,
+            page: 2,
+            load_id: 0,
+            result: Ok(ThreadReply { thread: Thread { thread_id: 42, ..Default::default() }, posts: posts(5), ..Default::default() }),
+        });
+        let Some(Screen::ThreadView(v)) = app.screens.last() else { panic!("thread view") };
+        assert_eq!((v.sel_post, v.scroll), (0, 0), "a fresh open lands at the top");
+
+        // Popping some OTHER screen keeps a live view's hint.
+        app.keep_thread_position = Some((42, 2, 3, 12));
+        app.push_screen(screens::home_state(false));
+        assert!(app.pop_screen());
+        assert!(app.keep_thread_position.is_some());
+    }
+
+    /// #121: the clamp re-asks only when that is progress. A refusal of the
+    /// very page `max_page` names — or a max of 0 — used to reload forever
+    /// (each reply minting a fresh load_id) with the error never shown.
+    #[tokio::test]
+    async fn a_page_clamp_that_makes_no_progress_shows_the_error() {
+        for max in [Some(2), Some(0)] {
+            let mut app = test_app();
+            app.api = std::sync::Arc::new(RecordingApi::default());
+            app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread { thread_id: 42, ..Default::default() },
+                page: 2,
+                loading: true,
+                ..Default::default()
+            }));
+            app.screens.push(Screen::ConversationView(screens::ConversationViewState {
+                conversation: Conversation { conversation_id: 7, ..Default::default() },
+                page: 2,
+                loading: true,
+                ..Default::default()
+            }));
+            let refusal = || TaskError {
+                message: "The requested page could not be found.".into(),
+                code: Some("invalid_page".into()),
+                max_page: max,
+                kind: TaskErrorKind::Api(400),
+            };
+            app.handle_msg(Msg::ThreadLoaded { id: 42, page: 2, load_id: 0, result: Err(refusal()) });
+            app.handle_msg(Msg::ConversationLoaded { id: 7, page: 2, load_id: 0, mark_read: false, result: Err(refusal()) });
+            for s in &app.screens {
+                match s {
+                    Screen::ThreadView(v) => {
+                        assert!(!v.loading && v.error.is_some(), "max {max:?}: thread view must stop and say why");
+                    }
+                    Screen::ConversationView(v) => {
+                        assert!(!v.loading && v.error.is_some(), "max {max:?}: conversation must stop and say why");
+                    }
+                    _ => {}
+                }
+            }
+            let next = tokio::time::timeout(std::time::Duration::from_millis(300), app.rx.recv()).await;
+            assert!(next.is_err(), "max {max:?}: nothing may be re-requested");
         }
     }
 
@@ -7256,6 +7440,29 @@ mod tests {
             Some(Screen::Compose(c)) => assert_eq!(c.body, "survives a broken relay"),
             _ => panic!("expected a composer"),
         }
+    }
+
+    /// forumtui#126: the relay now refuses a draft for a target the member
+    /// cannot see. That refusal is final — the obligation is settled rather
+    /// than retried every sync — and the words stay in the local store.
+    #[tokio::test]
+    async fn a_relay_refusal_for_an_unviewable_target_settles_and_keeps_the_words() {
+        let api = Arc::new(RecordingApi::default());
+        api.drafts_refuse_target.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut app = test_app();
+        app.api = api.clone();
+        app.screens.push(screens::home_state(false));
+        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "kept here".into();
+        }
+        app.pop_screen();
+        finish_draft_relays(&app).await;
+        let key = common::drafts::DraftKey::ThreadReply(7);
+        assert!(app.draft_operations.lock().expect("lock").get(&key).is_none(), "the refusal settled the obligation");
+        let stored = app.draft_store.load(app.draft_owner.as_ref().expect("test owner"));
+        assert_eq!(stored.get(&key).map(|d| d.body.as_str()), Some("kept here"), "the words are still local");
+        assert!(api.drafts_saved.lock().expect("lock").is_empty());
     }
 
     /// Signing out clears this machine's drafts, but must NOT reach across
@@ -11125,6 +11332,47 @@ mod tests {
         assert!(app.images.request_state(&request).0, "the viewer takes the freed worker slot");
     }
 
+    /// #139: the disk cache keeps only bytes that decoded. A transient bad
+    /// 200 (HTML, a truncated body) is not stored, and an entry already on
+    /// disk that no longer decodes is evicted — so a retry reaches the
+    /// network instead of failing on the same cached bytes forever.
+    #[tokio::test]
+    #[cfg(feature="images")]
+    async fn a_body_that_does_not_decode_never_poisons_the_disk_cache() {
+        use wiremock::{Mock,MockServer,ResponseTemplate};
+        use wiremock::matchers::{method,path};
+        let server=MockServer::start().await;
+        let png=include_bytes!("../../assets/wf-logo.png").to_vec();
+        Mock::given(method("GET")).and(path("/flaky.png"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type","image/png").set_body_bytes(b"<html>busy</html>".to_vec()))
+            .up_to_n_times(1).mount(&server).await;
+        Mock::given(method("GET")).and(path("/flaky.png"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type","image/png").set_body_bytes(png.clone()))
+            .mount(&server).await;
+        let dir=std::env::temp_dir().join(format!("wftui-image-cache-poison-{}",std::process::id()));
+        let _=std::fs::remove_dir_all(&dir);
+        let client=common::api::WfApiClient::with_store(common::token::Store::with_path(dir.join("token.json")),server.uri(),"fixture-client").unwrap();
+        let disk=crate::images::DiskCache::with_dir(dir.join("cache"),32*1024*1024);
+        let slots=Arc::new(tokio::sync::Semaphore::new(1));
+        let src=format!("{}/flaky.png",server.uri());
+        let pending=crate::images::Pending{key:src.clone(),cols:12,rows:4,full:false};
+        let load=|| crate::images::load(&client,&disk,ratatui_image::picker::Picker::halfblocks(),&pending,slots.clone().try_acquire_owned().unwrap(),None);
+        assert!(load().await.is_err(),"the HTML body does not decode");
+        assert!(disk.get(&src).is_none(),"…and was not stored");
+        assert!(load().await.is_ok(),"the retry reached the network");
+        assert_eq!(disk.get(&src).as_deref(),Some(png.as_slice()),"a decoded body is stored");
+
+        // An entry already on disk that no longer decodes is evicted, and the
+        // next attempt fetches again.
+        disk.put(&src,b"truncated");
+        let before=server.received_requests().await.unwrap_or_default().len();
+        assert!(load().await.is_err(),"the cached bytes are bad");
+        assert!(disk.get(&src).is_none(),"…so they are evicted");
+        assert!(load().await.is_ok());
+        assert_eq!(server.received_requests().await.unwrap_or_default().len(),before+1,"exactly one refetch");
+        let _=std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     #[cfg(feature="images")]
     async fn viewer_gets_its_own_eight_mib_budget_after_thumbnail_rejection() {
@@ -11155,6 +11403,34 @@ mod tests {
         let Some(Screen::ImageView(view))=app.screens.last() else {panic!("viewer")};
         assert!(view.error.is_none(), "thumbnail failure must not become the viewer error");
         assert!(view.image_requests.iter().any(|r|r.full),"a thumbnail budget failure must not prevent the full-size request");
+    }
+
+    /// #136: after a resize, nothing measured off the old frame may act —
+    /// a click drained in the same input batch finds no hit, and a band
+    /// made before it is gone rather than re-clamped onto the new layout
+    /// and copied as unrelated text.
+    #[tokio::test]
+    async fn a_resize_invalidates_the_old_frames_hits_and_selection() {
+        let mut app = test_app();
+        app.screens.push(screens::home_state(false));
+        frame(&mut app, 100, 30);
+        let (x, y) = find_hit(&app, 100, 30, |h| matches!(h, Hit::Key("?"))).expect("the keys cap is drawn");
+        app.selection = Some(Selection { anchor: (0, 0), end: (20, 2) });
+        assert!(!app.extract_selection_text(0, 0, 20, 2).is_empty(), "the old frame had text");
+
+        app.handle_resize();
+        assert!(app.selection.is_none(), "the band went with its layout");
+        assert!(app.extract_selection_text(0, 0, 20, 2).is_empty(), "nothing stale to copy");
+        assert!(find_hit(&app, 100, 30, |_| true).is_none(), "no hit survives the resize");
+        assert!(app.status.contains("resized"), "{}", app.status);
+        let before = app.screens.len();
+        click(&mut app, x, y);
+        assert!(!app.show_help, "the old frame's cap did not fire");
+        assert_eq!(app.screens.len(), before);
+
+        // The next draw rebuilds everything.
+        frame(&mut app, 80, 24);
+        assert!(find_hit(&app, 80, 24, |h| matches!(h, Hit::Key("?"))).is_some());
     }
 
     /// Press and release in the same cell: a click.
@@ -12327,6 +12603,80 @@ mod tests {
             terminal.draw(|frame| app.draw(frame)).unwrap();
         }
         println!("thread view selection step (n, full rebuild): {:?}", start.elapsed() / 10);
+    }
+
+    /// #28's checklist, each item measured in isolation at a large 200x60
+    /// frame, so each one can be closed with a number rather than a guess:
+    /// the per-frame selection mirror (`capture_screen`), the header's crumb
+    /// fitting, the image paint pass over a screenful of requests, the
+    /// hit-map lookups a click or wheel costs, and the tokio runtime build
+    /// that start-up could overlap with the graphics probe.
+    #[test]
+    #[ignore = "manual release-mode frame benchmark"]
+    fn benchmark_issue_28_per_frame_overheads() {
+        const N: u32 = 200;
+        let mut app = test_app();
+        let posts: Vec<Post> = (0..20)
+            .map(|i| Post { post_id: 300 + i as u32, user_id: i as u32 + 1, username: format!("user{i}"), message: bench_post_body(i), ..Default::default() })
+            .collect();
+        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
+            thread: Thread { thread_id: 101, title: "Benchmark".into(), ..Default::default() },
+            forum_title: "Windows Help and Support".into(),
+            posts, page: 1, last_page: 1, total: 20, ..Default::default()
+        }));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 60)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..N { terminal.draw(|frame| app.draw(frame)).unwrap(); }
+        let frame_cost = start.elapsed() / N;
+        let mut capture = Duration::ZERO;
+        for _ in 0..N {
+            terminal.draw(|frame| {
+                app.draw(frame);
+                let t = std::time::Instant::now();
+                app.capture_screen(frame);
+                capture += t.elapsed();
+            }).unwrap();
+        }
+        println!("whole 200x60 thread-view frame: {frame_cost:?}; capture_screen alone: {:?}", capture / N);
+
+        let crumbs: Vec<String> = ["Forums", "Windows 11", "Windows 11 Help and Support", "Drivers and Hardware", "A very long thread title about update schedules", "page 3"]
+            .iter().map(|s| s.to_string()).collect();
+        let cx = crate::chrome::Chrome::builtin(&app.theme, &app.glyphs);
+        let start = std::time::Instant::now();
+        for _ in 0..N * 10 {
+            std::hint::black_box(crate::chrome::header_line_hits(&cx, &crumbs, Some("alice"), 5, 3, Some(812), Some("0.0.9"), 80));
+        }
+        println!("header row with 6 crumbs at 80 cols (all rungs): {:?}", start.elapsed() / (N * 10));
+
+        #[cfg(feature = "images")]
+        {
+            app.images.set_policy(crate::images::Policy { tier: crate::images::Tier::Halfblocks, font: (10, 20) });
+            let reqs: Vec<crate::images::Request> = (0..12u16)
+                .map(|i| crate::images::Request { key: format!("https://data.example/img/{i}.png"), rect: ratatui::layout::Rect::new(2, i * 4, 30, 4), full: i % 4 == 0 })
+                .collect();
+            let mut paint = Duration::ZERO;
+            for _ in 0..N {
+                terminal.draw(|frame| {
+                    let t = std::time::Instant::now();
+                    std::hint::black_box(app.images.paint(frame, &reqs));
+                    paint += t.elapsed();
+                }).unwrap();
+            }
+            println!("image paint pass, 12 requests: {:?}", paint / N);
+        }
+
+        let start = std::time::Instant::now();
+        for _ in 0..N * 10 {
+            for y in 0..60u16 { std::hint::black_box(app.hits.at(100, y)); }
+        }
+        println!("hit-map lookup (one per row, 60 rows): {:?}", start.elapsed() / (N * 10));
+
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            drop(tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap());
+        }
+        println!("tokio multi-thread runtime build: {:?}", start.elapsed() / 20);
     }
 
     /// The conversation view re-parses every message whenever the memo key

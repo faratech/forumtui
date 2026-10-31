@@ -484,6 +484,12 @@ impl DiskCache {
         std::fs::read(path).ok()
     }
 
+    /// Forget an entry whose bytes turned out not to be a picture (#139), so
+    /// the next attempt goes back to the network. Best effort.
+    pub fn remove(&self, url: &str) {
+        let _ = std::fs::remove_file(self.path_for(url));
+    }
+
     /// Best effort: a cache that cannot be written is a slower client, not a
     /// broken one.
     pub fn put(&self, url: &str, bytes: &[u8]) {
@@ -1116,10 +1122,16 @@ pub async fn load(
     // would let a second signed-in account bypass its own permission check;
     // ignore even legacy unscoped entries for the exact bearer-auth boundary.
     let cacheable = !client.image_uses_bearer(&pending.key);
-    let bytes = if pending.key == LOGO_KEY {
-        logo.ok_or_else(|| "this site has no logo".to_string())?.to_vec()
+    // Where the bytes came from decides what a decode failure means for the
+    // disk cache (#139): fetched bytes are stored only once they decoded,
+    // and cached bytes that no longer decode are evicted — the old order
+    // stored first, so one transient HTML or truncated 200 was served from
+    // disk forever and R/retry could never reach the network again.
+    enum Source { Logo, Disk, Network }
+    let (bytes, source) = if pending.key == LOGO_KEY {
+        (logo.ok_or_else(|| "this site has no logo".to_string())?.to_vec(), Source::Logo)
     } else if let Some(cached) = cacheable.then(|| disk.get(&pending.key)).flatten() {
-        cached
+        (cached, Source::Disk)
     } else {
         let fetched = client
             .fetch_bytes(
@@ -1128,16 +1140,22 @@ pub async fn load(
             )
             .await
             .map_err(|e| e.to_string())?;
-        if cacheable { disk.put(&pending.key, &fetched); }
-        fetched
+        (fetched, Source::Network)
     };
     let (cols, rows) = (pending.cols, pending.rows);
-    tokio::task::spawn_blocking(move || {
+    let (decoded, bytes) = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        decode(&picker, &bytes, cols, rows)
+        let decoded = decode(&picker, &bytes, cols, rows);
+        (decoded, bytes)
     })
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    match (&decoded, source) {
+        (Ok(_), Source::Network) if cacheable => disk.put(&pending.key, &bytes),
+        (Err(_), Source::Disk) => disk.remove(&pending.key),
+        _ => {}
+    }
+    decoded
 }
 
 #[cfg(not(feature = "images"))]
