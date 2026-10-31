@@ -38,7 +38,7 @@ pub fn render(src: &str) -> Vec<Chunk> {
         let trimmed = line.trim_start();
 
         if let Some(marker) = &fence {
-            if trimmed.starts_with(marker.as_str()) && trimmed[marker.len()..].trim().is_empty() {
+            if closes_fence(trimmed, marker) {
                 fence = None;
             } else {
                 push_text(&mut out, line, code_style());
@@ -126,6 +126,16 @@ fn fence_open(trimmed: &str) -> Option<String> {
     None
 }
 
+/// CommonMark's closing fence: the opening character, a run **at least**
+/// as long as the opening one, and nothing but whitespace after it. The
+/// first version required the exact opening length, so a ```` line closing
+/// a ``` fence was code text and swallowed the rest of the answer (#140).
+fn closes_fence(trimmed: &str, marker: &str) -> bool {
+    let Some(ch) = marker.chars().next() else { return false };
+    let run = trimmed.chars().take_while(|c| *c == ch).count();
+    run >= marker.chars().count() && trimmed[run * ch.len_utf8()..].trim().is_empty()
+}
+
 fn is_rule(trimmed: &str) -> bool {
     let t: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
     t.len() >= 3
@@ -143,7 +153,19 @@ fn heading(trimmed: &str) -> Option<(u8, &str)> {
     if !(rest.is_empty() || rest.starts_with(' ')) {
         return None;
     }
-    let text = rest.trim().trim_end_matches('#').trim_end();
+    // An optional closing sequence goes only when it IS one — a run of `#`
+    // preceded by a space (or making up the whole heading) and followed
+    // only by spaces. Otherwise the `#` is part of the text: `# Using C#`
+    // is about C#, not C (#141).
+    let text = rest.trim();
+    let before_closing = text.trim_end_matches('#');
+    let text = if before_closing.is_empty() {
+        ""
+    } else if before_closing.len() < text.len() && before_closing.ends_with([' ', '\t']) {
+        before_closing.trim_end()
+    } else {
+        text
+    };
     Some(((hashes as u8).min(3), text))
 }
 
@@ -671,6 +693,40 @@ mod tests {
         assert!(all.contains("Get-Item  C:\\*\n"), "the fence body is verbatim: {all}");
         assert!(!all.contains("```") && !all.contains("Sub ##"), "{all}");
         assert!(all.ends_with("after"), "{all:?}");
+    }
+
+    /// #140: a closing fence may be longer than the opening one; the line
+    /// is not code, and what follows it is prose again. A shorter run or a
+    /// run of the other character does not close.
+    #[test]
+    fn a_longer_closing_fence_closes_the_block() {
+        let chunks = render("```\nGet-Item\n````\nafter **bold**");
+        assert!(styled(&chunks, "Get-Item").code);
+        assert!(!styled(&chunks, "after").code, "{chunks:?}");
+        assert!(styled(&chunks, "bold").bold);
+        assert!(!texts(&chunks).contains('`'), "{}", texts(&chunks));
+        let chunks = render("````\n```\n~~~~\nstill code");
+        assert!(styled(&chunks, "still code").code, "a shorter or foreign run does not close: {chunks:?}");
+        assert!(texts(&chunks).contains("```\n~~~~\n"), "{}", texts(&chunks));
+        let chunks = render("~~~\nx\n~~~~~   \ny");
+        assert!(!styled(&chunks, "y").code);
+    }
+
+    /// #141: only a real closing sequence (space before, nothing after) is
+    /// stripped from a heading; a `#` that is part of the title stays.
+    #[test]
+    fn a_heading_keeps_a_trailing_hash_that_is_part_of_its_text() {
+        let heading_text = |md: &str| {
+            let chunks = render(md);
+            assert!(chunks.iter().all(|c| !matches!(c, Chunk::Text(t, s) if !t.trim().is_empty() && s.heading.is_none())), "{md}: {chunks:?}");
+            texts(&chunks)
+        };
+        assert_eq!(heading_text("# Using C#"), "Using C#");
+        assert_eq!(heading_text("## F# and C# ##"), "F# and C#");
+        assert_eq!(heading_text("# Release 1.0 ##"), "Release 1.0");
+        assert_eq!(heading_text("## Sub ##   "), "Sub");
+        assert_eq!(heading_text("# foo#bar"), "foo#bar");
+        assert_eq!(render("### ###"), Vec::<Chunk>::new(), "an all-closing heading is empty");
     }
 
     #[test]

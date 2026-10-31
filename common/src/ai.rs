@@ -158,6 +158,12 @@ pub struct SseParser {
     /// Whether any answer text arrived, for the `*.done` events that carry
     /// the whole text only as a fallback.
     has_text: bool,
+    /// Local function calls whose arguments are complete (`output_item.done`)
+    /// but whose step is still shown as running: the backend executes them
+    /// only after that event, as the web client notes, so the step finishes
+    /// when the next model round starts, when answer text arrives, or at the
+    /// end of the turn — never at `output_item.done` itself (#117).
+    held_calls: Vec<String>,
 }
 
 impl SseParser {
@@ -235,6 +241,7 @@ impl SseParser {
         }
         if data == "[DONE]" {
             self.done = true;
+            self.release_held_calls(out);
             out.push(AiEvent::Completed);
             return;
         }
@@ -244,6 +251,15 @@ impl SseParser {
             return;
         };
         self.event(&v, out);
+    }
+
+    /// Mark every held function-call step finished (#117).
+    fn release_held_calls(&mut self, out: &mut Vec<AiEvent>) {
+        out.extend(
+            self.held_calls
+                .drain(..)
+                .map(|id| AiEvent::Progress { id, label: String::new(), done: true }),
+        );
     }
 
     fn event(&mut self, v: &serde_json::Value, out: &mut Vec<AiEvent>) {
@@ -293,9 +309,13 @@ impl SseParser {
                 self.done = true;
                 out.push(failed("response_incomplete", reason, true));
             }
+            // A new model round starts only after the previous round's
+            // local functions ran and their output was sent back.
+            "response.created" | "response.id" => self.release_held_calls(out),
             "response.output_text.delta" | "response.refusal.delta" => {
                 let delta = text_of("delta");
                 if !delta.is_empty() {
+                    self.release_held_calls(out);
                     self.has_text = true;
                     out.push(AiEvent::Delta(delta));
                 }
@@ -320,6 +340,7 @@ impl SseParser {
             }
             "chat.stream.completed" => {
                 self.done = true;
+                self.release_held_calls(out);
                 out.push(AiEvent::Completed);
             }
             "response.output_item.added" => {
@@ -336,10 +357,17 @@ impl SseParser {
             }
             "response.output_item.done" => {
                 let item = v.get("item");
+                let id = item.map(|i| str_at(i, "id")).filter(|id| !id.is_empty());
                 if item.map(|i| str_at(i, "type")) == Some("function_call") {
+                    // Arguments complete; execution has not started. Hold
+                    // the step until it has (#117) — returning here alone
+                    // left it running for the rest of the turn.
+                    if let Some(id) = id {
+                        self.held_calls.push(id.into());
+                    }
                     return;
                 }
-                if let Some(id) = item.map(|i| str_at(i, "id")).filter(|id| !id.is_empty()) {
+                if let Some(id) = id {
                     out.push(AiEvent::Progress { id: id.into(), label: String::new(), done: true });
                 }
             }
@@ -566,6 +594,29 @@ mod tests {
         for size in [1, 2, 3, 7, 64, 1000] {
             assert_eq!(parse_in_chunks(FIXTURE.as_bytes(), size), whole, "chunk size {size}");
         }
+    }
+
+    /// #117: a local function call's step is held past `output_item.done`
+    /// (execution starts only then) and finishes when the next round
+    /// starts, when answer text arrives, or at the end of the turn.
+    #[test]
+    fn function_call_steps_finish_once_the_call_has_run() {
+        let added = r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","name":"searchThreads"}}"#;
+        let done = r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","name":"searchThreads"}}"#;
+        let delta = r#"data: {"type":"response.output_text.delta","delta":"Hi"}"#;
+        let created = r#"data: {"type":"response.created","response":{"id":"resp_2"}}"#;
+        let completed = r#"data: {"type":"chat.stream.completed"}"#;
+        let step = |done| AiEvent::Progress { id: "fc_1".into(), label: if done { String::new() } else { "Searching threads".into() }, done };
+        let run = |frames: &[&str]| parse_in_chunks(frames.iter().map(|f| format!("{f}\n\n")).collect::<String>().as_bytes(), 7);
+
+        assert_eq!(run(&[added, done, created, delta, completed]),
+            vec![step(false), step(true), AiEvent::Delta("Hi".into()), AiEvent::Completed]);
+        assert_eq!(run(&[added, done, delta, completed]),
+            vec![step(false), step(true), AiEvent::Delta("Hi".into()), AiEvent::Completed]);
+        assert_eq!(run(&[added, done, completed]), vec![step(false), step(true), AiEvent::Completed]);
+        // Not before the call's arguments are complete.
+        assert_eq!(run(&[added, delta]).first(), Some(&step(false)));
+        assert!(!run(&[added, delta]).contains(&step(true)));
     }
 
     #[test]

@@ -45,6 +45,9 @@ impl VerifiedSession {
 
 pub struct WfApiClient {
     http: reqwest::Client,
+    /// `fetch_bytes`'s client for every URL outside our own API: no bearer,
+    /// and no non-public destination except the forum's own host (#130).
+    image_http: reqwest::Client,
     tokens: Mutex<Option<TokenSet>>,
     store: token::Store,
     requests_paused: AtomicBool,
@@ -153,8 +156,10 @@ impl WfApiClient {
             }
             other => other,
         };
+        let own_host = own_host_of(&base_url);
         Ok(WfApiClient {
             http: crate::http::build_with_ua(user_agent)?,
+            image_http: crate::http::build_public_with_ua(user_agent, own_host)?,
             tokens: Mutex::new(tokens),
             store,
             requests_paused: AtomicBool::new(false),
@@ -260,7 +265,7 @@ impl WfApiClient {
             }
         };
         Ok(Some(Self {
-            http: self.http.clone(), tokens: Mutex::new(Some(current)),
+            http: self.http.clone(), image_http: self.image_http.clone(), tokens: Mutex::new(Some(current)),
             store: self.store.clone(), requests_paused: AtomicBool::new(false),
             recovery_source: Some(stored), recovery_tokens: self.recovery_tokens.clone(),
             base: self.base.clone(), client_id: self.client_id.clone(),
@@ -763,13 +768,26 @@ impl WfApiClient {
         // `fetch_bytes_sends_the_token_only_to_our_own_api` pins both halves
         // — an image URL is attacker-influenced (a post can carry any
         // `[IMG]`), so a looser rule would hand the grant to whoever asked.
-        let mut req = self.http.get(url);
-        if self.image_uses_bearer(url) {
-            req = req.bearer_auth(self.dispatch_token(&[&self.image_gate]).await?);
+        //
+        // For the same reason everything else goes through `image_http`,
+        // which refuses non-public destinations (#130): the request itself
+        // is the attack, before any body is read — an `[IMG]` of
+        // `http://169.254.169.254/…` or `http://192.168.1.1/reboot` used to
+        // be sent the moment the post scrolled into view.
+        let req = if self.image_uses_bearer(url) {
+            self.http.get(url).bearer_auth(self.dispatch_token(&[&self.image_gate]).await?)
         } else {
+            let parsed = reqwest::Url::parse(url)
+                .map_err(|e| Error::FetchRejected(format!("unparseable image URL {url:?}: {e}")))?;
+            crate::http::check_public_url(&parsed, own_host_of(&self.base).as_deref())
+                .map_err(|refusal| Error::FetchRejected(refusal.0))?;
             self.image_gate.wait().await;
-        }
-        let response = req.send().await?;
+            self.image_http.get(parsed)
+        };
+        let response = req.send().await.map_err(|e| match crate::http::non_public_refusal(&e) {
+            Some(refusal) => Error::FetchRejected(refusal.0.clone()),
+            None => Error::Http(e),
+        })?;
         if !response.status().is_success() {
             let err = check_status(response).await.expect_err("non-success response must be an error");
             self.note_rate_limit(&err, &[&self.image_gate]);
@@ -825,6 +843,12 @@ impl WfApiClient {
             && target.port_or_known_default() == api.port_or_known_default()
             && target.path().starts_with(api.path())
     }
+}
+
+/// The forum's own host, as the URL parser normalises it — the one host
+/// `fetch_bytes`'s non-public guard exempts (#130).
+fn own_host_of(base: &str) -> Option<String> {
+    reqwest::Url::parse(base).ok().and_then(|u| u.host_str().map(str::to_owned))
 }
 
 pub(crate) async fn check_status(resp: reqwest::Response) -> Result<()> {
@@ -1192,8 +1216,19 @@ impl WfApi for WfApiClient {
             return Err(err);
         }
         let mut parser = crate::ai::SseParser::new();
+        // chat.php refuses inside a 200 stream too (an `error` frame with
+        // `retry_after`): that wait must hold the AI lane exactly like the
+        // pre-stream 429's Retry-After does (#113), or the next question is
+        // sent after the ordinary 3 s spacing and refused again. Only the AI
+        // lane: the forum API was not what refused.
+        let hold_ai_lane = |event: &crate::ai::AiEvent| {
+            if let crate::ai::AiEvent::Failed { retry_after: Some(wait), .. } = event {
+                self.ai_gate.penalize(*wait);
+            }
+        };
         while let Some(chunk) = resp.chunk().await? {
             for event in parser.push(&chunk) {
+                hold_ai_lane(&event);
                 if events.send(event).is_err() {
                     return Ok(());
                 }
@@ -1203,6 +1238,7 @@ impl WfApi for WfApiClient {
             }
         }
         for event in parser.finish() {
+            hold_ai_lane(&event);
             let _ = events.send(event);
         }
         Ok(())
@@ -2215,6 +2251,29 @@ mod tests {
         let err = c.ask_ai(&ai_request(), tx).await.expect_err("429");
         assert!(matches!(err, Error::RateLimited { retry_after: Some(d) } if d == Duration::from_secs(9)), "{err:?}");
         assert!(c.ai_gate.pending_wait() >= Duration::from_secs(8));
+    }
+
+    /// #113: a refusal inside the stream (chat.php's `error` frame with
+    /// `retry_after`, under a 200) holds the AI lane for that long too — the
+    /// old path only displayed the wait. The API lane is untouched.
+    #[tokio::test]
+    async fn an_in_stream_rate_limit_holds_the_ai_lane() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-askai-stream-429");
+        Mock::given(method("POST"))
+            .and(path("/api/wf-tui-ai"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"type\":\"error\",\"code\":\"rate_limited\",\"detail\":\"Slow down\",\"status_code\":429,\"retry_after\":60}\n\n",
+                "text/event-stream",
+            ))
+            .mount(&server)
+            .await;
+        let c = logged_in_client("tok-1").await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        c.ask_ai(&ai_request(), tx).await.unwrap();
+        assert!(matches!(rx.recv().await, Some(crate::ai::AiEvent::Failed { retry_after: Some(d), .. }) if d == Duration::from_secs(60)));
+        assert!(c.ai_gate.pending_wait() >= Duration::from_secs(55), "{:?}", c.ai_gate.pending_wait());
+        assert!(c.api_gate.pending_wait() < Duration::from_secs(5), "navigation is not held: {:?}", c.api_gate.pending_wait());
     }
 
     /// The relay reports chat.php's refusals in XF's envelope with
@@ -3712,6 +3771,65 @@ mod tests {
         match c.fetch_bytes(&url, 1024).await.unwrap_err() {
             Error::FetchRejected(msg) => assert!(msg.contains("1024"), "{msg}"),
             other => panic!("wrong error: {other}"),
+        }
+    }
+
+    /// #130: an `[IMG]` is fetched as soon as its post is on screen, so the
+    /// URL a post names must not be able to aim this machine at its own
+    /// loopback, its LAN or a metadata endpoint. The forum here is
+    /// `forum.example`, so the wiremock server on 127.0.0.1 is a *third
+    /// party* — and must never see a request, in any spelling.
+    #[tokio::test]
+    async fn fetch_bytes_refuses_non_public_destinations_named_by_content() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold("https://forum.example", "/tmp/wftui-t-fetch-ssrf");
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(vec![0x89u8, b'P', b'N', b'G'], "image/png"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let port = server.address().port();
+        let c = logged_in_client("tok-1").await;
+        for url in [
+            format!("http://127.0.0.1:{port}/probe.png"),
+            format!("http://localhost:{port}/probe.png"),
+            format!("http://LOCALHOST.:{port}/probe.png"),
+            format!("http://[::1]:{port}/probe.png"),
+            format!("http://[::ffff:127.0.0.1]:{port}/probe.png"),
+            format!("http://2130706433:{port}/probe.png"),
+            format!("http://0x7f.1:{port}/probe.png"),
+            "http://169.254.169.254/latest/meta-data/".to_string(),
+            "https://192.168.1.1/reboot.png".to_string(),
+            "http://10.0.0.1/x.png".to_string(),
+            "http://[fd00::1]/x.png".to_string(),
+            "http://0.0.0.0/x.png".to_string(),
+            "ftp://example.com/x.png".to_string(),
+        ] {
+            match c.fetch_bytes(&url, 1024).await {
+                Err(Error::FetchRejected(msg)) => assert!(msg.contains("refusing"), "{url}: {msg}"),
+                other => panic!("{url} must be refused before it is sent, got {other:?}"),
+            }
+        }
+        // `expect(0)` is verified when the server drops: nothing arrived.
+    }
+
+    /// #130, the redirect half: a public URL (here the forum's own host,
+    /// which is exempt) cannot 302 the fetch onto a non-public address. The
+    /// old policy followed any https hop.
+    #[tokio::test]
+    async fn fetch_bytes_refuses_a_redirect_onto_a_non_public_address() {
+        let server = MockServer::start().await;
+        let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-fetch-ssrf-hop");
+        Mock::given(method("GET"))
+            .and(path("/data/hop.png"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", "https://169.254.169.254/latest/meta-data/"))
+            .mount(&server)
+            .await;
+        let c = logged_in_client("tok-1").await;
+        let url = format!("{}/data/hop.png", server.uri());
+        match c.fetch_bytes(&url, 1024).await {
+            Err(Error::FetchRejected(msg)) => assert!(msg.contains("169.254.169.254"), "{msg}"),
+            other => panic!("the hop must be refused, got {other:?}"),
         }
     }
 

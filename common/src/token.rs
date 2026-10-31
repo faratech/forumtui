@@ -131,26 +131,56 @@ impl Store {
         let body = serde_json::to_vec_pretty(tokens)?;
 
         let tmp = tmp_sibling(&self.path);
-        {
-            #[allow(unused_mut)]
-            let mut opts = std::fs::OpenOptions::new();
-            #[cfg(unix)]
+        // The temp file holds the whole grant — access AND 90-day refresh
+        // token — so a write or rename that fails must not leave it behind
+        // (#111). `drafts.rs` already did this; the token store did not.
+        let result = (|| {
             {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
+                #[allow(unused_mut)]
+                let mut opts = std::fs::OpenOptions::new();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                let mut f = opts
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp)
+                    .map_err(|e| Error::TokenStore(format!("cannot write {}: {e}", tmp.display())))?;
+                f.write_all(&body)?;
+                f.sync_all().ok();
             }
-            let mut f = opts
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-                .map_err(|e| Error::TokenStore(format!("cannot write {}: {e}", tmp.display())))?;
-            f.write_all(&body)?;
-            f.sync_all().ok();
+            #[cfg(unix)]
+            restrict_permissions(&tmp);
+            std::fs::rename(&tmp, &self.path)
+                .map_err(|e| Error::TokenStore(format!("cannot finalize {}: {e}", self.path.display())))
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
-        #[cfg(unix)]
-        restrict_permissions(&tmp);
-        std::fs::rename(&tmp, &self.path)
-            .map_err(|e| Error::TokenStore(format!("cannot finalize {}: {e}", self.path.display())))
+        result
+    }
+
+    /// Remove `token.json.tmp.<pid>.<seq>` files a write left behind — a
+    /// process killed between writing its temp file and renaming it leaves
+    /// one no error path can clean (#111). Called with the store lock held,
+    /// and every writer writes its temp file under that same lock, so any
+    /// temp file seen here is an orphan, never a sibling's write in flight.
+    /// Best effort: sign-out must not fail because a stray file would not go.
+    fn remove_orphan_temps(&self) {
+        let (Some(dir), Some(prefix)) = (
+            self.path.parent(),
+            sibling_with_suffix(&self.path, "tmp").file_name().map(|n| format!("{}.", n.to_string_lossy())),
+        ) else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 
     /// Publish a verified recovery snapshot only if a sibling has not replaced
@@ -177,6 +207,7 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e.into()),
         };
+        self.remove_orphan_temps();
         if &current != expected { return Ok(false); }
         std::fs::remove_file(&self.path)?;
         Ok(true)
@@ -187,6 +218,7 @@ impl Store {
             return Ok(());
         }
         let _lock = lock_store(&self.path)?;
+        self.remove_orphan_temps();
         match std::fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -406,6 +438,39 @@ mod tests {
             expires_at: 1_800_000_000,
             scope: "node:read".into(),
         }
+    }
+
+    /// #111: a save that fails after the temp file was written (here the
+    /// rename, onto a directory) must not leave the grant on disk, and a
+    /// sign-out sweeps any orphan a killed process left behind.
+    #[test]
+    fn failed_save_and_sign_out_leave_no_secret_bearing_temp_file() {
+        let dir = std::env::temp_dir().join(format!("wftui-token-orphan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("token.json");
+        std::fs::create_dir_all(path.join("occupied")).unwrap();
+        let store = Store::with_path(path.clone());
+        assert!(store.save(&sample()).is_err(), "rename onto a non-empty directory must fail");
+        let temps = |dir: &std::path::Path| -> Vec<String> {
+            std::fs::read_dir(dir).unwrap().flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("token.json.tmp."))
+                .collect()
+        };
+        assert!(temps(&dir).is_empty(), "failed save left {:?}", temps(&dir));
+
+        std::fs::remove_dir_all(&path).unwrap();
+        // What a process killed between write and rename leaves behind.
+        std::fs::write(dir.join("token.json.tmp.4242.0"), b"{\"refresh_token\":\"rt\"}").unwrap();
+        std::fs::write(dir.join("unrelated.tmp.1"), b"keep").unwrap();
+        store.erase().unwrap();
+        assert!(temps(&dir).is_empty(), "sign-out left {:?}", temps(&dir));
+        assert!(dir.join("unrelated.tmp.1").exists(), "only this store's temp files go");
+        std::fs::write(dir.join("token.json.tmp.4242.1"), b"{}").unwrap();
+        store.save(&sample()).unwrap();
+        assert!(!store.erase_if_matches(&TokenSet { access_token: "other".into(), ..sample() }).unwrap());
+        assert!(temps(&dir).is_empty(), "a conditional sign-out sweeps too");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

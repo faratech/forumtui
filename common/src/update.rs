@@ -51,6 +51,11 @@ pub const MAX_BINARY_BYTES: usize = 64 * 1024 * 1024;
 /// The one checksum asset a release carries, covering every other asset.
 pub const SUMS_ASSET: &str = "SHA256SUMS.txt";
 pub const MAX_SUMS_BYTES: usize = 64 * 1024;
+/// `releases/latest` is release notes plus one entry per asset — the
+/// captured fixture is ~12 KiB. 1 MiB is generous and still far below what a
+/// hostile or broken `WFTUI_UPDATE_URL` could otherwise make a background
+/// check buffer (#119).
+pub const MAX_FEED_BYTES: usize = 1024 * 1024;
 /// A `.stage-*` directory older than this belongs to a process that died
 /// mid-write; it is removed on the next pass.
 const ABANDONED_STAGE_AGE: Duration = Duration::from_secs(60 * 60);
@@ -194,26 +199,24 @@ impl Target {
     /// The platform this binary was built for, or `None` where no release
     /// asset exists (macOS, a BSD, a 32-bit Linux) and the updater stays off.
     pub fn host() -> Option<Target> {
-        if cfg!(target_os = "linux") {
-            if cfg!(target_arch = "x86_64") {
-                Some(Target::LinuxX86_64)
-            } else if cfg!(target_arch = "aarch64") {
-                Some(Target::LinuxAarch64)
-            } else {
-                None
-            }
-        } else if cfg!(target_os = "windows") {
-            if cfg!(target_arch = "x86_64") {
-                Some(Target::WindowsX64)
-            } else if cfg!(target_arch = "x86") {
-                Some(Target::WindowsX86)
-            } else if cfg!(target_arch = "aarch64") {
-                Some(Target::WindowsArm64)
-            } else {
-                None
-            }
-        } else {
-            None
+        Self::released_for(std::env::consts::OS, std::env::consts::ARCH)
+    }
+
+    /// The release asset a platform (`std::env::consts` spelling) has, if
+    /// any — exactly what `release-binaries.yml` builds: Linux x86_64 and
+    /// Windows x64/x86/arm64. Linux aarch64 has a `Target` (its staged
+    /// generations still parse) but no asset, so it is `None` here, as
+    /// README and `packaging/install.sh` already say; enabling it made every
+    /// `g u` on such a build fail with "release has no asset" instead of
+    /// skipping cleanly (#131). Add it back in the same change that adds
+    /// the asset to the workflow.
+    pub fn released_for(os: &str, arch: &str) -> Option<Target> {
+        match (os, arch) {
+            ("linux", "x86_64") => Some(Target::LinuxX86_64),
+            ("windows", "x86_64") => Some(Target::WindowsX64),
+            ("windows", "x86") => Some(Target::WindowsX86),
+            ("windows", "aarch64") => Some(Target::WindowsArm64),
+            _ => None,
         }
     }
 
@@ -950,7 +953,7 @@ async fn fetch_capped(
             )));
         }
     }
-    let mut resp = client
+    let resp = client
         .get(url)
         .header(reqwest::header::ACCEPT, "application/octet-stream")
         .timeout(timeout)
@@ -959,6 +962,13 @@ async fn fetch_capped(
     if !resp.status().is_success() {
         return Err(feed_error(resp, what).await);
     }
+    read_capped(resp, max_bytes, what).await
+}
+
+/// A success body under a hard cap: refused at `Content-Length`, and again
+/// at the running total, so a body that lies about (or omits) its length is
+/// never buffered past `max_bytes`.
+async fn read_capped(mut resp: reqwest::Response, max_bytes: usize, what: &str) -> Result<Vec<u8>> {
     if let Some(len) = resp.content_length()
         && len as usize > max_bytes
     {
@@ -1010,7 +1020,9 @@ pub async fn check_and_stage(cfg: &UpdateConfig, force: bool) -> Result<Outcome>
     if !resp.status().is_success() {
         return Err(feed_error(resp, "release feed").await);
     }
-    let release: Release = serde_json::from_slice(&resp.bytes().await?)?;
+    // Streamed under a cap like every other body in this flow (#119): the
+    // feed is off-origin and runs unasked in the background.
+    let release: Release = serde_json::from_slice(&read_capped(resp, MAX_FEED_BYTES, "release feed").await?)?;
     if release.draft || release.prerelease {
         return Ok(Outcome::UpToDate { latest: cfg.current_version.to_string() });
     }
@@ -1148,6 +1160,50 @@ mod tests {
         assert!(!r.draft && !r.prerelease);
         assert!(r.assets.iter().any(|a| a.name.ends_with(".exe") && a.size > 0));
         assert!(r.assets.iter().all(|a| a.browser_download_url.starts_with("https://")));
+    }
+
+    /// #131: the updater is on exactly where a release asset exists. The
+    /// workflow builds no Linux aarch64 binary, so that platform skips.
+    #[test]
+    fn the_updater_targets_only_platforms_a_release_builds() {
+        assert_eq!(Target::released_for("linux", "x86_64"), Some(Target::LinuxX86_64));
+        assert_eq!(Target::released_for("linux", "aarch64"), None, "no linux-aarch64 asset is built");
+        assert_eq!(Target::released_for("windows", "x86_64"), Some(Target::WindowsX64));
+        assert_eq!(Target::released_for("windows", "x86"), Some(Target::WindowsX86));
+        assert_eq!(Target::released_for("windows", "aarch64"), Some(Target::WindowsArm64));
+        assert_eq!(Target::released_for("macos", "aarch64"), None);
+        assert_eq!(Target::released_for("linux", "x86"), None);
+        // Every platform the updater targets is one the workflow publishes.
+        let workflow = include_str!("../../.github/workflows/release-binaries.yml");
+        for (os, arch) in [("linux", "x86_64"), ("linux", "aarch64"), ("windows", "x86_64"), ("windows", "x86"), ("windows", "aarch64")] {
+            if let Some(t) = Target::released_for(os, arch) {
+                let tag = t.arch_tag();
+                // Linux assets are uploaded by glob; Windows ones are named by
+                // the packaging script and listed in the release notes.
+                let published = match tag.strip_prefix("windows-") {
+                    Some(arch) => workflow.contains("wftui-*-windows-{x64,x86,arm64}.exe") && ["x64", "x86", "arm64"].contains(&arch),
+                    None => workflow.contains(&format!("dist/wftui-*-{tag}")),
+                };
+                assert!(published, "{tag} is targeted but release-binaries.yml does not publish it");
+            }
+        }
+    }
+
+    /// #132 (and #78): the MSIX manifest template is BOM-less UTF-8 with
+    /// em dashes in it, and Windows PowerShell 5.1 reads and writes the
+    /// ANSI code page by default — so both the read and the write must pin
+    /// utf8, or the package carries silent mojibake.
+    #[test]
+    fn the_msix_manifest_is_read_and_written_as_utf8() {
+        let script = include_str!("../../packaging/msix/build-msix.ps1");
+        let template = include_str!("../../packaging/msix/AppxManifest.template.xml");
+        assert!(!template.starts_with('\u{feff}') && template.contains('\u{2014}'), "the case this guards: BOM-less, non-ASCII");
+        let reads: Vec<&str> = script.lines().filter(|l| l.contains("Get-Content $ManifestTemplate")).collect();
+        let writes: Vec<&str> = script.lines().filter(|l| l.contains("Set-Content") && l.contains("AppxManifest.xml")).collect();
+        assert!(!reads.is_empty() && !writes.is_empty());
+        for line in reads.iter().chain(&writes) {
+            assert!(line.contains("-Encoding utf8"), "unpinned encoding: {line}");
+        }
     }
 
     #[test]
@@ -1737,6 +1793,38 @@ mod tests {
         assert_eq!(apply_pending_update(&cfg), ApplyOutcome::Applied("0.0.2".into()));
         assert_eq!(std::fs::read(&f.exe).unwrap(), f.body);
         let _ = std::fs::remove_dir_all(&f.root);
+    }
+
+    /// #119: the feed body is streamed under `MAX_FEED_BYTES` like the sums
+    /// and the binary — a huge body (with or without a Content-Length) is
+    /// refused, never buffered whole and parsed.
+    #[tokio::test]
+    async fn an_oversized_feed_body_is_refused_not_buffered() {
+        let server = MockServer::start().await;
+        let root = scratch("feed-cap");
+        let exe = root.join("bin").join(host().binary_name());
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, synthetic_binary(host(), 0)).unwrap();
+        // Valid JSON the old code would have parsed and acted on.
+        let padded = format!(r#"{{"tag_name":"v0.0.2","html_url":"https://example.invalid","body":"{}","assets":[]}}"#, "x".repeat(MAX_FEED_BYTES));
+        Mock::given(method("GET"))
+            .and(path("/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(padded.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/chunked"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Transfer-Encoding", "chunked").set_body_string(padded))
+            .mount(&server)
+            .await;
+        for feed_path in ["latest", "chunked"] {
+            let cfg = cfg_at(&root.join("update"), &exe, &format!("{}/{feed_path}", server.uri()));
+            match check_and_stage(&cfg, true).await {
+                Err(Error::FetchRejected(msg)) => assert!(msg.contains("release feed"), "{msg}"),
+                other => panic!("{feed_path}: an oversized feed must be refused, got {other:?}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The feed is not our origin: no bearer, ever — and the house UA, which

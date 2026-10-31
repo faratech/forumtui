@@ -199,7 +199,24 @@ async fn wait_for_redirect_with(
             }
             let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
             let params = parse_query(query);
+            let state_ok = params.get("state").map(|s| s == expected_state) == Some(true);
             if let Some(err) = params.get("error") {
+                // An error ends the login only when it carries this flow's
+                // state, exactly like a code does (#110). XF's deny redirect
+                // always sends it (`OAuth2Controller::actionDeny`); a bare
+                // `?error=access_denied` from any local process or a stale
+                // tab is noise, and must not kill the approval still in
+                // flight in the real browser — the same rule as the
+                // mismatched-state arm below (#775).
+                if !state_ok {
+                    respond(
+                        &mut stream,
+                        400,
+                        "<html><body>State mismatch; return to the terminal and retry.</body></html>",
+                    )
+                    .await;
+                    continue;
+                }
                 let desc = params.get("error_description").cloned().unwrap_or_default();
                 respond(
                     &mut stream,
@@ -209,7 +226,6 @@ async fn wait_for_redirect_with(
                 .await;
                 return Err(Error::Handshake(format!("authorization denied: {err} {desc}")));
             }
-            let state_ok = params.get("state").map(|s| s == expected_state) == Some(true);
             let code = params.get("code").cloned().filter(|c| !c.is_empty());
             match (state_ok, code) {
                 (true, Some(code)) => {
@@ -462,8 +478,15 @@ pub async fn poll_link(client: &reqwest::Client, base: &str, id: &str) -> Result
         .post(url)
         .json(&serde_json::json!({"id": id}))
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    // Classified like every `WfApiClient` call (#112): a 429 keeps its
+    // `Retry-After` (`Error::RateLimited`) so the poll loop can hold off
+    // for as long as the server asked, and an XF envelope keeps its code.
+    // `error_for_status` reduced both to a bare `Error::Http`, and the loop
+    // went on polling every 2 s straight through the limit.
+    if !resp.status().is_success() {
+        return Err(crate::api::error_from_response(resp).await);
+    }
     let body = resp.bytes().await?;
     #[derive(Deserialize)]
     struct Poll {
@@ -484,6 +507,21 @@ pub async fn poll_link(client: &reqwest::Client, base: &str, id: &str) -> Result
         // one never did (it stayed `waiting` until the link expired).
         "denied" => Ok(PollStatus::Denied),
         _ => Ok(PollStatus::Waiting),
+    }
+}
+
+/// How long the relay poll loop waits before its next poll, after `outcome`
+/// (#112). Two seconds while things are healthy; a 429's `Retry-After` when
+/// the server named one (never less than the normal spacing); otherwise a
+/// failure doubles the previous wait up to 30 s, so a relay that is down
+/// or rate-limiting without saying for how long is not hammered.
+pub fn next_poll_delay(previous: Duration, outcome: &Result<PollStatus>) -> Duration {
+    const NORMAL: Duration = Duration::from_secs(2);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    match outcome {
+        Ok(_) => NORMAL,
+        Err(Error::RateLimited { retry_after: Some(wait) }) => (*wait).max(NORMAL),
+        Err(_) => previous.saturating_mul(2).clamp(NORMAL, MAX_BACKOFF),
     }
 }
 
@@ -928,6 +966,41 @@ mod tests {
         assert_eq!(code, "real");
     }
 
+    /// #110: an error redirect is held to the same state check as a code.
+    /// A stray `?error=access_denied` (no state, or another flow's) used to
+    /// end the whole login while the real approval was still in flight;
+    /// only the error carrying THIS flow's state ends it.
+    #[tokio::test]
+    async fn loopback_error_without_this_flows_state_is_ignored() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let waiter = tokio::spawn(wait_for_redirect(listener, "good", Duration::from_secs(10)));
+        use tokio::io::AsyncWriteExt;
+        for noise_request in [
+            &b"GET /callback?error=access_denied HTTP/1.1\r\n\r\n"[..],
+            &b"GET /callback?error=access_denied&state=evil HTTP/1.1\r\n\r\n"[..],
+        ] {
+            let mut noise = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            noise.write_all(noise_request).await.unwrap();
+            let mut buf = vec![0u8; 512];
+            let _ = noise.read(&mut buf).await;
+        }
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(b"GET /callback?code=real&state=good HTTP/1.1\r\n\r\n").await.unwrap();
+        assert_eq!(waiter.await.unwrap().unwrap(), "real");
+
+        // The real denial — this flow's state — still ends it.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let waiter = tokio::spawn(wait_for_redirect(listener, "good", Duration::from_secs(10)));
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(b"GET /callback?error=access_denied&state=good HTTP/1.1\r\n\r\n").await.unwrap();
+        match waiter.await.unwrap() {
+            Err(Error::Handshake(msg)) => assert!(msg.contains("access_denied"), "{msg}"),
+            other => panic!("this flow's denial must end it, got {other:?}"),
+        }
+    }
+
     // These token-endpoint tests take the mock server's origin as an
     // argument (issue #565), so they neither read nor write the
     // process-global `WFTUI_BASE_URL` and need no `ENV_LOCK`.
@@ -1071,6 +1144,47 @@ mod tests {
         let client = crate::http::build().unwrap();
         let status = poll_link(&client, &server.uri(), "abc123").await.unwrap();
         assert_eq!(status, PollStatus::Waiting);
+    }
+
+    /// #112: a refused poll keeps what the server said — a 429's
+    /// Retry-After and an XF envelope's code — instead of collapsing into a
+    /// bare `Error::Http`, and the loop's next wait follows it.
+    #[tokio::test]
+    async fn poll_link_keeps_retry_after_and_the_xf_envelope() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/wf-tuilink/poll"))
+            .and(wiremock::matchers::body_string_contains("limited"))
+            .respond_with(wiremock::ResponseTemplate::new(429).insert_header("Retry-After", "20"))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/wf-tuilink/poll"))
+            .and(wiremock::matchers::body_string_contains("broken"))
+            .respond_with(wiremock::ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "errors": [{"code": "wf_tuilink_busy", "message": "busy", "params": []}]
+            })))
+            .mount(&server)
+            .await;
+        let client = crate::http::build().unwrap();
+        let limited = poll_link(&client, &server.uri(), "limited").await;
+        assert!(matches!(limited, Err(Error::RateLimited { retry_after: Some(d) }) if d == Duration::from_secs(20)), "{limited:?}");
+        assert_eq!(next_poll_delay(Duration::from_secs(2), &limited), Duration::from_secs(20));
+        let broken = poll_link(&client, &server.uri(), "broken").await;
+        assert!(matches!(&broken, Err(Error::Api { code, status: 503, .. }) if code == "wf_tuilink_busy"), "{broken:?}");
+    }
+
+    #[test]
+    fn next_poll_delay_backs_off_and_recovers() {
+        let two = Duration::from_secs(2);
+        let err = || Err(Error::Throttled);
+        assert_eq!(next_poll_delay(two, &Ok(PollStatus::Waiting)), two);
+        assert_eq!(next_poll_delay(two, &err()), Duration::from_secs(4));
+        assert_eq!(next_poll_delay(Duration::from_secs(16), &err()), Duration::from_secs(30), "capped");
+        assert_eq!(next_poll_delay(Duration::from_secs(30), &err()), Duration::from_secs(30));
+        let soon = Err(Error::RateLimited { retry_after: Some(Duration::from_secs(1)) });
+        assert_eq!(next_poll_delay(two, &soon), two, "never faster than the normal spacing");
+        assert_eq!(next_poll_delay(Duration::from_secs(30), &Ok(PollStatus::Waiting)), two, "recovers at once");
     }
 
     #[tokio::test]

@@ -193,11 +193,14 @@ fn parse_size(raw: &str) -> Option<u8> {
         .replace("&quot;", "")
         .trim()
         .to_ascii_lowercase();
-    // XF's "is this a pure integer?" test: the round-trip through intval.
-    let pure_int = !v.is_empty()
-        && v.strip_prefix('-').unwrap_or(&v).chars().all(|c| c.is_ascii_digit())
-        && !v.starts_with('+')
-        && (v.len() == 1 || !v.starts_with('0'));
+    // XF's "is this a pure integer?" test: the round-trip through intval,
+    // compared with PHP's *loose* `==` — two numeric strings compare as
+    // numbers, so `07` passes as 7 (XF draws it 26px, checked against the
+    // live renderer). `intval` saturates at i64::MAX, so an integer past
+    // that fails the round-trip and is no size at all — exactly where
+    // Rust's i64 parse fails too (#118).
+    let digits = v.strip_prefix('-').unwrap_or(&v);
+    let pure_int = !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
     if pure_int {
         let n: i64 = v.parse().ok()?;
         if n <= 0 {
@@ -211,7 +214,10 @@ fn parse_size(raw: &str) -> Option<u8> {
     if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    let px: u32 = num.parse().ok()?;
+    // The px branch takes `intval` of the digits, which saturates instead
+    // of failing, and then clamps to 36: an enormous `Npx` is the top rung,
+    // not "no size" (#118).
+    let px: u32 = num.parse().unwrap_or(u32::MAX);
     Some(px_to_scale(px.clamp(8, 36) as f32))
 }
 
@@ -382,7 +388,7 @@ fn apply_frame(frame: &Frame, c: &mut FrameCounts, on: bool) {
         Frame::Underline => bump!(underline),
         Frame::Strike => bump!(strike),
         Frame::Spoiler => bump!(spoiler),
-        Frame::InlineCode => bump!(code),
+        Frame::InlineCode | Frame::RichCode => bump!(code),
         Frame::Quote { .. } => bump!(quote),
         Frame::List(_) => bump!(list),
         // A heading always carries bold; popping it drops the contribution.
@@ -488,6 +494,7 @@ fn is_closer(name: &str, f: &Frame) -> bool {
         | ("list", Frame::List(_))
         | ("spoiler" | "ispoiler", Frame::Spoiler)
         | ("icode" | "inlinecode", Frame::InlineCode)
+        | ("code", Frame::RichCode)
         | ("heading" | "h1" | "h2" | "h3", Frame::Heading(_))
         | ("color", Frame::Color(_))
         | ("size", Frame::Size(_))
@@ -549,6 +556,8 @@ enum Frame {
     List(ListKind),
     Spoiler,
     InlineCode,
+    /// `[CODE=rich]` — a code block whose body is BBCode (#114).
+    RichCode,
     Heading(u8),
     Color(String),
     Highlight,
@@ -809,7 +818,13 @@ pub fn render_at(src: &str, origin: &str) -> Vec<Chunk> {
                         // degrades the way it always has rather than
                         // swallowing the rest of the document like [CODE]'s
                         // unclosed fallback does.
-                        if let Some((inner, close_len)) = misses.split(src, rest, &tag_lower) {
+                        //
+                        // `[ICODE=rich]` is the exception XF's own
+                        // `parseValidateCode` makes: its children ARE BBCode
+                        // (#114), so it is the frame, never the verbatim body.
+                        if is_rich(value.as_deref()) {
+                            push_frame(&mut stack, &mut counts, &mut style, Frame::InlineCode);
+                        } else if let Some((inner, close_len)) = misses.split(src, rest, &tag_lower) {
                             let mut st = style.clone();
                             st.code = true;
                             flush_before_chunk(&mut out, &mut link_label, &style);
@@ -818,6 +833,22 @@ pub fn render_at(src: &str, origin: &str) -> Vec<Chunk> {
                         } else {
                             push_frame(&mut stack, &mut counts, &mut style, Frame::InlineCode);
                         }
+                    }
+                    // `[CODE=rich]`: XF parses the body as BBCode and draws
+                    // it in a code box headed "Rich (BB code)" (#114) — the
+                    // verbatim arm below printed `[B]bold[/B]` literally
+                    // under a `[rich code]` header.
+                    "code" if is_rich(value.as_deref()) => {
+                        let mut hst = style.clone();
+                        hst.bold = true;
+                        flush_before_chunk(&mut out, &mut link_label, &style);
+                        if !out.is_empty() && !ends_with_newline(&out) {
+                            out.push(Chunk::Text("\n".into(), style.clone()));
+                        }
+                        out.push(Chunk::Text("[Rich (BB code)]\n".into(), hst));
+                        // XF drops the blank lines that open the body.
+                        rest = rest.trim_start_matches(['\r', '\n']);
+                        push_frame(&mut stack, &mut counts, &mut style, Frame::RichCode);
                     }
                     "code" | "php" | "html" => {
                         let (inner, close_len) = take_until_close(rest, &tag_lower);
@@ -1187,6 +1218,18 @@ pub fn render_at(src: &str, origin: &str) -> Vec<Chunk> {
                             out.push(Chunk::Text("\n".into(), style.clone()));
                         }
                     }
+                    // Only a `[CODE=rich]` frame is ever open here; a plain
+                    // CODE body was consumed whole with its closer.
+                    "code" => {
+                        if pop_matching(&mut stack, &mut counts, &mut style, &mut links, "code") {
+                            if !out.is_empty() && !ends_with_newline(&out) {
+                                flush_before_chunk(&mut out, &mut link_label, &style);
+                                out.push(Chunk::Text("\n".into(), style.clone()));
+                            }
+                        } else {
+                            emit_text(&mut out, raw_tag, style.clone(), &mut link_label);
+                        }
+                    }
                     "td" | "th" => {
                         if pop_matching(&mut stack, &mut counts, &mut style, &mut links, &tag_lower)
                         {
@@ -1328,6 +1371,12 @@ pub fn strip_quote_blocks(src: &str) -> String {
 /// The stock XF rule set's verbatim regions. CODE/ICODE=rich explicitly
 /// permit BBCode children; ordinary code and plain tags do not. Invalid
 /// option shapes must remain literal rather than hiding a real quote.
+/// `CODE=rich` / `ICODE=rich`: the one option under which XF parses a code
+/// tag's children as BBCode (`RuleSet::parseValidateCode`).
+fn is_rich(value: Option<&str>) -> bool {
+    value.is_some_and(|v| strip_quotes(v).eq_ignore_ascii_case("rich"))
+}
+
 fn quote_plain_tag(tag: &str, name: &str) -> bool {
     let option = &tag[name.len() + 1..tag.len() - 1];
     match name {
@@ -1808,17 +1857,27 @@ fn take_until_close<'a>(s: &'a str, name: &str) -> (&'a str, usize) {
 /// `[URL]` frame (#663): flush any buffered label first so source order
 /// holds, and otherwise mark the body non-empty so the close cannot add a
 /// phantom href-as-label link on top of the chunk's own anchor.
+///
+/// The frame stays OPEN (#116): only the label so far is flushed, so text
+/// after the chunk — `[URL=x]text [IMG]t[/IMG] more[/URL]` — is still the
+/// anchor's. Dropping the pending frame here sent ` more` out as plain,
+/// unlinked text. The frame keeps its start offset, and the chunk about to
+/// land makes the body non-empty, so the close never adds a phantom
+/// href-as-label link (#663); a whitespace-only run is spacing, not a label.
 fn flush_before_chunk(
     out: &mut Vec<Chunk>,
     pending: &mut Option<(String, String, usize)>,
     style: &Style,
 ) {
-    match pending {
-        Some((label, _, _)) if label.is_empty() => {
-            pending.take();
+    let Some((label, href, _)) = pending.as_mut() else { return };
+    let label = std::mem::take(label);
+    if label.trim().is_empty() {
+        if !label.is_empty() {
+            out.push(Chunk::Text(label, style.clone()));
         }
-        Some(_) => flush_link_label(out, pending, style),
-        None => {}
+    } else {
+        let target = if href.is_empty() { label.clone() } else { href.clone() };
+        out.push(Chunk::Link(label, target, style.clone()));
     }
 }
 
@@ -1838,6 +1897,14 @@ fn flush_link_label(
         // marker plus a printed URL under every wrapped thumbnail (#663).
         let body_empty = out.len() == out_at && label.trim().is_empty();
         if body_empty && href.is_empty() {
+            return;
+        }
+        // The body had chunks of its own (anchored already) and nothing but
+        // spacing since the last of them: no link is owed (#116).
+        if !body_empty && label.trim().is_empty() {
+            if !label.is_empty() {
+                out.push(Chunk::Text(label, style.clone()));
+            }
             return;
         }
         let (label, target) = if href.is_empty() {
@@ -1910,12 +1977,24 @@ fn find_url(s: &str) -> Option<usize> {
 
 /// Split `s` at the URL starting at `pos` into (before, url, after). The URL
 /// ends at whitespace, a closing bracket/quote, or end-of-input (trailing
-/// punctuation kept — imperfect, harmless).
+/// punctuation kept — imperfect, harmless). A `)` ends it only when it
+/// closes nothing the URL itself opened (#115), the same balance rule as
+/// `markdown::bare_url`: `…/wiki/X_(disambiguation)` keeps its paren, while
+/// `(see https://x.example/a)` still stops before the prose's own.
 fn split_url(s: &str, pos: usize) -> (&str, &str, &str) {
     let rest = &s[pos..];
+    let mut depth = 0usize;
     let end = rest
         .char_indices()
         .find(|&(i, c)| {
+            match c {
+                '(' => depth += 1,
+                ')' if depth > 0 => {
+                    depth -= 1;
+                    return false;
+                }
+                _ => {}
+            }
             i > 0
                 && matches!(
                     c,
@@ -2558,6 +2637,70 @@ mod tests {
                 Chunk::Text(" here".into(), Style::default()),
             ]
         );
+    }
+
+    /// #115: a bare URL keeps the parentheses it balances (Wikipedia's
+    /// disambiguation links), but still stops at prose's own closing one.
+    #[test]
+    fn bare_urls_keep_balanced_parentheses() {
+        let links = |src: &str| -> Vec<String> {
+            render(src).into_iter().filter_map(|c| match c { Chunk::Link(_, u, _) => Some(u), _ => None }).collect()
+        };
+        assert_eq!(links("see https://en.wikipedia.org/wiki/X_(disambiguation) end"), ["https://en.wikipedia.org/wiki/X_(disambiguation)"]);
+        let chunks = render("see https://en.wikipedia.org/wiki/X_(disambiguation) end");
+        assert_eq!(texts(&chunks).concat(), "see  end", "no stray paren: {chunks:?}");
+        assert_eq!(links("(see https://example.com/a) and"), ["https://example.com/a"]);
+        assert_eq!(texts(&render("(see https://example.com/a) and")).concat(), "(see ) and");
+        assert_eq!(links("https://x.example/a_(b)_(c))"), ["https://x.example/a_(b)_(c)"]);
+    }
+
+    /// #116: XF draws ONE anchor around a [URL] body, so text after an image
+    /// inside it is still linked; an image-only anchor still gets no phantom
+    /// href-as-label link (#663).
+    #[test]
+    fn text_after_an_image_inside_a_url_keeps_the_link() {
+        let chunks = render("[URL=https://full.example/]text [IMG]https://t.example/a.png[/IMG] more[/URL] after");
+        let linked: Vec<(&str, &str)> = chunks.iter().filter_map(|c| match c {
+            Chunk::Link(l, u, _) => Some((l.as_str(), u.as_str())), _ => None,
+        }).collect();
+        assert_eq!(linked, [("text ", "https://full.example/"), (" more", "https://full.example/")], "{chunks:?}");
+        assert!(chunks.iter().any(|c| matches!(c, Chunk::Image { link: Some(l), .. } if l == "https://full.example/")));
+        assert_eq!(texts(&chunks).concat(), " after");
+
+        for src in [
+            "[URL=https://full.example/][IMG]https://t.example/a.png[/IMG][/URL]",
+            "[URL=https://full.example/] [IMG]https://t.example/a.png[/IMG] [/URL]",
+        ] {
+            let chunks = render(src);
+            assert!(!chunks.iter().any(|c| matches!(c, Chunk::Link(..))), "{src}: phantom link in {chunks:?}");
+            assert!(chunks.iter().any(|c| matches!(c, Chunk::Image { link: Some(_), .. })), "{chunks:?}");
+        }
+    }
+
+    /// #114: `[CODE=rich]` / `[ICODE=rich]` bodies are BBCode (XF's
+    /// `parseValidateCode`), drawn as code with their formatting; every
+    /// other CODE option stays verbatim.
+    #[test]
+    fn rich_code_renders_its_bbcode() {
+        let chunks = render("[CODE=rich]\n[B]bold[/B] plain[/CODE]after");
+        let all = texts(&chunks).concat();
+        assert!(!all.contains("[B]") && !all.contains("[rich code]"), "{all:?}");
+        assert!(all.starts_with("[Rich (BB code)]\n"), "{all:?}");
+        let bold = chunks.iter().find_map(|c| match c { Chunk::Text(t, s) if t == "bold" => Some(s.clone()), _ => None }).expect("bold run");
+        assert!(bold.bold && bold.code, "{bold:?}");
+        let plain = chunks.iter().find_map(|c| match c { Chunk::Text(t, s) if t.contains("plain") => Some(s.clone()), _ => None }).unwrap();
+        assert!(plain.code && !plain.bold);
+        let after = chunks.iter().find_map(|c| match c { Chunk::Text(t, s) if t.contains("after") => Some((t.clone(), s.clone())), _ => None }).unwrap();
+        assert!(!after.1.code, "the block closes: {chunks:?}");
+        assert!(all.contains("plain\nafter"), "{all:?}");
+
+        let chunks = render("x [ICODE=\"rich\"][I]it[/I][/ICODE] y");
+        let it = chunks.iter().find_map(|c| match c { Chunk::Text(t, s) if t == "it" => Some(s.clone()), _ => None }).expect("italic run");
+        assert!(it.italic && it.code, "{chunks:?}");
+        assert_eq!(texts(&chunks).concat(), "x it y");
+
+        let verbatim = texts(&render("[CODE=powershell][B]x[/B][/CODE]")).concat();
+        assert!(verbatim.contains("[B]x[/B]"), "{verbatim:?}");
     }
 
     #[test]
@@ -3264,6 +3407,25 @@ mod tests {
         assert_eq!(parse_size("100px"), Some(7), "clamped to 36px");
         assert_eq!(parse_size("1.5em"), None);
         assert_eq!(parse_size("120%"), None);
+    }
+
+    /// #118, against what XF's own renderer drew for each value on this
+    /// server (`$app->bbCode()->render("[SIZE=v]x[/SIZE]", 'html', …)`):
+    /// `999…px` → 36px, the top rung; a pure integer past i64 → no size
+    /// (intval saturates, so the round-trip fails); `07` → 26px (PHP's
+    /// loose `==` reads two numeric strings as numbers).
+    #[test]
+    fn huge_and_zero_padded_sizes_follow_the_live_renderer() {
+        assert_eq!(parse_size("999999999999999999999999px"), Some(7), "XF: 36px");
+        assert_eq!(parse_size("99999999999px"), Some(7));
+        assert_eq!(parse_size("40px"), Some(7));
+        assert_eq!(parse_size("999999999999999999999999"), None, "XF: no size");
+        assert_eq!(parse_size("9223372036854775807"), Some(7), "i64::MAX still round-trips");
+        assert_eq!(parse_size("9223372036854775808"), None);
+        assert_eq!(parse_size("07"), Some(7), "XF: 26px");
+        assert_eq!(parse_size("02"), Some(2));
+        assert_eq!(parse_size("00"), None);
+        assert_eq!(style_of("[SIZE=999999999999999999999999px]big[/SIZE]", "big").size, Some(7));
     }
 
     #[test]

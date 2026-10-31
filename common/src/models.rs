@@ -175,11 +175,38 @@ pub struct Thread {
     pub is_watching: bool,
     #[serde(default, rename = "view_url")]
     pub view_url: Option<String>,
+    /// A question thread's type data. XF sends it as `question`
+    /// (`ThreadType\QuestionHandler::addTypeDataToApiResult`, and the
+    /// captured `thread_permissions.json`), not as `type_data`.
+    #[serde(default, deserialize_with = "null_default")]
+    pub question: Option<QuestionData>,
+}
+
+/// `Thread::question`: the solution, and whether the forum allows question
+/// actions (marking a solution) at all.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct QuestionData {
+    #[serde(default, deserialize_with = "null_default")]
+    pub solution_post_id: u32,
+    #[serde(default, deserialize_with = "null_default")]
+    pub solution_user_id: u32,
+    /// `yes`, `no` or `paused` (XF's `allow_question_actions`).
+    #[serde(default, deserialize_with = "null_default")]
+    pub allow_question_actions: String,
 }
 
 impl Thread {
     pub fn can_reply(&self) -> bool {
         self.can_reply.unwrap_or(true)
+    }
+
+    /// Whether marking a solution can be offered at all (#122): a question
+    /// thread whose forum allows question actions — the first two checks of
+    /// `QuestionHandler::canMarkPostAsSolution`. The API sends no
+    /// per-reader flag for the rest (the node permission), so the caller
+    /// adds who the reader is.
+    pub fn allows_question_actions(&self) -> bool {
+        self.is_question() && self.question.as_ref().is_some_and(|q| q.allow_question_actions == "yes")
     }
 
     pub fn is_question(&self) -> bool {
@@ -199,18 +226,15 @@ impl Thread {
     }
 
     pub fn has_solution(&self) -> bool {
-        !self.highlighted_post_ids.is_empty()
-            || self
-                .type_data
-                .get("solution_post_id")
-                .and_then(|v| v.as_u64())
-                .is_some_and(|id| id > 0)
+        !self.highlighted_post_ids.is_empty() || self.solution_post_id().is_some()
     }
 
     pub fn solution_post_id(&self) -> Option<u32> {
         self.highlighted_post_ids
             .first()
             .copied()
+            .or_else(|| self.question.as_ref().map(|q| q.solution_post_id))
+            .filter(|&id| id > 0)
             .or_else(|| {
                 self.type_data
                     .get("solution_post_id")
@@ -251,6 +275,7 @@ impl Hash for Thread {
             .get("solution_post_id")
             .and_then(serde_json::Value::as_u64)
             .hash(state);
+        self.question.as_ref().map(|q| q.solution_post_id).hash(state);
         self.is_unread.hash(state);
         self.is_watching.hash(state);
         self.view_url.hash(state);
@@ -981,9 +1006,18 @@ pub struct MediaItem {
     pub rating_count: u64,
     #[serde(default, deserialize_with = "deserialize_tags")]
     pub tags: Vec<String>,
+    /// `visible`, `moderated` or `deleted` — XF's vocabulary, as on a thread
+    /// (#127). A moderator receives the other two in the same list; the
+    /// client's job is to say so (#704), via `state()`.
+    #[serde(default, deserialize_with = "null_default")]
+    pub media_state: String,
 }
 
 impl MediaItem {
+    pub fn state(&self) -> ContentState {
+        ContentState::parse(&self.media_state)
+    }
+
     /// True when there is a picture this client can actually draw.
     pub fn is_image(&self) -> bool {
         self.media_type == "image"
@@ -1104,6 +1138,16 @@ pub struct Resource {
     /// unexpected sequence fails the entire reply, not just the field.
     #[serde(default, deserialize_with = "deserialize_tags")]
     pub tags: Vec<String>,
+    /// `visible`, `moderated` or `deleted`, like `MediaItem::media_state`
+    /// (#127).
+    #[serde(default, deserialize_with = "null_default")]
+    pub resource_state: String,
+}
+
+impl Resource {
+    pub fn state(&self) -> ContentState {
+        ContentState::parse(&self.resource_state)
+    }
 }
 
 /// The nested `Category` object the single-resource call includes.
@@ -1372,6 +1416,27 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #127: the gallery and resource lists carry XF's content state, like
+    /// threads and posts — read from the captured bodies, then with the
+    /// state a moderator would receive.
+    #[test]
+    fn media_and_resource_state_come_from_the_wire() {
+        let media: serde_json::Value = serde_json::from_str(include_str!("testdata/media_page.json")).unwrap();
+        let resources: serde_json::Value = serde_json::from_str(include_str!("testdata/resources_page.json")).unwrap();
+        let mut m = media["media"][0].clone();
+        let mut r = resources["resources"][0].clone();
+        assert_eq!(serde_json::from_value::<MediaItem>(m.clone()).unwrap().state(), ContentState::Visible);
+        assert_eq!(serde_json::from_value::<Resource>(r.clone()).unwrap().state(), ContentState::Visible);
+        for (wire, state) in [("deleted", ContentState::Deleted), ("moderated", ContentState::Moderated)] {
+            m["media_state"] = wire.into();
+            r["resource_state"] = wire.into();
+            assert_eq!(serde_json::from_value::<MediaItem>(m.clone()).unwrap().state(), state);
+            assert_eq!(serde_json::from_value::<Resource>(r.clone()).unwrap().state(), state);
+        }
+        m["media_state"] = serde_json::Value::Null;
+        assert_eq!(serde_json::from_value::<MediaItem>(m).unwrap().state(), ContentState::Visible);
+    }
 
     #[test]
     fn captured_thread_and_post_permissions_keep_explicit_server_refusals() {
@@ -1642,6 +1707,26 @@ mod tests {
         let e: ApiErrorBody = serde_json::from_value(body).unwrap();
         assert_eq!(e.errors[0].code, "invalid_page");
         assert_eq!(e.errors[0].params["max"], 4);
+    }
+
+    /// #122: the captured question thread carries its type data under
+    /// `question`, and that is what gates the solution key.
+    #[test]
+    fn captured_question_thread_allows_question_actions() {
+        let reply: ThreadReply = serde_json::from_str(include_str!("testdata/thread_permissions.json")).unwrap();
+        let thread = reply.thread;
+        assert!(thread.is_question());
+        assert_eq!(thread.question.as_ref().map(|q| q.allow_question_actions.as_str()), Some("yes"));
+        assert!(thread.allows_question_actions());
+        let mut closed = thread.clone();
+        closed.question.as_mut().unwrap().allow_question_actions = "no".into();
+        assert!(!closed.allows_question_actions());
+        let mut discussion = thread.clone();
+        discussion.discussion_type = "discussion".into();
+        assert!(!discussion.allows_question_actions());
+        let mut solved = thread;
+        solved.question.as_mut().unwrap().solution_post_id = 77;
+        assert_eq!(solved.solution_post_id(), Some(77));
     }
 
     #[test]

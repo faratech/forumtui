@@ -182,11 +182,13 @@ foreach ($arch in $Architectures) {
     }
     Copy-Item (Join-Path $AssetsDir "*.png") (Join-Path $stage "Assets") -Force
 
-    $manifest = Get-Content $ManifestTemplate -Raw
+    # Pin the encoding on both sides: under Windows PowerShell 5.1 the
+    # default is the system ANSI code page. The template is BOM-less UTF-8,
+    # so reading it with the default turned its em dash into mojibake (#132)
+    # that the pinned write below then saved as valid UTF-8; writing with the
+    # default produced a manifest that declares utf-8 but is not (#78).
+    $manifest = Get-Content $ManifestTemplate -Raw -Encoding utf8
     $manifest = $manifest.Replace("{{VERSION}}", $MsixVersion).Replace("{{ARCH}}", $arch)
-    # Pin the encoding: under Windows PowerShell 5.1 the default is the
-    # system ANSI code page, and the template's em dash would produce a
-    # manifest that declares utf-8 but is not (#78).
     Set-Content -Path (Join-Path $stage "AppxManifest.xml") -Value $manifest -NoNewline -Encoding utf8
 
     $msixPath = Join-Path $OutDir "wftui-$Version-$arch.msix"
