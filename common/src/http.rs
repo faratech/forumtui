@@ -6,6 +6,8 @@
 //! to exactly one: the login flow and the logout revokes build short-lived
 //! clients of their own, deliberately outside the session's pool (#661).
 
+use std::sync::Arc;
+
 use crate::config;
 use crate::error::Result;
 
@@ -45,33 +47,292 @@ pub fn build_with_ua(ua: &str) -> Result<reqwest::Client> {
 }
 
 
-/// The client for bytes that forum *content* names (`WfApiClient::fetch_bytes`
+/// A client for bytes that forum *content* names (`WfApiClient::fetch_bytes`
 /// for anything but our own API): an `[IMG]` URL is written by whoever wrote
 /// the post, and it is fetched the moment a reader scrolls past it, so it
 /// must not be able to aim this machine at its own loopback, its LAN or a
 /// cloud metadata endpoint (#130). Three layers, because each one alone has
 /// a hole:
 ///
-/// - `check_public_url` refuses the initial URL when its host is a
-///   non-public IP literal (or `localhost`), before anything is sent;
+/// - `ContentPolicy::check_url` refuses the initial URL when its host is a
+///   non-public IP literal, `localhost` or the configured proxy, before
+///   anything is sent;
 /// - the redirect policy runs the same check on every hop;
 /// - the DNS resolver drops every non-public address a *name* resolves to,
 ///   so neither a hostname pointing at 127.0.0.1 nor a rebinding answer can
 ///   slip past the literal check — the connection only ever sees what the
 ///   resolver kept.
 ///
-/// `own_host` — the forum's own host — is exempt from all three: the user
-/// chose that site, and a forum on a LAN address (or the wiremock tests on
-/// 127.0.0.1) must still be able to show its own avatars.
-pub fn build_public_with_ua(ua: &str, own_host: Option<String>) -> Result<reqwest::Client> {
+/// There are two such clients, one per `ContentLane`. Only the `OwnMedia`
+/// one keeps a non-public answer for the forum's own name, and
+/// `fetch_bytes` sends it only the forum's exact origin on a media path
+/// (#146). A forum the user reached by IP literal or as `localhost` is
+/// exempt on its whole origin.
+///
+/// Through an HTTP proxy the proxy resolves the target, not this resolver,
+/// which then only ever sees the proxy's own name; that name is exempt
+/// (#147). The per-address guarantee for a proxied target is then
+/// `ContentPolicy::preflight`'s local lookup, which is best effort; the
+/// literal and per-hop checks still apply in full.
+pub fn build_public_with_ua(ua: &str, policy: Arc<ContentPolicy>, lane: ContentLane) -> Result<reqwest::Client> {
+    Ok(content_client_builder(ua, policy, lane).build()?)
+}
+
+/// `build_public_with_ua` before `build()`, so a test can add an explicit
+/// proxy instead of setting the process-wide proxy variables.
+pub(crate) fn content_client_builder(ua: &str, policy: Arc<ContentPolicy>, lane: ContentLane) -> reqwest::ClientBuilder {
     install_crypto_provider();
-    Ok(reqwest::Client::builder()
+    reqwest::Client::builder()
         .user_agent(ua)
         .connect_timeout(config::CONNECT_TIMEOUT)
         .timeout(config::REQUEST_TIMEOUT)
-        .dns_resolver(PublicOnlyResolver { own_host: own_host.clone() })
-        .redirect(hop_policy(Some(own_host)))
-        .build()?)
+        .dns_resolver(PublicOnlyResolver { policy: policy.clone(), lane })
+        .redirect(hop_policy(Some((policy, lane))))
+}
+
+/// Which of the two content clients a fetch uses (#146).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentLane {
+    /// Everything else. Every name is judged by what it resolves to,
+    /// the forum's own name included.
+    Strict,
+    /// The forum's exact origin on one of its media paths. This is the one
+    /// lane where the forum's own name keeps a non-public answer.
+    OwnMedia,
+}
+
+/// XenForo's media paths: avatars, attachments, gallery items, style
+/// assets and the image proxy. A forum whose own name resolves to a
+/// private or loopback address (split-horizon DNS, or a client running on
+/// the forum's own server) keeps its images, and nothing else on that
+/// address is reachable from content.
+const OWN_MEDIA_PREFIXES: [&str; 4] = ["/data/", "/attachments/", "/media/", "/styles/"];
+const OWN_MEDIA_EXACT: [&str; 1] = ["/proxy.php"];
+
+/// The proxy variables reqwest reads (through hyper-util's
+/// `Matcher::from_env`), in both spellings.
+const PROXY_VARS: [&str; 6] = ["ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"];
+
+/// What forum content may make this client contact (#130, #146, #147):
+/// the site's own origin, and the proxies the user configured.
+#[derive(Debug, Clone)]
+pub struct ContentPolicy {
+    /// The site origin, parsed: `scheme://host[:port]`.
+    own: Option<reqwest::Url>,
+    /// The site is an IP literal or `localhost`. Then the user chose a
+    /// local forum, and all of that origin is the forum.
+    own_is_local: bool,
+    /// Every host the proxy variables name, normalised by `normalize_name`.
+    proxy_hosts: Vec<String>,
+    /// Test-only answers for `lookup`, checked before the system resolver.
+    #[cfg(test)]
+    fixed_dns: Vec<(String, Vec<std::net::IpAddr>)>,
+}
+
+impl ContentPolicy {
+    /// The policy for a site origin, with this process's proxy variables.
+    pub fn for_site(base: &str) -> Self {
+        Self::with_proxy_env(base, |name| std::env::var(name).ok())
+    }
+
+    /// The policy for a site origin, with the proxy variables read through
+    /// `var`. It reads all six variables, where reqwest takes the first one
+    /// set of each pair. A name listed here that reqwest does not use as a
+    /// proxy is only refused as a content host, so that costs nothing.
+    pub fn with_proxy_env(base: &str, var: impl Fn(&str) -> Option<String>) -> Self {
+        let own = reqwest::Url::parse(base).ok().filter(|u| u.host_str().is_some());
+        let own_is_local = own.as_ref().and_then(|u| u.host_str()).is_some_and(|h| {
+            let bare = unbracket(h);
+            bare.parse::<std::net::IpAddr>().is_ok() || is_localhost_name(bare)
+        });
+        // reqwest ignores every proxy variable in a CGI process (the
+        // httpoxy rule): no proxy is used there, so none is exempt.
+        let mut proxy_hosts: Vec<String> = Vec::new();
+        if var("REQUEST_METHOD").is_none() {
+            for name in PROXY_VARS {
+                if let Some(host) = var(name).as_deref().and_then(proxy_host_of)
+                    && !proxy_hosts.contains(&host)
+                {
+                    proxy_hosts.push(host);
+                }
+            }
+        }
+        ContentPolicy {
+            own,
+            own_is_local,
+            proxy_hosts,
+            #[cfg(test)]
+            fixed_dns: Vec::new(),
+        }
+    }
+
+    /// The initial-URL (and per-hop) half of the gate: http or https, a
+    /// host, and, unless it is the forum's exact origin (scheme, host and
+    /// port), not a non-public IP literal, not `localhost` and not the
+    /// configured proxy. Hostnames are judged by what they resolve to, in
+    /// `PublicOnlyResolver`. The host is the URL's *parsed* host, which the
+    /// URL parser has already normalised (`http://2130706433/` is
+    /// `127.0.0.1` by then, and userinfo is not part of it).
+    pub fn check_url(&self, url: &reqwest::Url) -> std::result::Result<(), NonPublicDestination> {
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(NonPublicDestination(format!("refusing a {} URL from forum content", url.scheme())));
+        }
+        let Some(host) = url.host_str() else {
+            return Err(NonPublicDestination("refusing a URL with no host".into()));
+        };
+        if self.is_own_origin(url) {
+            return Ok(());
+        }
+        let bare = unbracket(host);
+        if let Ok(ip) = bare.parse::<std::net::IpAddr>()
+            && !is_public_ip(ip)
+        {
+            return Err(NonPublicDestination(format!("refusing to fetch from non-public address {host}")));
+        }
+        if is_localhost_name(bare) {
+            return Err(NonPublicDestination(format!("refusing to fetch from {host}")));
+        }
+        // The proxy's name is exempt in the resolver, so content must not
+        // be able to name it as a target (#147).
+        if self.is_proxy_host(bare) {
+            return Err(NonPublicDestination(format!("refusing to fetch from {host}: it is a configured proxy")));
+        }
+        Ok(())
+    }
+
+    /// The lane for a URL `check_url` accepted: `OwnMedia` for the forum's
+    /// exact origin, without userinfo, on a media path (any path when the
+    /// site is local); `Strict` for everything else.
+    pub fn lane(&self, url: &reqwest::Url) -> ContentLane {
+        let own_media = self.is_own_origin(url)
+            && url.username().is_empty()
+            && url.password().is_none()
+            && (self.own_is_local || is_media_path(url.path()));
+        if own_media { ContentLane::OwnMedia } else { ContentLane::Strict }
+    }
+
+    /// #147, best effort: a proxied request is resolved by the proxy, so
+    /// this resolver never sees the target's name. When a proxy is
+    /// configured, resolve a `Strict` target's name here first and refuse
+    /// it if any address is non-public. We cannot choose which address the
+    /// proxy uses, so a mixed answer is refused too. A name that does not
+    /// resolve here is allowed: on a network where only the proxy resolves
+    /// outside names, refusing it would refuse every image.
+    pub async fn preflight(&self, url: &reqwest::Url) -> std::result::Result<(), NonPublicDestination> {
+        if self.proxy_hosts.is_empty() {
+            return Ok(());
+        }
+        let Some(host) = url.host_str() else { return Ok(()) };
+        let bare = unbracket(host);
+        if bare.parse::<std::net::IpAddr>().is_ok() {
+            return Ok(()); // a literal is `check_url`'s to judge
+        }
+        let port = url.port_or_known_default().unwrap_or(80);
+        let Ok(found) = self.lookup(bare, port).await else { return Ok(()) };
+        if let Some(addr) = found.iter().find(|a| !is_public_ip(a.ip())) {
+            return Err(NonPublicDestination(format!(
+                "refusing to fetch from {host}: it resolves to the non-public address {}",
+                addr.ip()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The per-hop check for a client in `lane`: `check_url`, and for the
+    /// `OwnMedia` client, no hop to the forum's own name unless the hop is
+    /// itself own media. That client's resolver keeps the forum's
+    /// non-public addresses, so a hop to another port or path on that
+    /// name must not use it (#146).
+    fn hop_check(&self, url: &reqwest::Url, lane: ContentLane) -> std::result::Result<(), NonPublicDestination> {
+        self.check_url(url)?;
+        if lane == ContentLane::OwnMedia
+            && url.host_str().is_some_and(|h| self.is_own_name(h))
+            && self.lane(url) != ContentLane::OwnMedia
+        {
+            return Err(NonPublicDestination(format!(
+                "refusing a redirect to {}{}: only the forum's own media paths may use its own address",
+                url.host_str().unwrap_or(""),
+                url.path()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether the resolver for `lane` keeps every address `name` resolves
+    /// to. The proxy's name is kept in both lanes; the forum's own name is
+    /// kept in the `OwnMedia` lane only.
+    fn resolver_exempts(&self, name: &str, lane: ContentLane) -> bool {
+        self.is_proxy_host(name) || (lane == ContentLane::OwnMedia && self.is_own_name(name))
+    }
+
+    fn is_own_origin(&self, url: &reqwest::Url) -> bool {
+        self.own.as_ref().is_some_and(|own| own.origin() == url.origin())
+    }
+
+    fn is_own_name(&self, host: &str) -> bool {
+        self.own.as_ref().and_then(|u| u.host_str()).is_some_and(|own| normalize_name(own) == normalize_name(host))
+    }
+
+    fn is_proxy_host(&self, host: &str) -> bool {
+        let host = normalize_name(unbracket(host));
+        self.proxy_hosts.contains(&host)
+    }
+
+    /// The system resolver (and, in tests, `fixed_dns` first).
+    async fn lookup(&self, host: &str, port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        #[cfg(test)]
+        if let Some((_, ips)) = self.fixed_dns.iter().find(|(name, _)| *name == normalize_name(host)) {
+            if ips.is_empty() {
+                return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{host} did not resolve")));
+            }
+            return Ok(ips.iter().map(|ip| std::net::SocketAddr::new(*ip, port)).collect());
+        }
+        Ok(tokio::net::lookup_host((host, port)).await?.collect())
+    }
+
+    /// Test-only: answer `name` with `ips` (none: it does not resolve).
+    #[cfg(test)]
+    pub(crate) fn with_fixed_dns(mut self, name: &str, ips: &[&str]) -> Self {
+        self.fixed_dns.push((normalize_name(name), ips.iter().map(|ip| ip.parse().unwrap()).collect()));
+        self
+    }
+}
+
+fn is_media_path(path: &str) -> bool {
+    // Any percent-encoding disqualifies a path, so an encoded `.` or `/`
+    // cannot climb out of a media directory whichever way the server
+    // decodes it. The URL parser has already removed literal dot segments.
+    !path.contains('%') && (OWN_MEDIA_EXACT.contains(&path) || OWN_MEDIA_PREFIXES.iter().any(|p| path.starts_with(p)))
+}
+
+/// The host a proxy variable names, as the connector will pass it to the
+/// resolver: the authority's host, without userinfo or port, normalised.
+/// A value with no scheme means http, as it does for reqwest.
+fn proxy_host_of(value: &str) -> Option<String> {
+    let value = value.trim();
+    let rest = value.split_once("://").map_or(value, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host_port.split(':').next().unwrap_or(""),
+    };
+    let host = normalize_name(host);
+    (!host.is_empty()).then_some(host)
+}
+
+/// A name the way two spellings of it compare: lowercase, no trailing dot.
+fn normalize_name(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn unbracket(host: &str) -> &str {
+    host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host)
+}
+
+fn is_localhost_name(host: &str) -> bool {
+    let lower = normalize_name(host);
+    lower == "localhost" || lower.ends_with(".localhost")
 }
 
 /// Why a content-named fetch was refused before it reached the network.
@@ -99,6 +360,29 @@ pub fn non_public_refusal<'a>(err: &'a (dyn std::error::Error + 'static)) -> Opt
         cur = e.source();
     }
     None
+}
+
+/// The most of a non-2xx body any caller reads. 64 KiB is far more than an
+/// XF error envelope, a Cloudflare page or a GitHub error needs to say
+/// what went wrong.
+pub(crate) const MAX_ERROR_BODY: usize = 64 * 1024;
+
+/// Read an error body under `MAX_ERROR_BODY` and stop there. A size cap on
+/// the success branch alone is not enough: an origin that wants this
+/// process to buffer gigabytes only has to answer 403 or 500 instead of
+/// 200. `fetch_bytes` reads whatever `[IMG]` names (#46), and the updater
+/// asks an off-origin mirror in the background (#145); both read their
+/// error bodies through this. Whatever is past the cap is never read; the
+/// connection is dropped with the response.
+pub(crate) async fn read_error_body(mut resp: reqwest::Response) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    while bytes.len() < MAX_ERROR_BODY
+        && let Ok(Some(chunk)) = resp.chunk().await
+    {
+        let room = MAX_ERROR_BODY - bytes.len();
+        bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+    bytes
 }
 
 /// Whether an address is one a forum post may make this client contact:
@@ -166,48 +450,23 @@ fn is_public_v4(ip: std::net::Ipv4Addr) -> bool {
         || multicast_or_reserved)
 }
 
-/// The initial-URL (and per-hop) half of the #130 gate: http or https, a
-/// host, and — unless it is the forum's own host — not a non-public IP
-/// literal and not `localhost`. Hostnames are judged by what they resolve
-/// to, in `PublicOnlyResolver`. The host is the URL's *parsed* host, which
-/// the URL parser has already normalised (`http://2130706433/` is
-/// `127.0.0.1` by then, and userinfo is not part of it).
-pub fn check_public_url(url: &reqwest::Url, own_host: Option<&str>) -> std::result::Result<(), NonPublicDestination> {
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(NonPublicDestination(format!("refusing a {} URL from forum content", url.scheme())));
-    }
-    let Some(host) = url.host_str() else {
-        return Err(NonPublicDestination("refusing a URL with no host".into()));
-    };
-    if own_host.is_some_and(|own| own.eq_ignore_ascii_case(host)) {
-        return Ok(());
-    }
-    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
-    if let Ok(ip) = bare.parse::<std::net::IpAddr>()
-        && !is_public_ip(ip)
-    {
-        return Err(NonPublicDestination(format!("refusing to fetch from non-public address {host}")));
-    }
-    let lower = bare.trim_end_matches('.').to_ascii_lowercase();
-    if lower == "localhost" || lower.ends_with(".localhost") {
-        return Err(NonPublicDestination(format!("refusing to fetch from {host}")));
-    }
-    Ok(())
-}
-
 /// Resolves a name the way the system does, then keeps only the public
-/// addresses (all of them, for the forum's own host). An answer with no
-/// public address left is a refusal, not an empty success.
+/// addresses (all of them for a name `ContentPolicy::resolver_exempts`
+/// in this lane: the configured proxy, and in the `OwnMedia` lane the
+/// forum's own name). An answer with no public address left is a refusal,
+/// not an empty success.
 struct PublicOnlyResolver {
-    own_host: Option<String>,
+    policy: Arc<ContentPolicy>,
+    lane: ContentLane,
 }
 
 impl reqwest::dns::Resolve for PublicOnlyResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_owned();
-        let exempt = self.own_host.as_deref().is_some_and(|own| own.eq_ignore_ascii_case(&host));
+        let exempt = self.policy.resolver_exempts(&host, self.lane);
+        let policy = self.policy.clone();
         Box::pin(async move {
-            let found: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            let found = policy.lookup(&host, 0).await?;
             if found.is_empty() {
                 return Err(format!("{host} did not resolve").into());
             }
@@ -236,14 +495,16 @@ fn redirect_policy() -> reqwest::redirect::Policy {
 /// tricks (`127.0.0.1@evil.com`, `127.0.0.1.evil.com`) cannot pass — the
 /// same exact-match rule as update.rs's `is_loopback_host` (#68).
 ///
-/// `public_only` is `Some(own_host)` for the content client
-/// (`build_public_with_ua`): every hop must also pass `check_public_url`,
-/// so a public image URL cannot 302 the fetch onto a LAN address (#130).
-fn hop_policy(public_only: Option<Option<String>>) -> reqwest::redirect::Policy {
+/// `public_only` is set for the content clients (`build_public_with_ua`):
+/// every hop must also pass `ContentPolicy::hop_check`, so a public image
+/// URL cannot 302 the fetch onto a LAN address (#130), and the `OwnMedia`
+/// client cannot be redirected to another port or path on the forum's
+/// own name (#146).
+fn hop_policy(public_only: Option<(Arc<ContentPolicy>, ContentLane)>) -> reqwest::redirect::Policy {
     const MAX_HOPS: usize = 4;
     reqwest::redirect::Policy::custom(move |attempt| {
-        if let Some(own_host) = &public_only
-            && let Err(refusal) = check_public_url(attempt.url(), own_host.as_deref())
+        if let Some((policy, lane)) = &public_only
+            && let Err(refusal) = policy.hop_check(attempt.url(), *lane)
         {
             return attempt.error(refusal);
         }
@@ -323,32 +584,196 @@ mod tests {
         }
     }
 
-    #[test]
-    fn check_public_url_exempts_only_the_forum_host() {
-        let url = |s: &str| reqwest::Url::parse(s).unwrap();
-        assert!(check_public_url(&url("http://127.0.0.1:8080/a.png"), Some("127.0.0.1")).is_ok());
-        assert!(check_public_url(&url("http://127.0.0.1:8080/a.png"), Some("forum.example")).is_err());
-        assert!(check_public_url(&url("https://cdn.example/a.png"), Some("forum.example")).is_ok());
-        assert!(check_public_url(&url("https://127.0.0.1@cdn.example/a.png"), None).is_ok(), "userinfo is not the host");
-        assert!(check_public_url(&url("https://cdn.example@127.0.0.1/a.png"), None).is_err());
-        assert!(check_public_url(&url("file:///etc/passwd"), None).is_err());
+    fn url(s: &str) -> reqwest::Url {
+        reqwest::Url::parse(s).unwrap()
     }
 
-    /// The name half: a hostname is judged by what it resolves to, so a
-    /// name pointing at loopback is refused even though no literal check
-    /// could see it — unless it is the forum's own host.
-    #[tokio::test]
-    async fn resolver_drops_non_public_answers_except_for_the_forum_host() {
+    /// A policy for `base` with no proxy configured.
+    fn site(base: &str) -> ContentPolicy {
+        ContentPolicy::with_proxy_env(base, |_| None)
+    }
+
+    /// A policy for `base` whose HTTPS_PROXY and HTTP_PROXY are `proxy`.
+    fn site_behind(base: &str, proxy: &str) -> ContentPolicy {
+        let proxy = proxy.to_string();
+        ContentPolicy::with_proxy_env(base, move |name| matches!(name, "HTTPS_PROXY" | "HTTP_PROXY").then(|| proxy.clone()))
+    }
+
+    async fn resolve(policy: &ContentPolicy, lane: ContentLane, name: &str) -> std::result::Result<Vec<std::net::IpAddr>, String> {
         use reqwest::dns::Resolve;
-        let guarded = PublicOnlyResolver { own_host: Some("forum.example".into()) };
-        let err = match guarded.resolve("localhost".parse().unwrap()).await {
-            Ok(addrs) => panic!("localhost resolved through the guard to {:?}", addrs.collect::<Vec<_>>()),
-            Err(e) => e,
+        let resolver = PublicOnlyResolver { policy: Arc::new(policy.clone()), lane };
+        match resolver.resolve(name.parse().unwrap()).await {
+            Ok(addrs) => Ok(addrs.map(|a| a.ip()).collect()),
+            Err(e) => {
+                assert!(non_public_refusal(e.as_ref()).is_some(), "{name}: not a refusal: {e}");
+                Err(e.to_string())
+            }
+        }
+    }
+
+    /// #130 and #146: only the forum's exact origin skips the literal
+    /// checks. The same host on another port or scheme does not.
+    #[test]
+    fn check_url_exempts_only_the_forum_origin() {
+        let local = site("http://127.0.0.1:8080");
+        assert!(local.check_url(&url("http://127.0.0.1:8080/a.png")).is_ok());
+        assert!(local.check_url(&url("http://127.0.0.1:9999/a.png")).is_err(), "another port is not the forum");
+        assert!(local.check_url(&url("https://127.0.0.1:8080/a.png")).is_err(), "another scheme is not the forum");
+        let named = site("https://forum.example");
+        assert!(named.check_url(&url("http://127.0.0.1:8080/a.png")).is_err());
+        assert!(named.check_url(&url("https://cdn.example/a.png")).is_ok());
+        assert!(named.check_url(&url("https://127.0.0.1@cdn.example/a.png")).is_ok(), "userinfo is not the host");
+        assert!(named.check_url(&url("https://cdn.example@127.0.0.1/a.png")).is_err());
+        assert!(named.check_url(&url("file:///etc/passwd")).is_err());
+        let dev = site("http://localhost:3000");
+        assert!(dev.check_url(&url("http://localhost:3000/a.png")).is_ok());
+        assert!(dev.check_url(&url("http://localhost:3001/a.png")).is_err(), "another port on localhost is refused");
+    }
+
+    /// #146: the `OwnMedia` lane, the one that keeps a non-public answer
+    /// for the forum's own name, takes only the exact origin, without
+    /// userinfo, on a media path. A local site takes its whole origin.
+    #[test]
+    fn own_media_lane_is_the_exact_origin_on_media_paths() {
+        use ContentLane::{OwnMedia, Strict};
+        let named = site("https://forum.example");
+        for (u, lane) in [
+            ("https://forum.example/data/avatars/m/0/1.jpg?123", OwnMedia),
+            ("https://FORUM.example:443/attachments/a-png.12/", OwnMedia),
+            ("https://forum.example/media/x.3/full", OwnMedia),
+            ("https://forum.example/styles/default/xenforo/smilies/a.png", OwnMedia),
+            ("https://forum.example/proxy.php?image=https%3A%2F%2Fcdn.example%2Fa.png&hash=1", OwnMedia),
+            ("https://forum.example/admin.php", Strict),
+            ("https://forum.example/proxy.php.bak", Strict),
+            ("https://forum.example/datax/a.png", Strict),
+            ("https://forum.example/data/../admin.php", Strict),
+            ("https://forum.example/data/%2e%2e/admin.php", Strict),
+            ("https://forum.example/data/..%2fadmin.php", Strict),
+            ("http://forum.example/data/a.png", Strict),
+            ("https://forum.example:8443/data/a.png", Strict),
+            ("https://user@forum.example/data/a.png", Strict),
+            ("https://forum.example./data/a.png", Strict),
+            ("https://cdn.example/data/a.png", Strict),
+        ] {
+            assert_eq!(named.lane(&url(u)), lane, "{u}");
+        }
+        assert_eq!(site("http://localhost:3000").lane(&url("http://localhost:3000/anything")), OwnMedia);
+        assert_eq!(site("https://192.168.1.10").lane(&url("https://192.168.1.10/index.php")), OwnMedia);
+    }
+
+    /// #146, the name half: a forum name that resolves to loopback (the
+    /// client running on the forum's own server, or split-horizon DNS)
+    /// keeps that answer in the `OwnMedia` lane only. In the `Strict`
+    /// lane it is judged like any other name. The old resolver kept it
+    /// for every request to that name, on any port or path.
+    #[tokio::test]
+    async fn the_forum_name_keeps_a_loopback_answer_only_in_the_own_media_lane() {
+        let policy = site("https://forum.example")
+            .with_fixed_dns("forum.example", &["127.0.0.1"])
+            .with_fixed_dns("other.example", &["10.0.0.1"]);
+        assert_eq!(resolve(&policy, ContentLane::OwnMedia, "forum.example").await.unwrap(), ["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]);
+        assert!(resolve(&policy, ContentLane::Strict, "forum.example").await.is_err());
+        assert!(resolve(&policy, ContentLane::Strict, "FORUM.example.").await.is_err());
+        assert!(resolve(&policy, ContentLane::OwnMedia, "other.example").await.is_err());
+        // The system resolver, for the dev-forum case the wiremock tests use.
+        let dev = site("http://localhost:3000");
+        let kept = resolve(&dev, ContentLane::OwnMedia, "localhost").await.unwrap();
+        assert!(!kept.is_empty() && kept.iter().all(|ip| ip.is_loopback()), "{kept:?}");
+        assert!(resolve(&dev, ContentLane::Strict, "localhost").await.is_err());
+    }
+
+    /// #146, the redirect half: the `OwnMedia` client may not be sent to
+    /// another port or path on the forum's own name, because its resolver
+    /// would keep that name's non-public address. Other names are fine:
+    /// its resolver filters them like the `Strict` one does.
+    #[test]
+    fn own_media_redirects_stay_on_own_media() {
+        let policy = site("https://forum.example");
+        let own = ContentLane::OwnMedia;
+        assert!(policy.hop_check(&url("https://forum.example/data/b.png"), own).is_ok());
+        assert!(policy.hop_check(&url("https://cdn.example/a.png"), own).is_ok());
+        for hop in [
+            "https://forum.example/admin.php",
+            "https://forum.example:8444/data/a.png",
+            "http://forum.example/data/a.png",
+            "https://Forum.Example./data/a.png",
+        ] {
+            let err = policy.hop_check(&url(hop), own).expect_err(hop);
+            assert!(err.0.contains("own media"), "{hop}: {}", err.0);
+        }
+        // The Strict client may follow it: its resolver judges the name.
+        assert!(policy.hop_check(&url("https://forum.example/admin.php"), ContentLane::Strict).is_ok());
+        assert!(!policy.resolver_exempts("forum.example", ContentLane::Strict));
+    }
+
+    /// #147: the proxy names are read from the variables reqwest reads,
+    /// as the connector will pass them to the resolver.
+    #[test]
+    fn proxy_hosts_are_read_from_the_proxy_variables() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string())
         };
-        assert!(non_public_refusal(err.as_ref()).is_some(), "{err}");
-        let own = PublicOnlyResolver { own_host: Some("localhost".into()) };
-        let addrs: Vec<_> = own.resolve("localhost".parse().unwrap()).await.unwrap().collect();
-        assert!(addrs.iter().all(|a| a.ip().is_loopback()) && !addrs.is_empty(), "{addrs:?}");
+        let policy = ContentPolicy::with_proxy_env(
+            "https://forum.example",
+            env(&[
+                ("HTTPS_PROXY", "http://user:p%40ss@Proxy.Corp.Example.:3128/"),
+                ("http_proxy", "localhost:3128"),
+                ("ALL_PROXY", "socks5h://[fd00::1]:1080"),
+                ("HTTP_PROXY", ""),
+            ]),
+        );
+        // ALL_PROXY, HTTPS_PROXY, then http_proxy: an empty HTTP_PROXY names
+        // nothing. reqwest itself would skip http_proxy here (an empty
+        // HTTP_PROXY is still "set"); listing it anyway only refuses it as a
+        // content target.
+        assert_eq!(policy.proxy_hosts, ["fd00::1", "proxy.corp.example", "localhost"]);
+        let cgi = ContentPolicy::with_proxy_env(
+            "https://forum.example",
+            env(&[("HTTPS_PROXY", "http://proxy.corp.example:3128"), ("REQUEST_METHOD", "GET")]),
+        );
+        assert!(cgi.proxy_hosts.is_empty(), "reqwest uses no proxy in a CGI process");
+        assert!(site("https://forum.example").proxy_hosts.is_empty());
+    }
+
+    /// #147: a proxy named by a hostname that resolves to a private
+    /// address is the user's own infrastructure. The resolver keeps that
+    /// answer in both lanes; the old one refused it, which failed every
+    /// content image behind a corporate or local proxy. Content still may
+    /// not name the proxy as a target.
+    #[tokio::test]
+    async fn a_named_private_proxy_is_kept_but_never_a_content_target() {
+        let policy = site_behind("https://forum.example", "http://proxy.corp.example:3128")
+            .with_fixed_dns("proxy.corp.example", &["10.1.2.3"]);
+        let ten: std::net::IpAddr = "10.1.2.3".parse().unwrap();
+        assert_eq!(resolve(&policy, ContentLane::Strict, "proxy.corp.example").await.unwrap(), [ten]);
+        assert_eq!(resolve(&policy, ContentLane::OwnMedia, "proxy.corp.example").await.unwrap(), [ten]);
+        for target in ["http://proxy.corp.example:8080/a.png", "https://PROXY.corp.example./a.png"] {
+            let err = policy.check_url(&url(target)).expect_err(target);
+            assert!(err.0.contains("configured proxy"), "{target}: {}", err.0);
+        }
+    }
+
+    /// #147: behind a proxy, a target's name is looked up here before the
+    /// request, since the proxy, not our resolver, resolves it. Any
+    /// non-public address refuses it. A name that does not resolve here is
+    /// left to the proxy. Without a proxy nothing is looked up, because the
+    /// resolver already judges every name.
+    #[tokio::test]
+    async fn a_proxied_target_is_looked_up_before_it_is_sent() {
+        let policy = site_behind("https://forum.example", "http://proxy.corp.example:3128")
+            .with_fixed_dns("intranet.example", &["10.0.0.5"])
+            .with_fixed_dns("mixed.example", &["8.8.8.8", "127.0.0.1"])
+            .with_fixed_dns("cdn.example", &["8.8.8.8"])
+            .with_fixed_dns("proxy-only.example", &[]);
+        for target in ["http://intranet.example/a.png", "https://mixed.example/a.png"] {
+            let err = policy.preflight(&url(target)).await.expect_err(target);
+            assert!(err.0.contains("non-public address"), "{target}: {}", err.0);
+        }
+        assert!(policy.preflight(&url("https://cdn.example/a.png")).await.is_ok());
+        assert!(policy.preflight(&url("https://proxy-only.example/a.png")).await.is_ok());
+        assert!(policy.preflight(&url("https://8.8.8.8/a.png")).await.is_ok());
+        let direct = site("https://forum.example").with_fixed_dns("intranet.example", &["10.0.0.5"]);
+        assert!(direct.preflight(&url("http://intranet.example/a.png")).await.is_ok());
     }
 
     #[tokio::test]

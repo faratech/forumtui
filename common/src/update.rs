@@ -893,6 +893,12 @@ fn note_check(root: &Path, target: Target) {
 /// A non-2xx from the feed or the CDN. GitHub answers an exhausted
 /// unauthenticated quota with 403 as often as 429, so both are the quiet
 /// rate-limit error the app already knows how to sit out.
+///
+/// The body is read under `http::MAX_ERROR_BODY` and no further (#145). It
+/// used to be read with `resp.bytes()`, so a mirror that answered 403 or
+/// 500 instead of 200 could still make this background check buffer an
+/// unbounded body for the whole request timeout; #119 had capped only the
+/// success bodies.
 async fn feed_error(resp: reqwest::Response, what: &str) -> Error {
     let status = resp.status().as_u16();
     if status == 429 || status == 403 {
@@ -903,10 +909,10 @@ async fn feed_error(resp: reqwest::Response, what: &str) -> Error {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.trim().parse::<u64>().ok())
             .map(|secs| Duration::from_secs(secs.min(MAX_RETRY_AFTER_SECS)));
-        let _ = resp.bytes().await;
+        let _ = http::read_error_body(resp).await;
         return Error::RateLimited { retry_after };
     }
-    let _ = resp.bytes().await;
+    let _ = http::read_error_body(resp).await;
     Error::Config(format!("{what} answered http {status}"))
 }
 
@@ -1020,8 +1026,10 @@ pub async fn check_and_stage(cfg: &UpdateConfig, force: bool) -> Result<Outcome>
     if !resp.status().is_success() {
         return Err(feed_error(resp, "release feed").await);
     }
-    // Streamed under a cap like every other body in this flow (#119): the
-    // feed is off-origin and runs unasked in the background.
+    // Streamed under a cap (#119): the feed is off-origin and runs unasked
+    // in the background. The sums and the binary are capped the same way in
+    // `fetch_capped`, and every non-2xx body in this flow, the feed's
+    // included, is capped in `feed_error` (#145).
     let release: Release = serde_json::from_slice(&read_capped(resp, MAX_FEED_BYTES, "release feed").await?)?;
     if release.draft || release.prerelease {
         return Ok(Outcome::UpToDate { latest: cfg.current_version.to_string() });
@@ -1795,9 +1803,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&f.root);
     }
 
-    /// #119: the feed body is streamed under `MAX_FEED_BYTES` like the sums
-    /// and the binary — a huge body (with or without a Content-Length) is
-    /// refused, never buffered whole and parsed.
+    /// #119: a 2xx feed body is streamed under `MAX_FEED_BYTES`, as the sums
+    /// and the binary are under theirs — a huge body (with or without a
+    /// Content-Length) is refused, never buffered whole and parsed. The
+    /// non-2xx half is `a_non_2xx_body_is_capped_not_buffered` (#145).
     #[tokio::test]
     async fn an_oversized_feed_body_is_refused_not_buffered() {
         let server = MockServer::start().await;
@@ -1825,6 +1834,97 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A server that answers every request with `status` and a chunked body
+    /// that sends four times `MAX_FEED_BYTES` and then stalls, never sending
+    /// the final chunk: what a hostile mirror can do for the whole request
+    /// timeout. Reading such a body to the end blocks until that timeout;
+    /// a capped read stops after its first 64 KiB. The burst is bounded so
+    /// that a regression shows up as a slow test, not as an OOM.
+    async fn stalling_error_server(status: u16, extra_headers: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let mut head = Vec::new();
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let reply = format!(
+                        "HTTP/1.1 {status} Error\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n{extra_headers}\r\n"
+                    );
+                    if sock.write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let chunk = vec![b'x'; 64 * 1024];
+                    let mut sent = 0;
+                    while sent < 4 * MAX_FEED_BYTES {
+                        let frame = format!("{:x}\r\n", chunk.len());
+                        if sock.write_all(frame.as_bytes()).await.is_err()
+                            || sock.write_all(&chunk).await.is_err()
+                            || sock.write_all(b"\r\n").await.is_err()
+                        {
+                            return;
+                        }
+                        sent += chunk.len();
+                    }
+                    // Hold the connection open until the client hangs up.
+                    let _ = sock.read(&mut buf).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// #145: a non-2xx body (feed, sums or binary) is read under a small
+    /// cap, not to the end. `feed_error` used to call `resp.bytes()`, so a
+    /// mirror that answered 500 or 403 with an endless body made the
+    /// background check buffer it for the whole request timeout.
+    #[tokio::test]
+    async fn a_non_2xx_body_is_capped_not_buffered() {
+        const QUICK: Duration = Duration::from_secs(10);
+        let root = scratch("feed-err-cap");
+        let exe = root.join("bin").join(host().binary_name());
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, synthetic_binary(host(), 0)).unwrap();
+
+        let stall = stalling_error_server(500, "").await;
+        let cfg = cfg_at(&root.join("update"), &exe, &format!("{stall}/latest"));
+        match tokio::time::timeout(QUICK, check_and_stage(&cfg, true)).await {
+            Ok(Err(Error::Config(msg))) => assert!(msg.contains("release feed answered http 500"), "{msg}"),
+            Ok(other) => panic!("a 500 feed must be Error::Config, got {other:?}"),
+            Err(_) => panic!("the 500 feed body was read to the end instead of under a cap"),
+        }
+
+        let stall = stalling_error_server(403, "Retry-After: 120\r\n").await;
+        let cfg = cfg_at(&root.join("update"), &exe, &format!("{stall}/latest"));
+        match tokio::time::timeout(QUICK, check_and_stage(&cfg, true)).await {
+            Ok(Err(Error::RateLimited { retry_after })) => assert_eq!(retry_after, Some(Duration::from_secs(120))),
+            Ok(other) => panic!("a 403 feed must be Error::RateLimited, got {other:?}"),
+            Err(_) => panic!("the 403 feed body was read to the end instead of under a cap"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        // The feed is fine, the sums are fine, the binary answers 500.
+        let stall = stalling_error_server(500, "").await;
+        let f = feed("v0.0.2", synthetic_binary(host(), 5), None, |r| {
+            r["assets"][0]["browser_download_url"] = format!("{stall}/dl/binary").into();
+        })
+        .await;
+        match tokio::time::timeout(QUICK, check_and_stage(&f.cfg(), true)).await {
+            Ok(Err(Error::Config(msg))) => assert!(msg.contains("answered http 500"), "{msg}"),
+            Ok(other) => panic!("a 500 binary must be Error::Config, got {other:?}"),
+            Err(_) => panic!("the 500 binary body was read to the end instead of under a cap"),
+        }
+        assert!(load_pending(&f.cfg().root, host(), "0.0.1").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&f.root);
     }
 
     /// The feed is not our origin: no bearer, ever — and the house UA, which

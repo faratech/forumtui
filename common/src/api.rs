@@ -45,9 +45,14 @@ impl VerifiedSession {
 
 pub struct WfApiClient {
     http: reqwest::Client,
-    /// `fetch_bytes`'s client for every URL outside our own API: no bearer,
-    /// and no non-public destination except the forum's own host (#130).
+    /// `fetch_bytes`'s clients for every URL outside our own API: no bearer,
+    /// and no non-public destination (#130). `own_image_http` is the
+    /// `OwnMedia` lane, the forum's exact origin on a media path, and the
+    /// only one that keeps a non-public address for the forum's own name
+    /// (#146). `content` decides which lane a URL takes.
     image_http: reqwest::Client,
+    own_image_http: reqwest::Client,
+    content: Arc<crate::http::ContentPolicy>,
     tokens: Mutex<Option<TokenSet>>,
     store: token::Store,
     requests_paused: AtomicBool,
@@ -156,10 +161,12 @@ impl WfApiClient {
             }
             other => other,
         };
-        let own_host = own_host_of(&base_url);
+        let content = Arc::new(crate::http::ContentPolicy::for_site(&base_url));
         Ok(WfApiClient {
             http: crate::http::build_with_ua(user_agent)?,
-            image_http: crate::http::build_public_with_ua(user_agent, own_host)?,
+            image_http: crate::http::build_public_with_ua(user_agent, content.clone(), crate::http::ContentLane::Strict)?,
+            own_image_http: crate::http::build_public_with_ua(user_agent, content.clone(), crate::http::ContentLane::OwnMedia)?,
+            content,
             tokens: Mutex::new(tokens),
             store,
             requests_paused: AtomicBool::new(false),
@@ -265,7 +272,9 @@ impl WfApiClient {
             }
         };
         Ok(Some(Self {
-            http: self.http.clone(), image_http: self.image_http.clone(), tokens: Mutex::new(Some(current)),
+            http: self.http.clone(), image_http: self.image_http.clone(),
+            own_image_http: self.own_image_http.clone(), content: self.content.clone(),
+            tokens: Mutex::new(Some(current)),
             store: self.store.clone(), requests_paused: AtomicBool::new(false),
             recovery_source: Some(stored), recovery_tokens: self.recovery_tokens.clone(),
             base: self.base.clone(), client_id: self.client_id.clone(),
@@ -769,20 +778,30 @@ impl WfApiClient {
         // — an image URL is attacker-influenced (a post can carry any
         // `[IMG]`), so a looser rule would hand the grant to whoever asked.
         //
-        // For the same reason everything else goes through `image_http`,
-        // which refuses non-public destinations (#130): the request itself
-        // is the attack, before any body is read — an `[IMG]` of
+        // For the same reason everything else goes through the content
+        // clients, which refuse non-public destinations (#130): the request
+        // itself is the attack, before any body is read — an `[IMG]` of
         // `http://169.254.169.254/…` or `http://192.168.1.1/reboot` used to
-        // be sent the moment the post scrolled into view.
+        // be sent the moment the post scrolled into view. The forum's own
+        // name keeps a non-public address only on its exact origin and
+        // media paths (#146); a proxied target is looked up here first,
+        // since the proxy, not our resolver, resolves it (#147).
         let req = if self.image_uses_bearer(url) {
             self.http.get(url).bearer_auth(self.dispatch_token(&[&self.image_gate]).await?)
         } else {
+            use crate::http::ContentLane;
             let parsed = reqwest::Url::parse(url)
                 .map_err(|e| Error::FetchRejected(format!("unparseable image URL {url:?}: {e}")))?;
-            crate::http::check_public_url(&parsed, own_host_of(&self.base).as_deref())
-                .map_err(|refusal| Error::FetchRejected(refusal.0))?;
+            self.content.check_url(&parsed).map_err(|refusal| Error::FetchRejected(refusal.0))?;
+            let lane = self.content.lane(&parsed);
+            if lane == ContentLane::Strict {
+                self.content.preflight(&parsed).await.map_err(|refusal| Error::FetchRejected(refusal.0))?;
+            }
             self.image_gate.wait().await;
-            self.image_http.get(parsed)
+            match lane {
+                ContentLane::Strict => self.image_http.get(parsed),
+                ContentLane::OwnMedia => self.own_image_http.get(parsed),
+            }
         };
         let response = req.send().await.map_err(|e| match crate::http::non_public_refusal(&e) {
             Some(refusal) => Error::FetchRejected(refusal.0.clone()),
@@ -845,12 +864,6 @@ impl WfApiClient {
     }
 }
 
-/// The forum's own host, as the URL parser normalises it — the one host
-/// `fetch_bytes`'s non-public guard exempts (#130).
-fn own_host_of(base: &str) -> Option<String> {
-    reqwest::Url::parse(base).ok().and_then(|u| u.host_str().map(str::to_owned))
-}
-
 pub(crate) async fn check_status(resp: reqwest::Response) -> Result<()> {
     let status = resp.status().as_u16();
     if (200..300).contains(&status) {
@@ -883,10 +896,10 @@ pub(crate) async fn error_from_response(resp: reqwest::Response) -> Error {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.trim().parse::<u64>().ok())
             .map(|secs| Duration::from_secs(secs.min(MAX_RETRY_AFTER_SECS)));
-        let _ = read_error_body(resp).await; // drain politely; shape not needed
+        let _ = crate::http::read_error_body(resp).await; // drain politely; shape not needed
         return Error::RateLimited { retry_after };
     }
-    let bytes = read_error_body(resp).await;
+    let bytes = crate::http::read_error_body(resp).await;
     if let Some(first) = serde_json::from_slice::<ApiErrorBody>(&bytes)
         .ok()
         .and_then(|parsed| parsed.errors.into_iter().next())
@@ -905,25 +918,6 @@ pub(crate) async fn error_from_response(resp: reqwest::Response) -> Error {
         status,
         max_page: None,
     }
-}
-
-/// Read an error body under a hard cap. The old code buffered the whole
-/// body with `resp.bytes()`, and this is the one path a hostile origin can
-/// fatten at will — `fetch_bytes` reads whatever `[IMG]` names, and its
-/// per-URL caps only guarded the success branch, so a multi-gigabyte 403
-/// body OOM'd the client (#46). 64 KiB is far more than any XF error
-/// envelope or Cloudflare page needs to say what went wrong.
-async fn read_error_body(resp: reqwest::Response) -> Vec<u8> {
-    const MAX_ERROR_BODY: usize = 64 * 1024;
-    let mut resp = resp;
-    let mut bytes = Vec::new();
-    while bytes.len() < MAX_ERROR_BODY
-        && let Ok(Some(chunk)) = resp.chunk().await
-    {
-        let room = MAX_ERROR_BODY - bytes.len();
-        bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
-    }
-    bytes
 }
 
 /// XF's plain `/nodes` endpoint never emits `depth` (only
@@ -3830,6 +3824,109 @@ mod tests {
         match c.fetch_bytes(&url, 1024).await {
             Err(Error::FetchRejected(msg)) => assert!(msg.contains("169.254.169.254"), "{msg}"),
             other => panic!("the hop must be refused, got {other:?}"),
+        }
+    }
+
+    impl WfApiClient {
+        /// Swap the content policy and rebuild both content clients on it,
+        /// routed through `proxy` if one is given. A test never sets the
+        /// process-wide proxy variables, because every other test's
+        /// clients would read them too.
+        fn with_content_policy(mut self, policy: crate::http::ContentPolicy, proxy: Option<&str>) -> Self {
+            use crate::http::ContentLane;
+            let policy = Arc::new(policy);
+            let build = |lane| {
+                let mut b = crate::http::content_client_builder(&config::user_agent(), policy.clone(), lane);
+                if let Some(p) = proxy {
+                    b = b.proxy(reqwest::Proxy::all(p).unwrap());
+                }
+                b.build().unwrap()
+            };
+            self.image_http = build(ContentLane::Strict);
+            self.own_image_http = build(ContentLane::OwnMedia);
+            self.content = policy;
+            self
+        }
+    }
+
+    fn png() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_raw(vec![0x89u8, b'P', b'N', b'G'], "image/png")
+    }
+
+    /// #146: a forum whose own name resolves to loopback, which is what a
+    /// client on the forum's own server sees. Its media still load. Its
+    /// other paths, the same name on another port, and a redirect from a
+    /// media path to another path are refused before anything reaches the
+    /// loopback listener. The old exemption matched the name alone, so all
+    /// three were sent to 127.0.0.1.
+    #[tokio::test]
+    async fn fetch_bytes_keeps_a_loopback_forum_name_to_its_media_paths() {
+        let forum = MockServer::start().await;
+        let other = MockServer::start().await;
+        let _env = EnvGuard::hold(&forum.uri(), "/tmp/wftui-t-fetch-own-media");
+        Mock::given(method("GET")).and(path("/data/a.png")).respond_with(png()).expect(1).mount(&forum).await;
+        Mock::given(method("GET"))
+            .and(path("/data/hop.png"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", "/admin.php"))
+            .expect(1)
+            .mount(&forum)
+            .await;
+        Mock::given(method("GET")).and(path("/admin.php")).respond_with(png()).expect(0).mount(&forum).await;
+        Mock::given(method("GET")).respond_with(png()).expect(0).mount(&other).await;
+        let (port, other_port) = (forum.address().port(), other.address().port());
+        let policy = crate::http::ContentPolicy::with_proxy_env(&format!("http://forum.example:{port}"), |_| None)
+            .with_fixed_dns("forum.example", &["127.0.0.1"]);
+        let c = logged_in_client("tok-1").await.with_content_policy(policy, None);
+
+        let bytes = c.fetch_bytes(&format!("http://forum.example:{port}/data/a.png"), 1024).await.unwrap();
+        assert_eq!(&bytes[..4], b"\x89PNG");
+        for (u, why) in [
+            (format!("http://forum.example:{port}/admin.php"), "non-public"),
+            (format!("http://forum.example:{other_port}/data/a.png"), "non-public"),
+            (format!("http://forum.example:{port}/data/hop.png"), "own media"),
+        ] {
+            match c.fetch_bytes(&u, 1024).await {
+                Err(Error::FetchRejected(msg)) => assert!(msg.contains(why), "{u}: {msg}"),
+                other => panic!("{u} must be refused, got {other:?}"),
+            }
+        }
+        // `expect(..)` is verified when the servers drop.
+    }
+
+    /// #147: behind a proxy named by a hostname that resolves to a private
+    /// address, the forum's media and public images load through it. The
+    /// old resolver judged the proxy's name instead of the target's and
+    /// refused every one. Targets are still judged: a name that resolves
+    /// to a private address here is refused before it is sent, and so is
+    /// the proxy itself named as a target. A name only the proxy can
+    /// resolve is left to the proxy.
+    #[tokio::test]
+    async fn fetch_bytes_works_through_a_named_private_proxy_and_still_judges_targets() {
+        let proxy = MockServer::start().await;
+        let _env = EnvGuard::hold(&proxy.uri(), "/tmp/wftui-t-fetch-proxy");
+        for ok in ["/data/a.png", "/b.png", "/d.png"] {
+            Mock::given(method("GET")).and(path(ok)).respond_with(png()).expect(1).mount(&proxy).await;
+        }
+        Mock::given(method("GET")).respond_with(png()).expect(0).mount(&proxy).await;
+        let proxy_url = format!("http://proxy.corp.example:{}", proxy.address().port());
+        let policy = crate::http::ContentPolicy::with_proxy_env("http://forum.example", |name| {
+            matches!(name, "HTTPS_PROXY" | "HTTP_PROXY").then(|| proxy_url.clone())
+        })
+        .with_fixed_dns("proxy.corp.example", &["127.0.0.1"])
+        .with_fixed_dns("cdn.example", &["8.8.8.8"])
+        .with_fixed_dns("intranet.example", &["10.0.0.5"])
+        .with_fixed_dns("proxy-only.example", &[]);
+        let c = logged_in_client("tok-1").await.with_content_policy(policy, Some(&proxy_url));
+
+        for u in ["http://forum.example/data/a.png", "http://cdn.example/b.png", "http://proxy-only.example/d.png"] {
+            let bytes = c.fetch_bytes(u, 1024).await.unwrap_or_else(|e| panic!("{u} through the proxy: {e:?}"));
+            assert_eq!(&bytes[..4], b"\x89PNG", "{u}");
+        }
+        for u in ["http://intranet.example/c.png".to_string(), format!("{proxy_url}/e.png")] {
+            match c.fetch_bytes(&u, 1024).await {
+                Err(Error::FetchRejected(msg)) => assert!(msg.contains("refusing"), "{u}: {msg}"),
+                other => panic!("{u} must be refused, got {other:?}"),
+            }
         }
     }
 

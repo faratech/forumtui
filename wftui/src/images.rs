@@ -1673,9 +1673,11 @@ mod tests {
         let denied = load(&foreign, &disk, ratatui_image::picker::Picker::halfblocks(), &request,
             permits.clone().acquire_owned().await.unwrap(), None).await;
         assert!(denied.is_err(), "a different forum must not read A's legacy private entry either");
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 4);
-        assert!(!requests.last().unwrap().headers.contains_key("authorization"));
+        // That forum is 127.0.0.1:1, so this server's port is not its origin:
+        // the fetch is refused before it is sent (#146). Before, the
+        // exemption matched the host and ignored the port, and the request
+        // went out without a bearer.
+        assert_eq!(server.received_requests().await.unwrap().len(), 3, "the foreign client sent nothing");
         Mock::given(method("GET")).and(path("/thumb.png"))
             .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png")
                 .set_body_bytes(include_bytes!("../assets/wf-logo.png").to_vec())).mount(&server).await;
@@ -1685,7 +1687,7 @@ mod tests {
                 permits.clone().acquire_owned().await.unwrap(), None).await.is_ok());
         }
         assert!(disk.get(&public.key).is_some());
-        assert_eq!(server.received_requests().await.unwrap().len(), 5, "public bytes remain shared across clients");
+        assert_eq!(server.received_requests().await.unwrap().len(), 4, "public bytes remain shared across clients");
         let _ = std::fs::remove_dir_all(dir);
     }
 
