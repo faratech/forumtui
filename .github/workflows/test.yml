@@ -64,5 +64,10 @@ jobs:
       - name: Packaging output paths
         run: bash packaging/tests/build-tarball-smoke.sh
 
+      # The TuiLink add-on's own tests: stubbed XenForo, in-memory SQLite.
+      # No `-n` here: the runner's PHP loads pdo_sqlite from its ini.
+      - name: TuiLink add-on
+        run: php addon/tests/tuilink_test.php
+
       - name: No embedded escapes
         run: /usr/bin/grep -rn $'\x1b' wftui/src && exit 1 || exit 0

@@ -56,6 +56,13 @@ The draft endpoints mint no new OAuth scope: each draft kind asserts the
 scope its content type already implies, so a token that may post to a thread
 may draft to it and nothing else.
 
+## Tests
+
+`php -n addon/tests/tuilink_test.php` runs the add-on's unit tests against a
+stubbed XenForo and an in-memory SQLite copy of the link table — no forum,
+database server or Redis involved. Pass a directory to test another copy, for
+example the deployed one before exporting over it.
+
 ## Upgrading from 1.0.x
 
 `php cmd.php xf-addon:upgrade WindowsForum/TuiLink` creates the table. The

@@ -33,6 +33,13 @@ class DoneController extends \XF\Pub\Controller\AbstractController
 
 		if (!$id || !LinkStore::attachCode($id, $code))
 		{
+			// A revisit of this tab after the terminal already collected its
+			// code: that sign-in worked, and the code is not re-armed
+			// (forumtui#134).
+			if ($id && LinkStore::isConsumed($id))
+			{
+				return $this->message(\XF::phrase('wf_tuilink.authorized'));
+			}
 			return $this->message(\XF::phrase('wf_tuilink.expired'));
 		}
 

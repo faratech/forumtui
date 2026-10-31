@@ -90,14 +90,31 @@ final class LinkStore
 		return is_string($id) && $id !== '' ? $id : null;
 	}
 
+	/**
+	 * `code` is NULL until /tui-done attaches one, the code until the first
+	 * poll reads it, and then the empty string: consumed. A consumed record
+	 * never takes a code again (forumtui#134) — burning the code to NULL let
+	 * a refresh of the /tui-done tab (its URL sits in the browser history)
+	 * re-attach the same code for the rest of the TTL, so a second poll
+	 * could observe it after all.
+	 */
+	public const CONSUMED = '';
+
 	public static function attachCode(string $id, string $code): bool
 	{
 		return self::db()->update(
 			self::TABLE,
 			['code' => $code],
-			'link_id = ? AND expiry_date >= ?',
-			[$id, \XF::$time]
+			'link_id = ? AND expiry_date >= ? AND (code IS NULL OR code <> ?)',
+			[$id, \XF::$time, self::CONSUMED]
 		) > 0;
+	}
+
+	/** Whether this record's code was already handed to a poll. */
+	public static function isConsumed(string $id): bool
+	{
+		$record = self::get($id);
+		return $record !== null && $record['code'] === self::CONSUMED;
 	}
 
 	/**
@@ -105,13 +122,14 @@ final class LinkStore
 	 * compare-and-clear means exactly one poll ever observes the code, even
 	 * with concurrent pollers racing the legitimate client. The row itself
 	 * stays alive until TTL so status/denied keep answering; a repeat poll
-	 * after consumption simply finds no code.
+	 * after consumption finds the empty CONSUMED marker, which reads as no
+	 * code, and `attachCode` will not overwrite it.
 	 */
 	public static function consumeCode(string $id, string $code): bool
 	{
 		return self::db()->update(
 			self::TABLE,
-			['code' => null],
+			['code' => self::CONSUMED],
 			'link_id = ? AND code = ? AND expiry_date >= ?',
 			[$id, $code, \XF::$time]
 		) > 0;
@@ -145,7 +163,13 @@ final class LinkStore
 		try
 		{
 			$count = (int) $redis->incr($key);
-			if ($count === 1)
+			// Also repair a counter with no TTL (forumtui#125): only the INCR
+			// that created the key used to set one, so a worker that died
+			// between INCR and EXPIRE — or an INCR that recreated a key which
+			// expired a moment earlier — left a budget that never reset, and
+			// that address (often a shared NAT) 429'd every sign-in forever.
+			// TTL is -1 for a key without one.
+			if ($count === 1 || (int) $redis->ttl($key) === -1)
 			{
 				$redis->expire($key, self::REGISTER_WINDOW);
 			}

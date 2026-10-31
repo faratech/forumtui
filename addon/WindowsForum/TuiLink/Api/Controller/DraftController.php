@@ -44,13 +44,25 @@ class DraftController extends \XF\Api\Controller\AbstractController
 	 * not something to expose over an API nobody asked for it on.
 	 */
 	protected const KINDS = [
-		'/^thread-([0-9]{1,10})$/' => ['thread', 'thread_id'],
-		'/^forum-([0-9]{1,10})$/' => ['thread', 'node_id'],
+		'/^thread-([0-9]{1,10})$/' => ['thread', 'thread_id', 'thread-'],
+		'/^forum-([0-9]{1,10})$/' => ['thread', 'node_id', 'forum-'],
 		// Conversations take attachments under a content type this client
 		// does not upload to, so the context column is deliberately null:
 		// an attachment key offered for a conversation draft is refused.
-		'/^conversation-reply-([0-9]{1,10})$/' => ['conversation', null],
+		'/^conversation-reply-([0-9]{1,10})$/' => ['conversation', null, 'conversation-reply-'],
 	];
+
+	/** The most drafts one listing returns. */
+	protected const LIST_LIMIT = 200;
+
+	/**
+	 * Every action here is one member's own writing. An API key acting as
+	 * no user would read and write the guest's (user 0) draft rows.
+	 */
+	protected function preDispatchController($action, \XF\Mvc\ParameterBag $params)
+	{
+		$this->assertRegisteredUser();
+	}
 
 	/**
 	 * Parse a draft key into its scope family, its attachment context column
@@ -67,13 +79,14 @@ class DraftController extends \XF\Api\Controller\AbstractController
 			return null;
 		}
 
-		foreach (self::KINDS AS $pattern => [$family, $contextKey])
+		foreach (self::KINDS AS $pattern => [$family, $contextKey, $prefix])
 		{
 			if (preg_match($pattern, $key, $m))
 			{
 				return [
 					'family' => $family,
 					'context_key' => $contextKey,
+					'prefix' => $prefix,
 					'id' => (int) $m[1],
 				];
 			}
@@ -126,23 +139,112 @@ class DraftController extends \XF\Api\Controller\AbstractController
 		return $parsed;
 	}
 
+	/**
+	 * Permission to keep a draft for this target: the same check XF's own
+	 * draft actions make before `DraftPlugin` writes (`assertViewableThread`,
+	 * `assertViewableForum`, `assertViewableUserConversation`) — being able
+	 * to see it. The token scope alone let a member park rows for threads,
+	 * forums and conversations they cannot see (forumtui#126).
+	 *
+	 * A missing target and an unviewable one get the same 403: the relay
+	 * does not confirm what exists, and a 404 here would read to the client
+	 * as "no relay installed" and switch draft sync off for the session.
+	 */
+	protected function assertDraftTargetViewable(array $parsed)
+	{
+		$viewable = false;
+		try
+		{
+			switch ($parsed['prefix'])
+			{
+				case 'thread-':
+					$this->assertViewableApiRecord(\XF\Entity\Thread::class, $parsed['id']);
+					$viewable = true;
+					break;
+
+				case 'forum-':
+					$this->assertViewableApiRecord(\XF\Entity\Forum::class, $parsed['id']);
+					$viewable = true;
+					break;
+
+				case 'conversation-reply-':
+					$this->plugin(\XF\Api\ControllerPlugin\ConversationPlugin::class)
+						->assertViewableUserConversation($parsed['id'], []);
+					$viewable = true;
+					break;
+			}
+		}
+		catch (\XF\Mvc\Reply\Exception $e)
+		{
+			$viewable = false;
+		}
+
+		if (!$viewable)
+		{
+			throw $this->exception($this->apiError(
+				\XF::phrase('do_not_have_permission'),
+				'wf_tuilink_draft_target_unavailable',
+				null,
+				403
+			));
+		}
+	}
+
 	public function actionGet()
 	{
 		$visitor = \XF::visitor();
 
 		/** @var DraftFinder $finder */
 		$finder = $this->finder(DraftFinder::class);
-		$drafts = $finder->where('user_id', $visitor->user_id)
+		$finder->where('user_id', $visitor->user_id);
+
+		// Only the kinds this token may read count against the limit
+		// (forumtui#135): the limit used to be applied first and the
+		// filtering after, so 200 newer `report-` (or unscoped) drafts hid
+		// every older one this client could have adopted.
+		$kinds = [];
+		foreach (self::KINDS AS [$family, , $prefix])
+		{
+			if ($this->hasApiScope($family . ':read'))
+			{
+				$kinds[] = ['draft_key', 'LIKE', $finder->escapeLike($prefix, '?%')];
+			}
+		}
+		if (!$kinds)
+		{
+			return $this->apiResult(['success' => true, 'drafts' => []]);
+		}
+		$drafts = $finder->whereOr($kinds)
 			->order('last_update', 'DESC')
-			->limit(200)
+			->limit(self::LIST_LIMIT)
 			->fetch();
+
+		// A web draft's attachments are temp uploads that age out; say a
+		// draft has attachments only while they still exist (forumtui#133).
+		$hashes = [];
+		foreach ($drafts AS $draft)
+		{
+			$hash = ($draft->extra_data ?: [])['attachment_hash'] ?? '';
+			if (is_string($hash) && $hash !== '')
+			{
+				$hashes[$hash] = true;
+			}
+		}
+		$liveHashes = [];
+		if ($hashes)
+		{
+			$db = $this->app()->db();
+			$liveHashes = array_fill_keys($db->fetchAllColumn(
+				'SELECT DISTINCT temp_hash FROM xf_attachment WHERE temp_hash IN (' . $db->quote(array_keys($hashes)) . ')'
+			), true);
+		}
 
 		$out = [];
 		foreach ($drafts AS $draft)
 		{
 			$family = $this->scopeFamilyForKey($draft->draft_key);
-			// Unknown kinds (a `report-` draft, or one from an add-on that
-			// arrives later) are dropped rather than guessed at.
+			// A key that matched a prefix but not its exact shape is still
+			// dropped rather than guessed at.
 			if ($family === null || !$this->hasApiScope($family . ':read'))
 			{
 				continue;
@@ -162,7 +264,8 @@ class DraftController extends \XF\Api\Controller\AbstractController
 				// let either be set, so a hash cannot be turned back into a
 				// key a client could use. Saying whether files exist is
 				// honest; handing over a hash the client cannot spend is not.
-				'has_attachments' => !empty($extraData['attachment_hash']),
+				'has_attachments' => !empty($extraData['attachment_hash'])
+					&& isset($liveHashes[$extraData['attachment_hash']]),
 			];
 		}
 
@@ -177,6 +280,10 @@ class DraftController extends \XF\Api\Controller\AbstractController
 
 		$visitor = \XF::visitor();
 		$message = $this->filter('message', 'str');
+		if (strlen(trim($message)))
+		{
+			$this->assertDraftTargetViewable($parsed);
+		}
 
 		/** @var DraftRepository $draftRepo */
 		$draftRepo = $this->repository(DraftRepository::class);
@@ -229,9 +336,18 @@ class DraftController extends \XF\Api\Controller\AbstractController
 				[$parsed['context_key'] => $parsed['id']]
 			);
 
+		}
+
+		// Without this the upload ages out from under the draft — whether
+		// the hash came with this save or was attached in the browser and
+		// merely kept (forumtui#133). A draft resumed from the website has
+		// no API key to send, so every terminal save arrives key-less, and
+		// refreshing only on the key path let its files expire while the
+		// draft was being edited here.
+		if (!empty($extraData['attachment_hash']))
+		{
 			/** @var DraftPlugin $draftPlugin */
 			$draftPlugin = $this->plugin(DraftPlugin::class);
-			// Without this the upload ages out from under the draft.
 			$draftPlugin->refreshTempAttachments($extraData['attachment_hash']);
 		}
 
