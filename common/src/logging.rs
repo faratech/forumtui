@@ -41,8 +41,7 @@ pub fn init() {
     let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) else {
         return;
     };
-    let filter = EnvFilter::try_from_env("WFTUI_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("warn"));
+    let filter = EnvFilter::try_from_env("WFTUI_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(false)

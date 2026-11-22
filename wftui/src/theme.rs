@@ -299,7 +299,11 @@ impl Theme {
     /// and `chrome_fg` white. A no-op on mono.
     pub fn with_chrome_bg(mut self, rgb: common::bbcode::Rgb) -> Self {
         let mix = |c: u8| ((c as u16 * 28 + 255 * 72) / 100) as u8;
-        let dim = common::bbcode::Rgb { r: mix(rgb.r), g: mix(rgb.g), b: mix(rgb.b) };
+        let dim = common::bbcode::Rgb {
+            r: mix(rgb.r),
+            g: mix(rgb.g),
+            b: mix(rgb.b),
+        };
         if let (Some(bg), Some(dim)) = (quantize(self.tier, rgb), quantize(self.tier, dim)) {
             self.chrome_bg = bg;
             self.chrome_dim = dim;
@@ -512,7 +516,10 @@ pub fn fmt_age_parts_at(ts: i64, now: time::OffsetDateTime) -> (String, bool) {
     if age < 0 {
         // A clock skew or a scheduled post: fall back to the date rather than
         // printing a negative age.
-        return (format!("{} {}", MONTHS[t.month() as usize - 1], t.day()), false);
+        return (
+            format!("{} {}", MONTHS[t.month() as usize - 1], t.day()),
+            false,
+        );
     }
     if age < 60 {
         return ("now".into(), true);
@@ -527,7 +534,10 @@ pub fn fmt_age_parts_at(ts: i64, now: time::OffsetDateTime) -> (String, bool) {
         return (format!("{}d", age / 86_400), true);
     }
     if t.year() == now.year() {
-        return (format!("{} {}", MONTHS[t.month() as usize - 1], t.day()), false);
+        return (
+            format!("{} {}", MONTHS[t.month() as usize - 1], t.day()),
+            false,
+        );
     }
     (t.year().to_string(), false)
 }
@@ -547,19 +557,43 @@ mod tests {
     /// `chrome_dim` follows it towards white, and mono stays untouched.
     #[test]
     fn detect_with_quantises_chrome_bg_per_tier_and_keeps_mono_reset() {
-        let green = common::bbcode::Rgb { r: 0x3A, g: 0x7D, b: 0x44 };
+        let green = common::bbcode::Rgb {
+            r: 0x3A,
+            g: 0x7D,
+            b: 0x44,
+        };
         let t = Theme::truecolor().with_chrome_bg(green);
         assert_eq!(t.chrome_bg, Color::Rgb(0x3A, 0x7D, 0x44));
         assert_eq!(t.chrome_fg, Color::Rgb(0xFF, 0xFF, 0xFF));
-        let Color::Rgb(r, g, b) = t.chrome_dim else { panic!("{:?}", t.chrome_dim) };
-        assert!(r > 0x3A && g > 0x7D && b > 0x44, "dim is lighter than the band: {r:x}{g:x}{b:x}");
-        assert!(matches!(Theme::ansi256().with_chrome_bg(green).chrome_bg, Color::Indexed(_)));
-        assert!(!matches!(Theme::ansi16().with_chrome_bg(green).chrome_bg, Color::Rgb(..) | Color::Indexed(_)));
+        let Color::Rgb(r, g, b) = t.chrome_dim else {
+            panic!("{:?}", t.chrome_dim)
+        };
+        assert!(
+            r > 0x3A && g > 0x7D && b > 0x44,
+            "dim is lighter than the band: {r:x}{g:x}{b:x}"
+        );
+        assert!(matches!(
+            Theme::ansi256().with_chrome_bg(green).chrome_bg,
+            Color::Indexed(_)
+        ));
+        assert!(!matches!(
+            Theme::ansi16().with_chrome_bg(green).chrome_bg,
+            Color::Rgb(..) | Color::Indexed(_)
+        ));
         let mono = Theme::mono().with_chrome_bg(green);
         assert_eq!(mono.chrome_bg, Theme::mono().chrome_bg);
         assert_eq!(mono.chrome_dim, Theme::mono().chrome_dim);
         // The default blue is what every other role was tuned against.
-        assert_eq!(Theme::truecolor().with_chrome_bg(common::bbcode::Rgb { r: 0x0F, g: 0x6C, b: 0xBD }).chrome_bg, Theme::truecolor().chrome_bg);
+        assert_eq!(
+            Theme::truecolor()
+                .with_chrome_bg(common::bbcode::Rgb {
+                    r: 0x0F,
+                    g: 0x6C,
+                    b: 0xBD
+                })
+                .chrome_bg,
+            Theme::truecolor().chrome_bg
+        );
     }
 
     #[test]
@@ -575,11 +609,23 @@ mod tests {
         assert_eq!(fmt_age_at(n - 6 * 86_400, now), "6d");
         assert_eq!(fmt_age_at(n - 29 * 86_400, now), "29d");
         // Past a month, the same calendar year reads as a date…
-        assert_eq!(fmt_age_at(at(2026, time::Month::July, 26).unix_timestamp(), now), "Jul 26");
-        assert_eq!(fmt_age_at(at(2026, time::Month::February, 27).unix_timestamp(), now), "Feb 27");
+        assert_eq!(
+            fmt_age_at(at(2026, time::Month::July, 26).unix_timestamp(), now),
+            "Jul 26"
+        );
+        assert_eq!(
+            fmt_age_at(at(2026, time::Month::February, 27).unix_timestamp(), now),
+            "Feb 27"
+        );
         // …and an older year as the year alone.
-        assert_eq!(fmt_age_at(at(2025, time::Month::November, 2).unix_timestamp(), now), "2025");
-        assert_eq!(fmt_age_at(at(2013, time::Month::May, 1).unix_timestamp(), now), "2013");
+        assert_eq!(
+            fmt_age_at(at(2025, time::Month::November, 2).unix_timestamp(), now),
+            "2025"
+        );
+        assert_eq!(
+            fmt_age_at(at(2013, time::Month::May, 1).unix_timestamp(), now),
+            "2013"
+        );
     }
 
     #[test]
@@ -587,7 +633,12 @@ mod tests {
         let now = at(2026, time::Month::August, 30);
         let n = now.unix_timestamp();
         let samples = [
-            n, n - 30, n - 3600, n - 59 * 60, n - 23 * 3600, n - 29 * 86_400,
+            n,
+            n - 30,
+            n - 3600,
+            n - 59 * 60,
+            n - 23 * 3600,
+            n - 29 * 86_400,
             at(2026, time::Month::December, 31).unix_timestamp(),
             at(2026, time::Month::January, 1).unix_timestamp(),
             at(1999, time::Month::January, 1).unix_timestamp(),
@@ -610,7 +661,12 @@ mod tests {
             Theme::ansi16(),
             Theme::mono(),
         ] {
-            assert_eq!(t.text, Color::Reset, "{:?} must not paint body text", t.tier);
+            assert_eq!(
+                t.text,
+                Color::Reset,
+                "{:?} must not paint body text",
+                t.tier
+            );
         }
     }
 
@@ -618,9 +674,26 @@ mod tests {
     fn mono_paints_nothing() {
         let t = Theme::mono();
         for c in [
-            t.dim, t.accent, t.link, t.header, t.warn, t.error, t.selected_bg, t.faint,
-            t.accent_bg, t.accent_fg, t.keycap_bg, t.keycap_fg, t.chrome_bg, t.chrome_fg,
-            t.chrome_dim, t.badge_bg, t.badge_fg, t.ok, t.code_fg, t.code_bg,
+            t.dim,
+            t.accent,
+            t.link,
+            t.header,
+            t.warn,
+            t.error,
+            t.selected_bg,
+            t.faint,
+            t.accent_bg,
+            t.accent_fg,
+            t.keycap_bg,
+            t.keycap_fg,
+            t.chrome_bg,
+            t.chrome_fg,
+            t.chrome_dim,
+            t.badge_bg,
+            t.badge_fg,
+            t.ok,
+            t.code_fg,
+            t.code_bg,
         ] {
             assert_eq!(c, Color::Reset);
         }
@@ -642,7 +715,10 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::REVERSED)
         );
-        assert_eq!(Theme::truecolor().selected().bg, Some(Theme::truecolor().selected_bg));
+        assert_eq!(
+            Theme::truecolor().selected().bg,
+            Some(Theme::truecolor().selected_bg)
+        );
     }
 
     #[test]
@@ -676,7 +752,11 @@ mod tests {
         assert_eq!(quantize(Tier::Mono, red), None, "mono means no colour");
 
         // A near-grey should take the grey ramp, not the cube.
-        let grey = Rgb { r: 120, g: 122, b: 121 };
+        let grey = Rgb {
+            r: 120,
+            g: 122,
+            b: 121,
+        };
         match quantize(Tier::Ansi256, grey) {
             Some(Color::Indexed(i)) => {
                 assert!((232..=255).contains(&i), "expected the grey ramp, got {i}")
@@ -690,5 +770,4 @@ mod tests {
             }
         }
     }
-
 }

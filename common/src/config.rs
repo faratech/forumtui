@@ -142,7 +142,11 @@ pub fn user_agent() -> String {
 /// The UA for any other site: same prefix, the client's own project URL.
 /// Still distinctive, never another forum's address.
 pub fn user_agent_for_project() -> String {
-    format!("wftui/{} (+{})", env!("CARGO_PKG_VERSION"), crate::site::PROJECT_URL)
+    format!(
+        "wftui/{} (+{})",
+        env!("CARGO_PKG_VERSION"),
+        crate::site::PROJECT_URL
+    )
 }
 
 pub fn api_base() -> String {
@@ -169,9 +173,10 @@ pub fn mouse_enabled() -> bool {
 
 fn config_root() -> PathBuf {
     if let Ok(dir) = std::env::var("WFTUI_CONFIG_DIR")
-        && !dir.trim().is_empty() {
-            return PathBuf::from(dir);
-        }
+        && !dir.trim().is_empty()
+    {
+        return PathBuf::from(dir);
+    }
     default_config_root()
 }
 
@@ -295,12 +300,26 @@ mod tests {
     #[test]
     fn plain_http_is_only_accepted_for_a_loopback_forum() {
         // The token exchange and every bearer call go to this origin.
-        for ok in ["http://127.0.0.1:8080", "http://localhost:9000", "http://LOCALHOST", "http://[::1]:8080", "https://forum.example.com"] {
+        for ok in [
+            "http://127.0.0.1:8080",
+            "http://localhost:9000",
+            "http://LOCALHOST",
+            "http://[::1]:8080",
+            "https://forum.example.com",
+        ] {
             assert!(validate_base_url(ok).is_ok(), "refused {ok:?}");
         }
-        for refused in ["http://forum.example.com", "http://127.0.0.2", "http://10.0.0.5", "http://localhost.example.com"] {
+        for refused in [
+            "http://forum.example.com",
+            "http://127.0.0.2",
+            "http://10.0.0.5",
+            "http://localhost.example.com",
+        ] {
             let err = validate_base_url(refused).expect_err(refused);
-            assert!(format!("{err:?}").contains("loopback"), "{refused:?}: {err:?}");
+            assert!(
+                format!("{err:?}").contains("loopback"),
+                "{refused:?}: {err:?}"
+            );
         }
     }
 
@@ -311,7 +330,9 @@ mod tests {
         assert!(ua.contains("windowsforum.com"));
         let project = user_agent_for_project();
         assert!(project.starts_with("wftui/"));
-        assert!(project.contains("github.com/faratech/forumtui") && !project.contains("windowsforum"));
+        assert!(
+            project.contains("github.com/faratech/forumtui") && !project.contains("windowsforum")
+        );
         // Cloudflare's bot rules block bare library UAs (reqwest/hyper/...);
         // ours must never degrade to one of those signatures.
         for ua in [ua, project] {
@@ -338,7 +359,10 @@ mod tests {
             "media:read",
             "resource:read",
         ] {
-            assert!(scopes.iter().any(|s| s == needed), "missing scope: {needed}");
+            assert!(
+                scopes.iter().any(|s| s == needed),
+                "missing scope: {needed}"
+            );
         }
     }
 
@@ -361,9 +385,18 @@ mod tests {
         unsafe { std::env::set_var("WFTUI_CONFIG_DIR", "/tmp/wftui-t-roots") };
         assert_eq!(token_path_for("windowsforum"), token_path());
         assert_eq!(drafts_path_for("windowsforum"), drafts_path());
-        assert_eq!(token_path_for("other"), PathBuf::from("/tmp/wftui-t-roots/sites/other/token.json"));
-        assert_eq!(drafts_path_for("other"), PathBuf::from("/tmp/wftui-t-roots/sites/other/drafts.json"));
-        assert_eq!(crate::site::config_path(), PathBuf::from("/tmp/wftui-t-roots/config.json"));
+        assert_eq!(
+            token_path_for("other"),
+            PathBuf::from("/tmp/wftui-t-roots/sites/other/token.json")
+        );
+        assert_eq!(
+            drafts_path_for("other"),
+            PathBuf::from("/tmp/wftui-t-roots/sites/other/drafts.json")
+        );
+        assert_eq!(
+            crate::site::config_path(),
+            PathBuf::from("/tmp/wftui-t-roots/config.json")
+        );
         match saved {
             Some(v) => unsafe { std::env::set_var("WFTUI_CONFIG_DIR", v) },
             None => unsafe { std::env::remove_var("WFTUI_CONFIG_DIR") },
@@ -380,7 +413,10 @@ mod tests {
         assert!(mouse_enabled(), "the default is a captured mouse");
         for off in ["0", "off", "OFF", "false", "no", " 0 "] {
             unsafe { std::env::set_var("WFTUI_MOUSE", off) };
-            assert!(!mouse_enabled(), "WFTUI_MOUSE={off:?} must disable the mouse");
+            assert!(
+                !mouse_enabled(),
+                "WFTUI_MOUSE={off:?} must disable the mouse"
+            );
         }
         for on in ["1", "on", "yes", ""] {
             unsafe { std::env::set_var("WFTUI_MOUSE", on) };
@@ -403,14 +439,24 @@ mod tests {
         unsafe { std::env::set_var("WFTUI_UPDATE_URL", " http://127.0.0.1:1/latest.json ") };
         assert_eq!(update_feed_url(), "http://127.0.0.1:1/latest.json");
         unsafe { std::env::set_var("WFTUI_UPDATE_URL", "   ") };
-        assert_eq!(update_feed_url(), crate::update::DEFAULT_FEED_URL, "blank means default");
+        assert_eq!(
+            update_feed_url(),
+            crate::update::DEFAULT_FEED_URL,
+            "blank means default"
+        );
         for on in ["1", "true", "YES", " on "] {
             unsafe { std::env::set_var("WFTUI_NO_UPDATE", on) };
-            assert!(updates_disabled(), "WFTUI_NO_UPDATE={on:?} must disable updates");
+            assert!(
+                updates_disabled(),
+                "WFTUI_NO_UPDATE={on:?} must disable updates"
+            );
         }
         for off in ["0", "", "no"] {
             unsafe { std::env::set_var("WFTUI_NO_UPDATE", off) };
-            assert!(!updates_disabled(), "WFTUI_NO_UPDATE={off:?} must leave them on");
+            assert!(
+                !updates_disabled(),
+                "WFTUI_NO_UPDATE={off:?} must leave them on"
+            );
         }
         unsafe { std::env::remove_var("WFTUI_UPDATE_URL") };
         unsafe { std::env::remove_var("WFTUI_NO_UPDATE") };

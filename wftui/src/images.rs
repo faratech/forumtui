@@ -159,7 +159,10 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         // The halfblocks default from ratatui-image: arbitrary but a sane 1:2.
-        Policy { tier: Tier::Text, font: (10, 20) }
+        Policy {
+            tier: Tier::Text,
+            font: (10, 20),
+        }
     }
 }
 
@@ -269,7 +272,10 @@ pub type Sizes = HashMap<String, (u32, u32)>;
 
 /// The image key inside a store key (`store_key` prefixes it with the box).
 pub fn source_of(store_key: &str) -> &str {
-    store_key.split_once('|').map(|(_, key)| key).unwrap_or(store_key)
+    store_key
+        .split_once('|')
+        .map(|(_, key)| key)
+        .unwrap_or(store_key)
 }
 
 // ---------------------------------------------------------------- sizing ---
@@ -390,7 +396,11 @@ pub struct Lru<T> {
 
 impl<T> Lru<T> {
     pub fn new(cap: usize) -> Self {
-        Lru { cap: cap.max(1), map: HashMap::new(), order: Vec::new() }
+        Lru {
+            cap: cap.max(1),
+            map: HashMap::new(),
+            order: Vec::new(),
+        }
     }
 
     pub fn contains(&self, key: &str) -> bool {
@@ -455,7 +465,10 @@ impl Default for DiskCache {
 
 impl DiskCache {
     pub fn new() -> Self {
-        DiskCache { dir: default_cache_dir(), max_bytes: DISK_CAP_BYTES }
+        DiskCache {
+            dir: default_cache_dir(),
+            max_bytes: DISK_CAP_BYTES,
+        }
     }
 
     pub fn with_dir(dir: PathBuf, max_bytes: u64) -> Self {
@@ -469,7 +482,8 @@ impl DiskCache {
     fn path_for(&self, url: &str) -> PathBuf {
         // Older URL-only entries may contain authenticated API bytes from
         // any forum/account. Only the public-only loader can populate v2.
-        self.dir.join(format!("{}.img", digest(&format!("public-v2|{url}"))))
+        self.dir
+            .join(format!("{}.img", digest(&format!("public-v2|{url}"))))
     }
 
     pub fn get(&self, url: &str) -> Option<Vec<u8>> {
@@ -604,7 +618,9 @@ where
         return true;
     }
     matches!(
-        var("WFTUI_NO_IMAGES").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        var("WFTUI_NO_IMAGES")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
         Some("1") | Some("true") | Some("yes") | Some("on")
     )
 }
@@ -922,7 +938,7 @@ impl Images {
                 }
                 #[cfg(not(unix))]
                 unreachable!("Unix query is only selected on Unix")
-            },
+            }
         };
         let tier = tier_of(picker.protocol_type());
         let font = font_pair(&picker);
@@ -1009,8 +1025,14 @@ impl Images {
         // with current demand, so scrolling never leaves obsolete tasks.
         let mut deferred = VecDeque::new();
         while self.inflight.len() < LOAD_CONCURRENCY {
-            let Some(request) = self.queued.pop_front() else { break; };
-            if self.inflight.iter().any(|key| source_of(key) == request.key) {
+            let Some(request) = self.queued.pop_front() else {
+                break;
+            };
+            if self
+                .inflight
+                .iter()
+                .any(|key| source_of(key) == request.key)
+            {
                 deferred.push_back(request);
                 continue;
             }
@@ -1040,9 +1062,12 @@ impl Images {
             return (false, None);
         }
         let loading = self.inflight.contains(&key)
-            || self.queued.iter().any(|pending| pending.key == request.key
-                && pending.cols == request.rect.width && pending.rows == request.rect.height
-                && pending.full == request.full);
+            || self.queued.iter().any(|pending| {
+                pending.key == request.key
+                    && pending.cols == request.rect.width
+                    && pending.rows == request.rect.height
+                    && pending.full == request.full
+            });
         (loading, self.failed.get(&key).cloned())
     }
 
@@ -1060,7 +1085,8 @@ impl Images {
                 self.sizes.insert(source_of(&key).to_string(), loaded.px);
                 self.failed.remove(&key);
                 #[cfg(feature = "images")]
-                self.cache.insert(decoded_key(&key).to_string(), loaded.decoded);
+                self.cache
+                    .insert(decoded_key(&key).to_string(), loaded.decoded);
                 #[cfg(not(feature = "images"))]
                 {
                     let _ = (key, loaded);
@@ -1101,7 +1127,11 @@ pub fn decode(
     // ratatui-image 11 takes the target box as a `Size`, not a `Rect` (9 took
     // a Rect and ignored its origin).
     let decoded = picker
-        .new_protocol(img, Size::new(cols, rows), Resize::Fit(Some(FilterType::Lanczos3)))
+        .new_protocol(
+            img,
+            Size::new(cols, rows),
+            Resize::Fit(Some(FilterType::Lanczos3)),
+        )
         .map_err(|e| e.to_string())?;
     Ok(Loaded { decoded, px })
 }
@@ -1127,16 +1157,28 @@ pub async fn load(
     // and cached bytes that no longer decode are evicted — the old order
     // stored first, so one transient HTML or truncated 200 was served from
     // disk forever and R/retry could never reach the network again.
-    enum Source { Logo, Disk, Network }
+    enum Source {
+        Logo,
+        Disk,
+        Network,
+    }
     let (bytes, source) = if pending.key == LOGO_KEY {
-        (logo.ok_or_else(|| "this site has no logo".to_string())?.to_vec(), Source::Logo)
+        (
+            logo.ok_or_else(|| "this site has no logo".to_string())?
+                .to_vec(),
+            Source::Logo,
+        )
     } else if let Some(cached) = cacheable.then(|| disk.get(&pending.key)).flatten() {
         (cached, Source::Disk)
     } else {
         let fetched = client
             .fetch_bytes(
                 &pending.key,
-                if pending.full { MAX_VIEW_BYTES } else { MAX_IMAGE_BYTES },
+                if pending.full {
+                    MAX_VIEW_BYTES
+                } else {
+                    MAX_IMAGE_BYTES
+                },
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -1148,8 +1190,8 @@ pub async fn load(
         let decoded = decode(&picker, &bytes, cols, rows);
         (decoded, bytes)
     })
-        .await
-        .map_err(|e| e.to_string())?;
+    .await
+    .map_err(|e| e.to_string())?;
     match (&decoded, source) {
         (Ok(_), Source::Network) if cacheable => disk.put(&pending.key, &bytes),
         (Err(_), Source::Disk) => disk.remove(&pending.key),
@@ -1192,11 +1234,18 @@ mod tests {
         let (cols, rows) = fit(118, (1152, 720), (10, 20));
         assert_eq!(rows, MAX_ROWS, "a 16:10 shot is height-bound at 118 cols");
         assert_eq!(cols, 39);
-        assert!(cols <= 118 * WIDTH_PERCENT / 100, "{cols} exceeds the 40 % cap");
+        assert!(
+            cols <= 118 * WIDTH_PERCENT / 100,
+            "{cols} exceeds the 40 % cap"
+        );
 
         // 80-col terminal: inner area 78 wide, so the width cap bites first.
         let (cols, rows) = fit(78, (1152, 720), (10, 20));
-        assert_eq!(cols, 78 * WIDTH_PERCENT / 100, "width-bound: exactly the cap");
+        assert_eq!(
+            cols,
+            78 * WIDTH_PERCENT / 100,
+            "width-bound: exactly the cap"
+        );
         assert_eq!(cols, 31);
         assert_eq!(rows, 10);
         assert!(rows <= MAX_ROWS);
@@ -1229,7 +1278,10 @@ mod tests {
     fn a_very_tall_image_is_row_bound_and_a_very_wide_one_width_bound() {
         let (cols, rows) = fit(118, (100, 4000), (10, 20));
         assert_eq!(rows, MAX_ROWS);
-        assert!(cols < 47, "a column of pixels must not claim the width cap: {cols}");
+        assert!(
+            cols < 47,
+            "a column of pixels must not claim the width cap: {cols}"
+        );
 
         let (cols, rows) = fit(118, (4000, 100), (10, 20));
         assert_eq!(cols, 47);
@@ -1245,7 +1297,6 @@ mod tests {
     }
 
     // ---------- decode limits ----------
-
 
     /// A minimal uncompressed 24-bpp BMP: `w`/`h` go into the header
     /// verbatim, followed by `pixels` bytes of (possibly zero) pixel data.
@@ -1315,7 +1366,11 @@ mod tests {
     fn decode_still_accepts_a_small_image_and_reports_its_pixel_size() {
         let picker = ratatui_image::picker::Picker::halfblocks();
         // 2×2 24-bpp: 6 bytes per row padded to 8, bottom-up.
-        let ok = bmp(2, 2, &[10, 20, 30, 0, 0, 40, 50, 60, 0, 0, 70, 80, 90, 0, 0, 100]);
+        let ok = bmp(
+            2,
+            2,
+            &[10, 20, 30, 0, 0, 40, 50, 60, 0, 0, 70, 80, 90, 0, 0, 100],
+        );
         let loaded = decode(&picker, &ok, 39, 12).expect("a 2x2 bmp decodes");
         assert_eq!(loaded.px, (2, 2));
     }
@@ -1332,7 +1387,10 @@ mod tests {
             ((4000, 3000), (20, 5)),
         ] {
             let (cols, rows) = fit_within(box_wh.0, box_wh.1, px, font);
-            assert!(cols <= box_wh.0 && rows <= box_wh.1, "{px:?} in {box_wh:?} -> {cols}x{rows}");
+            assert!(
+                cols <= box_wh.0 && rows <= box_wh.1,
+                "{px:?} in {box_wh:?} -> {cols}x{rows}"
+            );
             assert!(cols >= 1 && rows >= 1);
             // One axis must be filled, or the image would float smaller than
             // it needs to.
@@ -1384,7 +1442,11 @@ mod tests {
 
     #[test]
     fn avatar_prefers_the_small_variant_then_medium() {
-        let mut u = User { user_id: 7, username: "Mike".into(), ..Default::default() };
+        let mut u = User {
+            user_id: 7,
+            username: "Mike".into(),
+            ..Default::default()
+        };
         assert_eq!(avatar_url(Some(&u)), None);
 
         u.avatar_urls = Some(common::models::AvatarUrls {
@@ -1430,11 +1492,26 @@ mod tests {
     #[test]
     fn graphics_override_parsing_covers_every_documented_value() {
         use GraphicsChoice::*;
-        assert_eq!(parse_graphics_choice("kitty"), Some(Tier(super::Tier::Kitty)));
-        assert_eq!(parse_graphics_choice(" SIXEL "), Some(Tier(super::Tier::Sixel)));
-        assert_eq!(parse_graphics_choice("iTerm2"), Some(Tier(super::Tier::Iterm2)));
-        assert_eq!(parse_graphics_choice("halfblocks"), Some(Tier(super::Tier::Halfblocks)));
-        assert_eq!(parse_graphics_choice("half-blocks"), Some(Tier(super::Tier::Halfblocks)));
+        assert_eq!(
+            parse_graphics_choice("kitty"),
+            Some(Tier(super::Tier::Kitty))
+        );
+        assert_eq!(
+            parse_graphics_choice(" SIXEL "),
+            Some(Tier(super::Tier::Sixel))
+        );
+        assert_eq!(
+            parse_graphics_choice("iTerm2"),
+            Some(Tier(super::Tier::Iterm2))
+        );
+        assert_eq!(
+            parse_graphics_choice("halfblocks"),
+            Some(Tier(super::Tier::Halfblocks))
+        );
+        assert_eq!(
+            parse_graphics_choice("half-blocks"),
+            Some(Tier(super::Tier::Halfblocks))
+        );
         assert_eq!(parse_graphics_choice("none"), Some(Off));
         assert_eq!(parse_graphics_choice("off"), Some(Off));
         assert_eq!(parse_graphics_choice("auto"), Some(Auto));
@@ -1458,14 +1535,26 @@ mod tests {
 
         // The override is honoured BEFORE any query, on both platforms.
         let g = |v: &'static str| move |k: &str| (k == "WFTUI_GRAPHICS").then(|| v.to_string());
-        assert_eq!(detect_plan(g("kitty"), false, true), DetectPlan::Forced(Tier::Kitty));
-        assert_eq!(detect_plan(g("sixel"), true, false), DetectPlan::Forced(Tier::Sixel));
-        assert_eq!(detect_plan(g("halfblocks"), false, true), DetectPlan::Forced(Tier::Halfblocks));
+        assert_eq!(
+            detect_plan(g("kitty"), false, true),
+            DetectPlan::Forced(Tier::Kitty)
+        );
+        assert_eq!(
+            detect_plan(g("sixel"), true, false),
+            DetectPlan::Forced(Tier::Sixel)
+        );
+        assert_eq!(
+            detect_plan(g("halfblocks"), false, true),
+            DetectPlan::Forced(Tier::Halfblocks)
+        );
         assert_eq!(detect_plan(g("none"), false, true), DetectPlan::TextOnly);
         // Auto and garbage both fall through to automatic detection.
         assert_eq!(detect_plan(g("auto"), false, true), DetectPlan::Query);
         assert_eq!(detect_plan(g("chafa"), false, true), DetectPlan::Query);
-        assert_eq!(detect_plan(g("chafa"), true, true), DetectPlan::WindowsQuery);
+        assert_eq!(
+            detect_plan(g("chafa"), true, true),
+            DetectPlan::WindowsQuery
+        );
 
         // The existing off switches still win over an override that asks for
         // pixels.
@@ -1513,7 +1602,10 @@ mod tests {
 
         let term_sixel = |k: &str| (k == "TERM").then(|| "xterm-sixel".to_string());
         assert_eq!(env_graphics_tier(&term_sixel), Some(Tier::Sixel));
-        assert_eq!(detect_plan(term_sixel, true, true), DetectPlan::WindowsQuery);
+        assert_eq!(
+            detect_plan(term_sixel, true, true),
+            DetectPlan::WindowsQuery
+        );
 
         let iterm = |k: &str| (k == "LC_TERMINAL").then(|| "iTerm2".to_string());
         assert_eq!(env_graphics_tier(&iterm), Some(Tier::Iterm2));
@@ -1536,7 +1628,10 @@ mod tests {
             "WFTUI_GRAPHICS" => Some("kitty".to_string()),
             _ => None,
         };
-        assert_eq!(detect_plan(wt_override, true, true), DetectPlan::Forced(Tier::Kitty));
+        assert_eq!(
+            detect_plan(wt_override, true, true),
+            DetectPlan::Forced(Tier::Kitty)
+        );
     }
 
     #[test]
@@ -1550,7 +1645,7 @@ mod tests {
         let reqs = vec![Request {
             key: "https://wf/thumb.png".into(),
             rect: Rect::new(0, 0, 8, 4),
-                full: false,
+            full: false,
         }];
         let mut pending = Vec::new();
         terminal
@@ -1565,14 +1660,17 @@ mod tests {
     #[test]
     fn an_inline_tier_asks_once_per_key_and_stops_after_a_failure() {
         let mut images = Images::text_only();
-        images.policy = Policy { tier: Tier::Halfblocks, font: (10, 20) };
+        images.policy = Policy {
+            tier: Tier::Halfblocks,
+            font: (10, 20),
+        };
 
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let reqs = vec![Request {
             key: "https://wf/thumb.png".into(),
             rect: Rect::new(0, 0, 8, 4),
-                full: false,
+            full: false,
         }];
 
         let mut first = Vec::new();
@@ -1588,106 +1686,284 @@ mod tests {
         images.on_loaded(first[0].store_key(), Err("404".into()));
         let mut third = Vec::new();
         terminal.draw(|f| third = images.paint(f, &reqs)).unwrap();
-        assert!(third.is_empty(), "a failed image must not be retried every frame");
+        assert!(
+            third.is_empty(),
+            "a failed image must not be retried every frame"
+        );
     }
 
     #[cfg(feature = "images")]
     #[test]
     fn thumbnail_failure_does_not_block_the_same_size_viewer_budget() {
         let mut images = Images::text_only();
-        images.policy = Policy { tier: Tier::Halfblocks, font: (10, 20) };
-        let thumbnail = Request { key: "https://wf/large.png".into(), rect: Rect::new(0, 0, 8, 4), full: false };
-        let viewer = Request { full: true, ..thumbnail.clone() };
+        images.policy = Policy {
+            tier: Tier::Halfblocks,
+            font: (10, 20),
+        };
+        let thumbnail = Request {
+            key: "https://wf/large.png".into(),
+            rect: Rect::new(0, 0, 8, 4),
+            full: false,
+        };
+        let viewer = Request {
+            full: true,
+            ..thumbnail.clone()
+        };
         assert_ne!(thumbnail.store_key(), viewer.store_key());
         assert_eq!(source_of(&viewer.store_key()), thumbnail.key);
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
         let mut pending = Vec::new();
-        terminal.draw(|f| pending = images.paint(f, std::slice::from_ref(&thumbnail))).unwrap();
+        terminal
+            .draw(|f| pending = images.paint(f, std::slice::from_ref(&thumbnail)))
+            .unwrap();
         images.on_loaded(pending[0].store_key(), Err("thumbnail byte cap".into()));
-        terminal.draw(|f| pending = images.paint(f, std::slice::from_ref(&viewer))).unwrap();
+        terminal
+            .draw(|f| pending = images.paint(f, std::slice::from_ref(&viewer)))
+            .unwrap();
         assert_eq!(pending.len(), 1, "the viewer has its own fetch budget");
         assert!(pending[0].full);
         images.on_loaded(pending[0].store_key(), Err("viewer failure".into()));
-        assert_eq!(images.request_state(&viewer), (false, Some("viewer failure".into())));
-        terminal.draw(|f| pending = images.paint(f, std::slice::from_ref(&viewer))).unwrap();
+        assert_eq!(
+            images.request_state(&viewer),
+            (false, Some("viewer failure".into()))
+        );
+        terminal
+            .draw(|f| pending = images.paint(f, std::slice::from_ref(&viewer)))
+            .unwrap();
         assert!(pending.is_empty(), "failure is not retried on every frame");
         images.retry_source(&viewer.key);
-        terminal.draw(|f| pending = images.paint(f, &[viewer])).unwrap();
-        assert_eq!(pending.len(), 1, "explicit retry reopens the current request");
+        terminal
+            .draw(|f| pending = images.paint(f, &[viewer]))
+            .unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "explicit retry reopens the current request"
+        );
     }
 
     #[cfg(feature = "images")]
     #[test]
     fn decoded_images_are_shared_between_budgets_but_not_other_sizes() {
         let mut images = Images::text_only();
-        images.policy = Policy { tier: Tier::Halfblocks, font: (10, 20) };
-        let thumbnail = Request { key: "https://wf/shot.png".into(), rect: Rect::new(0, 0, 8, 4), full: false };
-        let viewer = Request { full: true, ..thumbnail.clone() };
-        let loaded = decode(&ratatui_image::picker::Picker::halfblocks(), include_bytes!("../assets/wf-logo.png"), 8, 4).unwrap();
+        images.policy = Policy {
+            tier: Tier::Halfblocks,
+            font: (10, 20),
+        };
+        let thumbnail = Request {
+            key: "https://wf/shot.png".into(),
+            rect: Rect::new(0, 0, 8, 4),
+            full: false,
+        };
+        let viewer = Request {
+            full: true,
+            ..thumbnail.clone()
+        };
+        let loaded = decode(
+            &ratatui_image::picker::Picker::halfblocks(),
+            include_bytes!("../assets/wf-logo.png"),
+            8,
+            4,
+        )
+        .unwrap();
         images.on_loaded(thumbnail.store_key(), Ok(loaded));
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
         let mut pending = Vec::new();
-        terminal.draw(|f| pending = images.paint(f, std::slice::from_ref(&viewer))).unwrap();
-        assert!(pending.is_empty(), "a decoded image needs no second fetch for a different budget");
+        terminal
+            .draw(|f| pending = images.paint(f, std::slice::from_ref(&viewer)))
+            .unwrap();
+        assert!(
+            pending.is_empty(),
+            "a decoded image needs no second fetch for a different budget"
+        );
         assert_eq!(images.request_state(&viewer), (false, None));
-        let larger = Request { rect: Rect::new(0, 0, 12, 6), ..viewer };
-        terminal.draw(|f| pending = images.paint(f, std::slice::from_ref(&larger))).unwrap();
+        let larger = Request {
+            rect: Rect::new(0, 0, 12, 6),
+            ..viewer
+        };
+        terminal
+            .draw(|f| pending = images.paint(f, std::slice::from_ref(&larger)))
+            .unwrap();
         images.on_loaded(pending[0].store_key(), Err("full-size refused".into()));
-        assert_eq!(images.request_state(&larger), (false, Some("full-size refused".into())), "a known thumbnail cannot mask this failure");
+        assert_eq!(
+            images.request_state(&larger),
+            (false, Some("full-size refused".into())),
+            "a known thumbnail cannot mask this failure"
+        );
     }
 
     #[tokio::test]
-    #[cfg(feature="images")]
+    #[cfg(feature = "images")]
     async fn protected_disk_cache_never_bypasses_a_second_users_denial() {
-        use wiremock::{Mock,MockServer,ResponseTemplate};
-        use wiremock::matchers::{method,path,header};
-        let server=MockServer::start().await;
-        Mock::given(method("GET")).and(path("/api/media/7/data")).and(header("Authorization","Bearer account-a"))
-            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type","image/png").set_body_bytes(include_bytes!("../assets/wf-logo.png").to_vec())).mount(&server).await;
-        Mock::given(method("GET")).and(path("/api/media/7/data")).and(header("Authorization","Bearer account-b"))
-            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({"errors":[{"code":"no_permission","message":"Denied"}]}))).mount(&server).await;
-        let dir=std::env::temp_dir().join(format!("wftui-ui-audit-private-cache-{}",std::process::id()));
-        let a=common::api::WfApiClient::with_store(common::token::Store::with_path(dir.join("a-token.json")),server.uri(),"fixture-client").unwrap();
-        let b=common::api::WfApiClient::with_store(common::token::Store::with_path(dir.join("b-token.json")),server.uri(),"fixture-client").unwrap();
-        for (client,access) in [(&a,"account-a"),(&b,"account-b")] {
-            client.set_tokens(common::token::TokenSet{access_token:access.into(),refresh_token:"unused".into(),expires_at:time::OffsetDateTime::now_utc().unix_timestamp()+3600,scope:"media:read".into(),origin:String::new(),client_id:String::new()}).await.unwrap();
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/media/7/data"))
+            .and(header("Authorization", "Bearer account-a"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "image/png")
+                    .set_body_bytes(include_bytes!("../assets/wf-logo.png").to_vec()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/media/7/data"))
+            .and(header("Authorization", "Bearer account-b"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(
+                serde_json::json!({"errors":[{"code":"no_permission","message":"Denied"}]}),
+            ))
+            .mount(&server)
+            .await;
+        let dir = std::env::temp_dir().join(format!(
+            "wftui-ui-audit-private-cache-{}",
+            std::process::id()
+        ));
+        let a = common::api::WfApiClient::with_store(
+            common::token::Store::with_path(dir.join("a-token.json")),
+            server.uri(),
+            "fixture-client",
+        )
+        .unwrap();
+        let b = common::api::WfApiClient::with_store(
+            common::token::Store::with_path(dir.join("b-token.json")),
+            server.uri(),
+            "fixture-client",
+        )
+        .unwrap();
+        for (client, access) in [(&a, "account-a"), (&b, "account-b")] {
+            client
+                .set_tokens(common::token::TokenSet {
+                    access_token: access.into(),
+                    refresh_token: "unused".into(),
+                    expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                    scope: "media:read".into(),
+                    origin: String::new(),
+                    client_id: String::new(),
+                })
+                .await
+                .unwrap();
         }
-        let url=format!("{}/api/media/7/data",server.uri());
-        let disk=DiskCache::with_dir(dir.join("cache"),DISK_CAP_BYTES);
-        let request=Pending{key:url.clone(),cols:10,rows:4,full:true};
-        let permits=Arc::new(tokio::sync::Semaphore::new(1));
-        let first=load(&a,&disk,ratatui_image::picker::Picker::halfblocks(),&request,permits.clone().acquire_owned().await.unwrap(),None).await;
-        assert!(first.is_ok(),"owner A can view its protected image");
-        assert!(disk.get(&url).is_none(), "authenticated API bytes are not persisted");
+        let url = format!("{}/api/media/7/data", server.uri());
+        let disk = DiskCache::with_dir(dir.join("cache"), DISK_CAP_BYTES);
+        let request = Pending {
+            key: url.clone(),
+            cols: 10,
+            rows: 4,
+            full: true,
+        };
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let first = load(
+            &a,
+            &disk,
+            ratatui_image::picker::Picker::halfblocks(),
+            &request,
+            permits.clone().acquire_owned().await.unwrap(),
+            None,
+        )
+        .await;
+        assert!(first.is_ok(), "owner A can view its protected image");
+        assert!(
+            disk.get(&url).is_none(),
+            "authenticated API bytes are not persisted"
+        );
         // A pre-fix entry must also be ignored after upgrading.
         std::fs::create_dir_all(disk.dir()).unwrap();
-        std::fs::write(disk.dir().join(format!("{}.img", digest(&url))), include_bytes!("../assets/wf-logo.png")).unwrap();
-        assert!(disk.get(&url).is_none(), "unscoped legacy entries are not known to be public");
-        assert!(b.fetch_bytes(&url,MAX_VIEW_BYTES).await.is_err(),"the server denies B the same source");
-        let second=load(&b,&disk,ratatui_image::picker::Picker::halfblocks(),&request,permits.clone().acquire_owned().await.unwrap(),None).await;
-        assert!(second.is_err(),"account A's disk cache must not bypass B's server permission check");
-        assert_eq!(server.received_requests().await.unwrap().len(), 3, "both B reads reach its permission gate");
+        std::fs::write(
+            disk.dir().join(format!("{}.img", digest(&url))),
+            include_bytes!("../assets/wf-logo.png"),
+        )
+        .unwrap();
+        assert!(
+            disk.get(&url).is_none(),
+            "unscoped legacy entries are not known to be public"
+        );
+        assert!(
+            b.fetch_bytes(&url, MAX_VIEW_BYTES).await.is_err(),
+            "the server denies B the same source"
+        );
+        let second = load(
+            &b,
+            &disk,
+            ratatui_image::picker::Picker::halfblocks(),
+            &request,
+            permits.clone().acquire_owned().await.unwrap(),
+            None,
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "account A's disk cache must not bypass B's server permission check"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            3,
+            "both B reads reach its permission gate"
+        );
         let foreign = common::api::WfApiClient::with_store(
-            common::token::Store::with_path(dir.join("foreign-token.json")), "http://127.0.0.1:1", "fixture-client",
-        ).unwrap();
-        let denied = load(&foreign, &disk, ratatui_image::picker::Picker::halfblocks(), &request,
-            permits.clone().acquire_owned().await.unwrap(), None).await;
-        assert!(denied.is_err(), "a different forum must not read A's legacy private entry either");
+            common::token::Store::with_path(dir.join("foreign-token.json")),
+            "http://127.0.0.1:1",
+            "fixture-client",
+        )
+        .unwrap();
+        let denied = load(
+            &foreign,
+            &disk,
+            ratatui_image::picker::Picker::halfblocks(),
+            &request,
+            permits.clone().acquire_owned().await.unwrap(),
+            None,
+        )
+        .await;
+        assert!(
+            denied.is_err(),
+            "a different forum must not read A's legacy private entry either"
+        );
         // That forum is 127.0.0.1:1, so this server's port is not its origin:
         // the fetch is refused before it is sent (#146). Before, the
         // exemption matched the host and ignored the port, and the request
         // went out without a bearer.
-        assert_eq!(server.received_requests().await.unwrap().len(), 3, "the foreign client sent nothing");
-        Mock::given(method("GET")).and(path("/thumb.png"))
-            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "image/png")
-                .set_body_bytes(include_bytes!("../assets/wf-logo.png").to_vec())).mount(&server).await;
-        let public = Pending { key: format!("{}/thumb.png", server.uri()), ..request };
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            3,
+            "the foreign client sent nothing"
+        );
+        Mock::given(method("GET"))
+            .and(path("/thumb.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "image/png")
+                    .set_body_bytes(include_bytes!("../assets/wf-logo.png").to_vec()),
+            )
+            .mount(&server)
+            .await;
+        let public = Pending {
+            key: format!("{}/thumb.png", server.uri()),
+            ..request
+        };
         for client in [&a, &foreign] {
-            assert!(load(client, &disk, ratatui_image::picker::Picker::halfblocks(), &public,
-                permits.clone().acquire_owned().await.unwrap(), None).await.is_ok());
+            assert!(
+                load(
+                    client,
+                    &disk,
+                    ratatui_image::picker::Picker::halfblocks(),
+                    &public,
+                    permits.clone().acquire_owned().await.unwrap(),
+                    None
+                )
+                .await
+                .is_ok()
+            );
         }
         assert!(disk.get(&public.key).is_some());
-        assert_eq!(server.received_requests().await.unwrap().len(), 4, "public bytes remain shared across clients");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            4,
+            "public bytes remain shared across clients"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1700,7 +1976,11 @@ mod tests {
     fn painted(images: &mut Images, rect: Rect, w: u16, h: u16) -> ratatui::buffer::Buffer {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-        let reqs = vec![Request { key: LOGO_KEY.to_string(), rect, full: false }];
+        let reqs = vec![Request {
+            key: LOGO_KEY.to_string(),
+            rect,
+            full: false,
+        }];
         let mut pending = Vec::new();
         let mut frame = ratatui::buffer::Buffer::empty(Rect::new(0, 0, w, h));
         terminal
@@ -1709,7 +1989,10 @@ mod tests {
                 frame = f.buffer_mut().clone();
             })
             .unwrap();
-        assert!(pending.is_empty(), "a decoded image must not be requested again");
+        assert!(
+            pending.is_empty(),
+            "a decoded image must not be requested again"
+        );
         frame
     }
 
@@ -1730,7 +2013,10 @@ mod tests {
         });
         let proto = decode(&picker, TEST_PNG, LOGO_COLS, LOGO_ROWS).expect("decode the logo");
         let mut images = Images::text_only();
-        images.policy = Policy { tier, font: font_pair(&picker) };
+        images.policy = Policy {
+            tier,
+            font: font_pair(&picker),
+        };
         images.picker = Some(picker);
         images.on_loaded(store_key(LOGO_KEY, LOGO_COLS, LOGO_ROWS), Ok(proto));
         images
@@ -1866,7 +2152,8 @@ mod tests {
     // ---------- disk cache ----------
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("wftui-img-test-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("wftui-img-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -1875,7 +2162,11 @@ mod tests {
     fn disk_cache_round_trips_and_is_owner_only() {
         let dir = scratch("roundtrip");
         let cache = DiskCache::with_dir(dir.clone(), DISK_CAP_BYTES);
-        assert_eq!(cache.get("https://wf/a.png"), None, "a cold cache must miss");
+        assert_eq!(
+            cache.get("https://wf/a.png"),
+            None,
+            "a cold cache must miss"
+        );
 
         let bytes = vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4];
         cache.put("https://wf/a.png", &bytes);
@@ -1891,7 +2182,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| n.contains(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
 
         #[cfg(unix)]
         {
@@ -1949,7 +2243,9 @@ mod tests {
         for h in handles {
             h.join().expect("writers must not panic");
         }
-        let got = cache.get("https://wf/same.png").expect("a final entry exists");
+        let got = cache
+            .get("https://wf/same.png")
+            .expect("a final entry exists");
         assert!(
             got == a || got == b,
             "the entry must be one whole write, not an interleaving: {} bytes, first={:?}",
@@ -1976,7 +2272,10 @@ mod tests {
         assert_eq!(cache.get("https://wf/ok.png"), Some(vec![1u8; 512]));
         let big = cache.path_for("https://wf/huge.png");
         std::fs::write(&big, vec![0u8; 8192]).unwrap();
-        assert!(cache.get("https://wf/huge.png").is_none(), "an oversized entry must not be read");
+        assert!(
+            cache.get("https://wf/huge.png").is_none(),
+            "an oversized entry must not be read"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1995,32 +2294,77 @@ mod tests {
     #[test]
     fn image_queue_tracks_visible_work_and_deduplicates_source_downloads() {
         let mut images = Images::text_only();
-        images.policy = Policy { tier: Tier::Halfblocks, font: (10, 20) };
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-        let requests: Vec<_> = (0..100).map(|id| Request {
-            key: format!("http://127.0.0.1:9/{id}.png"), rect: Rect::new(0, 0, 8, 4), full: false,
-        }).collect();
+        images.policy = Policy {
+            tier: Tier::Halfblocks,
+            font: (10, 20),
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let requests: Vec<_> = (0..100)
+            .map(|id| Request {
+                key: format!("http://127.0.0.1:9/{id}.png"),
+                rect: Rect::new(0, 0, 8, 4),
+                full: false,
+            })
+            .collect();
         let mut first = Vec::new();
-        terminal.draw(|frame| first = images.paint(frame, &requests)).unwrap();
+        terminal
+            .draw(|frame| first = images.paint(frame, &requests))
+            .unwrap();
         assert_eq!(first.len(), LOAD_CONCURRENCY);
         assert!(images.queued.len() <= QUEUE_CAP);
-        let viewer = Request { key: "http://127.0.0.1:9/current.png".into(), rect: Rect::new(0, 0, 80, 24), full: true };
-        terminal.draw(|frame| { assert!(images.paint(frame, std::slice::from_ref(&viewer)).is_empty()); }).unwrap();
+        let viewer = Request {
+            key: "http://127.0.0.1:9/current.png".into(),
+            rect: Rect::new(0, 0, 80, 24),
+            full: true,
+        };
+        terminal
+            .draw(|frame| {
+                assert!(
+                    images
+                        .paint(frame, std::slice::from_ref(&viewer))
+                        .is_empty()
+                );
+            })
+            .unwrap();
         assert_eq!(images.queued.len(), 1, "obsolete queued work is gone");
         images.on_loaded(first[0].store_key(), Err("done".into()));
         let mut current = Vec::new();
-        terminal.draw(|frame| current = images.paint(frame, std::slice::from_ref(&viewer))).unwrap();
+        terminal
+            .draw(|frame| current = images.paint(frame, std::slice::from_ref(&viewer)))
+            .unwrap();
         assert_eq!(current.len(), 1);
-        assert_eq!(current[0].key, viewer.key, "the current viewer gets the next freed slot");
+        assert_eq!(
+            current[0].key, viewer.key,
+            "the current viewer gets the next freed slot"
+        );
 
         images.reset_session();
-        let sizes = [viewer.clone(), Request { rect: Rect::new(0, 0, 40, 12), ..viewer }];
-        terminal.draw(|frame| current = images.paint(frame, &sizes)).unwrap();
-        assert_eq!(current.len(), 1, "two sizes share one source download at a time");
+        let sizes = [
+            viewer.clone(),
+            Request {
+                rect: Rect::new(0, 0, 40, 12),
+                ..viewer
+            },
+        ];
+        terminal
+            .draw(|frame| current = images.paint(frame, &sizes))
+            .unwrap();
+        assert_eq!(
+            current.len(),
+            1,
+            "two sizes share one source download at a time"
+        );
         assert_eq!(images.queued.len(), 1);
         images.reset_session();
-        terminal.draw(|frame| current = images.paint(frame, &sizes)).unwrap();
-        assert_eq!(current.len(), 1, "cancelled images are requestable in the next session");
+        terminal
+            .draw(|frame| current = images.paint(frame, &sizes))
+            .unwrap();
+        assert_eq!(
+            current.len(),
+            1,
+            "cancelled images are requestable in the next session"
+        );
     }
 
     #[cfg(feature = "images")]
@@ -2031,63 +2375,148 @@ mod tests {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = requests.clone();
         let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::new_rgb8(20, 20).write_to(&mut png, image::ImageFormat::Png).unwrap();
-        Mock::given(method("GET")).respond_with(move |request: &wiremock::Request| {
-            observed.lock().unwrap().push(request.url.path().to_owned());
-            ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(100))
-                .set_body_raw(png.get_ref().clone(), "image/png")
-        }).mount(&server).await;
+        image::DynamicImage::new_rgb8(20, 20)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        Mock::given(method("GET"))
+            .respond_with(move |request: &wiremock::Request| {
+                observed.lock().unwrap().push(request.url.path().to_owned());
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(100))
+                    .set_body_raw(png.get_ref().clone(), "image/png")
+            })
+            .mount(&server)
+            .await;
         let dir = std::env::temp_dir().join(format!("wftui-delayed-images-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut client = common::api::WfApiClient::with_store(
-            common::token::Store::with_path(dir.join("token.json")), server.uri(), "test-client"
-        ).unwrap();
+            common::token::Store::with_path(dir.join("token.json")),
+            server.uri(),
+            "test-client",
+        )
+        .unwrap();
         client.image_gate = Arc::new(common::ratelimit::Gate::new(0));
         let client = Arc::new(client);
         let disk = DiskCache::with_dir(dir.join("images"), DISK_CAP_BYTES);
         let picker = ratatui_image::picker::Picker::halfblocks();
         let slots = Arc::new(tokio::sync::Semaphore::new(LOAD_CONCURRENCY));
         let mut images = Images::text_only_at(dir.join("images"));
-        images.policy = Policy { tier: Tier::Halfblocks, font: (10, 20) };
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-        let mut jobs = tokio::task::JoinSet::new();
-        let start = |pending: Vec<Pending>, jobs: &mut tokio::task::JoinSet<(String, Result<Loaded, String>)>| {
-            for pending in pending {
-                let (client, disk, picker, slots) = (client.clone(), disk.clone(), picker.clone(), slots.clone());
-                jobs.spawn(async move {
-                    let permit = slots.acquire_owned().await.unwrap();
-                    let result = load(&client, &disk, picker, &pending, permit, embedded_logo()).await;
-                    (pending.store_key(), result)
-                });
-            }
+        images.policy = Policy {
+            tier: Tier::Halfblocks,
+            font: (10, 20),
         };
-        let old: Vec<_> = (0..100).map(|id| Request { key: format!("{}/{id}.png", server.uri()), rect: Rect::new(0, 0, 8, 4), full: false }).collect();
-        terminal.draw(|frame| start(images.paint(frame, &old), &mut jobs)).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut jobs = tokio::task::JoinSet::new();
+        let start =
+            |pending: Vec<Pending>,
+             jobs: &mut tokio::task::JoinSet<(String, Result<Loaded, String>)>| {
+                for pending in pending {
+                    let (client, disk, picker, slots) =
+                        (client.clone(), disk.clone(), picker.clone(), slots.clone());
+                    jobs.spawn(async move {
+                        let permit = slots.acquire_owned().await.unwrap();
+                        let result =
+                            load(&client, &disk, picker, &pending, permit, embedded_logo()).await;
+                        (pending.store_key(), result)
+                    });
+                }
+            };
+        let old: Vec<_> = (0..100)
+            .map(|id| Request {
+                key: format!("{}/{id}.png", server.uri()),
+                rect: Rect::new(0, 0, 8, 4),
+                full: false,
+            })
+            .collect();
+        terminal
+            .draw(|frame| start(images.paint(frame, &old), &mut jobs))
+            .unwrap();
         assert_eq!(jobs.len(), LOAD_CONCURRENCY);
-        let current = Request { key: format!("{}/current.png", server.uri()), rect: Rect::new(0, 0, 80, 24), full: true };
-        terminal.draw(|frame| start(images.paint(frame, std::slice::from_ref(&current)), &mut jobs)).unwrap();
+        let current = Request {
+            key: format!("{}/current.png", server.uri()),
+            rect: Rect::new(0, 0, 80, 24),
+            full: true,
+        };
+        terminal
+            .draw(|frame| {
+                start(
+                    images.paint(frame, std::slice::from_ref(&current)),
+                    &mut jobs,
+                )
+            })
+            .unwrap();
         let (key, result) = jobs.join_next().await.unwrap().unwrap();
-        assert!(result.is_ok()); images.on_loaded(key, result);
-        terminal.draw(|frame| start(images.paint(frame, std::slice::from_ref(&current)), &mut jobs)).unwrap();
+        assert!(result.is_ok());
+        images.on_loaded(key, result);
+        terminal
+            .draw(|frame| {
+                start(
+                    images.paint(frame, std::slice::from_ref(&current)),
+                    &mut jobs,
+                )
+            })
+            .unwrap();
         while let Some(result) = jobs.join_next().await {
-            let (key, result) = result.unwrap(); assert!(result.is_ok()); images.on_loaded(key, result);
+            let (key, result) = result.unwrap();
+            assert!(result.is_ok());
+            images.on_loaded(key, result);
         }
         let fetched = requests.lock().unwrap().clone();
-        assert_eq!(fetched.len(), 4, "none of the obsolete queued requests should reach HTTP");
+        assert_eq!(
+            fetched.len(),
+            4,
+            "none of the obsolete queued requests should reach HTTP"
+        );
         assert!(fetched.contains(&"/current.png".to_owned()));
 
         images.reset_session();
-        let mut shared = Request { key: format!("{}/shared.png", server.uri()), rect: Rect::new(0, 0, 8, 4), full: false };
-        terminal.draw(|frame| start(images.paint(frame, std::slice::from_ref(&shared)), &mut jobs)).unwrap();
+        let mut shared = Request {
+            key: format!("{}/shared.png", server.uri()),
+            rect: Rect::new(0, 0, 8, 4),
+            full: false,
+        };
+        terminal
+            .draw(|frame| {
+                start(
+                    images.paint(frame, std::slice::from_ref(&shared)),
+                    &mut jobs,
+                )
+            })
+            .unwrap();
         shared.rect = Rect::new(0, 0, 40, 20);
-        terminal.draw(|frame| start(images.paint(frame, std::slice::from_ref(&shared)), &mut jobs)).unwrap();
+        terminal
+            .draw(|frame| {
+                start(
+                    images.paint(frame, std::slice::from_ref(&shared)),
+                    &mut jobs,
+                )
+            })
+            .unwrap();
         assert_eq!(jobs.len(), 1);
-        let (key, result) = jobs.join_next().await.unwrap().unwrap(); images.on_loaded(key, result);
-        terminal.draw(|frame| start(images.paint(frame, std::slice::from_ref(&shared)), &mut jobs)).unwrap();
-        let (key, result) = jobs.join_next().await.unwrap().unwrap(); assert!(result.is_ok()); images.on_loaded(key, result);
-        assert_eq!(requests.lock().unwrap().iter().filter(|path| *path == "/shared.png").count(), 1);
+        let (key, result) = jobs.join_next().await.unwrap().unwrap();
+        images.on_loaded(key, result);
+        terminal
+            .draw(|frame| {
+                start(
+                    images.paint(frame, std::slice::from_ref(&shared)),
+                    &mut jobs,
+                )
+            })
+            .unwrap();
+        let (key, result) = jobs.join_next().await.unwrap().unwrap();
+        assert!(result.is_ok());
+        images.on_loaded(key, result);
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| *path == "/shared.png")
+                .count(),
+            1
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
-
 }

@@ -36,7 +36,10 @@ impl App {
         }
         for screen in &mut self.screens {
             match screen {
-                Screen::Home(h) => { cancel(&mut h.tree.loading, &mut h.tree.error); cancel(&mut h.list.loading, &mut h.list.error); }
+                Screen::Home(h) => {
+                    cancel(&mut h.tree.loading, &mut h.tree.error);
+                    cancel(&mut h.list.loading, &mut h.list.error);
+                }
                 Screen::ForumTree(s) => cancel(&mut s.loading, &mut s.error),
                 Screen::ThreadList(s) => cancel(&mut s.loading, &mut s.error),
                 Screen::ThreadView(s) => cancel(&mut s.loading, &mut s.error),
@@ -54,15 +57,23 @@ impl App {
                         s.alerts_view_id = 0;
                     }
                     s.alerts_view_pending = false;
-                    if let Some(view) = &mut s.view { cancel(&mut view.loading, &mut view.error); }
+                    if let Some(view) = &mut s.view {
+                        cancel(&mut view.loading, &mut view.error);
+                    }
                 }
                 Screen::Compose(s) => {
-                    if s.busy || s.uploading { s.error = Some("Session rechecked; review before retrying.".into()); }
-                    s.busy = false; s.uploading = false;
+                    if s.busy || s.uploading {
+                        s.error = Some("Session rechecked; review before retrying.".into());
+                    }
+                    s.busy = false;
+                    s.uploading = false;
                 }
                 Screen::NewConversation(s) => {
-                    if s.busy { s.errors = vec!["Session rechecked; review before retrying.".into()]; }
-                    s.busy = false; s.sending = false;
+                    if s.busy {
+                        s.errors = vec!["Session rechecked; review before retrying.".into()];
+                    }
+                    s.busy = false;
+                    s.sending = false;
                 }
                 _ => {}
             }
@@ -99,21 +110,35 @@ impl App {
         self.stop_pollers();
         self.abort_session_tasks();
         self.abort_writes();
-        if let Some(task) = self.login_task.take() { task.abort(); }
-        if let Some(task) = self.update_task.take() { task.abort(); }
-        let read: Vec<_> = self.screens.iter().filter_map(|screen| {
-            match screen {
-                Screen::ThreadView(view) if view.seen_date > view.reported_date && view.seen_date > 0 =>
-                    Some((view.thread.thread_id, view.seen_date)),
+        if let Some(task) = self.login_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.update_task.take() {
+            task.abort();
+        }
+        let read: Vec<_> = self
+            .screens
+            .iter()
+            .filter_map(|screen| match screen {
+                Screen::ThreadView(view)
+                    if view.seen_date > view.reported_date && view.seen_date > 0 =>
+                {
+                    Some((view.thread.thread_id, view.seen_date))
+                }
                 _ => None,
-            }
-        }).collect();
-        while self.screens.len() > 1 { self.pop_screen_with_relay(false); }
+            })
+            .collect();
+        while self.screens.len() > 1 {
+            self.pop_screen_with_relay(false);
+        }
         if self.me.is_some() {
             let api = self.api.clone();
             let _ = tokio::time::timeout(Duration::from_secs(2), async move {
-                for (id, seen) in read { let _ = api.mark_thread_read(id, Some(seen)).await; }
-            }).await;
+                for (id, seen) in read {
+                    let _ = api.mark_thread_read(id, Some(seen)).await;
+                }
+            })
+            .await;
         }
     }
 
@@ -161,7 +186,11 @@ impl App {
         if matches!(self.screens.last(), Some(Screen::Setup(_))) {
             self.screens.pop();
         }
-        self.set_hint(format!("Saved {} to {}", site.brand.name, self.config_path.display()));
+        self.set_hint(format!(
+            "Saved {} to {}",
+            site.brand.name,
+            self.config_path.display()
+        ));
         self.push_screen(screens::home_state(true));
         self.push_screen(screens::login_state());
         self.begin_login();
@@ -252,17 +281,36 @@ impl App {
                     }
                 }
             }
-            let mut guard = ReportGuard { tx: tx.clone(), generation, reported: false };
+            let mut guard = ReportGuard {
+                tx: tx.clone(),
+                generation,
+                reported: false,
+            };
             let result = match client.stored_session_candidate().await {
-                Ok(Some(candidate)) => candidate.verify_recovery().await.map_err(|e| TaskError::of(&e)),
-                Ok(None) => Err(TaskError { message: reason, code: None, max_page: None, kind: TaskErrorKind::NoToken }),
+                Ok(Some(candidate)) => candidate
+                    .verify_recovery()
+                    .await
+                    .map_err(|e| TaskError::of(&e)),
+                Ok(None) => Err(TaskError {
+                    message: reason,
+                    code: None,
+                    max_page: None,
+                    kind: TaskErrorKind::NoToken,
+                }),
                 Err(e) => Err(TaskError::of(&e)),
             };
             guard.reported = true;
             tx.send(match result {
-                Ok(verified) => Msg::RecoveryVerified { generation, verified: Box::new(verified) },
-                Err(e) => Msg::Bootstrap { generation, result: Err(e) },
-            }).ok();
+                Ok(verified) => Msg::RecoveryVerified {
+                    generation,
+                    verified: Box::new(verified),
+                },
+                Err(e) => Msg::Bootstrap {
+                    generation,
+                    result: Err(e),
+                },
+            })
+            .ok();
         });
     }
 
@@ -425,7 +473,11 @@ impl App {
                 match api.alerts(1).await {
                     Ok(page) => {
                         let unread = page.alerts.iter().filter(|a| !a.viewed()).count() as u32;
-                        tx.send(session_msg(generation, Msg::Notice(format!("alerts:{unread}")))).ok();
+                        tx.send(session_msg(
+                            generation,
+                            Msg::Notice(format!("alerts:{unread}")),
+                        ))
+                        .ok();
                     }
                     // A poller is the first thing to notice a session that
                     // has quietly ended (the user is reading, nothing else
@@ -449,15 +501,17 @@ impl App {
         let generation = self.session_generation;
         self.poller_handles.push(tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(
-                    common::config::CONVERSATION_POLL_SECS,
-                ))
-                .await;
+                tokio::time::sleep(Duration::from_secs(common::config::CONVERSATION_POLL_SECS))
+                    .await;
                 match api.conversations(1).await {
                     Ok(page) => {
                         let unread =
                             common::models::count_unread_conversations(&page.conversations);
-                        tx.send(session_msg(generation, Msg::Notice(format!("convos:{unread}")))).ok();
+                        tx.send(session_msg(
+                            generation,
+                            Msg::Notice(format!("convos:{unread}")),
+                        ))
+                        .ok();
                     }
                     // See the alerts poller above (issue #557).
                     Err(e) => {
@@ -487,7 +541,11 @@ impl App {
         self.spawn_session_task(async move {
             if let Ok(page) = api.alerts(1).await {
                 let unread = page.alerts.iter().filter(|a| !a.viewed()).count() as u32;
-                tx.send(session_msg(generation, Msg::Notice(format!("alerts:{unread}")))).ok();
+                tx.send(session_msg(
+                    generation,
+                    Msg::Notice(format!("alerts:{unread}")),
+                ))
+                .ok();
             }
         });
         let api = self.api.clone();
@@ -496,7 +554,11 @@ impl App {
         self.spawn_session_task(async move {
             if let Ok(page) = api.conversations(1).await {
                 let unread = common::models::count_unread_conversations(&page.conversations);
-                tx.send(session_msg(generation, Msg::Notice(format!("convos:{unread}")))).ok();
+                tx.send(session_msg(
+                    generation,
+                    Msg::Notice(format!("convos:{unread}")),
+                ))
+                .ok();
             }
         });
     }
@@ -570,10 +632,22 @@ impl App {
         let (paste_tx, paste_rx) = mpsc::unbounded_channel();
         self.login_paste_tx = Some(paste_tx);
         let handle = tokio::spawn(async move {
-            if let Err(message) =
-                run_login_flow(&tx, client, generation, browser_opener, site, mode, paste_rx).await
+            if let Err(message) = run_login_flow(
+                &tx,
+                client,
+                generation,
+                browser_opener,
+                site,
+                mode,
+                paste_rx,
+            )
+            .await
             {
-                tx.send(Msg::LoginFailed { generation, message }).ok();
+                tx.send(Msg::LoginFailed {
+                    generation,
+                    message,
+                })
+                .ok();
             }
         });
         self.login_task = Some(handle.abort_handle());
@@ -607,11 +681,12 @@ impl App {
                 Ok(tokens) => (tokens, Ok(())),
                 Err(e) => (None, Err(e)),
             };
-            let snapshot_result = forgotten
-                .as_ref()
-                .map(|_| ())
-                .map_err(ToString::to_string);
-            tx.send(Msg::LogoutSnapshot { generation, result: snapshot_result }).ok();
+            let snapshot_result = forgotten.as_ref().map(|_| ()).map_err(ToString::to_string);
+            tx.send(Msg::LogoutSnapshot {
+                generation,
+                result: snapshot_result,
+            })
+            .ok();
             // Revoke the refresh token first and the access token second,
             // each with its `token_type_hint` — the endpoint defaults to
             // `access_token`, so the old single call left the 90-day refresh
@@ -635,8 +710,14 @@ impl App {
                                 continue;
                             }
                             let base = client.base_url();
-                            if let Err(e) =
-                                common::oauth::revoke(&http, base, token, Some(hint), client.client_id()).await
+                            if let Err(e) = common::oauth::revoke(
+                                &http,
+                                base,
+                                token,
+                                Some(hint),
+                                client.client_id(),
+                            )
+                            .await
                             {
                                 tracing::warn!("logout: {hint} was not revoked server-side: {e}");
                                 failed.push(hint);

@@ -10,14 +10,14 @@
 //! the digits, `y`). Esc while reading stops an answer that is still coming,
 //! and otherwise leaves.
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
-use super::browse::{chunk_lines_aligned, wrap_spans, wrap_spans_aligned, RuleWidth};
+use super::browse::{RuleWidth, chunk_lines_aligned, wrap_spans, wrap_spans_aligned};
 use super::{Action, AskAiState, AskTurnState, HitMap};
 use crate::chrome::{self, Hints};
 use crate::glyph::Glyphs;
@@ -84,10 +84,15 @@ pub fn rebuild_lines(s: &mut AskAiState, theme: &Theme, g: &Glyphs) {
             .cloned()
             .collect();
         if !fresh.is_empty() {
-            s.lines.push(Line::from(Span::styled("Sources", theme.dim())));
+            s.lines
+                .push(Line::from(Span::styled("Sources", theme.dim())));
             for (url, title) in fresh {
                 s.links.push(url.clone());
-                let label = if title.is_empty() { url.clone() } else { format!("{title} \u{2014} {url}") };
+                let label = if title.is_empty() {
+                    url.clone()
+                } else {
+                    format!("{title} \u{2014} {url}")
+                };
                 let spans = [
                     Span::styled(format!("[{}] ", s.links.len()), theme.link()),
                     Span::styled(label, theme.dim()),
@@ -99,7 +104,8 @@ pub fn rebuild_lines(s: &mut AskAiState, theme: &Theme, g: &Glyphs) {
         }
         match &turn.state {
             AskTurnState::Streaming if turn.answer.is_empty() => {
-                s.lines.push(Line::from(Span::styled("\u{2026}", theme.dim())));
+                s.lines
+                    .push(Line::from(Span::styled("\u{2026}", theme.dim())));
             }
             AskTurnState::Failed(msg) => {
                 let text = format!("{} {msg}", if g.ascii { "!" } else { "\u{26a0}" });
@@ -108,10 +114,12 @@ pub fn rebuild_lines(s: &mut AskAiState, theme: &Theme, g: &Glyphs) {
                 }
             }
             AskTurnState::Cancelled => {
-                s.lines.push(Line::from(Span::styled("(stopped)", theme.faint())));
+                s.lines
+                    .push(Line::from(Span::styled("(stopped)", theme.faint())));
             }
             AskTurnState::Done if turn.answer.trim().is_empty() => {
-                s.lines.push(Line::from(Span::styled("(no answer)", theme.faint())));
+                s.lines
+                    .push(Line::from(Span::styled("(no answer)", theme.faint())));
             }
             _ => {}
         }
@@ -150,7 +158,11 @@ pub fn render(
     }
     s.scroll = s.scroll.min(max_scroll);
     f.render_widget(
-        Paragraph::new(crate::editor::visible_window(&s.lines, s.scroll, body.height)),
+        Paragraph::new(crate::editor::visible_window(
+            &s.lines,
+            s.scroll,
+            body.height,
+        )),
         body,
     );
     hits.push(body, Hit::Pane(HitPane::List));
@@ -169,7 +181,10 @@ pub fn render(
             });
         Line::from(Span::styled(
             chrome::take_cells(
-                &format!("{} {step}\u{2026}", chrome::spinner(g, chrome::spinner_tick())),
+                &format!(
+                    "{} {step}\u{2026}",
+                    chrome::spinner(g, chrome::spinner_tick())
+                ),
                 status.width as usize,
             ),
             theme.dim(),
@@ -193,10 +208,20 @@ pub fn render(
     )];
     let mut caret = 0u16;
     if s.input.is_empty() && !s.input_mode {
-        spans.push(Span::styled(chrome::take_cells("press i to ask a question", room), theme.dim()));
+        spans.push(Span::styled(
+            chrome::take_cells("press i to ask a question", room),
+            theme.dim(),
+        ));
     } else if s.input.is_empty() {
         spans.push(Span::styled(
-            chrome::take_cells(if s.busy { "answering\u{2026}" } else { "Ask a question" }, room),
+            chrome::take_cells(
+                if s.busy {
+                    "answering\u{2026}"
+                } else {
+                    "Ask a question"
+                },
+                room,
+            ),
             theme.faint(),
         ));
     } else {
@@ -219,7 +244,9 @@ pub fn click_field(s: &mut AskAiState, col: u16) {
     s.input_mode = true;
     let prompt = chrome::cell_width(PROMPT);
     let room = (s.input_rect.width as usize).saturating_sub(prompt);
-    let x = col.saturating_sub(s.input_rect.x).saturating_sub(prompt as u16) as usize;
+    let x = col
+        .saturating_sub(s.input_rect.x)
+        .saturating_sub(prompt as u16) as usize;
     s.cursor = crate::editor::field_caret_at(&s.input, s.cursor, room, x);
 }
 
@@ -303,7 +330,9 @@ fn submit(s: &mut AskAiState) -> Action {
         return Action::Notice("Type a question first.".into());
     }
     if s.busy {
-        return Action::Notice("Still answering \u{2014} wait for it, or Esc twice to stop it.".into());
+        return Action::Notice(
+            "Still answering \u{2014} wait for it, or Esc twice to stop it.".into(),
+        );
     }
     if question.len() > common::ai::MAX_QUESTION_BYTES {
         return Action::Notice(format!(
@@ -371,7 +400,12 @@ pub fn hints(s: &AskAiState) -> Hints {
     keys.push(("n", "new chat"));
     keys.push(("o", "open web"));
     keys.push(("Esc", if s.busy { "stop" } else { "back" }));
-    let short: Vec<chrome::Hint> = vec![("i", "ask"), ("j/k", ""), ("n", "new"), ("Esc", if s.busy { "stop" } else { "back" })];
+    let short: Vec<chrome::Hint> = vec![
+        ("i", "ask"),
+        ("j/k", ""),
+        ("n", "new"),
+        ("Esc", if s.busy { "stop" } else { "back" }),
+    ];
     Hints::with_short(&keys, &short, 0)
 }
 
@@ -381,7 +415,11 @@ mod tests {
     use crate::screens::AskTurn;
 
     fn state() -> AskAiState {
-        AskAiState { input_mode: true, follow: true, ..Default::default() }
+        AskAiState {
+            input_mode: true,
+            follow: true,
+            ..Default::default()
+        }
     }
 
     fn press(s: &mut AskAiState, code: KeyCode) -> Action {
@@ -424,12 +462,26 @@ mod tests {
         let mut s = state();
         s.input_mode = false;
         s.links = vec!["https://windowsforum.com/threads/1/".into()];
-        s.turns.push(AskTurn { question: "q".into(), answer: "**a**".into(), ..Default::default() });
-        assert!(matches!(press(&mut s, KeyCode::Char('1')), Action::OpenUrl(u) if u.ends_with("/threads/1/")));
-        assert!(matches!(press(&mut s, KeyCode::Char('2')), Action::Notice(_)));
+        s.turns.push(AskTurn {
+            question: "q".into(),
+            answer: "**a**".into(),
+            ..Default::default()
+        });
+        assert!(
+            matches!(press(&mut s, KeyCode::Char('1')), Action::OpenUrl(u) if u.ends_with("/threads/1/"))
+        );
+        assert!(matches!(
+            press(&mut s, KeyCode::Char('2')),
+            Action::Notice(_)
+        ));
         assert!(matches!(press(&mut s, KeyCode::Char('y')), Action::OscCopy(t) if t == "**a**"));
-        assert!(matches!(press(&mut s, KeyCode::Char('n')), Action::AskAiNewChat));
-        assert!(matches!(press(&mut s, KeyCode::Char('o')), Action::OpenUrl(u) if u == "https://windowsforum.com/pages/ai/"));
+        assert!(matches!(
+            press(&mut s, KeyCode::Char('n')),
+            Action::AskAiNewChat
+        ));
+        assert!(
+            matches!(press(&mut s, KeyCode::Char('o')), Action::OpenUrl(u) if u == "https://windowsforum.com/pages/ai/")
+        );
         assert!(matches!(press(&mut s, KeyCode::Char('i')), Action::None));
         assert!(s.input_mode);
         // Esc in the field goes back to reading, never out of the screen.

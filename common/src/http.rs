@@ -46,7 +46,6 @@ pub fn build_with_ua(ua: &str) -> Result<reqwest::Client> {
         .build()?)
 }
 
-
 /// A client for bytes that forum *content* names (`WfApiClient::fetch_bytes`
 /// for anything but our own API): an `[IMG]` URL is written by whoever wrote
 /// the post, and it is fetched the moment a reader scrolls past it, so it
@@ -74,19 +73,30 @@ pub fn build_with_ua(ua: &str) -> Result<reqwest::Client> {
 /// (#147). The per-address guarantee for a proxied target is then
 /// `ContentPolicy::preflight`'s local lookup, which is best effort; the
 /// literal and per-hop checks still apply in full.
-pub fn build_public_with_ua(ua: &str, policy: Arc<ContentPolicy>, lane: ContentLane) -> Result<reqwest::Client> {
+pub fn build_public_with_ua(
+    ua: &str,
+    policy: Arc<ContentPolicy>,
+    lane: ContentLane,
+) -> Result<reqwest::Client> {
     Ok(content_client_builder(ua, policy, lane).build()?)
 }
 
 /// `build_public_with_ua` before `build()`, so a test can add an explicit
 /// proxy instead of setting the process-wide proxy variables.
-pub(crate) fn content_client_builder(ua: &str, policy: Arc<ContentPolicy>, lane: ContentLane) -> reqwest::ClientBuilder {
+pub(crate) fn content_client_builder(
+    ua: &str,
+    policy: Arc<ContentPolicy>,
+    lane: ContentLane,
+) -> reqwest::ClientBuilder {
     install_crypto_provider();
     reqwest::Client::builder()
         .user_agent(ua)
         .connect_timeout(config::CONNECT_TIMEOUT)
         .timeout(config::REQUEST_TIMEOUT)
-        .dns_resolver(PublicOnlyResolver { policy: policy.clone(), lane })
+        .dns_resolver(PublicOnlyResolver {
+            policy: policy.clone(),
+            lane,
+        })
         .redirect(hop_policy(Some((policy, lane))))
 }
 
@@ -111,7 +121,14 @@ const OWN_MEDIA_EXACT: [&str; 1] = ["/proxy.php"];
 
 /// The proxy variables reqwest reads (through hyper-util's
 /// `Matcher::from_env`), in both spellings.
-const PROXY_VARS: [&str; 6] = ["ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"];
+const PROXY_VARS: [&str; 6] = [
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+];
 
 /// What forum content may make this client contact (#130, #146, #147):
 /// the site's own origin, and the proxies the user configured.
@@ -140,7 +157,9 @@ impl ContentPolicy {
     /// set of each pair. A name listed here that reqwest does not use as a
     /// proxy is only refused as a content host, so that costs nothing.
     pub fn with_proxy_env(base: &str, var: impl Fn(&str) -> Option<String>) -> Self {
-        let own = reqwest::Url::parse(base).ok().filter(|u| u.host_str().is_some());
+        let own = reqwest::Url::parse(base)
+            .ok()
+            .filter(|u| u.host_str().is_some());
         let own_is_local = own.as_ref().and_then(|u| u.host_str()).is_some_and(|h| {
             let bare = unbracket(h);
             bare.parse::<std::net::IpAddr>().is_ok() || is_localhost_name(bare)
@@ -175,7 +194,10 @@ impl ContentPolicy {
     /// `127.0.0.1` by then, and userinfo is not part of it).
     pub fn check_url(&self, url: &reqwest::Url) -> std::result::Result<(), NonPublicDestination> {
         if !matches!(url.scheme(), "http" | "https") {
-            return Err(NonPublicDestination(format!("refusing a {} URL from forum content", url.scheme())));
+            return Err(NonPublicDestination(format!(
+                "refusing a {} URL from forum content",
+                url.scheme()
+            )));
         }
         let Some(host) = url.host_str() else {
             return Err(NonPublicDestination("refusing a URL with no host".into()));
@@ -187,15 +209,21 @@ impl ContentPolicy {
         if let Ok(ip) = bare.parse::<std::net::IpAddr>()
             && !is_public_ip(ip)
         {
-            return Err(NonPublicDestination(format!("refusing to fetch from non-public address {host}")));
+            return Err(NonPublicDestination(format!(
+                "refusing to fetch from non-public address {host}"
+            )));
         }
         if is_localhost_name(bare) {
-            return Err(NonPublicDestination(format!("refusing to fetch from {host}")));
+            return Err(NonPublicDestination(format!(
+                "refusing to fetch from {host}"
+            )));
         }
         // The proxy's name is exempt in the resolver, so content must not
         // be able to name it as a target (#147).
         if self.is_proxy_host(bare) {
-            return Err(NonPublicDestination(format!("refusing to fetch from {host}: it is a configured proxy")));
+            return Err(NonPublicDestination(format!(
+                "refusing to fetch from {host}: it is a configured proxy"
+            )));
         }
         Ok(())
     }
@@ -208,7 +236,11 @@ impl ContentPolicy {
             && url.username().is_empty()
             && url.password().is_none()
             && (self.own_is_local || is_media_path(url.path()));
-        if own_media { ContentLane::OwnMedia } else { ContentLane::Strict }
+        if own_media {
+            ContentLane::OwnMedia
+        } else {
+            ContentLane::Strict
+        }
     }
 
     /// #147, best effort: a proxied request is resolved by the proxy, so
@@ -218,17 +250,24 @@ impl ContentPolicy {
     /// proxy uses, so a mixed answer is refused too. A name that does not
     /// resolve here is allowed: on a network where only the proxy resolves
     /// outside names, refusing it would refuse every image.
-    pub async fn preflight(&self, url: &reqwest::Url) -> std::result::Result<(), NonPublicDestination> {
+    pub async fn preflight(
+        &self,
+        url: &reqwest::Url,
+    ) -> std::result::Result<(), NonPublicDestination> {
         if self.proxy_hosts.is_empty() {
             return Ok(());
         }
-        let Some(host) = url.host_str() else { return Ok(()) };
+        let Some(host) = url.host_str() else {
+            return Ok(());
+        };
         let bare = unbracket(host);
         if bare.parse::<std::net::IpAddr>().is_ok() {
             return Ok(()); // a literal is `check_url`'s to judge
         }
         let port = url.port_or_known_default().unwrap_or(80);
-        let Ok(found) = self.lookup(bare, port).await else { return Ok(()) };
+        let Ok(found) = self.lookup(bare, port).await else {
+            return Ok(());
+        };
         if let Some(addr) = found.iter().find(|a| !is_public_ip(a.ip())) {
             return Err(NonPublicDestination(format!(
                 "refusing to fetch from {host}: it resolves to the non-public address {}",
@@ -243,7 +282,11 @@ impl ContentPolicy {
     /// itself own media. That client's resolver keeps the forum's
     /// non-public addresses, so a hop to another port or path on that
     /// name must not use it (#146).
-    fn hop_check(&self, url: &reqwest::Url, lane: ContentLane) -> std::result::Result<(), NonPublicDestination> {
+    fn hop_check(
+        &self,
+        url: &reqwest::Url,
+        lane: ContentLane,
+    ) -> std::result::Result<(), NonPublicDestination> {
         self.check_url(url)?;
         if lane == ContentLane::OwnMedia
             && url.host_str().is_some_and(|h| self.is_own_name(h))
@@ -266,11 +309,16 @@ impl ContentPolicy {
     }
 
     fn is_own_origin(&self, url: &reqwest::Url) -> bool {
-        self.own.as_ref().is_some_and(|own| own.origin() == url.origin())
+        self.own
+            .as_ref()
+            .is_some_and(|own| own.origin() == url.origin())
     }
 
     fn is_own_name(&self, host: &str) -> bool {
-        self.own.as_ref().and_then(|u| u.host_str()).is_some_and(|own| normalize_name(own) == normalize_name(host))
+        self.own
+            .as_ref()
+            .and_then(|u| u.host_str())
+            .is_some_and(|own| normalize_name(own) == normalize_name(host))
     }
 
     fn is_proxy_host(&self, host: &str) -> bool {
@@ -281,11 +329,21 @@ impl ContentPolicy {
     /// The system resolver (and, in tests, `fixed_dns` first).
     async fn lookup(&self, host: &str, port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
         #[cfg(test)]
-        if let Some((_, ips)) = self.fixed_dns.iter().find(|(name, _)| *name == normalize_name(host)) {
+        if let Some((_, ips)) = self
+            .fixed_dns
+            .iter()
+            .find(|(name, _)| *name == normalize_name(host))
+        {
             if ips.is_empty() {
-                return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{host} did not resolve")));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{host} did not resolve"),
+                ));
             }
-            return Ok(ips.iter().map(|ip| std::net::SocketAddr::new(*ip, port)).collect());
+            return Ok(ips
+                .iter()
+                .map(|ip| std::net::SocketAddr::new(*ip, port))
+                .collect());
         }
         Ok(tokio::net::lookup_host((host, port)).await?.collect())
     }
@@ -293,7 +351,10 @@ impl ContentPolicy {
     /// Test-only: answer `name` with `ips` (none: it does not resolve).
     #[cfg(test)]
     pub(crate) fn with_fixed_dns(mut self, name: &str, ips: &[&str]) -> Self {
-        self.fixed_dns.push((normalize_name(name), ips.iter().map(|ip| ip.parse().unwrap()).collect()));
+        self.fixed_dns.push((
+            normalize_name(name),
+            ips.iter().map(|ip| ip.parse().unwrap()).collect(),
+        ));
         self
     }
 }
@@ -302,7 +363,9 @@ fn is_media_path(path: &str) -> bool {
     // Any percent-encoding disqualifies a path, so an encoded `.` or `/`
     // cannot climb out of a media directory whichever way the server
     // decodes it. The URL parser has already removed literal dot segments.
-    !path.contains('%') && (OWN_MEDIA_EXACT.contains(&path) || OWN_MEDIA_PREFIXES.iter().any(|p| path.starts_with(p)))
+    !path.contains('%')
+        && (OWN_MEDIA_EXACT.contains(&path)
+            || OWN_MEDIA_PREFIXES.iter().any(|p| path.starts_with(p)))
 }
 
 /// The host a proxy variable names, as the connector will pass it to the
@@ -312,7 +375,9 @@ fn proxy_host_of(value: &str) -> Option<String> {
     let value = value.trim();
     let rest = value.split_once("://").map_or(value, |(_, rest)| rest);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host_port = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
     let host = match host_port.strip_prefix('[') {
         Some(v6) => v6.split(']').next().unwrap_or(""),
         None => host_port.split(':').next().unwrap_or(""),
@@ -327,7 +392,9 @@ fn normalize_name(host: &str) -> String {
 }
 
 fn unbracket(host: &str) -> &str {
-    host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host)
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 fn is_localhost_name(host: &str) -> bool {
@@ -351,7 +418,9 @@ impl std::fmt::Display for NonPublicDestination {
 impl std::error::Error for NonPublicDestination {}
 
 /// The refusal inside a reqwest error's source chain, if that is what it is.
-pub fn non_public_refusal<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a NonPublicDestination> {
+pub fn non_public_refusal<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a NonPublicDestination> {
     let mut cur: Option<&'a (dyn std::error::Error + 'static)> = Some(err);
     while let Some(e) = cur {
         if let Some(hit) = e.downcast_ref::<NonPublicDestination>() {
@@ -422,7 +491,13 @@ pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
             let link_local = (s[0] & 0xffc0) == 0xfe80; // fe80::/10
             let site_local = (s[0] & 0xffc0) == 0xfec0; // fec0::/10
             let multicast = (s[0] & 0xff00) == 0xff00; // ff00::/8
-            !(local_nat64 || discard || documentation || unique_local || link_local || site_local || multicast)
+            !(local_nat64
+                || discard
+                || documentation
+                || unique_local
+                || link_local
+                || site_local
+                || multicast)
         }
     }
 }
@@ -435,8 +510,9 @@ fn is_public_v4(ip: std::net::Ipv4Addr) -> bool {
     let loopback = a == 127;
     let link_local = a == 169 && b == 254;
     let ietf = a == 192 && b == 0 && c == 0; // 192.0.0.0/24
-    let documentation =
-        (a == 192 && b == 0 && c == 2) || (a == 198 && b == 51 && c == 100) || (a == 203 && b == 0 && c == 113);
+    let documentation = (a == 192 && b == 0 && c == 2)
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113);
     let benchmarking = a == 198 && (b == 18 || b == 19); // 198.18.0.0/15
     let multicast_or_reserved = a >= 224; // 224/4, 240/4, 255.255.255.255
     !(this_network
@@ -470,10 +546,14 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
             if found.is_empty() {
                 return Err(format!("{host} did not resolve").into());
             }
-            let kept: Vec<std::net::SocketAddr> =
-                found.into_iter().filter(|a| exempt || is_public_ip(a.ip())).collect();
+            let kept: Vec<std::net::SocketAddr> = found
+                .into_iter()
+                .filter(|a| exempt || is_public_ip(a.ip()))
+                .collect();
             if kept.is_empty() {
-                let refusal = NonPublicDestination(format!("refusing to fetch from {host}: it resolves only to non-public addresses"));
+                let refusal = NonPublicDestination(format!(
+                    "refusing to fetch from {host}: it resolves only to non-public addresses"
+                ));
                 return Err(Box::new(refusal) as Box<dyn std::error::Error + Send + Sync>);
             }
             Ok(Box::new(kept.into_iter()) as reqwest::dns::Addrs)
@@ -566,18 +646,58 @@ mod tests {
     #[test]
     fn public_ip_classification() {
         for ip in [
-            "127.0.0.1", "127.255.0.9", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.0.1",
-            "169.254.169.254", "100.64.0.1", "100.127.255.255", "0.0.0.0", "0.1.2.3", "192.0.0.8",
-            "192.0.2.1", "198.51.100.7", "203.0.113.9", "198.18.0.1", "224.0.0.1", "240.0.0.1",
-            "255.255.255.255", "::", "::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "::127.0.0.1",
-            "64:ff9b::a9fe:a9fe", "64:ff9b:1::1", "2002:c0a8:0101::1", "fd00::1", "fc00::1",
-            "fe80::1", "fec0::1", "ff02::1", "2001:db8::1", "100::1",
+            "127.0.0.1",
+            "127.255.0.9",
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.0.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "100.127.255.255",
+            "0.0.0.0",
+            "0.1.2.3",
+            "192.0.0.8",
+            "192.0.2.1",
+            "198.51.100.7",
+            "203.0.113.9",
+            "198.18.0.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::127.0.0.1",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::1",
+            "2002:c0a8:0101::1",
+            "fd00::1",
+            "fc00::1",
+            "fe80::1",
+            "fec0::1",
+            "ff02::1",
+            "2001:db8::1",
+            "100::1",
         ] {
-            assert!(!is_public_ip(ip.parse().unwrap()), "{ip} must not count as public");
+            assert!(
+                !is_public_ip(ip.parse().unwrap()),
+                "{ip} must not count as public"
+            );
         }
         for ip in [
-            "1.1.1.1", "8.8.8.8", "104.196.9.116", "172.15.0.1", "172.32.0.1", "100.63.0.1",
-            "100.128.0.1", "192.169.0.1", "2606:4700::1111", "::ffff:8.8.8.8", "2002:0808:0808::1",
+            "1.1.1.1",
+            "8.8.8.8",
+            "104.196.9.116",
+            "172.15.0.1",
+            "172.32.0.1",
+            "100.63.0.1",
+            "100.128.0.1",
+            "192.169.0.1",
+            "2606:4700::1111",
+            "::ffff:8.8.8.8",
+            "2002:0808:0808::1",
             "64:ff9b::808:808",
         ] {
             assert!(is_public_ip(ip.parse().unwrap()), "{ip} is public");
@@ -596,16 +716,28 @@ mod tests {
     /// A policy for `base` whose HTTPS_PROXY and HTTP_PROXY are `proxy`.
     fn site_behind(base: &str, proxy: &str) -> ContentPolicy {
         let proxy = proxy.to_string();
-        ContentPolicy::with_proxy_env(base, move |name| matches!(name, "HTTPS_PROXY" | "HTTP_PROXY").then(|| proxy.clone()))
+        ContentPolicy::with_proxy_env(base, move |name| {
+            matches!(name, "HTTPS_PROXY" | "HTTP_PROXY").then(|| proxy.clone())
+        })
     }
 
-    async fn resolve(policy: &ContentPolicy, lane: ContentLane, name: &str) -> std::result::Result<Vec<std::net::IpAddr>, String> {
+    async fn resolve(
+        policy: &ContentPolicy,
+        lane: ContentLane,
+        name: &str,
+    ) -> std::result::Result<Vec<std::net::IpAddr>, String> {
         use reqwest::dns::Resolve;
-        let resolver = PublicOnlyResolver { policy: Arc::new(policy.clone()), lane };
+        let resolver = PublicOnlyResolver {
+            policy: Arc::new(policy.clone()),
+            lane,
+        };
         match resolver.resolve(name.parse().unwrap()).await {
             Ok(addrs) => Ok(addrs.map(|a| a.ip()).collect()),
             Err(e) => {
-                assert!(non_public_refusal(e.as_ref()).is_some(), "{name}: not a refusal: {e}");
+                assert!(
+                    non_public_refusal(e.as_ref()).is_some(),
+                    "{name}: not a refusal: {e}"
+                );
                 Err(e.to_string())
             }
         }
@@ -617,17 +749,43 @@ mod tests {
     fn check_url_exempts_only_the_forum_origin() {
         let local = site("http://127.0.0.1:8080");
         assert!(local.check_url(&url("http://127.0.0.1:8080/a.png")).is_ok());
-        assert!(local.check_url(&url("http://127.0.0.1:9999/a.png")).is_err(), "another port is not the forum");
-        assert!(local.check_url(&url("https://127.0.0.1:8080/a.png")).is_err(), "another scheme is not the forum");
+        assert!(
+            local
+                .check_url(&url("http://127.0.0.1:9999/a.png"))
+                .is_err(),
+            "another port is not the forum"
+        );
+        assert!(
+            local
+                .check_url(&url("https://127.0.0.1:8080/a.png"))
+                .is_err(),
+            "another scheme is not the forum"
+        );
         let named = site("https://forum.example");
-        assert!(named.check_url(&url("http://127.0.0.1:8080/a.png")).is_err());
+        assert!(
+            named
+                .check_url(&url("http://127.0.0.1:8080/a.png"))
+                .is_err()
+        );
         assert!(named.check_url(&url("https://cdn.example/a.png")).is_ok());
-        assert!(named.check_url(&url("https://127.0.0.1@cdn.example/a.png")).is_ok(), "userinfo is not the host");
-        assert!(named.check_url(&url("https://cdn.example@127.0.0.1/a.png")).is_err());
+        assert!(
+            named
+                .check_url(&url("https://127.0.0.1@cdn.example/a.png"))
+                .is_ok(),
+            "userinfo is not the host"
+        );
+        assert!(
+            named
+                .check_url(&url("https://cdn.example@127.0.0.1/a.png"))
+                .is_err()
+        );
         assert!(named.check_url(&url("file:///etc/passwd")).is_err());
         let dev = site("http://localhost:3000");
         assert!(dev.check_url(&url("http://localhost:3000/a.png")).is_ok());
-        assert!(dev.check_url(&url("http://localhost:3001/a.png")).is_err(), "another port on localhost is refused");
+        assert!(
+            dev.check_url(&url("http://localhost:3001/a.png")).is_err(),
+            "another port on localhost is refused"
+        );
     }
 
     /// #146: the `OwnMedia` lane, the one that keeps a non-public answer
@@ -641,8 +799,14 @@ mod tests {
             ("https://forum.example/data/avatars/m/0/1.jpg?123", OwnMedia),
             ("https://FORUM.example:443/attachments/a-png.12/", OwnMedia),
             ("https://forum.example/media/x.3/full", OwnMedia),
-            ("https://forum.example/styles/default/xenforo/smilies/a.png", OwnMedia),
-            ("https://forum.example/proxy.php?image=https%3A%2F%2Fcdn.example%2Fa.png&hash=1", OwnMedia),
+            (
+                "https://forum.example/styles/default/xenforo/smilies/a.png",
+                OwnMedia,
+            ),
+            (
+                "https://forum.example/proxy.php?image=https%3A%2F%2Fcdn.example%2Fa.png&hash=1",
+                OwnMedia,
+            ),
             ("https://forum.example/admin.php", Strict),
             ("https://forum.example/proxy.php.bak", Strict),
             ("https://forum.example/datax/a.png", Strict),
@@ -657,8 +821,14 @@ mod tests {
         ] {
             assert_eq!(named.lane(&url(u)), lane, "{u}");
         }
-        assert_eq!(site("http://localhost:3000").lane(&url("http://localhost:3000/anything")), OwnMedia);
-        assert_eq!(site("https://192.168.1.10").lane(&url("https://192.168.1.10/index.php")), OwnMedia);
+        assert_eq!(
+            site("http://localhost:3000").lane(&url("http://localhost:3000/anything")),
+            OwnMedia
+        );
+        assert_eq!(
+            site("https://192.168.1.10").lane(&url("https://192.168.1.10/index.php")),
+            OwnMedia
+        );
     }
 
     /// #146, the name half: a forum name that resolves to loopback (the
@@ -671,15 +841,41 @@ mod tests {
         let policy = site("https://forum.example")
             .with_fixed_dns("forum.example", &["127.0.0.1"])
             .with_fixed_dns("other.example", &["10.0.0.1"]);
-        assert_eq!(resolve(&policy, ContentLane::OwnMedia, "forum.example").await.unwrap(), ["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]);
-        assert!(resolve(&policy, ContentLane::Strict, "forum.example").await.is_err());
-        assert!(resolve(&policy, ContentLane::Strict, "FORUM.example.").await.is_err());
-        assert!(resolve(&policy, ContentLane::OwnMedia, "other.example").await.is_err());
+        assert_eq!(
+            resolve(&policy, ContentLane::OwnMedia, "forum.example")
+                .await
+                .unwrap(),
+            ["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert!(
+            resolve(&policy, ContentLane::Strict, "forum.example")
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve(&policy, ContentLane::Strict, "FORUM.example.")
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve(&policy, ContentLane::OwnMedia, "other.example")
+                .await
+                .is_err()
+        );
         // The system resolver, for the dev-forum case the wiremock tests use.
         let dev = site("http://localhost:3000");
-        let kept = resolve(&dev, ContentLane::OwnMedia, "localhost").await.unwrap();
-        assert!(!kept.is_empty() && kept.iter().all(|ip| ip.is_loopback()), "{kept:?}");
-        assert!(resolve(&dev, ContentLane::Strict, "localhost").await.is_err());
+        let kept = resolve(&dev, ContentLane::OwnMedia, "localhost")
+            .await
+            .unwrap();
+        assert!(
+            !kept.is_empty() && kept.iter().all(|ip| ip.is_loopback()),
+            "{kept:?}"
+        );
+        assert!(
+            resolve(&dev, ContentLane::Strict, "localhost")
+                .await
+                .is_err()
+        );
     }
 
     /// #146, the redirect half: the `OwnMedia` client may not be sent to
@@ -690,8 +886,16 @@ mod tests {
     fn own_media_redirects_stay_on_own_media() {
         let policy = site("https://forum.example");
         let own = ContentLane::OwnMedia;
-        assert!(policy.hop_check(&url("https://forum.example/data/b.png"), own).is_ok());
-        assert!(policy.hop_check(&url("https://cdn.example/a.png"), own).is_ok());
+        assert!(
+            policy
+                .hop_check(&url("https://forum.example/data/b.png"), own)
+                .is_ok()
+        );
+        assert!(
+            policy
+                .hop_check(&url("https://cdn.example/a.png"), own)
+                .is_ok()
+        );
         for hop in [
             "https://forum.example/admin.php",
             "https://forum.example:8444/data/a.png",
@@ -702,7 +906,11 @@ mod tests {
             assert!(err.0.contains("own media"), "{hop}: {}", err.0);
         }
         // The Strict client may follow it: its resolver judges the name.
-        assert!(policy.hop_check(&url("https://forum.example/admin.php"), ContentLane::Strict).is_ok());
+        assert!(
+            policy
+                .hop_check(&url("https://forum.example/admin.php"), ContentLane::Strict)
+                .is_ok()
+        );
         assert!(!policy.resolver_exempts("forum.example", ContentLane::Strict));
     }
 
@@ -711,12 +919,20 @@ mod tests {
     #[test]
     fn proxy_hosts_are_read_from_the_proxy_variables() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string())
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
         };
         let policy = ContentPolicy::with_proxy_env(
             "https://forum.example",
             env(&[
-                ("HTTPS_PROXY", "http://user:p%40ss@Proxy.Corp.Example.:3128/"),
+                (
+                    "HTTPS_PROXY",
+                    "http://user:p%40ss@Proxy.Corp.Example.:3128/",
+                ),
                 ("http_proxy", "localhost:3128"),
                 ("ALL_PROXY", "socks5h://[fd00::1]:1080"),
                 ("HTTP_PROXY", ""),
@@ -726,12 +942,21 @@ mod tests {
         // nothing. reqwest itself would skip http_proxy here (an empty
         // HTTP_PROXY is still "set"); listing it anyway only refuses it as a
         // content target.
-        assert_eq!(policy.proxy_hosts, ["fd00::1", "proxy.corp.example", "localhost"]);
+        assert_eq!(
+            policy.proxy_hosts,
+            ["fd00::1", "proxy.corp.example", "localhost"]
+        );
         let cgi = ContentPolicy::with_proxy_env(
             "https://forum.example",
-            env(&[("HTTPS_PROXY", "http://proxy.corp.example:3128"), ("REQUEST_METHOD", "GET")]),
+            env(&[
+                ("HTTPS_PROXY", "http://proxy.corp.example:3128"),
+                ("REQUEST_METHOD", "GET"),
+            ]),
         );
-        assert!(cgi.proxy_hosts.is_empty(), "reqwest uses no proxy in a CGI process");
+        assert!(
+            cgi.proxy_hosts.is_empty(),
+            "reqwest uses no proxy in a CGI process"
+        );
         assert!(site("https://forum.example").proxy_hosts.is_empty());
     }
 
@@ -745,9 +970,22 @@ mod tests {
         let policy = site_behind("https://forum.example", "http://proxy.corp.example:3128")
             .with_fixed_dns("proxy.corp.example", &["10.1.2.3"]);
         let ten: std::net::IpAddr = "10.1.2.3".parse().unwrap();
-        assert_eq!(resolve(&policy, ContentLane::Strict, "proxy.corp.example").await.unwrap(), [ten]);
-        assert_eq!(resolve(&policy, ContentLane::OwnMedia, "proxy.corp.example").await.unwrap(), [ten]);
-        for target in ["http://proxy.corp.example:8080/a.png", "https://PROXY.corp.example./a.png"] {
+        assert_eq!(
+            resolve(&policy, ContentLane::Strict, "proxy.corp.example")
+                .await
+                .unwrap(),
+            [ten]
+        );
+        assert_eq!(
+            resolve(&policy, ContentLane::OwnMedia, "proxy.corp.example")
+                .await
+                .unwrap(),
+            [ten]
+        );
+        for target in [
+            "http://proxy.corp.example:8080/a.png",
+            "https://PROXY.corp.example./a.png",
+        ] {
             let err = policy.check_url(&url(target)).expect_err(target);
             assert!(err.0.contains("configured proxy"), "{target}: {}", err.0);
         }
@@ -765,15 +1003,39 @@ mod tests {
             .with_fixed_dns("mixed.example", &["8.8.8.8", "127.0.0.1"])
             .with_fixed_dns("cdn.example", &["8.8.8.8"])
             .with_fixed_dns("proxy-only.example", &[]);
-        for target in ["http://intranet.example/a.png", "https://mixed.example/a.png"] {
+        for target in [
+            "http://intranet.example/a.png",
+            "https://mixed.example/a.png",
+        ] {
             let err = policy.preflight(&url(target)).await.expect_err(target);
             assert!(err.0.contains("non-public address"), "{target}: {}", err.0);
         }
-        assert!(policy.preflight(&url("https://cdn.example/a.png")).await.is_ok());
-        assert!(policy.preflight(&url("https://proxy-only.example/a.png")).await.is_ok());
-        assert!(policy.preflight(&url("https://8.8.8.8/a.png")).await.is_ok());
-        let direct = site("https://forum.example").with_fixed_dns("intranet.example", &["10.0.0.5"]);
-        assert!(direct.preflight(&url("http://intranet.example/a.png")).await.is_ok());
+        assert!(
+            policy
+                .preflight(&url("https://cdn.example/a.png"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            policy
+                .preflight(&url("https://proxy-only.example/a.png"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            policy
+                .preflight(&url("https://8.8.8.8/a.png"))
+                .await
+                .is_ok()
+        );
+        let direct =
+            site("https://forum.example").with_fixed_dns("intranet.example", &["10.0.0.5"]);
+        assert!(
+            direct
+                .preflight(&url("http://intranet.example/a.png"))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

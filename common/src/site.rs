@@ -27,7 +27,11 @@ pub const HAS_BUILTIN_SITE: bool = cfg!(feature = "builtin-windowsforum");
 
 /// What the product is called in this edition (the `--help` banner, the
 /// Setup screen, packaging). The command is `wftui` in both.
-pub const PRODUCT_NAME: &str = if HAS_BUILTIN_SITE { "Forum Terminal (TUI)" } else { "Terminal for XenForo" };
+pub const PRODUCT_NAME: &str = if HAS_BUILTIN_SITE {
+    "Forum Terminal (TUI)"
+} else {
+    "Terminal for XenForo"
+};
 
 /// The edition's mark in release asset names: the two editions share one
 /// update feed, and the updater must never install the other one's binary.
@@ -199,13 +203,29 @@ impl SiteConfig {
                 name: "WindowsForum".into(),
                 mark: "WF".into(),
                 bold_prefix: "Windows".into(),
-                chrome_bg: Some(Rgb { r: 0x0F, g: 0x6C, b: 0xBD }),
+                chrome_bg: Some(Rgb {
+                    r: 0x0F,
+                    g: 0x6C,
+                    b: 0xBD,
+                }),
                 logo: None,
             },
             quick: vec![
-                QuickNode { key: 'n', label: "Windows News".into(), node_id: 4 },
-                QuickNode { key: 's', label: "Security Alerts".into(), node_id: 84 },
-                QuickNode { key: 't', label: "Windows Tutorials".into(), node_id: 305 },
+                QuickNode {
+                    key: 'n',
+                    label: "Windows News".into(),
+                    node_id: 4,
+                },
+                QuickNode {
+                    key: 's',
+                    label: "Security Alerts".into(),
+                    node_id: 84,
+                },
+                QuickNode {
+                    key: 't',
+                    label: "Windows Tutorials".into(),
+                    node_id: 305,
+                },
             ],
             bot_user_ids: vec![125_694],
             prefix_strip: vec!["Windows ".into()],
@@ -215,7 +235,11 @@ impl SiteConfig {
     /// A site the file names but the binary knows nothing about: no origin,
     /// no client id, no add-ons, a brand made from the slug.
     pub fn blank(name: &str) -> Self {
-        let mark: String = name.chars().take(2).collect::<String>().to_ascii_uppercase();
+        let mark: String = name
+            .chars()
+            .take(2)
+            .collect::<String>()
+            .to_ascii_uppercase();
         SiteConfig {
             name: name.into(),
             origin: String::new(),
@@ -307,7 +331,9 @@ impl SiteConfig {
             )));
         }
         if self.origin.is_empty() {
-            return Err(bad("\"origin\" is required (https://forum.example.com)".into()));
+            return Err(bad(
+                "\"origin\" is required (https://forum.example.com)".into()
+            ));
         }
         config::validate_base_url(&self.origin)?;
         if self.oauth_client_id.trim().is_empty() {
@@ -329,24 +355,33 @@ impl SiteConfig {
         }
         let mark = &self.brand.mark;
         if mark.is_empty() || mark.len() > 4 || !mark.bytes().all(|b| b.is_ascii_graphic()) {
-            return Err(bad("\"brand.mark\" must be 1-4 printable ASCII characters".into()));
+            return Err(bad(
+                "\"brand.mark\" must be 1-4 printable ASCII characters".into()
+            ));
         }
         if self.brand.name.trim().is_empty() {
             return Err(bad("\"brand.name\" must not be empty".into()));
         }
-        if !self.brand.bold_prefix.is_empty() && !self.brand.name.starts_with(&self.brand.bold_prefix) {
+        if !self.brand.bold_prefix.is_empty()
+            && !self.brand.name.starts_with(&self.brand.bold_prefix)
+        {
             return Err(bad(format!(
                 "\"brand.bold_prefix\" {:?} is not a prefix of \"brand.name\" {:?}",
                 self.brand.bold_prefix, self.brand.name
             )));
         }
         if self.quick.len() > MAX_QUICK {
-            return Err(bad(format!("at most {MAX_QUICK} \"quick\" entries (they are the 1-9 keys)")));
+            return Err(bad(format!(
+                "at most {MAX_QUICK} \"quick\" entries (they are the 1-9 keys)"
+            )));
         }
         let mut seen = Vec::new();
         for q in &self.quick {
             if !q.key.is_ascii_lowercase() {
-                return Err(bad(format!("quick key {:?} must be a lowercase letter", q.key)));
+                return Err(bad(format!(
+                    "quick key {:?} must be a lowercase letter",
+                    q.key
+                )));
             }
             if RESERVED_CHORDS.contains(&q.key) {
                 return Err(bad(format!(
@@ -360,7 +395,9 @@ impl SiteConfig {
             }
             seen.push(q.key);
             if q.label.trim().is_empty() || q.node_id == 0 {
-                return Err(bad("every \"quick\" entry needs a label and a node_id".into()));
+                return Err(bad(
+                    "every \"quick\" entry needs a label and a node_id".into()
+                ));
             }
         }
         Ok(())
@@ -479,7 +516,11 @@ impl RawSite {
         }
         if let Some(v) = &self.brand.logo {
             let p = PathBuf::from(v);
-            site.brand.logo = Some(if p.is_absolute() { p } else { config_dir.join(p) });
+            site.brand.logo = Some(if p.is_absolute() {
+                p
+            } else {
+                config_dir.join(p)
+            });
         }
         if let Some(v) = &self.quick {
             site.quick = v
@@ -495,7 +536,11 @@ impl RawSite {
                             )));
                         }
                     };
-                    Ok(QuickNode { key, label: q.label.trim().to_string(), node_id: q.node_id })
+                    Ok(QuickNode {
+                        key,
+                        label: q.label.trim().to_string(),
+                        node_id: q.node_id,
+                    })
                 })
                 .collect::<Result<Vec<_>>>()?;
         }
@@ -519,7 +564,12 @@ impl Config {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
-            Err(e) => return Err(Error::Config(format!("cannot read {}: {e}", path.display()))),
+            Err(e) => {
+                return Err(Error::Config(format!(
+                    "cannot read {}: {e}",
+                    path.display()
+                )));
+            }
         };
         let config: Config = serde_json::from_str(&text).map_err(|e| {
             Error::Config(format!(
@@ -608,10 +658,18 @@ pub fn save_site(path: &Path, site: &SiteConfig) -> Result<()> {
         Ok(text) => serde_json::from_str(&text)
             .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(Error::Config(format!("cannot read {}: {e}", path.display()))),
+        Err(e) => {
+            return Err(Error::Config(format!(
+                "cannot read {}: {e}",
+                path.display()
+            )));
+        }
     };
     if !root.is_object() {
-        return Err(Error::Config(format!("{}: not a JSON object", path.display())));
+        return Err(Error::Config(format!(
+            "{}: not a JSON object",
+            path.display()
+        )));
     }
     let entry = serde_json::json!({
         "name": site.name,
@@ -636,9 +694,15 @@ pub fn save_site(path: &Path, site: &SiteConfig) -> Result<()> {
         .entry("sites")
         .or_insert_with(|| serde_json::Value::Array(Vec::new()));
     let Some(list) = sites.as_array_mut() else {
-        return Err(Error::Config(format!("{}: \"sites\" is not a list", path.display())));
+        return Err(Error::Config(format!(
+            "{}: \"sites\" is not a list",
+            path.display()
+        )));
     };
-    match list.iter_mut().find(|s| s.get("name").and_then(|n| n.as_str()) == Some(site.name.as_str())) {
+    match list
+        .iter_mut()
+        .find(|s| s.get("name").and_then(|n| n.as_str()) == Some(site.name.as_str()))
+    {
         // The doc promise above is that keys the loader would ignore
         // survive: merge the modelled fields INTO the existing entry
         // instead of replacing it, so a Setup re-run over a colliding slug
@@ -647,7 +711,10 @@ pub fn save_site(path: &Path, site: &SiteConfig) -> Result<()> {
         Some(existing) => merge_site_entry(existing, &entry),
         None => list.push(entry),
     }
-    obj.insert("default_site".into(), serde_json::Value::String(site.name.clone()));
+    obj.insert(
+        "default_site".into(),
+        serde_json::Value::String(site.name.clone()),
+    );
     let body = serde_json::to_string_pretty(&root).map_err(Error::Json)? + "\n";
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -655,7 +722,10 @@ pub fn save_site(path: &Path, site: &SiteConfig) -> Result<()> {
     let tmp = path.with_file_name(format!(
         "config.json.tmp.{}.{}",
         std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
     ));
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
@@ -694,7 +764,13 @@ fn merge_site_entry(existing: &mut serde_json::Value, entry: &serde_json::Value)
 pub fn site_from_setup(origin: &str, client_id: &str, name: &str) -> Result<SiteConfig> {
     let origin = origin.trim().trim_end_matches('/');
     let host = origin.split_once("://").map(|(_, r)| r).unwrap_or(origin);
-    let host = host.split('/').next().unwrap_or(host).split(':').next().unwrap_or(host);
+    let host = host
+        .split('/')
+        .next()
+        .unwrap_or(host)
+        .split(':')
+        .next()
+        .unwrap_or(host);
     let slug: String = host
         .to_ascii_lowercase()
         .chars()
@@ -703,7 +779,9 @@ pub fn site_from_setup(origin: &str, client_id: &str, name: &str) -> Result<Site
         .trim_matches('-')
         .to_string();
     if slug.is_empty() {
-        return Err(Error::Config("\"origin\" is required (https://forum.example.com)".into()));
+        return Err(Error::Config(
+            "\"origin\" is required (https://forum.example.com)".into(),
+        ));
     }
     let mut site = SiteConfig::blank(&slug);
     site.origin = origin.to_string();
@@ -711,7 +789,12 @@ pub fn site_from_setup(origin: &str, client_id: &str, name: &str) -> Result<Site
     let name = name.trim();
     if !name.is_empty() {
         site.brand.name = name.to_string();
-        let mark: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).take(2).collect::<String>().to_ascii_uppercase();
+        let mark: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(2)
+            .collect::<String>()
+            .to_ascii_uppercase();
         if !mark.is_empty() {
             site.brand.mark = mark;
         }
@@ -745,7 +828,9 @@ pub fn resolve_or_setup(
     site_arg: Option<&str>,
     config_dir: &Path,
 ) -> Result<Option<SiteConfig>> {
-    let env_site = std::env::var("WFTUI_SITE").ok().filter(|s| !s.trim().is_empty());
+    let env_site = std::env::var("WFTUI_SITE")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     let name: String = match (site_arg, env_site, &config.default_site) {
         (Some(arg), _, _) => arg.trim().to_string(),
         (None, Some(env), _) => env.trim().to_string(),
@@ -831,7 +916,10 @@ mod tests {
         let root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let entry = &root["sites"][0];
-        assert_eq!(entry["origin"], "https://new.example", "modelled fields update");
+        assert_eq!(
+            entry["origin"], "https://new.example",
+            "modelled fields update"
+        );
         assert_eq!(entry["oauth_client_id"], "new-id");
         assert_eq!(entry["brand"]["name"], "New");
         assert_eq!(
@@ -841,7 +929,10 @@ mod tests {
         );
         assert_eq!(entry["quick"][0]["label"], "Rules", "quick survives");
         assert_eq!(entry["_comment"], "hand-edited");
-        assert_eq!(entry["brand"]["logo"], "old.png", "the logo survives the brand merge");
+        assert_eq!(
+            entry["brand"]["logo"], "old.png",
+            "the logo survives the brand merge"
+        );
         assert_eq!(root["default_site"], "forum");
     }
 
@@ -849,10 +940,11 @@ mod tests {
     /// reads, restoring them after — a test must not see a sibling's site.
     fn without_env<T>(f: impl FnOnce() -> T) -> T {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let saved: Vec<(&str, Option<String>)> = ["WFTUI_SITE", "WFTUI_BASE_URL", "WFTUI_OAUTH_CLIENT_ID"]
-            .into_iter()
-            .map(|k| (k, std::env::var(k).ok()))
-            .collect();
+        let saved: Vec<(&str, Option<String>)> =
+            ["WFTUI_SITE", "WFTUI_BASE_URL", "WFTUI_OAUTH_CLIENT_ID"]
+                .into_iter()
+                .map(|k| (k, std::env::var(k).ok()))
+                .collect();
         for (k, _) in &saved {
             unsafe { std::env::remove_var(k) };
         }
@@ -877,21 +969,46 @@ mod tests {
         assert_eq!(wf.scopes, None);
         assert_eq!(
             wf.features,
-            Features { xfmg: true, xfrm: true, tuilink: Some(true), drafts_relay: Some(true), ask_ai: true }
+            Features {
+                xfmg: true,
+                xfrm: true,
+                tuilink: Some(true),
+                drafts_relay: Some(true),
+                ask_ai: true
+            }
         );
         assert_eq!(wf.login, LoginMode::Auto);
         assert_eq!(wf.brand.name, "WindowsForum");
         assert_eq!(wf.brand.mark, "WF");
         assert_eq!(wf.brand.bold_prefix, "Windows");
         assert_eq!(wf.brand.split(), ("Windows", "Forum"));
-        assert_eq!(wf.brand.chrome_bg, Some(Rgb { r: 0x0F, g: 0x6C, b: 0xBD }));
+        assert_eq!(
+            wf.brand.chrome_bg,
+            Some(Rgb {
+                r: 0x0F,
+                g: 0x6C,
+                b: 0xBD
+            })
+        );
         assert_eq!(wf.brand.logo, None);
         assert_eq!(
             wf.quick,
             vec![
-                QuickNode { key: 'n', label: "Windows News".into(), node_id: 4 },
-                QuickNode { key: 's', label: "Security Alerts".into(), node_id: 84 },
-                QuickNode { key: 't', label: "Windows Tutorials".into(), node_id: 305 },
+                QuickNode {
+                    key: 'n',
+                    label: "Windows News".into(),
+                    node_id: 4
+                },
+                QuickNode {
+                    key: 's',
+                    label: "Security Alerts".into(),
+                    node_id: 84
+                },
+                QuickNode {
+                    key: 't',
+                    label: "Windows Tutorials".into(),
+                    node_id: 305
+                },
             ]
         );
         assert_eq!(wf.bot_user_ids, vec![125_694]);
@@ -907,14 +1024,23 @@ mod tests {
         let wf = SiteConfig::windowsforum();
         let scopes = wf.effective_scopes();
         assert_eq!(scopes.len(), 14);
-        assert!(scopes.iter().any(|s| s == "media:read") && scopes.iter().any(|s| s == "resource:read"));
+        assert!(
+            scopes.iter().any(|s| s == "media:read") && scopes.iter().any(|s| s == "resource:read")
+        );
         for s in BASE_SCOPES {
             assert!(scopes.iter().any(|x| x == s), "missing {s}");
         }
         let mut plain = SiteConfig::blank("plain");
-        assert_eq!(plain.effective_scopes(), BASE_SCOPES.map(String::from).to_vec());
+        assert_eq!(
+            plain.effective_scopes(),
+            BASE_SCOPES.map(String::from).to_vec()
+        );
         plain.features.xfrm = true;
-        assert!(plain.effective_scopes().ends_with(&["resource:read".to_string()]));
+        assert!(
+            plain
+                .effective_scopes()
+                .ends_with(&["resource:read".to_string()])
+        );
         plain.scopes = Some(vec!["thread:read".into()]);
         assert_eq!(plain.effective_scopes(), vec!["thread:read".to_string()]);
     }
@@ -938,7 +1064,11 @@ mod tests {
         if HAS_BUILTIN_SITE {
             assert_eq!(cfg.site_names(), vec![BUILTIN_NAME.to_string()]);
             let site = without_env(|| resolve(&cfg, None, &dir).unwrap());
-            assert_eq!(site, SiteConfig::windowsforum(), "no file, no env: exactly the built-in site");
+            assert_eq!(
+                site,
+                SiteConfig::windowsforum(),
+                "no file, no env: exactly the built-in site"
+            );
         } else {
             assert!(cfg.site_names().is_empty());
         }
@@ -957,11 +1087,24 @@ mod tests {
             assert_eq!(fallback.is_some(), HAS_BUILTIN_SITE);
             if !HAS_BUILTIN_SITE {
                 let err = resolve(&cfg, None, &dir).unwrap_err().to_string();
-                assert!(err.contains("no site configured") && err.contains("config.json"), "{err}");
+                assert!(
+                    err.contains("no site configured") && err.contains("config.json"),
+                    "{err}"
+                );
             }
-            assert_eq!(resolve(&cfg, Some("windowsforum"), &dir).unwrap(), SiteConfig::windowsforum());
+            assert_eq!(
+                resolve(&cfg, Some("windowsforum"), &dir).unwrap(),
+                SiteConfig::windowsforum()
+            );
         });
-        assert_eq!(PRODUCT_NAME, if HAS_BUILTIN_SITE { "Forum Terminal (TUI)" } else { "Terminal for XenForo" });
+        assert_eq!(
+            PRODUCT_NAME,
+            if HAS_BUILTIN_SITE {
+                "Forum Terminal (TUI)"
+            } else {
+                "Terminal for XenForo"
+            }
+        );
         assert_eq!(EDITION_SUFFIX, if HAS_BUILTIN_SITE { "" } else { "-xf" });
     }
 
@@ -970,10 +1113,16 @@ mod tests {
         let p = SiteConfig::placeholder();
         assert!(p.is_placeholder());
         assert!(!SiteConfig::windowsforum().is_placeholder());
-        assert!(!SiteConfig::blank("setup").is_placeholder(), "the name alone is not the marker");
+        assert!(
+            !SiteConfig::blank("setup").is_placeholder(),
+            "the name alone is not the marker"
+        );
         assert_eq!(p.brand.name, PRODUCT_NAME);
         assert_eq!(p.brand.mark, "XF");
-        assert!(p.validate().is_err() || p.oauth_client_id == "-", "never written as a real site");
+        assert!(
+            p.validate().is_err() || p.oauth_client_id == "-",
+            "never written as a real site"
+        );
         assert!(!p.is_builtin());
     }
 
@@ -985,26 +1134,52 @@ mod tests {
         let cfg = Config::load(&path).unwrap();
         if HAS_BUILTIN_SITE {
             assert_eq!(cfg.default_site.as_deref(), Some("windowsforum"));
-            assert_eq!(cfg.site_names(), vec!["windowsforum".to_string(), "example".to_string()]);
+            assert_eq!(
+                cfg.site_names(),
+                vec!["windowsforum".to_string(), "example".to_string()]
+            );
         } else {
             assert_eq!(cfg.default_site.as_deref(), Some("example"));
             assert_eq!(cfg.site_names(), vec!["example".to_string()]);
         }
         without_env(|| {
             if HAS_BUILTIN_SITE {
-                assert_eq!(resolve(&cfg, None, &dir).unwrap(), SiteConfig::windowsforum());
+                assert_eq!(
+                    resolve(&cfg, None, &dir).unwrap(),
+                    SiteConfig::windowsforum()
+                );
             }
             let ex = resolve(&cfg, Some("example"), &dir).unwrap();
             assert_eq!(ex.origin, "https://forum.example.com");
             assert_eq!(ex.oauth_client_id, "PASTE-CLIENT-ID");
             assert_eq!(ex.brand.split(), ("Example", "Forum"));
             assert_eq!(ex.brand.mark, "EX");
-            assert_eq!(ex.brand.chrome_bg, Some(Rgb { r: 0x3A, g: 0x7D, b: 0x44 }));
+            assert_eq!(
+                ex.brand.chrome_bg,
+                Some(Rgb {
+                    r: 0x3A,
+                    g: 0x7D,
+                    b: 0x44
+                })
+            );
             assert_eq!(
                 ex.features,
-                Features { xfmg: false, xfrm: false, tuilink: None, drafts_relay: None, ask_ai: false }
+                Features {
+                    xfmg: false,
+                    xfrm: false,
+                    tuilink: None,
+                    drafts_relay: None,
+                    ask_ai: false
+                }
             );
-            assert_eq!(ex.quick, vec![QuickNode { key: 'n', label: "News".into(), node_id: 12 }]);
+            assert_eq!(
+                ex.quick,
+                vec![QuickNode {
+                    key: 'n',
+                    label: "News".into(),
+                    node_id: 12
+                }]
+            );
             assert_eq!(ex.effective_scopes().len(), 12);
             assert!(!ex.is_builtin());
         });
@@ -1020,7 +1195,10 @@ mod tests {
         assert_eq!(site.brand.mark, "W");
         assert_eq!(site.brand.name, "WindowsForum");
         assert!(!site.features.xfmg && site.features.xfrm);
-        assert!(site.features.ask_ai, "overriding one flag keeps Ask the AI on the built-in site");
+        assert!(
+            site.features.ask_ai,
+            "overriding one flag keeps Ask the AI on the built-in site"
+        );
         assert!(site.quick.is_empty());
         assert_eq!(site.oauth_client_id, "6014883021104153");
         assert_eq!(site.effective_scopes().len(), 13);
@@ -1032,12 +1210,18 @@ mod tests {
         let path = dir.join("config.json");
         std::fs::write(&path, "{\n  \"sites\": [ {\"name\": \"x\",}\n]}").unwrap();
         let err = Config::load(&path).unwrap_err().to_string();
-        assert!(err.contains("config.json") && err.contains("line 2"), "{err}");
+        assert!(
+            err.contains("config.json") && err.contains("line 2"),
+            "{err}"
+        );
         std::fs::write(&path, r#"{"sites":[{"name":"a"},{"name":"a"}]}"#).unwrap();
         let err = Config::load(&path).unwrap_err().to_string();
         assert!(err.contains("listed twice"), "{err}");
         std::fs::create_dir_all(dir.join("dir.json")).unwrap();
-        assert!(Config::load(&dir.join("dir.json")).is_err(), "a directory is not a missing file");
+        assert!(
+            Config::load(&dir.join("dir.json")).is_err(),
+            "a directory is not a missing file"
+        );
     }
 
     #[test]
@@ -1072,8 +1256,15 @@ mod tests {
             assert_eq!(site.origin, "http://127.0.0.1:1");
             assert_eq!(site.oauth_client_id, "env-id");
             let wf = resolve(&cfg, Some("windowsforum"), &dir).unwrap();
-            assert_eq!(wf.origin, "http://127.0.0.1:1", "staging via env still works with no entry");
-            assert_eq!(wf.user_agent(), config::user_agent(), "and it is still the WF site");
+            assert_eq!(
+                wf.origin, "http://127.0.0.1:1",
+                "staging via env still works with no entry"
+            );
+            assert_eq!(
+                wf.user_agent(),
+                config::user_agent(),
+                "and it is still the WF site"
+            );
         });
     }
 
@@ -1090,18 +1281,41 @@ mod tests {
             assert_eq!(resolve(&cfg, Some("a"), &dir).unwrap().name, "a");
             assert_eq!(resolve(&cfg, None, &dir).unwrap().name, "b", "default_site");
             unsafe { std::env::set_var("WFTUI_SITE", "a") };
-            assert_eq!(resolve(&cfg, None, &dir).unwrap().name, "a", "env beats default_site");
-            assert_eq!(resolve(&cfg, Some("b"), &dir).unwrap().name, "b", "arg beats env");
+            assert_eq!(
+                resolve(&cfg, None, &dir).unwrap().name,
+                "a",
+                "env beats default_site"
+            );
+            assert_eq!(
+                resolve(&cfg, Some("b"), &dir).unwrap().name,
+                "b",
+                "arg beats env"
+            );
             unsafe { std::env::remove_var("WFTUI_SITE") };
             let err = resolve(&cfg, Some("nope"), &dir).unwrap_err().to_string();
-            assert!(err.contains("unknown site") && err.contains("a, b"), "{err}");
+            assert!(
+                err.contains("unknown site") && err.contains("a, b"),
+                "{err}"
+            );
             assert_eq!(err.contains("windowsforum"), HAS_BUILTIN_SITE, "{err}");
         });
-        std::fs::write(&path, r#"{"sites":[{"name":"only","origin":"https://o.example","oauth_client_id":"1"}]}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"sites":[{"name":"only","origin":"https://o.example","oauth_client_id":"1"}]}"#,
+        )
+        .unwrap();
         let cfg = Config::load(&path).unwrap();
         without_env(|| {
-            assert_eq!(resolve(&cfg, None, &dir).unwrap().name, "only", "the only listed site wins over the built-in");
-            assert_eq!(resolve(&cfg, Some("windowsforum"), &dir).unwrap().name, "windowsforum", "but the built-in is always reachable");
+            assert_eq!(
+                resolve(&cfg, None, &dir).unwrap().name,
+                "only",
+                "the only listed site wins over the built-in"
+            );
+            assert_eq!(
+                resolve(&cfg, Some("windowsforum"), &dir).unwrap().name,
+                "windowsforum",
+                "but the built-in is always reachable"
+            );
         });
     }
 
@@ -1111,16 +1325,39 @@ mod tests {
         site.origin = "https://q.example".into();
         site.oauth_client_id = "1".into();
         site.validate().unwrap();
-        let q = |k: char| QuickNode { key: k, label: "L".into(), node_id: 1 };
+        let q = |k: char| QuickNode {
+            key: k,
+            label: "L".into(),
+            node_id: 1,
+        };
         site.quick = vec![q('m')];
-        assert!(site.validate().unwrap_err().to_string().contains("reserved"));
+        assert!(
+            site.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("reserved")
+        );
         site.quick = vec![q('N')];
-        assert!(site.validate().unwrap_err().to_string().contains("lowercase"));
+        assert!(
+            site.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("lowercase")
+        );
         site.quick = vec![q('n'), q('n')];
         assert!(site.validate().unwrap_err().to_string().contains("twice"));
         site.quick = (0..10).map(|i| q((b'b' + i as u8) as char)).collect();
-        assert!(site.validate().unwrap_err().to_string().contains("at most 9"));
-        site.quick = vec![QuickNode { key: 'n', label: "".into(), node_id: 1 }];
+        assert!(
+            site.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("at most 9")
+        );
+        site.quick = vec![QuickNode {
+            key: 'n',
+            label: "".into(),
+            node_id: 1,
+        }];
         assert!(site.validate().is_err());
         site.quick = vec![q('n'), q('o'), q('s')];
         site.validate().unwrap();
@@ -1157,7 +1394,9 @@ mod tests {
         // Renaming the built-in brand without renaming the prefix drops it
         // rather than failing.
         let dir = scratch("bold");
-        let raw: RawSite = serde_json::from_str(r#"{"name":"windowsforum","brand":{"name":"Elsewhere"}}"#).unwrap();
+        let raw: RawSite =
+            serde_json::from_str(r#"{"name":"windowsforum","brand":{"name":"Elsewhere"}}"#)
+                .unwrap();
         let site = raw.apply(SiteConfig::windowsforum(), &dir).unwrap();
         assert_eq!(site.brand.split(), ("", "Elsewhere"));
     }
@@ -1186,9 +1425,18 @@ mod tests {
         let site = raw.apply(SiteConfig::blank("l"), &dir).unwrap();
         assert_eq!(site.brand.logo, Some(dir.join("logo.png")));
         assert_eq!(site.brand.chrome_bg, Some(Rgb { r: 1, g: 2, b: 3 }));
-        let raw: RawSite = serde_json::from_str(r#"{"name":"l","brand":{"chrome_bg":"blueish"}}"#).unwrap();
-        assert!(raw.apply(SiteConfig::blank("l"), &dir).unwrap_err().to_string().contains("CSS colour"));
+        let raw: RawSite =
+            serde_json::from_str(r#"{"name":"l","brand":{"chrome_bg":"blueish"}}"#).unwrap();
+        assert!(
+            raw.apply(SiteConfig::blank("l"), &dir)
+                .unwrap_err()
+                .to_string()
+                .contains("CSS colour")
+        );
         assert_eq!(LoginMode::Auto.next().next().next().next(), LoginMode::Auto);
-        assert_eq!(serde_json::from_str::<LoginMode>("\"paste\"").unwrap(), LoginMode::Paste);
+        assert_eq!(
+            serde_json::from_str::<LoginMode>("\"paste\"").unwrap(),
+            LoginMode::Paste
+        );
     }
 }

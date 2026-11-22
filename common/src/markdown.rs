@@ -56,13 +56,19 @@ pub fn render(src: &str) -> Vec<Chunk> {
             continue;
         }
         if let Some((level, text)) = heading(trimmed) {
-            let style = Style { heading: Some(level), ..Style::default() };
+            let style = Style {
+                heading: Some(level),
+                ..Style::default()
+            };
             inline(text, style, &mut out);
             push_text(&mut out, "\n", Style::default());
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix('>') {
-            let style = Style { quote_depth: 1, ..Style::default() };
+            let style = Style {
+                quote_depth: 1,
+                ..Style::default()
+            };
             inline(rest.strip_prefix(' ').unwrap_or(rest), style, &mut out);
             push_text(&mut out, "\n", Style::default());
             continue;
@@ -70,8 +76,15 @@ pub fn render(src: &str) -> Vec<Chunk> {
         let indent = line.len() - trimmed.len();
         if let Some((marker, text)) = list_item(trimmed) {
             let depth = (indent / 2 + 1).min(8) as u8;
-            let style = Style { list_depth: depth, ..Style::default() };
-            push_text(&mut out, &format!("{}{marker}", "  ".repeat(depth as usize - 1)), style.clone());
+            let style = Style {
+                list_depth: depth,
+                ..Style::default()
+            };
+            push_text(
+                &mut out,
+                &format!("{}{marker}", "  ".repeat(depth as usize - 1)),
+                style.clone(),
+            );
             inline(text, style, &mut out);
             push_text(&mut out, "\n", Style::default());
             continue;
@@ -92,7 +105,10 @@ pub fn render(src: &str) -> Vec<Chunk> {
 }
 
 fn code_style() -> Style {
-    Style { code: true, ..Style::default() }
+    Style {
+        code: true,
+        ..Style::default()
+    }
 }
 
 /// Append text, merging into the previous chunk when the style matches, so
@@ -131,15 +147,16 @@ fn fence_open(trimmed: &str) -> Option<String> {
 /// first version required the exact opening length, so a ```` line closing
 /// a ``` fence was code text and swallowed the rest of the answer (#140).
 fn closes_fence(trimmed: &str, marker: &str) -> bool {
-    let Some(ch) = marker.chars().next() else { return false };
+    let Some(ch) = marker.chars().next() else {
+        return false;
+    };
     let run = trimmed.chars().take_while(|c| *c == ch).count();
     run >= marker.chars().count() && trimmed[run * ch.len_utf8()..].trim().is_empty()
 }
 
 fn is_rule(trimmed: &str) -> bool {
     let t: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
-    t.len() >= 3
-        && ['-', '*', '_'].iter().any(|m| t.chars().all(|c| c == *m))
+    t.len() >= 3 && ['-', '*', '_'].iter().any(|m| t.chars().all(|c| c == *m))
 }
 
 /// `# ` .. `###### `: levels past three share the third weight, as the
@@ -209,7 +226,9 @@ fn inline(text: &str, base: Style, out: &mut Vec<Chunk>) {
     };
     while i < text.len() {
         #[cfg(test)]
-        { inline_visits += 1; }
+        {
+            inline_visits += 1;
+        }
         let rest = &text[i..];
         let prev = text[..i].chars().next_back();
 
@@ -219,8 +238,18 @@ fn inline(text: &str, base: Style, out: &mut Vec<Chunk>) {
             if close != usize::MAX {
                 flush(&mut plain, &style, out);
                 let body = &text[i + run..close];
-                let body = body.strip_prefix(' ').and_then(|b| b.strip_suffix(' ')).unwrap_or(body);
-                push_text(out, body, Style { code: true, ..style.clone() });
+                let body = body
+                    .strip_prefix(' ')
+                    .and_then(|b| b.strip_suffix(' '))
+                    .unwrap_or(body);
+                push_text(
+                    out,
+                    body,
+                    Style {
+                        code: true,
+                        ..style.clone()
+                    },
+                );
                 i = close + run;
                 continue;
             }
@@ -230,7 +259,10 @@ fn inline(text: &str, base: Style, out: &mut Vec<Chunk>) {
             // `__` only at a word edge: snake_case_names are not emphasis.
             let at_edge = marker == "**"
                 || (!prev.is_some_and(|c| c.is_alphanumeric())
-                    || !rest[2..].chars().next().is_some_and(|c| c.is_alphanumeric()));
+                    || !rest[2..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_alphanumeric()));
             if at_edge && (style.bold != base.bold || scan.marker_from(i + 2, marker)) {
                 flush(&mut plain, &style, out);
                 style.bold = !style.bold;
@@ -264,7 +296,11 @@ fn inline(text: &str, base: Style, out: &mut Vec<Chunk>) {
         {
             flush(&mut plain, &style, out);
             let label = strip_inline_markers(label);
-            let label = if label.trim().is_empty() { url.to_string() } else { label };
+            let label = if label.trim().is_empty() {
+                url.to_string()
+            } else {
+                label
+            };
             out.push(Chunk::Link(label, url.to_string(), style.clone()));
             i += used;
             continue;
@@ -357,7 +393,9 @@ impl LineScan {
         let mut k = 0;
         while (has_delimiters || has_ticks) && k < n {
             #[cfg(test)]
-            { tables.index_steps += 1; }
+            {
+                tables.index_steps += 1;
+            }
             match bytes[k] {
                 b'[' => brackets.push(k),
                 b']' => {
@@ -373,7 +411,9 @@ impl LineScan {
                     for open in angles.drain(..) {
                         tables.bracket_close[open] = k;
                         #[cfg(test)]
-                        { tables.index_steps += 1; }
+                        {
+                            tables.index_steps += 1;
+                        }
                     }
                 }
                 b')' => {
@@ -392,7 +432,9 @@ impl LineScan {
                     let start = k;
                     while k < n && bytes[k] == b'`' {
                         #[cfg(test)]
-                        { tables.index_steps += 1; }
+                        {
+                            tables.index_steps += 1;
+                        }
                         k += 1;
                     }
                     ticks.push((start, k));
@@ -407,7 +449,9 @@ impl LineScan {
         // run. Index every such query in two passes over the tick bytes.
         let longest = ticks.iter().map(|(a, b)| b - a).max().unwrap_or(0);
         #[cfg(test)]
-        { tables.index_steps += ticks.len(); }
+        {
+            tables.index_steps += ticks.len();
+        }
         let mut next_run = vec![usize::MAX; longest + 1];
         for &(start, end) in ticks.iter().rev() {
             for at in start..end {
@@ -416,7 +460,9 @@ impl LineScan {
             }
             next_run[1..=end - start].fill(start);
             #[cfg(test)]
-            { tables.index_steps += 2 * (end - start); }
+            {
+                tables.index_steps += 2 * (end - start);
+            }
         }
         for (table, needle) in [
             (&mut tables.bold_from, &b"**"[..]),
@@ -426,7 +472,9 @@ impl LineScan {
             let mut seen = false;
             for k in (0..n).rev() {
                 #[cfg(test)]
-                { tables.index_steps += 1; }
+                {
+                    tables.index_steps += 1;
+                }
                 seen = seen || (k + 2 <= n && &bytes[k..k + 2] == needle);
                 table[k] = seen;
             }
@@ -440,12 +488,16 @@ impl LineScan {
         let mut k = 0usize;
         while k < n {
             #[cfg(test)]
-            { tables.index_steps += 1; }
+            {
+                tables.index_steps += 1;
+            }
             if bytes[k] == b'*' {
                 let run_start = k;
                 while k < n && bytes[k] == b'*' {
                     #[cfg(test)]
-                    { tables.index_steps += 1; }
+                    {
+                        tables.index_steps += 1;
+                    }
                     k += 1;
                 }
                 let run_len = k - run_start;
@@ -466,7 +518,9 @@ impl LineScan {
         let mut seen = false;
         for k in (0..n).rev() {
             #[cfg(test)]
-            { tables.index_steps += 1; }
+            {
+                tables.index_steps += 1;
+            }
             seen = seen || candidate[k];
             tables.closer_from[k] = seen;
         }
@@ -503,7 +557,10 @@ impl LineScan {
             return None;
         }
         let url_end = self.paren_space[open_paren].min(end);
-        let target = text[open_paren + 1..url_end].trim().trim_start_matches('<').trim_end_matches('>');
+        let target = text[open_paren + 1..url_end]
+            .trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>');
         // is_http_url lowercases the entire target; rejected nested links
         // may overlap, so only inspect the scheme here (the same result).
         if !has_http_scheme(target) {
@@ -515,8 +572,12 @@ impl LineScan {
 
 fn has_http_scheme(target: &str) -> bool {
     let scheme = target.trim_start();
-    scheme.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://"))
-        || scheme.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    scheme
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+        || scheme
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
 }
 
 /// Whether a `*` in `rest` could close an italic run: one that follows a
@@ -586,7 +647,10 @@ fn link_reference(rest: &str) -> Option<(&str, &str, usize)> {
     }
     let close_paren = close_paren?;
     let url_end = url_end.unwrap_or(close_paren);
-    let target = inner[..url_end].trim().trim_start_matches('<').trim_end_matches('>');
+    let target = inner[..url_end]
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>');
     if !is_http_url(target) {
         return None;
     }
@@ -596,7 +660,9 @@ fn link_reference(rest: &str) -> Option<(&str, &str, usize)> {
 /// A bare URL runs to whitespace, minus trailing sentence punctuation and an
 /// unbalanced closing parenthesis.
 fn bare_url(rest: &str) -> &str {
-    let end = rest.find(|c: char| c.is_whitespace() || c == '<' || c == '"').unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '<' || c == '"')
+        .unwrap_or(rest.len());
     let mut url = &rest[..end];
     let opens = url.bytes().filter(|&b| b == b'(').count();
     let mut closes = url.bytes().filter(|&b| b == b')').count();
@@ -684,13 +750,19 @@ mod tests {
         assert_eq!(styled(&chunks, "Deep").heading, Some(3));
         assert_eq!(styled(&chunks, "nested").list_depth, 2);
         let all = texts(&chunks);
-        assert!(all.contains("• one\n") && all.contains("  • nested\n") && all.contains("3. three\n"), "{all}");
+        assert!(
+            all.contains("• one\n") && all.contains("  • nested\n") && all.contains("3. three\n"),
+            "{all}"
+        );
         assert_eq!(styled(&chunks, "quoted").quote_depth, 1);
         assert!(styled(&chunks, "here").italic);
         assert!(all.contains("---"), "{all}");
         let code = styled(&chunks, "Get-Item");
         assert!(code.code);
-        assert!(all.contains("Get-Item  C:\\*\n"), "the fence body is verbatim: {all}");
+        assert!(
+            all.contains("Get-Item  C:\\*\n"),
+            "the fence body is verbatim: {all}"
+        );
         assert!(!all.contains("```") && !all.contains("Sub ##"), "{all}");
         assert!(all.ends_with("after"), "{all:?}");
     }
@@ -706,7 +778,10 @@ mod tests {
         assert!(styled(&chunks, "bold").bold);
         assert!(!texts(&chunks).contains('`'), "{}", texts(&chunks));
         let chunks = render("````\n```\n~~~~\nstill code");
-        assert!(styled(&chunks, "still code").code, "a shorter or foreign run does not close: {chunks:?}");
+        assert!(
+            styled(&chunks, "still code").code,
+            "a shorter or foreign run does not close: {chunks:?}"
+        );
         assert!(texts(&chunks).contains("```\n~~~~\n"), "{}", texts(&chunks));
         let chunks = render("~~~\nx\n~~~~~   \ny");
         assert!(!styled(&chunks, "y").code);
@@ -726,7 +801,11 @@ mod tests {
         assert_eq!(heading_text("# Release 1.0 ##"), "Release 1.0");
         assert_eq!(heading_text("## Sub ##   "), "Sub");
         assert_eq!(heading_text("# foo#bar"), "foo#bar");
-        assert_eq!(render("### ###"), Vec::<Chunk>::new(), "an all-closing heading is empty");
+        assert_eq!(
+            render("### ###"),
+            Vec::<Chunk>::new(),
+            "an all-closing heading is empty"
+        );
     }
 
     #[test]
@@ -747,12 +826,17 @@ mod tests {
         assert!(styled(&chunks, "reboot").strikethrough);
         assert!(!styled(&chunks, "my_var_name").bold);
         assert!(styled(&chunks, "bold").bold);
-        assert_eq!(texts(&chunks), "Use DISM /Online then reboot check my_var_name and bold");
+        assert_eq!(
+            texts(&chunks),
+            "Use DISM /Online then reboot check my_var_name and bold"
+        );
     }
 
     #[test]
     fn links_only_for_http_targets_and_bare_urls_lose_trailing_punctuation() {
-        let chunks = render("See [docs](https://learn.microsoft.com/a_(b)) and [x](javascript:alert(1)). Or https://windowsforum.com/threads/1/.");
+        let chunks = render(
+            "See [docs](https://learn.microsoft.com/a_(b)) and [x](javascript:alert(1)). Or https://windowsforum.com/threads/1/.",
+        );
         assert_eq!(
             texts(&chunks),
             "See <docs|https://learn.microsoft.com/a_(b)> and [x](javascript:alert(1)). Or <https://windowsforum.com/threads/1/|https://windowsforum.com/threads/1/>."
@@ -766,10 +850,12 @@ mod tests {
         let alphabet: Vec<char> = "[]()`<>http:/x é".chars().collect();
         let mut seed = 0x53a8_u64;
         let mut sample = |n: usize| {
-            (0..n).map(|_| {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                alphabet[(seed >> 32) as usize % alphabet.len()]
-            }).collect::<String>()
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    alphabet[(seed >> 32) as usize % alphabet.len()]
+                })
+                .collect::<String>()
         };
         let mut cases = vec![
             "[outer [x] title](https://example.test/a_(b) \"title\")".into(),
@@ -783,15 +869,27 @@ mod tests {
             let scan = LineScan::of(&text);
             for (at, ch) in text.char_indices() {
                 if ch == '[' {
-                    assert_eq!(scan.link(&text, at), link_reference(&text[at..]), "link at {at} of {text:?}");
+                    assert_eq!(
+                        scan.link(&text, at),
+                        link_reference(&text[at..]),
+                        "link at {at} of {text:?}"
+                    );
                 } else if ch == '`' {
                     let rest = &text[at..];
                     let run = rest.bytes().take_while(|&c| c == b'`').count();
                     let close = rest[run..].find(&rest[..run]).map(|k| at + run + k);
                     assert_eq!(scan.backtick_end[at], at + run, "run at {at} of {text:?}");
-                    assert_eq!(scan.backtick_close[at], close.unwrap_or(usize::MAX), "close at {at} of {text:?}");
+                    assert_eq!(
+                        scan.backtick_close[at],
+                        close.unwrap_or(usize::MAX),
+                        "close at {at} of {text:?}"
+                    );
                 } else if ch == '<' {
-                    assert_eq!(scan.bracket_close[at], text[at..].find('>').map_or(usize::MAX, |k| at + k), "angle at {at} of {text:?}");
+                    assert_eq!(
+                        scan.bracket_close[at],
+                        text[at..].find('>').map_or(usize::MAX, |k| at + k),
+                        "angle at {at} of {text:?}"
+                    );
                 }
             }
         }
@@ -800,14 +898,26 @@ mod tests {
     #[test]
     fn malformed_brackets_and_backticks_use_linear_index_work() {
         for n in [10_000, 40_000, 160_000] {
-            for src in ["[".repeat(n), format!("x{}", "`".repeat(n)), "<http".repeat(n / 5)] {
+            for src in [
+                "[".repeat(n),
+                format!("x{}", "`".repeat(n)),
+                "<http".repeat(n / 5),
+            ] {
                 let scan = LineScan::of(&src);
-                assert!(scan.index_steps <= 14 * src.len(), "{} full-index steps for {} bytes", scan.index_steps, src.len());
+                assert!(
+                    scan.index_steps <= 14 * src.len(),
+                    "{} full-index steps for {} bytes",
+                    scan.index_steps,
+                    src.len()
+                );
                 assert_eq!(texts(&render(&src)), src, "unclosed input stays literal");
             }
             let suffix = ")".repeat(n);
             let chunks = render(&format!("https://example.test{suffix}"));
-            assert_eq!(texts(&chunks), format!("<https://example.test|https://example.test>{suffix}"));
+            assert_eq!(
+                texts(&chunks),
+                format!("<https://example.test|https://example.test>{suffix}")
+            );
         }
     }
 
@@ -818,7 +928,9 @@ mod tests {
         let alphabet = "*_~ab \n";
         let mut seed = 0xc0ffee_u64;
         let lcg = |s: &mut u64| {
-            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (*s >> 33) as usize
         };
         for _ in 0..300 {
@@ -842,7 +954,7 @@ mod tests {
                     closes_later(&line[k..]),
                     "closer at {k} of {line:?}"
                 );
-                                        }
+            }
             let q = lcg(&mut seed) % (line.len() + 1);
             assert_eq!(
                 scan.marker_from(q, "~~"),
@@ -882,28 +994,45 @@ mod tests {
             let src = literal.clone() + &" ~~c~~ ".repeat(strikes);
             let (chunks, work) = measured(&src);
             assert_eq!(texts(&chunks), literal + &" c ".repeat(strikes));
-            let struck: String = chunks.iter().filter_map(|chunk| match chunk {
-                Chunk::Text(text, style) if style.strikethrough => Some(text.as_str()),
-                _ => None,
-            }).collect();
+            let struck: String = chunks
+                .iter()
+                .filter_map(|chunk| match chunk {
+                    Chunk::Text(text, style) if style.strikethrough => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
             assert_eq!(struck, "c".repeat(strikes));
-            assert!(chunks.iter().all(|chunk| match chunk {
-                Chunk::Text(_, style) => !style.italic,
-                _ => false,
-            }), "unmatched stars stay literal, not italic");
+            assert!(
+                chunks.iter().all(|chunk| match chunk {
+                    Chunk::Text(_, style) => !style.italic,
+                    _ => false,
+                }),
+                "unmatched stars stay literal, not italic"
+            );
 
             // Four suffix tables, one candidate pass plus its star runs,
             // and two bounded flags scans take at most eight byte visits.
             // Each emitted character/marker is visited once; each star and
             // opening strike pair performs exactly one indexed query.
-            assert!(work.index_steps <= 8 * src.len(), "{work:?} for {} bytes", src.len());
+            assert!(
+                work.index_steps <= 8 * src.len(),
+                "{work:?} for {} bytes",
+                src.len()
+            );
             assert_eq!(work.inline_visits, 3 * stars + 5 * strikes);
-            assert_eq!(work.indexed_queries, stars + strikes,
-                "every opener must use the precomputed index");
+            assert_eq!(
+                work.indexed_queries,
+                stars + strikes,
+                "every opener must use the precomputed index"
+            );
             let total = work.index_steps + work.inline_visits + work.indexed_queries;
             assert!(total <= 10 * src.len(), "{work:?} for {} bytes", src.len());
             if let Some(first) = baseline {
-                assert_eq!(total, first * scale, "operation count must scale with input");
+                assert_eq!(
+                    total,
+                    first * scale,
+                    "operation count must scale with input"
+                );
             } else {
                 baseline = Some(total);
             }

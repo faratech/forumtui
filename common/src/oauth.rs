@@ -13,9 +13,9 @@ use base64ct::{Base64UrlUnpadded, Encoding};
 use rand::TryRng;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use time::OffsetDateTime;
 
 use crate::config;
 use crate::error::{Error, Result};
@@ -111,7 +111,10 @@ pub async fn bind_loopback() -> Result<(TcpListener, String)> {
 /// route, which `register_link` surfaces as a structured OAuth/API error;
 /// a transport failure or a 5xx is NOT this — the add-on may well be there.
 pub fn is_route_missing(e: &Error) -> bool {
-    matches!(e, Error::OAuth { status: 404, .. } | Error::Api { status: 404, .. })
+    matches!(
+        e,
+        Error::OAuth { status: 404, .. } | Error::Api { status: 404, .. }
+    )
 }
 
 /// Wait for the browser redirect on an already-bound listener and return the
@@ -224,7 +227,9 @@ async fn wait_for_redirect_with(
                     "<html><body>Authorization failed; return to the terminal.</body></html>",
                 )
                 .await;
-                return Err(Error::Handshake(format!("authorization denied: {err} {desc}")));
+                return Err(Error::Handshake(format!(
+                    "authorization denied: {err} {desc}"
+                )));
             }
             let code = params.get("code").cloned().filter(|c| !c.is_empty());
             match (state_ok, code) {
@@ -280,7 +285,9 @@ pub fn code_from_pasted(input: &str, expected_state: &str) -> Result<String> {
     };
     if !query.is_empty()
         && !query.contains('=')
-        && query.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        && query
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
     {
         return Ok(query.to_string());
     }
@@ -362,7 +369,12 @@ pub async fn revoke(
         form.push(("token_type_hint", hint));
     }
     let url = format!("{base}{}", config::OAUTH_REVOKE_PATH);
-    client.post(url).form(&form).send().await?.error_for_status()?;
+    client
+        .post(url)
+        .form(&form)
+        .send()
+        .await?
+        .error_for_status()?;
     Ok(())
 }
 
@@ -444,7 +456,9 @@ pub async fn register_link(
 /// handed to the opener, which ShellExecutes on Windows.
 pub fn link_is_valid(id: &str, url: &str, base: &str) -> bool {
     let id_ok = (6..=32).contains(&id.len())
-        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
     let (Ok(link), Ok(site)) = (reqwest::Url::parse(url), reqwest::Url::parse(base)) else {
         return false;
     };
@@ -459,8 +473,10 @@ pub fn link_is_valid(id: &str, url: &str, base: &str) -> bool {
         && link.password().is_none()
         && link.query().is_none()
         && link.fragment().is_none()
-        && (path.strip_prefix(site.path().trim_end_matches('/')) == Some(&format!("/tui-start/{id}"))
-            || path.strip_prefix(site.path().trim_end_matches('/')) == Some(&format!("/tui-start/{id}/")))
+        && (path.strip_prefix(site.path().trim_end_matches('/'))
+            == Some(&format!("/tui-start/{id}"))
+            || path.strip_prefix(site.path().trim_end_matches('/'))
+                == Some(&format!("/tui-start/{id}/")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -520,7 +536,9 @@ pub fn next_poll_delay(previous: Duration, outcome: &Result<PollStatus>) -> Dura
     const MAX_BACKOFF: Duration = Duration::from_secs(30);
     match outcome {
         Ok(_) => NORMAL,
-        Err(Error::RateLimited { retry_after: Some(wait) }) => (*wait).max(NORMAL),
+        Err(Error::RateLimited {
+            retry_after: Some(wait),
+        }) => (*wait).max(NORMAL),
         Err(_) => previous.saturating_mul(2).clamp(NORMAL, MAX_BACKOFF),
     }
 }
@@ -602,8 +620,12 @@ async fn token_request(
     // sub-minute access tokens is broken; treating the grant as a minute
     // long is the honest recovery.
     const MIN_EXPIRES_IN_SECS: i64 = 61;
-    let expires_in = parsed.expires_in.clamp(MIN_EXPIRES_IN_SECS, MAX_EXPIRES_IN_SECS);
-    Ok(TokenSet { origin: String::new(), client_id: String::new(),
+    let expires_in = parsed
+        .expires_in
+        .clamp(MIN_EXPIRES_IN_SECS, MAX_EXPIRES_IN_SECS);
+    Ok(TokenSet {
+        origin: String::new(),
+        client_id: String::new(),
         access_token: parsed.access_token,
         refresh_token: parsed.refresh_token,
         expires_at: now.saturating_add(expires_in),
@@ -633,9 +655,7 @@ async fn respond(stream: &mut tokio::net::TcpStream, status: u16, html: &str) {
         400 => "Bad Request",
         _ => "Not Found",
     };
-    let body = format!(
-        "<html><head><title>wftui</title></head><body>{html}</body></html>"
-    );
+    let body = format!("<html><head><title>wftui</title></head><body>{html}</body></html>");
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\n\
          Content-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
@@ -747,9 +767,21 @@ mod tests {
     #[test]
     fn relay_login_link_must_be_the_sites_own_tui_start_page() {
         let base = "https://windowsforum.com";
-        assert!(link_is_valid("abc123", "https://windowsforum.com/tui-start/abc123", base));
-        assert!(link_is_valid("k7Qx2p-_", "https://windowsforum.com/tui-start/k7Qx2p-_/", base));
-        assert!(link_is_valid("abc123", "https://example.com/forum/tui-start/abc123", "https://example.com/forum"));
+        assert!(link_is_valid(
+            "abc123",
+            "https://windowsforum.com/tui-start/abc123",
+            base
+        ));
+        assert!(link_is_valid(
+            "k7Qx2p-_",
+            "https://windowsforum.com/tui-start/k7Qx2p-_/",
+            base
+        ));
+        assert!(link_is_valid(
+            "abc123",
+            "https://example.com/forum/tui-start/abc123",
+            "https://example.com/forum"
+        ));
         for url in [
             "file:///C:/Windows/System32/calc.exe",
             "search-ms:query=x",
@@ -764,8 +796,14 @@ mod tests {
         ] {
             assert!(!link_is_valid("abc123", url, base), "{url} must be refused");
         }
-        assert!(!link_is_valid("abc", "https://windowsforum.com/tui-start/abc", base), "id too short");
-        assert!(!link_is_valid("abc12$", "https://windowsforum.com/tui-start/abc12$", base), "id charset");
+        assert!(
+            !link_is_valid("abc", "https://windowsforum.com/tui-start/abc", base),
+            "id too short"
+        );
+        assert!(
+            !link_is_valid("abc12$", "https://windowsforum.com/tui-start/abc12$", base),
+            "id charset"
+        );
     }
 
     #[test]
@@ -809,8 +847,18 @@ mod tests {
             challenge: "chal".into(),
         };
         let scopes = crate::site::SiteConfig::windowsforum().effective_scopes();
-        let url = authorize_url("https://forum.example", &pkce, "state123", "http://127.0.0.1:9420/callback", "cid", &scopes);
-        assert!(url.starts_with("https://forum.example/oauth2/authorize?"), "{url}");
+        let url = authorize_url(
+            "https://forum.example",
+            &pkce,
+            "state123",
+            "http://127.0.0.1:9420/callback",
+            "cid",
+            &scopes,
+        );
+        assert!(
+            url.starts_with("https://forum.example/oauth2/authorize?"),
+            "{url}"
+        );
         assert!(url.contains("response_type=code"));
         assert!(url.contains("client_id=cid"));
         assert!(url.contains("code_challenge=chal"));
@@ -839,10 +887,16 @@ mod tests {
     /// query and goes through the state check as before.
     #[test]
     fn pasted_bare_code_is_accepted() {
-        assert_eq!(code_from_pasted("  abc-DEF_123.x  ", "st1").unwrap(), "abc-DEF_123.x");
+        assert_eq!(
+            code_from_pasted("  abc-DEF_123.x  ", "st1").unwrap(),
+            "abc-DEF_123.x"
+        );
         assert!(code_from_pasted("", "st1").is_err());
         assert!(code_from_pasted("has space", "st1").is_err());
-        assert!(code_from_pasted("code=abc&state=wrong", "st1").is_err(), "a query still checks state");
+        assert!(
+            code_from_pasted("code=abc&state=wrong", "st1").is_err(),
+            "a query still checks state"
+        );
     }
 
     #[tokio::test]
@@ -855,8 +909,16 @@ mod tests {
         let port_b = b.local_addr().unwrap().port();
         assert_ne!(port_a, port_b);
         assert_eq!(uri_b, format!("http://127.0.0.1:{port_b}/callback"));
-        assert!(is_route_missing(&Error::OAuth { code: "x".into(), message: "".into(), status: 404 }));
-        assert!(!is_route_missing(&Error::OAuth { code: "x".into(), message: "".into(), status: 500 }));
+        assert!(is_route_missing(&Error::OAuth {
+            code: "x".into(),
+            message: "".into(),
+            status: 404
+        }));
+        assert!(!is_route_missing(&Error::OAuth {
+            code: "x".into(),
+            message: "".into(),
+            status: 500
+        }));
         assert!(!is_route_missing(&Error::NoToken));
     }
 
@@ -872,11 +934,7 @@ mod tests {
     async fn loopback_listener_captures_code() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let waiter = tokio::spawn(wait_for_redirect(
-            listener,
-            "st9",
-            Duration::from_secs(10),
-        ));
+        let waiter = tokio::spawn(wait_for_redirect(listener, "st9", Duration::from_secs(10)));
         let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();
@@ -939,11 +997,7 @@ mod tests {
         // on the next connection still completes the handshake.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let waiter = tokio::spawn(wait_for_redirect(
-            listener,
-            "good",
-            Duration::from_secs(10),
-        ));
+        let waiter = tokio::spawn(wait_for_redirect(listener, "good", Duration::from_secs(10)));
         let mut noise = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();
@@ -980,21 +1034,33 @@ mod tests {
             &b"GET /callback?error=access_denied HTTP/1.1\r\n\r\n"[..],
             &b"GET /callback?error=access_denied&state=evil HTTP/1.1\r\n\r\n"[..],
         ] {
-            let mut noise = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let mut noise = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
             noise.write_all(noise_request).await.unwrap();
             let mut buf = vec![0u8; 512];
             let _ = noise.read(&mut buf).await;
         }
-        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        stream.write_all(b"GET /callback?code=real&state=good HTTP/1.1\r\n\r\n").await.unwrap();
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /callback?code=real&state=good HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
         assert_eq!(waiter.await.unwrap().unwrap(), "real");
 
         // The real denial — this flow's state — still ends it.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let waiter = tokio::spawn(wait_for_redirect(listener, "good", Duration::from_secs(10)));
-        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        stream.write_all(b"GET /callback?error=access_denied&state=good HTTP/1.1\r\n\r\n").await.unwrap();
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /callback?error=access_denied&state=good HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
         match waiter.await.unwrap() {
             Err(Error::Handshake(msg)) => assert!(msg.contains("access_denied"), "{msg}"),
             other => panic!("this flow's denial must end it, got {other:?}"),
@@ -1027,9 +1093,15 @@ mod tests {
             .await;
 
         let client = crate::http::build().unwrap();
-        let err = refresh(&client, &server.uri(), "stale-refresh-token", "cid").await.unwrap_err();
+        let err = refresh(&client, &server.uri(), "stale-refresh-token", "cid")
+            .await
+            .unwrap_err();
         match err {
-            Error::OAuth { code, message, status } => {
+            Error::OAuth {
+                code,
+                message,
+                status,
+            } => {
                 assert_eq!(code, "invalid_grant");
                 assert!(message.contains("invalid"), "{message}");
                 assert_eq!(status, 400);
@@ -1046,17 +1118,25 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(config::OAUTH_TOKEN_PATH))
-            .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
-                "error": "invalid_grant",
-                "error_description": "Token expired"
-            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": "invalid_grant",
+                    "error_description": "Token expired"
+                })),
+            )
             .mount(&server)
             .await;
 
         let client = crate::http::build().unwrap();
-        let err = refresh(&client, &server.uri(), "stale-refresh-token", "cid").await.unwrap_err();
+        let err = refresh(&client, &server.uri(), "stale-refresh-token", "cid")
+            .await
+            .unwrap_err();
         match err {
-            Error::OAuth { code, message, status } => {
+            Error::OAuth {
+                code,
+                message,
+                status,
+            } => {
                 assert_eq!(code, "invalid_grant");
                 assert_eq!(message, "Token expired");
                 assert_eq!(status, 400);
@@ -1077,12 +1157,14 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(config::OAUTH_TOKEN_PATH))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "at",
-                "refresh_token": "rt",
-                "expires_in": 9_223_372_036_854_775_807i64,
-                "scope": "node:read"
-            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "at",
+                    "refresh_token": "rt",
+                    "expires_in": 9_223_372_036_854_775_807i64,
+                    "scope": "node:read"
+                })),
+            )
             .mount(&server)
             .await;
 
@@ -1135,9 +1217,10 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/api/wf-tuilink/poll"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({ "status": "authorized" }),
-            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "status": "authorized" })),
+            )
             .mount(&server)
             .await;
 
@@ -1161,17 +1244,28 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/api/wf-tuilink/poll"))
             .and(wiremock::matchers::body_string_contains("broken"))
-            .respond_with(wiremock::ResponseTemplate::new(503).set_body_json(serde_json::json!({
-                "errors": [{"code": "wf_tuilink_busy", "message": "busy", "params": []}]
-            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                    "errors": [{"code": "wf_tuilink_busy", "message": "busy", "params": []}]
+                })),
+            )
             .mount(&server)
             .await;
         let client = crate::http::build().unwrap();
         let limited = poll_link(&client, &server.uri(), "limited").await;
-        assert!(matches!(limited, Err(Error::RateLimited { retry_after: Some(d) }) if d == Duration::from_secs(20)), "{limited:?}");
-        assert_eq!(next_poll_delay(Duration::from_secs(2), &limited), Duration::from_secs(20));
+        assert!(
+            matches!(limited, Err(Error::RateLimited { retry_after: Some(d) }) if d == Duration::from_secs(20)),
+            "{limited:?}"
+        );
+        assert_eq!(
+            next_poll_delay(Duration::from_secs(2), &limited),
+            Duration::from_secs(20)
+        );
         let broken = poll_link(&client, &server.uri(), "broken").await;
-        assert!(matches!(&broken, Err(Error::Api { code, status: 503, .. }) if code == "wf_tuilink_busy"), "{broken:?}");
+        assert!(
+            matches!(&broken, Err(Error::Api { code, status: 503, .. }) if code == "wf_tuilink_busy"),
+            "{broken:?}"
+        );
     }
 
     #[test]
@@ -1180,15 +1274,33 @@ mod tests {
         let err = || Err(Error::Throttled);
         assert_eq!(next_poll_delay(two, &Ok(PollStatus::Waiting)), two);
         assert_eq!(next_poll_delay(two, &err()), Duration::from_secs(4));
-        assert_eq!(next_poll_delay(Duration::from_secs(16), &err()), Duration::from_secs(30), "capped");
-        assert_eq!(next_poll_delay(Duration::from_secs(30), &err()), Duration::from_secs(30));
-        let soon = Err(Error::RateLimited { retry_after: Some(Duration::from_secs(1)) });
-        assert_eq!(next_poll_delay(two, &soon), two, "never faster than the normal spacing");
-        assert_eq!(next_poll_delay(Duration::from_secs(30), &Ok(PollStatus::Waiting)), two, "recovers at once");
+        assert_eq!(
+            next_poll_delay(Duration::from_secs(16), &err()),
+            Duration::from_secs(30),
+            "capped"
+        );
+        assert_eq!(
+            next_poll_delay(Duration::from_secs(30), &err()),
+            Duration::from_secs(30)
+        );
+        let soon = Err(Error::RateLimited {
+            retry_after: Some(Duration::from_secs(1)),
+        });
+        assert_eq!(
+            next_poll_delay(two, &soon),
+            two,
+            "never faster than the normal spacing"
+        );
+        assert_eq!(
+            next_poll_delay(Duration::from_secs(30), &Ok(PollStatus::Waiting)),
+            two,
+            "recovers at once"
+        );
     }
 
     #[tokio::test]
-    async fn token_request_falls_back_to_http_error_for_non_json_bodies() {        let server = wiremock::MockServer::start().await;
+    async fn token_request_falls_back_to_http_error_for_non_json_bodies() {
+        let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(config::OAUTH_TOKEN_PATH))
             .respond_with(
@@ -1200,7 +1312,9 @@ mod tests {
             .await;
 
         let client = crate::http::build().unwrap();
-        let err = refresh(&client, &server.uri(), "whatever", "cid").await.unwrap_err();
+        let err = refresh(&client, &server.uri(), "whatever", "cid")
+            .await
+            .unwrap_err();
         match err {
             Error::OAuth { code, status, .. } => {
                 assert_eq!(code, "http_error");

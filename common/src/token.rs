@@ -36,8 +36,16 @@ impl TokenSet {
     /// `client_id`. Missing legacy fields identify the shipped WindowsForum
     /// grant; they never act as wildcards for a configured forum.
     pub fn belongs_to(&self, origin: &str, client_id: &str) -> bool {
-        let stored_origin = if self.origin.is_empty() { crate::config::BASE_URL } else { &self.origin };
-        let stored_client = if self.client_id.is_empty() { crate::config::DEFAULT_OAUTH_CLIENT_ID } else { &self.client_id };
+        let stored_origin = if self.origin.is_empty() {
+            crate::config::BASE_URL
+        } else {
+            &self.origin
+        };
+        let stored_client = if self.client_id.is_empty() {
+            crate::config::DEFAULT_OAUTH_CLIENT_ID
+        } else {
+            &self.client_id
+        };
         stored_origin == origin && stored_client == client_id
     }
 }
@@ -48,7 +56,10 @@ impl TokenSet {
 impl std::fmt::Debug for TokenSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenSet")
-            .field("access_token", &format_args!("[redacted; {} chars]", self.access_token.len()))
+            .field(
+                "access_token",
+                &format_args!("[redacted; {} chars]", self.access_token.len()),
+            )
             .field(
                 "refresh_token",
                 &format_args!("[redacted; {} chars]", self.refresh_token.len()),
@@ -143,18 +154,17 @@ impl Store {
                     use std::os::unix::fs::OpenOptionsExt;
                     opts.mode(0o600);
                 }
-                let mut f = opts
-                    .write(true)
-                    .create_new(true)
-                    .open(&tmp)
-                    .map_err(|e| Error::TokenStore(format!("cannot write {}: {e}", tmp.display())))?;
+                let mut f = opts.write(true).create_new(true).open(&tmp).map_err(|e| {
+                    Error::TokenStore(format!("cannot write {}: {e}", tmp.display()))
+                })?;
                 f.write_all(&body)?;
                 f.sync_all().ok();
             }
             #[cfg(unix)]
             restrict_permissions(&tmp);
-            std::fs::rename(&tmp, &self.path)
-                .map_err(|e| Error::TokenStore(format!("cannot finalize {}: {e}", self.path.display())))
+            std::fs::rename(&tmp, &self.path).map_err(|e| {
+                Error::TokenStore(format!("cannot finalize {}: {e}", self.path.display()))
+            })
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&tmp);
@@ -171,11 +181,15 @@ impl Store {
     fn remove_orphan_temps(&self) {
         let (Some(dir), Some(prefix)) = (
             self.path.parent(),
-            sibling_with_suffix(&self.path, "tmp").file_name().map(|n| format!("{}.", n.to_string_lossy())),
+            sibling_with_suffix(&self.path, "tmp")
+                .file_name()
+                .map(|n| format!("{}.", n.to_string_lossy())),
         ) else {
             return;
         };
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             if entry.file_name().to_string_lossy().starts_with(&prefix) {
                 let _ = std::fs::remove_file(entry.path());
@@ -192,7 +206,9 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e.into()),
         };
-        if &current != expected { return Ok(false); }
+        if &current != expected {
+            return Ok(false);
+        }
         self.write_locked(replacement)?;
         Ok(true)
     }
@@ -200,7 +216,9 @@ impl Store {
     /// Sign-out also supports access-only grants. Comparing the complete grant
     /// prevents removal of a sibling's newer token, even without a refresh token.
     pub fn erase_if_matches(&self, expected: &TokenSet) -> Result<bool> {
-        if self.path.parent().is_some_and(|dir| !dir.exists()) { return Ok(false); }
+        if self.path.parent().is_some_and(|dir| !dir.exists()) {
+            return Ok(false);
+        }
         let _lock = lock_store(&self.path)?;
         let current = match std::fs::read(&self.path) {
             Ok(bytes) => serde_json::from_slice::<TokenSet>(&bytes)?,
@@ -208,7 +226,9 @@ impl Store {
             Err(e) => return Err(e.into()),
         };
         self.remove_orphan_temps();
-        if &current != expected { return Ok(false); }
+        if &current != expected {
+            return Ok(false);
+        }
         std::fs::remove_file(&self.path)?;
         Ok(true)
     }
@@ -362,7 +382,10 @@ pub(crate) fn try_lock_store(path: &Path) -> Result<Option<StoreLock>> {
         // `lock_contended_error` is EWOULDBLOCK on Unix and
         // ERROR_LOCK_VIOLATION on Windows; only the OS code is comparable.
         Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => Ok(None),
-        Err(e) => Err(Error::TokenStore(format!("cannot lock {}: {e}", lock_path.display()))),
+        Err(e) => Err(Error::TokenStore(format!(
+            "cannot lock {}: {e}",
+            lock_path.display()
+        ))),
     }
 }
 
@@ -377,7 +400,11 @@ pub(crate) fn tmp_sibling(path: &Path) -> PathBuf {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| ".wftui-token.tmp".into());
-    base.with_file_name(format!("{name}.{}.{}", std::process::id(), TMP_SEQ.fetch_add(1, Ordering::Relaxed)))
+    base.with_file_name(format!(
+        "{name}.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 pub(crate) fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -405,13 +432,23 @@ mod tests {
     #[test]
     fn legacy_identity_fields_are_bound_to_the_shipped_site() {
         let mut token = sample();
-        assert!(token.belongs_to(crate::config::BASE_URL, crate::config::DEFAULT_OAUTH_CLIENT_ID));
-        assert!(!token.belongs_to("https://another.example", crate::config::DEFAULT_OAUTH_CLIENT_ID));
+        assert!(token.belongs_to(
+            crate::config::BASE_URL,
+            crate::config::DEFAULT_OAUTH_CLIENT_ID
+        ));
+        assert!(!token.belongs_to(
+            "https://another.example",
+            crate::config::DEFAULT_OAUTH_CLIENT_ID
+        ));
         assert!(!token.belongs_to(crate::config::BASE_URL, "another-client"));
         token.origin = crate::config::BASE_URL.into();
         assert!(!token.belongs_to(crate::config::BASE_URL, "another-client"));
-        token.origin.clear(); token.client_id = crate::config::DEFAULT_OAUTH_CLIENT_ID.into();
-        assert!(!token.belongs_to("https://another.example", crate::config::DEFAULT_OAUTH_CLIENT_ID));
+        token.origin.clear();
+        token.client_id = crate::config::DEFAULT_OAUTH_CLIENT_ID.into();
+        assert!(!token.belongs_to(
+            "https://another.example",
+            crate::config::DEFAULT_OAUTH_CLIENT_ID
+        ));
     }
 
     #[test]
@@ -419,9 +456,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wftui-token-cas-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::with_path(dir.join("token.json"));
-        let mut old = sample(); old.refresh_token.clear();
+        let mut old = sample();
+        old.refresh_token.clear();
         store.save(&old).unwrap();
-        let mut newer = old.clone(); newer.access_token = "newer".into();
+        let mut newer = old.clone();
+        newer.access_token = "newer".into();
         assert!(store.replace_if_matches(&old, &newer).unwrap());
         assert!(!store.erase_if_matches(&old).unwrap());
         assert!(!store.replace_if_matches(&old, &old).unwrap());
@@ -432,7 +471,9 @@ mod tests {
     }
 
     fn sample() -> TokenSet {
-        TokenSet { origin: String::new(), client_id: String::new(),
+        TokenSet {
+            origin: String::new(),
+            client_id: String::new(),
             access_token: "at".into(),
             refresh_token: "rt".into(),
             expires_at: 1_800_000_000,
@@ -450,9 +491,14 @@ mod tests {
         let path = dir.join("token.json");
         std::fs::create_dir_all(path.join("occupied")).unwrap();
         let store = Store::with_path(path.clone());
-        assert!(store.save(&sample()).is_err(), "rename onto a non-empty directory must fail");
+        assert!(
+            store.save(&sample()).is_err(),
+            "rename onto a non-empty directory must fail"
+        );
         let temps = |dir: &std::path::Path| -> Vec<String> {
-            std::fs::read_dir(dir).unwrap().flatten()
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .filter(|n| n.starts_with("token.json.tmp."))
                 .collect()
@@ -461,14 +507,28 @@ mod tests {
 
         std::fs::remove_dir_all(&path).unwrap();
         // What a process killed between write and rename leaves behind.
-        std::fs::write(dir.join("token.json.tmp.4242.0"), b"{\"refresh_token\":\"rt\"}").unwrap();
+        std::fs::write(
+            dir.join("token.json.tmp.4242.0"),
+            b"{\"refresh_token\":\"rt\"}",
+        )
+        .unwrap();
         std::fs::write(dir.join("unrelated.tmp.1"), b"keep").unwrap();
         store.erase().unwrap();
         assert!(temps(&dir).is_empty(), "sign-out left {:?}", temps(&dir));
-        assert!(dir.join("unrelated.tmp.1").exists(), "only this store's temp files go");
+        assert!(
+            dir.join("unrelated.tmp.1").exists(),
+            "only this store's temp files go"
+        );
         std::fs::write(dir.join("token.json.tmp.4242.1"), b"{}").unwrap();
         store.save(&sample()).unwrap();
-        assert!(!store.erase_if_matches(&TokenSet { access_token: "other".into(), ..sample() }).unwrap());
+        assert!(
+            !store
+                .erase_if_matches(&TokenSet {
+                    access_token: "other".into(),
+                    ..sample()
+                })
+                .unwrap()
+        );
         assert!(temps(&dir).is_empty(), "a conditional sign-out sweeps too");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -479,8 +539,20 @@ mod tests {
         let first = tmp_sibling(path);
         let second = tmp_sibling(path);
         assert_ne!(first, second, "atomic writers must not share a temp inode");
-        assert!(first.file_name().unwrap().to_string_lossy().contains(".tmp."));
-        assert!(second.file_name().unwrap().to_string_lossy().contains(".tmp."));
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".tmp.")
+        );
+        assert!(
+            second
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".tmp.")
+        );
     }
 
     #[test]
@@ -501,12 +573,15 @@ mod tests {
 
     #[test]
     fn conditional_erase_does_not_remove_a_newer_grant() {
-        let dir = std::env::temp_dir().join(format!("wftui-token-conditional-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("wftui-token-conditional-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::with_path(dir.join("token.json"));
         store.save(&sample()).unwrap();
         store
-            .save(&TokenSet { origin: String::new(), client_id: String::new(),
+            .save(&TokenSet {
+                origin: String::new(),
+                client_id: String::new(),
                 refresh_token: "new-refresh".into(),
                 ..sample()
             })
@@ -527,7 +602,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::with_path(dir.join("token.json"));
         store.save(&sample()).unwrap();
-        let mode = std::fs::metadata(store.path()).unwrap().permissions().mode();
+        let mode = std::fs::metadata(store.path())
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -543,7 +621,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("token.json");
-        std::fs::write(&path, br#"{"access_token":"a","refresh_token":"b","expires_at":1}"#).unwrap();
+        std::fs::write(
+            &path,
+            br#"{"access_token":"a","refresh_token":"b","expires_at":1}"#,
+        )
+        .unwrap();
         let store = Store::with_path(path);
 
         let err = store.load().unwrap_err();
@@ -556,7 +638,8 @@ mod tests {
 
     #[test]
     fn quarantine_corrupt_renames_the_file_and_load_then_sees_no_session() {
-        let dir = std::env::temp_dir().join(format!("wftui-token-quarantine-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("wftui-token-quarantine-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("token.json");
@@ -573,7 +656,10 @@ mod tests {
 
     #[test]
     fn quarantine_corrupt_does_not_move_a_valid_replacement() {
-        let dir = std::env::temp_dir().join(format!("wftui-token-quarantine-valid-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "wftui-token-quarantine-valid-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("token.json");
@@ -617,8 +703,17 @@ mod tests {
     fn debug_redacts_both_secrets() {
         let t = sample();
         let dbg = format!("{t:?}");
-        assert!(!dbg.contains("\"at\""), "Debug leaked the access token: {dbg}");
-        assert!(!dbg.contains("\"rt\""), "Debug leaked the refresh token: {dbg}");
-        assert!(dbg.contains("redacted"), "Debug must say it redacted: {dbg}");
+        assert!(
+            !dbg.contains("\"at\""),
+            "Debug leaked the access token: {dbg}"
+        );
+        assert!(
+            !dbg.contains("\"rt\""),
+            "Debug leaked the refresh token: {dbg}"
+        );
+        assert!(
+            dbg.contains("redacted"),
+            "Debug must say it redacted: {dbg}"
+        );
     }
 }

@@ -17,7 +17,7 @@ Two editions build from this one repository. The command is `wftui` in both:
   <img src="docs/demo/wftui-demo.gif" alt="Forum Terminal (TUI): browsing the forum tree, opening a thread, stepping through posts, starting a reply (saved as a draft), and jumping to the inbox from the palette" width="832">
 </p>
 
-Current version: **0.0.5** (see `version` in [wftui/Cargo.toml](wftui/Cargo.toml)).
+Current version: **0.0.6** (see `version` in [wftui/Cargo.toml](wftui/Cargo.toml)).
 
 ## Quick start
 
@@ -64,13 +64,13 @@ Release platforms, as built by [.github/workflows/release-binaries.yml](.github/
 
 ### Building from source
 
-Requires Rust **1.99.1** (pinned by [rust-toolchain.toml](rust-toolchain.toml); `rustup` picks it up automatically). No C toolchain is needed — the dependency graph is pure Rust.
+Requires Rust **1.100.0** (pinned by [rust-toolchain.toml](rust-toolchain.toml); `rustup` picks it up automatically). No C toolchain is needed — the dependency graph is pure Rust.
 
 ```sh
 git clone https://github.com/faratech/forumtui
 cd forumtui
 cargo install --path wftui          # Forum Terminal (TUI) edition
-wftui --version                     # prints: wftui 0.0.5
+wftui --version                     # prints: wftui 0.0.6
 ```
 
 Edition variants:
@@ -371,7 +371,7 @@ Release builds check the GitHub release feed in the background (first check a fe
 ```text
 forumtui/
 ├── Cargo.toml            workspace (members: common, wftui) + release profile
-├── rust-toolchain.toml   pins Rust 1.99.1 (clippy + rustfmt components)
+├── rust-toolchain.toml   pins Rust 1.100.0 (clippy + rustfmt components)
 ├── wftui/                the `wftui` binary (ratatui/crossterm TUI)
 │   ├── Cargo.toml        features: images (default), builtin-windowsforum (default)
 │   ├── assets/           embedded sign-in logo (built-in edition)

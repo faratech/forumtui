@@ -12,16 +12,16 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
 use super::{
-    browse::{push_bbcode, truncate},
     Action, AlertsState, ConversationViewState, ConversationsState, InboxPane, InboxState,
     InboxTab, NewConversationState,
+    browse::{push_bbcode, truncate},
 };
 use common::models::{Alert, Conversation};
 
 use crate::chrome::{self, Hints};
 use crate::glyph::Glyphs;
 use crate::hit::{Hit, HitMap, HitPane};
-use crate::theme::{fmt_age, fmt_age_parts, Theme};
+use crate::theme::{Theme, fmt_age, fmt_age_parts};
 
 /// Both panes fit side by side from here up (DESIGN.md) — the same threshold
 /// Home uses for its own tree+list split.
@@ -73,7 +73,11 @@ pub fn inbox_hints(s: &InboxState) -> Hints {
     // The same rule now covers Enter/m (#58): they act on the selected row
     // of the tab's list, so with nothing in it they were advertised and
     // dead — the catalog screens drop the caps, `profile_key` refuses.
-    let open_label = if s.tab == InboxTab::Alerts { "read" } else { "open" };
+    let open_label = if s.tab == InboxTab::Alerts {
+        "read"
+    } else {
+        "open"
+    };
     let empty = match s.tab {
         InboxTab::Conversations => s.convos.conversations.is_empty(),
         InboxTab::Alerts => s.alerts.alerts.is_empty(),
@@ -289,15 +293,9 @@ pub fn render_inbox(
     s.view_rect = right;
     render_inbox_list(s, f, left, theme, g, s.focus == InboxPane::List, hits);
     match &mut s.view {
-        Some(view) => render_inbox_view_panel(
-            view,
-            f,
-            right,
-            theme,
-            g,
-            s.focus == InboxPane::View,
-            hits,
-        ),
+        Some(view) => {
+            render_inbox_view_panel(view, f, right, theme, g, s.focus == InboxPane::View, hits)
+        }
         None => {
             f.render_widget(chrome::panel(theme, g, "Inbox", false, None, None), right);
         }
@@ -463,7 +461,10 @@ fn render_conversations_rows(
         return;
     }
     if s.conversations.is_empty() {
-        f.render_widget(Paragraph::new("No conversations yet.").style(theme.dim()), area);
+        f.render_widget(
+            Paragraph::new("No conversations yet.").style(theme.dim()),
+            area,
+        );
         return;
     }
 
@@ -562,54 +563,54 @@ fn render_alerts_rows(
     // Alert rows are width-independent (nothing truncates against the pane),
     // so the cache keys on the data fingerprint alone (#23).
     let items: Vec<ListItem> = {
-        let rows = s
-            .row_cache
-            .get(0, alerts_fingerprint(&s.alerts), || {
-                s.alerts
-                    .iter()
-                    .map(|a| {
-                        let (marker, style) = if a.viewed() {
-                            (Span::raw(" "), theme.dim())
-                        } else {
-                            (
-                                Span::styled(g.unread.to_string(), Style::new().fg(theme.accent)),
-                                theme.base().add_modifier(Modifier::BOLD),
-                            )
-                        };
-                        // XF carries the alert KIND in `action` (`quote`/`mention`/
-                        // `reaction`/`insert`/`award`/…); `content_type` is the CONTENT's
-                        // type (`post`/`trophy`/`user`/…) and never contains "quote" or
-                        // "mention" (issue #601).
-                        let action = a.action.to_ascii_lowercase();
-                        let kind_glyph = if action.contains("quote") {
-                            g.quote_alert
-                        } else if action.contains("mention") {
-                            g.mention
-                        } else {
-                            // Reaction/insert/award/etc. share the reply glyph — the
-                            // glyph set has no dedicated reaction mark.
-                            g.reply_alert
-                        };
-                        // `alert_text` is the server-rendered human-readable body (built
-                        // from the alert handler's push template); fall back to
-                        // `content_type action` for a payload that hasn't populated it.
-                        let body = if a.alert_text.is_empty() {
-                            format!("{} {}", a.content_type, a.action).trim().replace('_', " ")
-                        } else {
-                            a.alert_text.clone()
-                        };
-                        Line::from(vec![
-                            Span::raw(" "),
-                            marker,
-                            Span::raw(" "),
-                            Span::styled(format!("{kind_glyph} "), theme.dim()),
-                            Span::styled(a.username.clone(), style),
-                            Span::styled(format!("  {body} "), theme.dim()),
-                            Span::styled(fmt_age(a.event_date), theme.dim()),
-                        ])
-                    })
-                    .collect()
-            });
+        let rows = s.row_cache.get(0, alerts_fingerprint(&s.alerts), || {
+            s.alerts
+                .iter()
+                .map(|a| {
+                    let (marker, style) = if a.viewed() {
+                        (Span::raw(" "), theme.dim())
+                    } else {
+                        (
+                            Span::styled(g.unread.to_string(), Style::new().fg(theme.accent)),
+                            theme.base().add_modifier(Modifier::BOLD),
+                        )
+                    };
+                    // XF carries the alert KIND in `action` (`quote`/`mention`/
+                    // `reaction`/`insert`/`award`/…); `content_type` is the CONTENT's
+                    // type (`post`/`trophy`/`user`/…) and never contains "quote" or
+                    // "mention" (issue #601).
+                    let action = a.action.to_ascii_lowercase();
+                    let kind_glyph = if action.contains("quote") {
+                        g.quote_alert
+                    } else if action.contains("mention") {
+                        g.mention
+                    } else {
+                        // Reaction/insert/award/etc. share the reply glyph — the
+                        // glyph set has no dedicated reaction mark.
+                        g.reply_alert
+                    };
+                    // `alert_text` is the server-rendered human-readable body (built
+                    // from the alert handler's push template); fall back to
+                    // `content_type action` for a payload that hasn't populated it.
+                    let body = if a.alert_text.is_empty() {
+                        format!("{} {}", a.content_type, a.action)
+                            .trim()
+                            .replace('_', " ")
+                    } else {
+                        a.alert_text.clone()
+                    };
+                    Line::from(vec![
+                        Span::raw(" "),
+                        marker,
+                        Span::raw(" "),
+                        Span::styled(format!("{kind_glyph} "), theme.dim()),
+                        Span::styled(a.username.clone(), style),
+                        Span::styled(format!("  {body} "), theme.dim()),
+                        Span::styled(fmt_age(a.event_date), theme.dim()),
+                    ])
+                })
+                .collect()
+        });
         rows.iter().map(|l| ListItem::new(l.clone())).collect()
     };
     let mut state = ListState::default().with_selected(Some(s.sel.min(s.alerts.len() - 1)));
@@ -648,7 +649,10 @@ fn render_inbox_view_panel(
     }
 
     if view.loading && view.messages.is_empty() {
-        f.render_widget(Paragraph::new("Loading messages…").style(theme.dim()), inner);
+        f.render_widget(
+            Paragraph::new("Loading messages…").style(theme.dim()),
+            inner,
+        );
         return;
     }
     if let Some(err) = &view.error {
@@ -705,7 +709,10 @@ fn render_inbox_view_panel(
     f.render_widget(
         Paragraph::new(vec![
             Line::from(meta),
-            Line::from(Span::styled(rule.repeat(inner.width as usize), theme.faint())),
+            Line::from(Span::styled(
+                rule.repeat(inner.width as usize),
+                theme.faint(),
+            )),
         ]),
         header_area,
     );
@@ -717,9 +724,12 @@ fn render_inbox_view_panel(
     }
     // Sliced rather than `Paragraph::scroll`, whose offset is a `u16`
     // (issue #558).
-    let mut window =
-        crate::editor::visible_window(&view.lines, view.scroll, body_area.height);
-    let sel_start = view.msg_line_offsets.get(view.sel_msg).copied().unwrap_or(0);
+    let mut window = crate::editor::visible_window(&view.lines, view.scroll, body_area.height);
+    let sel_start = view
+        .msg_line_offsets
+        .get(view.sel_msg)
+        .copied()
+        .unwrap_or(0);
     let sel_end = view
         .msg_line_offsets
         .get(view.sel_msg + 1)
@@ -752,14 +762,21 @@ fn message_hits(view: &ConversationViewState, area: Rect, hits: &mut HitMap) {
         else {
             continue;
         };
-        hits.push(Rect::new(area.x, area.y + row, area.width, 1), Hit::Post(msg));
+        hits.push(
+            Rect::new(area.x, area.y + row, area.width, 1),
+            Hit::Post(msg),
+        );
     }
 }
 
 /// Left content, then padding, then right-aligned content — a small local
 /// cousin of ThreadView's `justify` (private to `browse`), used for the
 /// message-card header's right-aligned age.
-fn justify_line(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
+fn justify_line(
+    left: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
+    width: usize,
+) -> Line<'static> {
     let lw: usize = left.iter().map(Span::width).sum();
     let rw: usize = right.iter().map(Span::width).sum();
     if lw + rw < width {
@@ -878,9 +895,7 @@ impl ConversationViewState {
         // Defensive clamp: sel_msg is written by the n/N keys against the
         // PREVIOUS page's message count, and paging/reload can shrink the
         // list out from under it before this next rebuild runs (issue #534).
-        self.sel_msg = self
-            .sel_msg
-            .min(self.messages.len().saturating_sub(1));
+        self.sel_msg = self.sel_msg.min(self.messages.len().saturating_sub(1));
         if self.built == Some((width, self.reveal_spoilers)) {
             return;
         }
@@ -907,7 +922,14 @@ impl ConversationViewState {
             let gutter_style = theme.faint();
             let mut sink: Vec<Line<'static>> = Vec::new();
             let mut links = Vec::new();
-            push_bbcode(&mut sink, &mut links, &msg.message, &self.site.origin, theme, self.reveal_spoilers);
+            push_bbcode(
+                &mut sink,
+                &mut links,
+                &msg.message,
+                &self.site.origin,
+                theme,
+                self.reveal_spoilers,
+            );
             for logical in sink {
                 for wrapped in wrap_line(&logical.spans, body_w) {
                     let mut spans = vec![
@@ -928,9 +950,7 @@ impl ConversationViewState {
 
 pub fn conversation_view_key(s: &mut ConversationViewState, key: KeyEvent) -> Action {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => {
-            Action::PopScreen
-        }
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => Action::PopScreen,
         _ => conversation_view_key_inner(s, key),
     }
 }
@@ -1034,10 +1054,7 @@ pub fn conversation_view_hints(s: &ConversationViewState) -> Hints {
             ("r", "reply"),
             ("j/k", "scroll"),
             ("n/N", "next/prev msg"),
-            (
-                "x",
-                if s.reveal_spoilers { "hide" } else { "reveal" },
-            ),
+            ("x", if s.reveal_spoilers { "hide" } else { "reveal" }),
             ("p", "author profile"),
             ("P", "starter profile"),
             ("[/]", "page"),
@@ -1047,10 +1064,7 @@ pub fn conversation_view_hints(s: &ConversationViewState) -> Hints {
             ("r", "reply"),
             ("j/k", ""),
             ("n/N", "msg"),
-            (
-                "x",
-                if s.reveal_spoilers { "hide" } else { "reveal" },
-            ),
+            ("x", if s.reveal_spoilers { "hide" } else { "reveal" }),
             ("p", "profile"),
             ("Esc", "back"),
         ],
@@ -1148,8 +1162,7 @@ pub fn render_conversation_view(
         g.gutter,
         Style::new().fg(theme.accent),
     );
-    f.render_widget(Paragraph::new(window), view,
-    );
+    f.render_widget(Paragraph::new(window), view);
     message_hits(s, view, hits);
 }
 
@@ -1300,7 +1313,11 @@ pub fn new_conversation_key(s: &mut super::NewConversationState, key: KeyEvent) 
                 KeyCode::PageUp => -page,
                 _ => page,
             };
-            let width = if s.body_width == 0 { 1 } else { s.body_width as usize };
+            let width = if s.body_width == 0 {
+                1
+            } else {
+                s.body_width as usize
+            };
             // Through the cache, like the Reply editor (issue #678).
             s.wrap.sync(&s.body, width, s.body_epoch);
             s.wrap
@@ -1526,7 +1543,10 @@ pub fn render_new_conversation(
             (body_area.x + caret_col as u16).min(body_area.x + body_area.width.saturating_sub(1)),
             // Subtract in `usize`, narrow afterwards: the difference is at
             // most one pane height, however many rows the draft has (#558).
-            (body_area.y + caret_row.saturating_sub(s.body_scroll).min(u16::MAX as usize) as u16)
+            (body_area.y
+                + caret_row
+                    .saturating_sub(s.body_scroll)
+                    .min(u16::MAX as usize) as u16)
                 .min(body_area.y + body_area.height.saturating_sub(1)),
         )),
         _ => None,
@@ -1537,12 +1557,18 @@ pub fn render_new_conversation(
 
     let mut status_lines: Vec<Line> = Vec::new();
     for e in &s.errors {
-        status_lines.push(Line::from(Span::styled(e.clone(), Style::new().fg(theme.error))));
+        status_lines.push(Line::from(Span::styled(
+            e.clone(),
+            Style::new().fg(theme.error),
+        )));
     }
     if s.sending {
         status_lines.push(Line::from(Span::styled("Sending…", theme.dim())));
     } else if s.busy {
-        status_lines.push(Line::from(Span::styled("Resolving recipients…", theme.dim())));
+        status_lines.push(Line::from(Span::styled(
+            "Resolving recipients…",
+            theme.dim(),
+        )));
     }
     if !status_lines.is_empty() {
         let status_area = ratatui::layout::Rect::new(
@@ -1567,28 +1593,63 @@ mod tests {
     /// alert).
     #[test]
     fn an_empty_inbox_does_not_advertise_the_row_keys() {
-        let mut s = InboxState { tab: InboxTab::Conversations, ..Default::default() };
+        let mut s = InboxState {
+            tab: InboxTab::Conversations,
+            ..Default::default()
+        };
         let hints = inbox_hints(&s);
-        assert!(!hints.keys.iter().any(|(k, _)| *k == "Enter"), "{:?}", hints.keys);
-        assert!(!hints.keys.iter().any(|(k, _)| *k == "m"), "{:?}", hints.keys);
+        assert!(
+            !hints.keys.iter().any(|(k, _)| *k == "Enter"),
+            "{:?}",
+            hints.keys
+        );
+        assert!(
+            !hints.keys.iter().any(|(k, _)| *k == "m"),
+            "{:?}",
+            hints.keys
+        );
 
-        s.convos.conversations.push(Conversation { conversation_id: 1, ..Default::default() });
+        s.convos.conversations.push(Conversation {
+            conversation_id: 1,
+            ..Default::default()
+        });
         let hints = inbox_hints(&s);
         assert_eq!(
-            hints.keys.iter().find(|(k, _)| *k == "Enter").map(|(_, l)| *l),
+            hints
+                .keys
+                .iter()
+                .find(|(k, _)| *k == "Enter")
+                .map(|(_, l)| *l),
             Some("open")
         );
         assert!(hints.keys.iter().any(|(k, _)| *k == "m"));
 
         // The alerts tab measures alerts, not conversations.
-        let mut a = InboxState { tab: InboxTab::Alerts, ..Default::default() };
-        a.convos.conversations.push(Conversation { conversation_id: 1, ..Default::default() });
+        let mut a = InboxState {
+            tab: InboxTab::Alerts,
+            ..Default::default()
+        };
+        a.convos.conversations.push(Conversation {
+            conversation_id: 1,
+            ..Default::default()
+        });
         let hints = inbox_hints(&a);
-        assert!(!hints.keys.iter().any(|(k, _)| *k == "Enter"), "{:?}", hints.keys);
-        a.alerts.alerts.push(crate::screens::Alert { alert_id: 1, ..Default::default() });
+        assert!(
+            !hints.keys.iter().any(|(k, _)| *k == "Enter"),
+            "{:?}",
+            hints.keys
+        );
+        a.alerts.alerts.push(crate::screens::Alert {
+            alert_id: 1,
+            ..Default::default()
+        });
         let hints = inbox_hints(&a);
         assert_eq!(
-            hints.keys.iter().find(|(k, _)| *k == "Enter").map(|(_, l)| *l),
+            hints
+                .keys
+                .iter()
+                .find(|(k, _)| *k == "Enter")
+                .map(|(_, l)| *l),
             Some("read")
         );
     }
@@ -1658,12 +1719,23 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_inbox(s, f, area, &theme, &crate::glyph::UNICODE, &mut crate::hit::HitMap::default());
+            render_inbox(
+                s,
+                f,
+                area,
+                &theme,
+                &crate::glyph::UNICODE,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let buf = term.backend().buffer().clone();
         (0..h)
-            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
             .collect()
     }
 
@@ -1685,7 +1757,14 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE, &mut crate::hit::HitMap::default());
+            render_new_conversation(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &crate::glyph::UNICODE,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
@@ -1693,7 +1772,9 @@ mod tests {
         // Per-cell symbols, one per column — unlike a joined `String`, this
         // keeps the index aligned to the buffer's x coordinate even though
         // the border glyphs are multi-byte UTF-8.
-        let cells: Vec<String> = (0..80).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
+        let cells: Vec<String> = (0..80)
+            .map(|x| buf[(x, pos.y)].symbol().to_string())
+            .collect();
         let text_start = cells
             .windows(3)
             .position(|w| w[0] == "a" && w[1] == "b" && w[2] == "c")
@@ -1725,7 +1806,11 @@ mod tests {
         s.body_cursor = 0;
         s.body_width = 40;
         new_conversation_key(&mut s, key(KeyCode::Down));
-        assert_eq!((s.field, s.body_cursor), (2, 4), "in the message Down moves a row, not a field");
+        assert_eq!(
+            (s.field, s.body_cursor),
+            (2, 4),
+            "in the message Down moves a row, not a field"
+        );
     }
 
     /// Issue #569: both single-line fields on this screen placed their
@@ -1746,17 +1831,30 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE, &mut crate::hit::HitMap::default());
+            render_new_conversation(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &crate::glyph::UNICODE,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
         let buf = term.backend().buffer().clone();
-        let cells: Vec<String> = (0..80).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
+        let cells: Vec<String> = (0..80)
+            .map(|x| buf[(x, pos.y)].symbol().to_string())
+            .collect();
         let text_start = cells
             .iter()
             .position(|c| c == "\u{6f22}")
             .expect("recipients text on screen") as u16;
-        assert_eq!(pos.x, text_start + 4, "recipients caret must move 4 cells, not 2");
+        assert_eq!(
+            pos.x,
+            text_start + 4,
+            "recipients caret must move 4 cells, not 2"
+        );
 
         let mut s = super::super::NewConversationState {
             field: 1,
@@ -1768,17 +1866,30 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE, &mut crate::hit::HitMap::default());
+            render_new_conversation(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &crate::glyph::UNICODE,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
         let buf = term.backend().buffer().clone();
-        let cells: Vec<String> = (0..80).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
+        let cells: Vec<String> = (0..80)
+            .map(|x| buf[(x, pos.y)].symbol().to_string())
+            .collect();
         let text_start = cells
             .iter()
             .position(|c| c == "\u{6f22}")
             .expect("title text on screen") as u16;
-        assert_eq!(pos.x, text_start + 4, "title caret must move 4 cells, not 2");
+        assert_eq!(
+            pos.x,
+            text_start + 4,
+            "title caret must move 4 cells, not 2"
+        );
     }
 
     /// Issue #606: the DM recipients field scrolls horizontally too — a long
@@ -1798,13 +1909,25 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE, &mut crate::hit::HitMap::default());
+            render_new_conversation(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &crate::glyph::UNICODE,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
         let buf = term.backend().buffer().clone();
-        let row: String = (0..80).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
-        assert!(row.contains("Zed"), "the tail being typed must be visible: {row}");
+        let row: String = (0..80)
+            .map(|x| buf[(x, pos.y)].symbol().to_string())
+            .collect();
+        assert!(
+            row.contains("Zed"),
+            "the tail being typed must be visible: {row}"
+        );
         let z = row.chars().position(|c| c == 'Z').expect("Z on screen") as u16;
         assert_eq!(pos.x, z + 3, "caret sits just past the text: {row}");
         assert!(pos.x < 79, "caret must stay inside the panel: {}", pos.x);
@@ -1815,12 +1938,13 @@ mod tests {
     /// empty form stacked three identical rows over the body.
     #[test]
     fn empty_form_enter_twice_leaves_one_validation_row() {
-        let mut s = super::super::NewConversationState { field: 2, ..Default::default() };
+        let mut s = super::super::NewConversationState {
+            field: 2,
+            ..Default::default()
+        };
         for _ in 0..3 {
-            let action = new_conversation_key(
-                &mut s,
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            );
+            let action =
+                new_conversation_key(&mut s, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             assert!(matches!(action, Action::None));
         }
         assert_eq!(s.errors.len(), 1, "{:?}", s.errors);
@@ -1845,24 +1969,48 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_new_conversation(&mut s, f, area, &theme, &crate::glyph::UNICODE, &mut crate::hit::HitMap::default());
+            render_new_conversation(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &crate::glyph::UNICODE,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
         let buf = term.backend().buffer().clone();
         let rows: Vec<String> = (0..24)
-            .map(|y| (0..80).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .map(|y| {
+                (0..80)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
             .collect();
         let screen = rows.join("\n");
-        assert!(screen.contains("row 39"), "the caret's line is off screen:\n{screen}");
-        assert!(!screen.contains("row 00"), "the pane did not scroll:\n{screen}");
-        let caret_row = rows.iter().position(|r| r.contains("row 39")).expect("last row") as u16;
+        assert!(
+            screen.contains("row 39"),
+            "the caret's line is off screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("row 00"),
+            "the pane did not scroll:\n{screen}"
+        );
+        let caret_row = rows
+            .iter()
+            .position(|r| r.contains("row 39"))
+            .expect("last row") as u16;
         assert_eq!((pos.x, pos.y), (1 + 6, caret_row));
 
         // Up now moves a visual row instead of doing nothing.
         new_conversation_key(&mut s, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         // Each row is "row NN" + "\n" = 7 chars; column 6 of row 38.
-        assert_eq!(s.body_cursor, 7 * 38 + 6, "Up lands at column 6 of the row above");
+        assert_eq!(
+            s.body_cursor,
+            7 * 38 + 6,
+            "Up lands at column 6 of the row above"
+        );
     }
 
     /// Issue #528: the standalone DM screen used to clamp its scroll by
@@ -1905,12 +2053,23 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_conversation_view(&mut state, f, area, &theme, &crate::glyph::UNICODE, &mut crate::hit::HitMap::default());
+            render_conversation_view(
+                &mut state,
+                f,
+                area,
+                &theme,
+                &crate::glyph::UNICODE,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let buf = term.backend().buffer().clone();
         let rows: Vec<String> = (0..24)
-            .map(|y| (0..80).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .map(|y| {
+                (0..80)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
             .collect();
         let screen = rows.join("\n");
         assert!(
@@ -1938,7 +2097,11 @@ mod tests {
         // A sentinel survives a second call with the same key: no rebuild.
         state.lines = vec![Line::from(Span::raw("SENTINEL"))];
         state.rebuild_message_lines(&theme, &g, 60);
-        assert_eq!(state.lines.len(), 1, "the cards were rebuilt for an unchanged frame");
+        assert_eq!(
+            state.lines.len(),
+            1,
+            "the cards were rebuilt for an unchanged frame"
+        );
 
         // A width change rebuilds...
         state.rebuild_message_lines(&theme, &g, 40);
@@ -2003,7 +2166,10 @@ mod tests {
         conversation_view_key_inner(&mut state, key('N'));
         assert_eq!(state.sel_msg, 0);
         conversation_view_key_inner(&mut state, key('N'));
-        assert_eq!(state.sel_msg, 0, "N past the top must be a no-op, not a panic");
+        assert_eq!(
+            state.sel_msg, 0,
+            "N past the top must be a no-op, not a panic"
+        );
     }
 
     fn key(c: char) -> KeyEvent {
@@ -2040,7 +2206,11 @@ mod tests {
             let mut s = sample_inbox_state();
             s.focus = InboxPane::View;
             let action = inbox_key(&mut s, k);
-            assert!(matches!(action, Action::None), "{:?} should not act", k.code);
+            assert!(
+                matches!(action, Action::None),
+                "{:?} should not act",
+                k.code
+            );
             assert_eq!(s.focus, InboxPane::List, "{:?} should return focus", k.code);
         }
         // ...and from the list `q` still leaves the Inbox entirely.
@@ -2129,7 +2299,9 @@ mod tests {
         let mut s = sample_inbox_state();
         s.focus = InboxPane::View;
         {
-            let Some(view) = s.view.as_mut() else { panic!("test setup: a view is open") };
+            let Some(view) = s.view.as_mut() else {
+                panic!("test setup: a view is open")
+            };
             view.page = 1;
             view.last_page = 3;
         }
@@ -2151,27 +2323,50 @@ mod tests {
         let theme = Theme::truecolor();
         for inline in [false, true] {
             let view = crate::screens::ConversationViewState {
-                conversation: crate::screens::Conversation { conversation_id: 3, title: "A DM".into(), ..Default::default() },
+                conversation: crate::screens::Conversation {
+                    conversation_id: 3,
+                    title: "A DM".into(),
+                    ..Default::default()
+                },
                 messages: vec![crate::screens::ConversationMessage {
-                    message_id: 1, user_id: 7, username: "kemical".into(),
-                    message: "before [ISPOILER]dm secret[/ISPOILER] after".into(), ..Default::default()
-                }], ..Default::default()
+                    message_id: 1,
+                    user_id: 7,
+                    username: "kemical".into(),
+                    message: "before [ISPOILER]dm secret[/ISPOILER] after".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
             };
             let mut screen = if inline {
                 let mut inbox = sample_inbox_state();
                 inbox.focus = InboxPane::View;
                 inbox.view = Some(view);
                 crate::screens::Screen::Inbox(inbox)
-            } else { crate::screens::Screen::ConversationView(view) };
-            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+            } else {
+                crate::screens::Screen::ConversationView(view)
+            };
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
             for revealed in [false, true] {
-                if revealed { screen.on_key(key('x')); }
-                terminal.draw(|frame| {
-                    screen.render(frame, frame.area(), &theme, &crate::glyph::UNICODE, &mut HitMap::default());
-                }).unwrap();
+                if revealed {
+                    screen.on_key(key('x'));
+                }
+                terminal
+                    .draw(|frame| {
+                        screen.render(
+                            frame,
+                            frame.area(),
+                            &theme,
+                            &crate::glyph::UNICODE,
+                            &mut HitMap::default(),
+                        );
+                    })
+                    .unwrap();
                 let buffer = terminal.backend().buffer();
                 let hidden = buffer.content.iter().any(|cell| {
-                    cell.fg == ratatui::style::Color::Black && cell.bg == ratatui::style::Color::Black && cell.symbol() != " "
+                    cell.fg == ratatui::style::Color::Black
+                        && cell.bg == ratatui::style::Color::Black
+                        && cell.symbol() != " "
                 });
                 assert_eq!(hidden, !revealed, "inline={inline}, revealed={revealed}");
                 let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
@@ -2188,7 +2383,10 @@ mod tests {
         let text = rows.join("\n");
         assert!(text.contains("Conversations"), "{text}");
         assert!(text.contains("Alerts"), "{text}");
-        assert!(text.contains("of 18"), "conversations footer missing: {text}");
+        assert!(
+            text.contains("of 18"),
+            "conversations footer missing: {text}"
+        );
         assert!(text.contains("r reply"), "view panel right segment: {text}");
         assert!(text.contains("kemical"), "message card author: {text}");
 
@@ -2267,7 +2465,10 @@ mod tests {
 
         let mut s = InboxState {
             tab: InboxTab::Alerts,
-            alerts: AlertsState { alerts: vec![alert("post", "quote")], ..Default::default() },
+            alerts: AlertsState {
+                alerts: vec![alert("post", "quote")],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let rows = render_rows_inbox(&mut s, 120, 36);
@@ -2278,7 +2479,10 @@ mod tests {
 
         let mut s = InboxState {
             tab: InboxTab::Alerts,
-            alerts: AlertsState { alerts: vec![alert("user", "mention")], ..Default::default() },
+            alerts: AlertsState {
+                alerts: vec![alert("user", "mention")],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let rows = render_rows_inbox(&mut s, 120, 36);
@@ -2291,13 +2495,22 @@ mod tests {
         // glyph off `content_type` alone.
         let mut s = InboxState {
             tab: InboxTab::Alerts,
-            alerts: AlertsState { alerts: vec![alert("trophy", "award")], ..Default::default() },
+            alerts: AlertsState {
+                alerts: vec![alert("trophy", "award")],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let rows = render_rows_inbox(&mut s, 120, 36);
         let text = rows.join("\n");
-        assert!(!text.contains(g.quote_alert), "trophy/award must not render the quote glyph");
-        assert!(!text.contains(g.mention), "trophy/award must not render the mention glyph");
+        assert!(
+            !text.contains(g.quote_alert),
+            "trophy/award must not render the quote glyph"
+        );
+        assert!(
+            !text.contains(g.mention),
+            "trophy/award must not render the mention glyph"
+        );
     }
 
     /// Issue #578: the view panel's header used to append "ago"
@@ -2314,7 +2527,10 @@ mod tests {
         // relative one — otherwise this test would pass for the wrong
         // reason regardless of the fix.
         let (age_text, is_relative) = crate::theme::fmt_age_parts(ninety_days_ago);
-        assert!(!is_relative, "test setup: 90 days must land past the relative rungs");
+        assert!(
+            !is_relative,
+            "test setup: 90 days must land past the relative rungs"
+        );
 
         let mut s = sample_inbox_state();
         if let Some(view) = &mut s.view {
@@ -2337,7 +2553,10 @@ mod tests {
         // within the last minute.
         let five_seconds_ago = now.unix_timestamp() - 5;
         let (now_text, now_is_relative) = crate::theme::fmt_age_parts(five_seconds_ago);
-        assert_eq!(now_text, "now", "test setup: must land on the under-a-minute rung");
+        assert_eq!(
+            now_text, "now",
+            "test setup: must land on the under-a-minute rung"
+        );
         assert!(now_is_relative);
 
         let mut s = sample_inbox_state();
@@ -2346,8 +2565,14 @@ mod tests {
         }
         let rows = render_rows_inbox(&mut s, 120, 36);
         let text = rows.join("\n");
-        assert!(text.contains("started just now"), "expected \"just now\" wording: {text}");
-        assert!(!text.contains("started now ago"), "\"started now ago\" is nonsense: {text}");
+        assert!(
+            text.contains("started just now"),
+            "expected \"just now\" wording: {text}"
+        );
+        assert!(
+            !text.contains("started now ago"),
+            "\"started now ago\" is nonsense: {text}"
+        );
     }
 
     /// Issue #582: `Msg::ConversationLoaded` replaces `view.messages`
@@ -2414,12 +2639,27 @@ mod tests {
         s.view = Some(ConversationViewState::default());
         s.focus = InboxPane::View;
         inbox_key(&mut s, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(s.focus, InboxPane::List, "Tab from the view returns to the list");
-        assert_eq!(s.tab, InboxTab::Alerts, "Tab from the view must not also flip tabs");
+        assert_eq!(
+            s.focus,
+            InboxPane::List,
+            "Tab from the view returns to the list"
+        );
+        assert_eq!(
+            s.tab,
+            InboxTab::Alerts,
+            "Tab from the view must not also flip tabs"
+        );
 
         s.focus = InboxPane::View;
-        inbox_key(&mut s, KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
-        assert_eq!(s.focus, InboxPane::List, "h also returns focus from the view");
+        inbox_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+        );
+        assert_eq!(
+            s.focus,
+            InboxPane::List,
+            "h also returns focus from the view"
+        );
     }
 
     #[test]
@@ -2444,17 +2684,26 @@ mod tests {
     fn n_and_r_work_from_the_list_regardless_of_active_tab() {
         let mut s = sample_inbox_state();
         s.tab = InboxTab::Alerts;
-        let act = inbox_key(&mut s, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        let act = inbox_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
         assert!(matches!(act, Action::StartNewConversation(None)));
 
-        let act = inbox_key(&mut s, KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        let act = inbox_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        );
         assert!(matches!(act, Action::StartReplyConversation(c) if c.conversation_id == 3));
     }
 
     #[test]
     fn m_marks_read_on_whichever_tab_is_active() {
         let mut s = sample_inbox_state();
-        let act = inbox_key(&mut s, KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        let act = inbox_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        );
         assert!(matches!(act, Action::MarkConversationRead(id) if id == 3));
 
         s.tab = InboxTab::Alerts;
@@ -2465,7 +2714,10 @@ mod tests {
             action: "quote".into(),
             ..Default::default()
         }];
-        let act = inbox_key(&mut s, KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        let act = inbox_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        );
         assert!(matches!(act, Action::MarkAlertRead(id) if id == 9));
     }
 
@@ -2557,7 +2809,9 @@ mod tests {
             &mut state,
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
         );
-        assert!(matches!(act, Action::OpenProfile(uid, name) if uid == 4 && name == "Dave_Auditor"));
+        assert!(
+            matches!(act, Action::OpenProfile(uid, name) if uid == 4 && name == "Dave_Auditor")
+        );
 
         // 'P': open starter profile (Alice)
         let act = conversation_view_key(
@@ -2587,6 +2841,8 @@ mod tests {
             ..Default::default()
         };
         let act = conversation_view_key(&mut state, key('P'));
-        assert!(matches!(act, Action::Notice(ref msg) if msg.contains("No conversation starter profile")));
+        assert!(
+            matches!(act, Action::Notice(ref msg) if msg.contains("No conversation starter profile"))
+        );
     }
 }

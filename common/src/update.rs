@@ -104,7 +104,9 @@ pub fn parse_version(s: &str) -> Option<Version> {
             if ids.iter().any(|id| {
                 id.is_empty()
                     || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                    || (id.len() > 1 && id.starts_with('0') && id.bytes().all(|b| b.is_ascii_digit()))
+                    || (id.len() > 1
+                        && id.starts_with('0')
+                        && id.bytes().all(|b| b.is_ascii_digit()))
             }) {
                 return None;
             }
@@ -268,7 +270,11 @@ impl Target {
 
     /// The file name a staged generation and the installed binary use.
     fn binary_name(self) -> &'static str {
-        if self.is_windows() { "wftui.exe" } else { "wftui" }
+        if self.is_windows() {
+            "wftui.exe"
+        } else {
+            "wftui"
+        }
     }
 }
 
@@ -287,7 +293,9 @@ pub fn pick_assets(release: &Release, target: Target) -> Result<(Asset, Asset)> 
             .iter()
             .find(|a| a.name == name)
             .cloned()
-            .ok_or_else(|| Error::Config(format!("release {} has no asset {name}", release.tag_name)))
+            .ok_or_else(|| {
+                Error::Config(format!("release {} has no asset {name}", release.tag_name))
+            })
     };
     Ok((find(&wanted)?, find(SUMS_ASSET)?))
 }
@@ -320,7 +328,9 @@ pub fn parse_sums(text: &str) -> Vec<(String, String)> {
 }
 
 pub fn expected_sha256<'a>(sums: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    sums.iter().find(|(_, n)| n == name).map(|(h, _)| h.as_str())
+    sums.iter()
+        .find(|(_, n)| n == name)
+        .map(|(h, _)| h.as_str())
 }
 
 /// Reject anything that is not plausibly a wftui binary for `target`: a CDN
@@ -347,7 +357,8 @@ pub fn sniff_binary(bytes: &[u8], target: Target) -> Result<()> {
         if &bytes[0..2] != b"MZ" {
             return Err(Error::FetchRejected("missing MZ header".into()));
         }
-        let e_lfanew = u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]]) as usize;
+        let e_lfanew =
+            u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]]) as usize;
         let Some(hdr) = bytes.get(e_lfanew..e_lfanew + 6) else {
             return Err(Error::FetchRejected("PE header out of bounds".into()));
         };
@@ -385,8 +396,9 @@ pub fn sniff_binary(bytes: &[u8], target: Target) -> Result<()> {
 pub fn verify(bytes: &[u8], target: Target, sums_text: &str, asset_name: &str) -> Result<String> {
     sniff_binary(bytes, target)?;
     let sums = parse_sums(sums_text);
-    let want = expected_sha256(&sums, asset_name)
-        .ok_or_else(|| Error::FetchRejected(format!("{SUMS_ASSET} has no line for {asset_name}")))?;
+    let want = expected_sha256(&sums, asset_name).ok_or_else(|| {
+        Error::FetchRejected(format!("{SUMS_ASSET} has no line for {asset_name}"))
+    })?;
     let got = sha256_hex(bytes);
     if got != want {
         return Err(Error::FetchRejected(format!(
@@ -432,7 +444,8 @@ fn meta_text(version: &str, target: Target, sha256: &str) -> String {
 }
 
 fn meta_field<'a>(meta: &'a str, key: &str) -> Option<&'a str> {
-    meta.lines().find_map(|l| l.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
+    meta.lines()
+        .find_map(|l| l.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
 }
 
 /// Write the pair into a private `.stage-<id>/`, then publish it with one
@@ -446,7 +459,9 @@ pub fn stage_pending_in(
     body: &[u8],
 ) -> Result<Pending> {
     if parse_version(version).is_none() {
-        return Err(Error::Config(format!("release version is not SemVer: {version}")));
+        return Err(Error::Config(format!(
+            "release version is not SemVer: {version}"
+        )));
     }
     std::fs::create_dir_all(root)?;
     let id = unique_generation_id();
@@ -461,7 +476,10 @@ pub fn stage_pending_in(
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))?;
         }
-        write_synced(&staging.join(META_NAME), meta_text(version, target, sha256).as_bytes())?;
+        write_synced(
+            &staging.join(META_NAME),
+            meta_text(version, target, sha256).as_bytes(),
+        )?;
         std::fs::rename(&staging, &generation)
     })();
     if let Err(e) = result {
@@ -623,7 +641,10 @@ pub enum Refusal {
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Refusal::Msix => write!(f, "installed from the MSIX package; update from the release page"),
+            Refusal::Msix => write!(
+                f,
+                "installed from the MSIX package; update from the release page"
+            ),
             Refusal::CargoTarget => write!(f, "running from a cargo target directory"),
             Refusal::Unsupported(what) => write!(f, "no release binary for {what}"),
             Refusal::ReadOnly(p) => write!(f, "{} is not writable", p.display()),
@@ -654,7 +675,11 @@ pub fn classify_exe_as(exe: &Path, windows: bool) -> std::result::Result<Install
     if under_cargo_target {
         return Err(Refusal::CargoTarget);
     }
-    Ok(if windows { Install::RenameAside } else { Install::RenameOver })
+    Ok(if windows {
+        Install::RenameAside
+    } else {
+        Install::RenameOver
+    })
 }
 
 /// Can this user create a file beside `exe`? Probed with a real create
@@ -664,7 +689,11 @@ pub fn install_dir_writable(exe: &Path) -> bool {
         return false;
     };
     let probe = dir.join(format!(".wftui-update-probe-{}", std::process::id()));
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);
             true
@@ -787,7 +816,10 @@ pub fn apply_pending_update(cfg: &UpdateConfig) -> ApplyOutcome {
             if matches!(why, Refusal::Msix | Refusal::CargoTarget) {
                 let _ = std::fs::remove_dir_all(&newest.dir);
             }
-            return ApplyOutcome::Refused { version: newest.version, why };
+            return ApplyOutcome::Refused {
+                version: newest.version,
+                why,
+            };
         }
     };
     if !install_dir_writable(exe) {
@@ -833,7 +865,12 @@ impl UpdateConfig {
         }
     }
 
-    pub fn for_test(root: PathBuf, feed_url: String, exe: PathBuf, current_version: &'static str) -> Self {
+    pub fn for_test(
+        root: PathBuf,
+        feed_url: String,
+        exe: PathBuf,
+        current_version: &'static str,
+    ) -> Self {
         UpdateConfig {
             feed_url,
             root,
@@ -853,15 +890,28 @@ pub enum Outcome {
     Skipped(String),
     /// The auto check ran less than `MIN_CHECK_INTERVAL` ago.
     Throttled,
-    UpToDate { latest: String },
+    UpToDate {
+        latest: String,
+    },
     /// Downloaded, verified and staged; the next start applies it.
-    Staged { version: String, path: PathBuf },
+    Staged {
+        version: String,
+        path: PathBuf,
+    },
     /// Newer, but this binary cannot be replaced in place (MSIX); nothing was
     /// downloaded and `html_url` is the release page to visit.
-    Available { version: String, html_url: String, why: Refusal },
+    Available {
+        version: String,
+        html_url: String,
+        why: Refusal,
+    },
     /// Staged, but the install directory is not this user's: `command` is
     /// the install-then-rename line to run by hand.
-    ManualInstall { version: String, staged: PathBuf, command: String },
+    ManualInstall {
+        version: String,
+        staged: PathBuf,
+        command: String,
+    },
 }
 
 fn last_check_path_for(root: &Path, target: Target, edition: &str) -> PathBuf {
@@ -921,7 +971,10 @@ async fn feed_error(resp: reqwest::Response, what: &str) -> Error {
 /// stripped, case-folded (#68).
 fn is_loopback_host(rest: &str) -> bool {
     let authority = rest.split('/').next().unwrap_or("");
-    let host_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
     // Bracketed IPv6 first: `split(':')` would shred `[::1]`.
     let host = if let Some(rest) = host_port.strip_prefix('[') {
         match rest.find(']') {
@@ -931,7 +984,10 @@ fn is_loopback_host(rest: &str) -> bool {
     } else {
         host_port.split(':').next().unwrap_or(host_port)
     };
-    matches!(host.to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1")
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    )
 }
 
 /// GET `url` with a hard byte cap, streamed so an oversized body is cut off
@@ -978,13 +1034,17 @@ async fn read_capped(mut resp: reqwest::Response, max_bytes: usize, what: &str) 
     if let Some(len) = resp.content_length()
         && len as usize > max_bytes
     {
-        return Err(Error::FetchRejected(format!("{what} is {len} bytes, over the {max_bytes} cap")));
+        return Err(Error::FetchRejected(format!(
+            "{what} is {len} bytes, over the {max_bytes} cap"
+        )));
     }
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = resp.chunk().await? {
         buf.extend_from_slice(&chunk);
         if buf.len() > max_bytes {
-            return Err(Error::FetchRejected(format!("{what} exceeded the {max_bytes} byte cap")));
+            return Err(Error::FetchRejected(format!(
+                "{what} exceeded the {max_bytes} byte cap"
+            )));
         }
     }
     Ok(buf)
@@ -994,7 +1054,9 @@ async fn read_capped(mut resp: reqwest::Response, max_bytes: usize, what: &str) 
 /// use. `force` is the manual check: it ignores the interval, nothing else.
 pub async fn check_and_stage(cfg: &UpdateConfig, force: bool) -> Result<Outcome> {
     if cfg.disabled {
-        return Ok(Outcome::Skipped("updates are disabled (WFTUI_NO_UPDATE)".into()));
+        return Ok(Outcome::Skipped(
+            "updates are disabled (WFTUI_NO_UPDATE)".into(),
+        ));
     }
     let Some(target) = cfg.target else {
         return Ok(Outcome::Skipped(format!(
@@ -1004,7 +1066,9 @@ pub async fn check_and_stage(cfg: &UpdateConfig, force: bool) -> Result<Outcome>
         )));
     };
     let Some(exe) = &cfg.exe else {
-        return Ok(Outcome::Skipped("the running binary's path is unknown".into()));
+        return Ok(Outcome::Skipped(
+            "the running binary's path is unknown".into(),
+        ));
     };
     let strategy = classify_exe(exe);
     if strategy == Err(Refusal::CargoTarget) {
@@ -1030,9 +1094,12 @@ pub async fn check_and_stage(cfg: &UpdateConfig, force: bool) -> Result<Outcome>
     // in the background. The sums and the binary are capped the same way in
     // `fetch_capped`, and every non-2xx body in this flow, the feed's
     // included, is capped in `feed_error` (#145).
-    let release: Release = serde_json::from_slice(&read_capped(resp, MAX_FEED_BYTES, "release feed").await?)?;
+    let release: Release =
+        serde_json::from_slice(&read_capped(resp, MAX_FEED_BYTES, "release feed").await?)?;
     if release.draft || release.prerelease {
-        return Ok(Outcome::UpToDate { latest: cfg.current_version.to_string() });
+        return Ok(Outcome::UpToDate {
+            latest: cfg.current_version.to_string(),
+        });
     }
     let latest = version_of_tag(&release.tag_name).to_string();
     if !is_newer(&latest, cfg.current_version) {
@@ -1042,7 +1109,11 @@ pub async fn check_and_stage(cfg: &UpdateConfig, force: bool) -> Result<Outcome>
         return Ok(Outcome::UpToDate { latest });
     }
     if let Err(why) = strategy {
-        return Ok(Outcome::Available { version: latest, html_url: release.html_url, why });
+        return Ok(Outcome::Available {
+            version: latest,
+            html_url: release.html_url,
+            why,
+        });
     }
     let already = |root: &Path| -> Result<Option<Pending>> {
         Ok(load_pending(root, target, cfg.current_version)?
@@ -1057,9 +1128,23 @@ pub async fn check_and_stage(cfg: &UpdateConfig, force: bool) -> Result<Outcome>
     }
 
     let (binary, sums) = pick_assets(&release, target)?;
-    let sums_text = fetch_capped(&client, &sums.browser_download_url, MAX_SUMS_BYTES, config::REQUEST_TIMEOUT, SUMS_ASSET).await?;
+    let sums_text = fetch_capped(
+        &client,
+        &sums.browser_download_url,
+        MAX_SUMS_BYTES,
+        config::REQUEST_TIMEOUT,
+        SUMS_ASSET,
+    )
+    .await?;
     let sums_text = String::from_utf8_lossy(&sums_text).into_owned();
-    let body = fetch_capped(&client, &binary.browser_download_url, MAX_BINARY_BYTES, config::DOWNLOAD_TIMEOUT, &binary.name).await?;
+    let body = fetch_capped(
+        &client,
+        &binary.browser_download_url,
+        MAX_BINARY_BYTES,
+        config::DOWNLOAD_TIMEOUT,
+        &binary.name,
+    )
+    .await?;
     let digest = verify(&body, target, &sums_text, &binary.name)?;
 
     let _lock = UpdateLock::acquire(&cfg.root)?;
@@ -1073,7 +1158,10 @@ pub async fn check_and_stage(cfg: &UpdateConfig, force: bool) -> Result<Outcome>
 
 fn staged_outcome(p: Pending, exe: &Path) -> Outcome {
     if install_dir_writable(exe) {
-        Outcome::Staged { version: p.version, path: p.path }
+        Outcome::Staged {
+            version: p.version,
+            path: p.path,
+        }
     } else {
         Outcome::ManualInstall {
             version: p.version,
@@ -1117,7 +1205,11 @@ mod tests {
         } else {
             b[0..4].copy_from_slice(b"\x7fELF");
             b[5] = 1;
-            let m: u16 = if target == Target::LinuxX86_64 { 0x3e } else { 0xb7 };
+            let m: u16 = if target == Target::LinuxX86_64 {
+                0x3e
+            } else {
+                0xb7
+            };
             b[18..20].copy_from_slice(&m.to_le_bytes());
         }
         b
@@ -1140,20 +1232,47 @@ mod tests {
         assert!(v("1.0.0-beta.2") < v("1.0.0-beta.11"));
         assert!(v("1.0.0-rc.1") < v("1.0.0"));
         assert_eq!(v("1.0.0+build.5"), v("1.0.0"), "build metadata is ignored");
-        assert_eq!(v("v0.0.2"), v("0.0.2"), "a tag's v is not part of the version");
+        assert_eq!(
+            v("v0.0.2"),
+            v("0.0.2"),
+            "a tag's v is not part of the version"
+        );
         assert!(is_newer("0.0.2", "0.0.1"));
         assert!(!is_newer("0.0.1", "0.0.1"));
-        assert!(!is_newer("0.0.1", "0.0.2"), "a downgrade is never an update");
-        assert!(is_newer("0.1.0", "0.1.0-rc.1"), "a release outranks its own rc");
+        assert!(
+            !is_newer("0.0.1", "0.0.2"),
+            "a downgrade is never an update"
+        );
+        assert!(
+            is_newer("0.1.0", "0.1.0-rc.1"),
+            "a release outranks its own rc"
+        );
         assert!(!is_newer("latest", "0.0.1"), "garbage is never an update");
     }
 
     #[test]
     fn parse_version_rejects_malformed_and_accepts_v_prefix() {
-        for bad in ["", "1", "1.2", "1.2.3.4", "01.2.3", "1.2.3-", "1.2.3-a..b", "a.b.c", "1.2.3-01"] {
+        for bad in [
+            "",
+            "1",
+            "1.2",
+            "1.2.3.4",
+            "01.2.3",
+            "1.2.3-",
+            "1.2.3-a..b",
+            "a.b.c",
+            "1.2.3-01",
+        ] {
             assert!(parse_version(bad).is_none(), "{bad:?} must not parse");
         }
-        for good in ["0.0.1", "v0.0.1", " v1.2.3 ", "1.2.3-rc.1", "1.2.3-rc.1+sha.abc", "1.2.3+only"] {
+        for good in [
+            "0.0.1",
+            "v0.0.1",
+            " v1.2.3 ",
+            "1.2.3-rc.1",
+            "1.2.3-rc.1+sha.abc",
+            "1.2.3+only",
+        ] {
             assert!(parse_version(good).is_some(), "{good:?} must parse");
         }
     }
@@ -1162,37 +1281,74 @@ mod tests {
     /// decode whole — every field the updater reads is present on the wire.
     #[test]
     fn release_fixture_deserializes_the_whole_captured_body() {
-        let r: Release = serde_json::from_str(include_str!("testdata/github_release_latest.json")).unwrap();
+        let r: Release =
+            serde_json::from_str(include_str!("testdata/github_release_latest.json")).unwrap();
         assert_eq!(r.tag_name, "v0.2.9");
         assert!(r.html_url.starts_with("https://github.com/"));
         assert!(!r.draft && !r.prerelease);
-        assert!(r.assets.iter().any(|a| a.name.ends_with(".exe") && a.size > 0));
-        assert!(r.assets.iter().all(|a| a.browser_download_url.starts_with("https://")));
+        assert!(
+            r.assets
+                .iter()
+                .any(|a| a.name.ends_with(".exe") && a.size > 0)
+        );
+        assert!(
+            r.assets
+                .iter()
+                .all(|a| a.browser_download_url.starts_with("https://"))
+        );
     }
 
     /// #131: the updater is on exactly where a release asset exists. The
     /// workflow builds no Linux aarch64 binary, so that platform skips.
     #[test]
     fn the_updater_targets_only_platforms_a_release_builds() {
-        assert_eq!(Target::released_for("linux", "x86_64"), Some(Target::LinuxX86_64));
-        assert_eq!(Target::released_for("linux", "aarch64"), None, "no linux-aarch64 asset is built");
-        assert_eq!(Target::released_for("windows", "x86_64"), Some(Target::WindowsX64));
-        assert_eq!(Target::released_for("windows", "x86"), Some(Target::WindowsX86));
-        assert_eq!(Target::released_for("windows", "aarch64"), Some(Target::WindowsArm64));
+        assert_eq!(
+            Target::released_for("linux", "x86_64"),
+            Some(Target::LinuxX86_64)
+        );
+        assert_eq!(
+            Target::released_for("linux", "aarch64"),
+            None,
+            "no linux-aarch64 asset is built"
+        );
+        assert_eq!(
+            Target::released_for("windows", "x86_64"),
+            Some(Target::WindowsX64)
+        );
+        assert_eq!(
+            Target::released_for("windows", "x86"),
+            Some(Target::WindowsX86)
+        );
+        assert_eq!(
+            Target::released_for("windows", "aarch64"),
+            Some(Target::WindowsArm64)
+        );
         assert_eq!(Target::released_for("macos", "aarch64"), None);
         assert_eq!(Target::released_for("linux", "x86"), None);
         // Every platform the updater targets is one the workflow publishes.
         let workflow = include_str!("../../.github/workflows/release-binaries.yml");
-        for (os, arch) in [("linux", "x86_64"), ("linux", "aarch64"), ("windows", "x86_64"), ("windows", "x86"), ("windows", "aarch64")] {
+        for (os, arch) in [
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("windows", "x86_64"),
+            ("windows", "x86"),
+            ("windows", "aarch64"),
+        ] {
             if let Some(t) = Target::released_for(os, arch) {
                 let tag = t.arch_tag();
                 // Linux assets are uploaded by glob; Windows ones are named by
                 // the packaging script and listed in the release notes.
                 let published = match tag.strip_prefix("windows-") {
-                    Some(arch) => workflow.contains("wftui-*-windows-{x64,x86,arm64}.exe") && ["x64", "x86", "arm64"].contains(&arch),
+                    Some(arch) => {
+                        workflow.contains("wftui-*-windows-{x64,x86,arm64}.exe")
+                            && ["x64", "x86", "arm64"].contains(&arch)
+                    }
                     None => workflow.contains(&format!("dist/wftui-*-{tag}")),
                 };
-                assert!(published, "{tag} is targeted but release-binaries.yml does not publish it");
+                assert!(
+                    published,
+                    "{tag} is targeted but release-binaries.yml does not publish it"
+                );
             }
         }
     }
@@ -1205,9 +1361,18 @@ mod tests {
     fn the_msix_manifest_is_read_and_written_as_utf8() {
         let script = include_str!("../../packaging/msix/build-msix.ps1");
         let template = include_str!("../../packaging/msix/AppxManifest.template.xml");
-        assert!(!template.starts_with('\u{feff}') && template.contains('\u{2014}'), "the case this guards: BOM-less, non-ASCII");
-        let reads: Vec<&str> = script.lines().filter(|l| l.contains("Get-Content $ManifestTemplate")).collect();
-        let writes: Vec<&str> = script.lines().filter(|l| l.contains("Set-Content") && l.contains("AppxManifest.xml")).collect();
+        assert!(
+            !template.starts_with('\u{feff}') && template.contains('\u{2014}'),
+            "the case this guards: BOM-less, non-ASCII"
+        );
+        let reads: Vec<&str> = script
+            .lines()
+            .filter(|l| l.contains("Get-Content $ManifestTemplate"))
+            .collect();
+        let writes: Vec<&str> = script
+            .lines()
+            .filter(|l| l.contains("Set-Content") && l.contains("AppxManifest.xml"))
+            .collect();
         assert!(!reads.is_empty() && !writes.is_empty());
         for line in reads.iter().chain(&writes) {
             assert!(line.contains("-Encoding utf8"), "unpinned encoding: {line}");
@@ -1216,15 +1381,36 @@ mod tests {
 
     #[test]
     fn asset_names_follow_the_release_naming_contract() {
-        assert_eq!(Target::LinuxX86_64.asset_name_for("", "0.0.2"), "wftui-0.0.2-linux-x86_64");
-        assert_eq!(Target::LinuxAarch64.asset_name_for("", "0.0.2"), "wftui-0.0.2-linux-aarch64");
-        assert_eq!(Target::WindowsX64.asset_name_for("", "0.0.2"), "wftui-0.0.2-windows-x64.exe");
-        assert_eq!(Target::WindowsX86.asset_name_for("", "0.0.2"), "wftui-0.0.2-windows-x86.exe");
-        assert_eq!(Target::WindowsArm64.asset_name_for("", "0.0.2"), "wftui-0.0.2-windows-arm64.exe");
+        assert_eq!(
+            Target::LinuxX86_64.asset_name_for("", "0.0.2"),
+            "wftui-0.0.2-linux-x86_64"
+        );
+        assert_eq!(
+            Target::LinuxAarch64.asset_name_for("", "0.0.2"),
+            "wftui-0.0.2-linux-aarch64"
+        );
+        assert_eq!(
+            Target::WindowsX64.asset_name_for("", "0.0.2"),
+            "wftui-0.0.2-windows-x64.exe"
+        );
+        assert_eq!(
+            Target::WindowsX86.asset_name_for("", "0.0.2"),
+            "wftui-0.0.2-windows-x86.exe"
+        );
+        assert_eq!(
+            Target::WindowsArm64.asset_name_for("", "0.0.2"),
+            "wftui-0.0.2-windows-arm64.exe"
+        );
         // The generic edition: same shape, its own prefix, so one release can
         // carry both and neither updater takes the other's binary.
-        assert_eq!(Target::LinuxX86_64.asset_name_for("-xf", "0.0.2"), "wftui-xf-0.0.2-linux-x86_64");
-        assert_eq!(Target::WindowsX64.asset_name_for("-xf", "0.0.2"), "wftui-xf-0.0.2-windows-x64.exe");
+        assert_eq!(
+            Target::LinuxX86_64.asset_name_for("-xf", "0.0.2"),
+            "wftui-xf-0.0.2-linux-x86_64"
+        );
+        assert_eq!(
+            Target::WindowsX64.asset_name_for("-xf", "0.0.2"),
+            "wftui-xf-0.0.2-windows-x64.exe"
+        );
         assert_eq!(
             Target::LinuxX86_64.asset_name("0.0.2"),
             Target::LinuxX86_64.asset_name_for(crate::site::EDITION_SUFFIX, "0.0.2"),
@@ -1258,15 +1444,31 @@ mod tests {
         let win = format!("wftui{s}-0.0.2-windows-x64.exe");
         let r = release_with(
             "v0.0.2",
-            &[&linux, &win, "SHA256SUMS.txt", "wftui-0.0.2.msixbundle", "wftui-0.0.2-linux-x86_64", "wftui-xf-0.0.2-linux-x86_64"],
+            &[
+                &linux,
+                &win,
+                "SHA256SUMS.txt",
+                "wftui-0.0.2.msixbundle",
+                "wftui-0.0.2-linux-x86_64",
+                "wftui-xf-0.0.2-linux-x86_64",
+            ],
         );
         let (bin, sums) = pick_assets(&r, Target::LinuxX86_64).unwrap();
-        assert_eq!((bin.name.as_str(), sums.name.as_str()), (linux.as_str(), "SHA256SUMS.txt"));
+        assert_eq!(
+            (bin.name.as_str(), sums.name.as_str()),
+            (linux.as_str(), "SHA256SUMS.txt")
+        );
         let (bin, _) = pick_assets(&r, Target::WindowsX64).unwrap();
         assert_eq!(bin.name, win);
-        assert!(pick_assets(&r, Target::WindowsArm64).is_err(), "no arm64 asset in this release");
+        assert!(
+            pick_assets(&r, Target::WindowsArm64).is_err(),
+            "no arm64 asset in this release"
+        );
         let no_sums = release_with("v0.0.2", &[&linux]);
-        assert!(pick_assets(&no_sums, Target::LinuxX86_64).is_err(), "a release without sums is unusable");
+        assert!(
+            pick_assets(&no_sums, Target::LinuxX86_64).is_err(),
+            "a release without sums is unusable"
+        );
     }
 
     #[test]
@@ -1278,20 +1480,59 @@ mod tests {
         );
         let sums = parse_sums(&text);
         assert_eq!(sums.len(), 2);
-        assert_eq!(expected_sha256(&sums, "wftui-0.0.2-linux-x86_64"), Some(hex.as_str()));
-        assert_eq!(expected_sha256(&sums, "wftui-0.0.2-windows-x64.exe"), Some(hex.as_str()), "lower-cased");
+        assert_eq!(
+            expected_sha256(&sums, "wftui-0.0.2-linux-x86_64"),
+            Some(hex.as_str())
+        );
+        assert_eq!(
+            expected_sha256(&sums, "wftui-0.0.2-windows-x64.exe"),
+            Some(hex.as_str()),
+            "lower-cased"
+        );
         assert_eq!(expected_sha256(&sums, "short.bin"), None);
     }
 
     #[test]
     fn sniff_accepts_synthetic_elf_and_pe_only_for_the_matching_machine() {
-        for t in [Target::LinuxX86_64, Target::LinuxAarch64, Target::WindowsX64, Target::WindowsX86, Target::WindowsArm64] {
+        for t in [
+            Target::LinuxX86_64,
+            Target::LinuxAarch64,
+            Target::WindowsX64,
+            Target::WindowsX86,
+            Target::WindowsArm64,
+        ] {
             assert!(sniff_binary(&synthetic_binary(t, 0), t).is_ok(), "{t:?}");
         }
-        assert!(sniff_binary(&synthetic_binary(Target::LinuxAarch64, 0), Target::LinuxX86_64).is_err());
-        assert!(sniff_binary(&synthetic_binary(Target::WindowsArm64, 0), Target::WindowsX64).is_err());
-        assert!(sniff_binary(&synthetic_binary(Target::LinuxX86_64, 0), Target::WindowsX64).is_err(), "an ELF is not a PE");
-        assert!(sniff_binary(&synthetic_binary(Target::WindowsX64, 0), Target::LinuxX86_64).is_err(), "a PE is not an ELF");
+        assert!(
+            sniff_binary(
+                &synthetic_binary(Target::LinuxAarch64, 0),
+                Target::LinuxX86_64
+            )
+            .is_err()
+        );
+        assert!(
+            sniff_binary(
+                &synthetic_binary(Target::WindowsArm64, 0),
+                Target::WindowsX64
+            )
+            .is_err()
+        );
+        assert!(
+            sniff_binary(
+                &synthetic_binary(Target::LinuxX86_64, 0),
+                Target::WindowsX64
+            )
+            .is_err(),
+            "an ELF is not a PE"
+        );
+        assert!(
+            sniff_binary(
+                &synthetic_binary(Target::WindowsX64, 0),
+                Target::LinuxX86_64
+            )
+            .is_err(),
+            "a PE is not an ELF"
+        );
     }
 
     #[test]
@@ -1305,7 +1546,10 @@ mod tests {
         assert!(sniff_binary(&[], host()).is_err());
         let mut oob = synthetic_binary(Target::WindowsX64, 0);
         oob[0x3c..0x40].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(sniff_binary(&oob, Target::WindowsX64).is_err(), "e_lfanew past the end");
+        assert!(
+            sniff_binary(&oob, Target::WindowsX64).is_err(),
+            "e_lfanew past the end"
+        );
     }
 
     #[test]
@@ -1313,11 +1557,20 @@ mod tests {
         let body = synthetic_binary(host(), 1);
         let name = host().asset_name("0.0.2");
         let good = format!("{}  {name}\n", sha256_hex(&body));
-        assert_eq!(verify(&body, host(), &good, &name).unwrap(), sha256_hex(&body));
+        assert_eq!(
+            verify(&body, host(), &good, &name).unwrap(),
+            sha256_hex(&body)
+        );
         let wrong = format!("{}  {name}\n", "0".repeat(64));
-        assert!(matches!(verify(&body, host(), &wrong, &name), Err(Error::FetchRejected(_))));
+        assert!(matches!(
+            verify(&body, host(), &wrong, &name),
+            Err(Error::FetchRejected(_))
+        ));
         let other = format!("{}  something-else\n", sha256_hex(&body));
-        assert!(matches!(verify(&body, host(), &other, &name), Err(Error::FetchRejected(_))));
+        assert!(matches!(
+            verify(&body, host(), &other, &name),
+            Err(Error::FetchRejected(_))
+        ));
     }
 
     #[test]
@@ -1326,7 +1579,13 @@ mod tests {
         let body = synthetic_binary(host(), 2);
         let p = stage_pending_in(&root, "0.0.2", host(), &sha256_hex(&body), &body).unwrap();
         assert!(p.dir.starts_with(&root));
-        assert!(p.dir.file_name().unwrap().to_string_lossy().starts_with("pending-"));
+        assert!(
+            p.dir
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("pending-")
+        );
         assert_eq!(std::fs::read(&p.path).unwrap(), body);
         let meta = std::fs::read_to_string(p.dir.join(META_NAME)).unwrap();
         assert!(meta.contains("version=0.0.2\n"));
@@ -1355,7 +1614,10 @@ mod tests {
             "http://[::1]:9/fed",
         ];
         for url in ok {
-            assert!(url.strip_prefix("http://").is_some_and(is_loopback_host), "{url}");
+            assert!(
+                url.strip_prefix("http://").is_some_and(is_loopback_host),
+                "{url}"
+            );
         }
         let refused = [
             "http://127.0.0.1.evil.com/fed",
@@ -1365,7 +1627,10 @@ mod tests {
             "http://1.127.0.0.1/fed",
         ];
         for url in refused {
-            assert!(!url.strip_prefix("http://").is_some_and(is_loopback_host), "{url}");
+            assert!(
+                !url.strip_prefix("http://").is_some_and(is_loopback_host),
+                "{url}"
+            );
         }
     }
 
@@ -1380,7 +1645,11 @@ mod tests {
         let ours = stage_pending_in(&root, "9.9.9", target, &sha256_hex(&body), &body).unwrap();
         // A generation the OTHER edition staged: same platform, correct
         // digest, its meta carrying the foreign suffix.
-        let other_suffix = if crate::site::EDITION_SUFFIX == "-xf" { "" } else { "-xf" };
+        let other_suffix = if crate::site::EDITION_SUFFIX == "-xf" {
+            ""
+        } else {
+            "-xf"
+        };
         let foreign_body = synthetic_binary(target, 3);
         let foreign = stage_pending_in(
             &root,
@@ -1409,7 +1678,10 @@ mod tests {
             !pending.iter().any(|p| p.version == "0.0.1"),
             "the other edition's generation is never adopted"
         );
-        assert!(foreign.dir.exists(), "the other edition still needs its staged update");
+        assert!(
+            foreign.dir.exists(),
+            "the other edition still needs its staged update"
+        );
         assert_eq!(std::fs::read(&foreign.path).unwrap(), foreign_body);
         assert!(ours.dir.exists());
         let _ = std::fs::remove_dir_all(root);
@@ -1426,7 +1698,10 @@ mod tests {
         let body = synthetic_binary(target, 3);
         let staged = stage_pending_in(&root, "0.0.2", target, &sha256_hex(&body), &body).unwrap();
         assert!(load_pending(&root, host(), "9.9.9").unwrap().is_empty());
-        assert!(staged.dir.exists(), "another platform's version is not ours to prune");
+        assert!(
+            staged.dir.exists(),
+            "another platform's version is not ours to prune"
+        );
         assert_eq!(std::fs::read(&staged.path).unwrap(), body);
         assert_eq!(load_pending(&root, target, "0.0.1").unwrap(), vec![staged]);
         let _ = std::fs::remove_dir_all(root);
@@ -1440,11 +1715,19 @@ mod tests {
                 let root = root.clone();
                 std::thread::spawn(move || {
                     let body = synthetic_binary(host(), i);
-                    stage_pending_in(&root, &format!("0.0.{}", i + 2), host(), &sha256_hex(&body), &body).unwrap()
+                    stage_pending_in(
+                        &root,
+                        &format!("0.0.{}", i + 2),
+                        host(),
+                        &sha256_hex(&body),
+                        &body,
+                    )
+                    .unwrap()
                 })
             })
             .collect();
-        let dirs: std::collections::HashSet<PathBuf> = handles.into_iter().map(|h| h.join().unwrap().dir).collect();
+        let dirs: std::collections::HashSet<PathBuf> =
+            handles.into_iter().map(|h| h.join().unwrap().dir).collect();
         assert_eq!(dirs.len(), 4);
         let pending = load_pending(&root, host(), "0.0.1").unwrap();
         assert_eq!(pending.len(), 4);
@@ -1463,7 +1746,11 @@ mod tests {
         let tampered = stage_pending_in(&root, "0.0.4", host(), &digest, &body).unwrap();
         std::fs::write(&tampered.path, synthetic_binary(host(), 9)).unwrap();
         let wrong_arch = stage_pending_in(&root, "0.0.5", host(), &digest, &body).unwrap();
-        std::fs::write(wrong_arch.dir.join(META_NAME), "version=0.0.5\narch=plan9-mips\nsha256=x\n").unwrap();
+        std::fs::write(
+            wrong_arch.dir.join(META_NAME),
+            "version=0.0.5\narch=plan9-mips\nsha256=x\n",
+        )
+        .unwrap();
         let no_meta = stage_pending_in(&root, "0.0.6", host(), &digest, &body).unwrap();
         std::fs::remove_file(no_meta.dir.join(META_NAME)).unwrap();
         let stale_stage = root.join(".stage-stale");
@@ -1480,8 +1767,11 @@ mod tests {
             // https://learn.microsoft.com/windows/win32/fileio/obtaining-a-handle-to-a-directory
             const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
             const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-            std::fs::OpenOptions::new().access_mode(FILE_WRITE_ATTRIBUTES)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(&stale_stage).unwrap()
+            std::fs::OpenOptions::new()
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&stale_stage)
+                .unwrap()
         };
         #[cfg(not(windows))]
         let stage_handle = std::fs::File::open(&stale_stage).unwrap();
@@ -1495,32 +1785,58 @@ mod tests {
             assert!(!gone.dir.exists(), "{} must be removed", gone.dir.display());
         }
         assert!(!stale_stage.exists(), "an hour-old stage dir is garbage");
-        assert!(fresh_stage.exists(), "a fresh stage dir may still be written to");
-        assert!(load_pending(&root.join("missing"), host(), "0.0.1").unwrap().is_empty());
+        assert!(
+            fresh_stage.exists(),
+            "a fresh stage dir may still be written to"
+        );
+        assert!(
+            load_pending(&root.join("missing"), host(), "0.0.1")
+                .unwrap()
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn classify_exe_refuses_windowsapps_appxmanifest_and_cargo_target() {
         assert_eq!(
-            classify_exe_as(Path::new(r"C:\Program Files\WindowsApps\MikeFara.WindowsForumTUI_0.0.1.0_x64__abc\wftui.exe"), true),
+            classify_exe_as(
+                Path::new(
+                    r"C:\Program Files\WindowsApps\MikeFara.WindowsForumTUI_0.0.1.0_x64__abc\wftui.exe"
+                ),
+                true
+            ),
             Err(Refusal::Msix)
         );
         let root = scratch("classify");
         let pkg = root.join("pkg");
         std::fs::create_dir_all(&pkg).unwrap();
         std::fs::write(pkg.join("AppxManifest.xml"), "<Package/>").unwrap();
-        assert_eq!(classify_exe_as(&pkg.join("wftui.exe"), true), Err(Refusal::Msix));
+        assert_eq!(
+            classify_exe_as(&pkg.join("wftui.exe"), true),
+            Err(Refusal::Msix)
+        );
         let checkout = root.join("checkout");
         std::fs::create_dir_all(checkout.join("target").join("release")).unwrap();
         std::fs::write(checkout.join("Cargo.toml"), "[workspace]").unwrap();
-        assert_eq!(classify_exe_as(&checkout.join("target/release/wftui"), false), Err(Refusal::CargoTarget));
+        assert_eq!(
+            classify_exe_as(&checkout.join("target/release/wftui"), false),
+            Err(Refusal::CargoTarget)
+        );
         let bin = checkout.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        assert_eq!(classify_exe_as(&bin.join("wftui"), false), Ok(Install::RenameOver), "bin/wftui in a checkout is a real install");
+        assert_eq!(
+            classify_exe_as(&bin.join("wftui"), false),
+            Ok(Install::RenameOver),
+            "bin/wftui in a checkout is a real install"
+        );
         let plain = root.join("target").join("wftui");
         std::fs::create_dir_all(plain.parent().unwrap()).unwrap();
-        assert_eq!(classify_exe_as(&plain, false), Ok(Install::RenameOver), "a dir merely named target is not cargo's");
+        assert_eq!(
+            classify_exe_as(&plain, false),
+            Ok(Install::RenameOver),
+            "a dir merely named target is not cargo's"
+        );
         assert_eq!(classify_exe_as(&plain, true), Ok(Install::RenameAside));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1538,10 +1854,17 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&exe).unwrap().permissions().mode() & 0o777, 0o755);
+            assert_eq!(
+                std::fs::metadata(&exe).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
         }
         assert!(install_over(&root.join("absent"), &exe, Install::RenameOver).is_err());
-        assert_eq!(std::fs::read(&exe).unwrap(), b"new", "a failed install leaves the binary alone");
+        assert_eq!(
+            std::fs::read(&exe).unwrap(),
+            b"new",
+            "a failed install leaves the binary alone"
+        );
         assert!(!root.join("wftui.new").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1576,31 +1899,61 @@ mod tests {
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
         std::fs::write(&exe, synthetic_binary(host(), 0)).unwrap();
         let cfg = cfg_at(&root.join("update"), &exe, "http://127.0.0.1:1/");
-        assert_eq!(apply_pending_update(&cfg), ApplyOutcome::NothingPending, "no update dir yet");
+        assert_eq!(
+            apply_pending_update(&cfg),
+            ApplyOutcome::NothingPending,
+            "no update dir yet"
+        );
 
         let body = synthetic_binary(host(), 7);
         let older = synthetic_binary(host(), 8);
         stage_pending_in(&cfg.root, "0.0.2", host(), &sha256_hex(&older), &older).unwrap();
-        let newest = stage_pending_in(&cfg.root, "0.0.3", host(), &sha256_hex(&body), &body).unwrap();
-        assert_eq!(apply_pending_update(&cfg), ApplyOutcome::Applied("0.0.3".into()));
-        assert_eq!(std::fs::read(&exe).unwrap(), body, "the newest generation won");
+        let newest =
+            stage_pending_in(&cfg.root, "0.0.3", host(), &sha256_hex(&body), &body).unwrap();
+        assert_eq!(
+            apply_pending_update(&cfg),
+            ApplyOutcome::Applied("0.0.3".into())
+        );
+        assert_eq!(
+            std::fs::read(&exe).unwrap(),
+            body,
+            "the newest generation won"
+        );
         assert!(!newest.dir.exists(), "the applied generation is consumed");
 
         // The next start runs as 0.0.3: the 0.0.2 generation is a downgrade now.
-        let cfg3 = UpdateConfig { current_version: "0.0.3", ..cfg.clone() };
+        let cfg3 = UpdateConfig {
+            current_version: "0.0.3",
+            ..cfg.clone()
+        };
         assert_eq!(apply_pending_update(&cfg3), ApplyOutcome::NothingPending);
-        assert!(load_pending(&cfg.root, host(), "0.0.1").unwrap().is_empty(), "pruned");
+        assert!(
+            load_pending(&cfg.root, host(), "0.0.1").unwrap().is_empty(),
+            "pruned"
+        );
 
         // Held by a sibling: never applied, never blocks, and never claims "applied".
         let again = synthetic_binary(host(), 9);
         stage_pending_in(&cfg.root, "0.0.4", host(), &sha256_hex(&again), &again).unwrap();
         let held = UpdateLock::acquire(&cfg.root).unwrap();
-        assert!(matches!(apply_pending_update(&cfg), ApplyOutcome::Incomplete(_)));
+        assert!(matches!(
+            apply_pending_update(&cfg),
+            ApplyOutcome::Incomplete(_)
+        ));
         drop(held);
-        assert_eq!(apply_pending_update(&cfg), ApplyOutcome::Applied("0.0.4".into()));
+        assert_eq!(
+            apply_pending_update(&cfg),
+            ApplyOutcome::Applied("0.0.4".into())
+        );
 
-        let disabled = UpdateConfig { disabled: true, ..cfg.clone() };
-        assert_eq!(apply_pending_update(&disabled), ApplyOutcome::NothingPending);
+        let disabled = UpdateConfig {
+            disabled: true,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            apply_pending_update(&disabled),
+            ApplyOutcome::NothingPending
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1628,12 +1981,22 @@ mod tests {
         let ours = synthetic_binary(host(), 4);
         stage_pending_in(&cfg.root, "0.0.2", host(), &sha256_hex(&ours), &ours).unwrap();
         let theirs = synthetic_binary(host(), 5);
-        let foreign = stage_pending_in(&cfg.root, "9.9.9", host(), &sha256_hex(&theirs), &theirs).unwrap();
-        let other_edition = if crate::site::EDITION_SUFFIX == "-xf" { "" } else { "-xf" };
-        let meta = meta_text("9.9.9", host(), &sha256_hex(&theirs))
-            .replace(&format!("edition={}\n", crate::site::EDITION_SUFFIX), &format!("edition={other_edition}\n"));
+        let foreign =
+            stage_pending_in(&cfg.root, "9.9.9", host(), &sha256_hex(&theirs), &theirs).unwrap();
+        let other_edition = if crate::site::EDITION_SUFFIX == "-xf" {
+            ""
+        } else {
+            "-xf"
+        };
+        let meta = meta_text("9.9.9", host(), &sha256_hex(&theirs)).replace(
+            &format!("edition={}\n", crate::site::EDITION_SUFFIX),
+            &format!("edition={other_edition}\n"),
+        );
         std::fs::write(foreign.dir.join(META_NAME), meta).unwrap();
-        assert_eq!(apply_pending_update(&cfg), ApplyOutcome::Applied("0.0.2".into()));
+        assert_eq!(
+            apply_pending_update(&cfg),
+            ApplyOutcome::Applied("0.0.2".into())
+        );
         assert_eq!(std::fs::read(exe).unwrap(), ours);
         assert_eq!(std::fs::read(foreign.path).unwrap(), theirs);
         let _ = std::fs::remove_dir_all(root);
@@ -1643,7 +2006,10 @@ mod tests {
     fn apply_refuses_a_cargo_target_binary_and_discards_the_generation() {
         let root = scratch("refuse");
         let checkout = root.join("checkout");
-        let exe = checkout.join("target").join("release").join(host().binary_name());
+        let exe = checkout
+            .join("target")
+            .join("release")
+            .join(host().binary_name());
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
         std::fs::write(checkout.join("Cargo.toml"), "[workspace]").unwrap();
         std::fs::write(&exe, b"dev").unwrap();
@@ -1652,7 +2018,10 @@ mod tests {
         let p = stage_pending_in(&cfg.root, "0.0.2", host(), &sha256_hex(&body), &body).unwrap();
         assert_eq!(
             apply_pending_update(&cfg),
-            ApplyOutcome::Refused { version: "0.0.2".into(), why: Refusal::CargoTarget }
+            ApplyOutcome::Refused {
+                version: "0.0.2".into(),
+                why: Refusal::CargoTarget
+            }
         );
         assert_eq!(std::fs::read(&exe).unwrap(), b"dev");
         assert!(!p.dir.exists());
@@ -1661,7 +2030,10 @@ mod tests {
 
     #[test]
     fn manual_install_command_is_the_install_then_rename_swap() {
-        let cmd = manual_install_command(Path::new("/cfg/update/pending-1/wftui"), Path::new("/usr/local/bin/wftui"));
+        let cmd = manual_install_command(
+            Path::new("/cfg/update/pending-1/wftui"),
+            Path::new("/usr/local/bin/wftui"),
+        );
         if cfg!(windows) {
             assert!(cmd.contains("move /y") && cmd.contains("copy /y"));
         } else {
@@ -1682,12 +2054,24 @@ mod tests {
         let exe = root.join("wftui");
         std::fs::write(&exe, b"x").unwrap();
         let cfg = cfg_at(&root, &exe, "http://127.0.0.1:1/latest");
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        assert_eq!(rt.block_on(check_and_stage(&cfg, false)).unwrap(), Outcome::Throttled);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(
+            rt.block_on(check_and_stage(&cfg, false)).unwrap(),
+            Outcome::Throttled
+        );
         // Forced: the throttle is skipped, so the (unreachable) feed is actually tried.
         assert!(rt.block_on(check_and_stage(&cfg, true)).is_err());
-        let disabled = UpdateConfig { disabled: true, ..cfg.clone() };
-        assert!(matches!(rt.block_on(check_and_stage(&disabled, true)).unwrap(), Outcome::Skipped(_)));
+        let disabled = UpdateConfig {
+            disabled: true,
+            ..cfg.clone()
+        };
+        assert!(matches!(
+            rt.block_on(check_and_stage(&disabled, true)).unwrap(),
+            Outcome::Skipped(_)
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1695,18 +2079,29 @@ mod tests {
     fn last_check_is_scoped_to_edition_and_platform() {
         let root = scratch("throttle-owner");
         let target = host();
-        let other_edition = if crate::site::EDITION_SUFFIX == "-xf" { "" } else { "-xf" };
+        let other_edition = if crate::site::EDITION_SUFFIX == "-xf" {
+            ""
+        } else {
+            "-xf"
+        };
         let other_target = if target == Target::LinuxX86_64 {
             Target::WindowsArm64
         } else {
             Target::LinuxX86_64
         };
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
         std::fs::write(root.join(LAST_CHECK_NAME), &now).unwrap();
         let foreign = last_check_path_for(&root, target, other_edition);
         std::fs::write(&foreign, &now).unwrap();
         note_check(&root, other_target);
-        assert!(since_last_check(&root, target).is_none(), "other owners cannot suppress our check");
+        assert!(
+            since_last_check(&root, target).is_none(),
+            "other owners cannot suppress our check"
+        );
         note_check(&root, target);
         assert!(since_last_check(&root, target).is_some_and(|age| age < MIN_CHECK_INTERVAL));
         assert_eq!(std::fs::read_to_string(foreign).unwrap(), now);
@@ -1728,7 +2123,12 @@ mod tests {
 
     /// A mock release at `tag` whose binary is `body`, with `sums` as the
     /// checksum file's text (so a test can publish a wrong one).
-    async fn feed(tag: &str, body: Vec<u8>, sums: Option<String>, tweak: impl FnOnce(&mut serde_json::Value)) -> Feed {
+    async fn feed(
+        tag: &str,
+        body: Vec<u8>,
+        sums: Option<String>,
+        tweak: impl FnOnce(&mut serde_json::Value),
+    ) -> Feed {
         let server = MockServer::start().await;
         let root = scratch("feed");
         let exe = root.join("bin").join(host().binary_name());
@@ -1761,12 +2161,21 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string(sums))
             .mount(&server)
             .await;
-        Feed { server, root, exe, body }
+        Feed {
+            server,
+            root,
+            exe,
+            body,
+        }
     }
 
     impl Feed {
         fn cfg(&self) -> UpdateConfig {
-            cfg_at(&self.root.join("update"), &self.exe, &format!("{}/latest", self.server.uri()))
+            cfg_at(
+                &self.root.join("update"),
+                &self.exe,
+                &format!("{}/latest", self.server.uri()),
+            )
         }
         async fn requests(&self) -> Vec<Request> {
             self.server.received_requests().await.unwrap_or_default()
@@ -1778,8 +2187,16 @@ mod tests {
         let f = feed("v0.0.2", synthetic_binary(host(), 5), None, |_| {}).await;
         let cfg = f.cfg();
         std::fs::create_dir_all(&cfg.root).unwrap();
-        let other_edition = if crate::site::EDITION_SUFFIX == "-xf" { "" } else { "-xf" };
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string();
+        let other_edition = if crate::site::EDITION_SUFFIX == "-xf" {
+            ""
+        } else {
+            "-xf"
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
         std::fs::write(cfg.root.join(LAST_CHECK_NAME), &now).unwrap();
         std::fs::write(last_check_path_for(&cfg.root, host(), other_edition), &now).unwrap();
         let out = check_and_stage(&cfg, false).await.unwrap();
@@ -1789,16 +2206,30 @@ mod tests {
         assert_eq!(version, "0.0.2");
         assert_eq!(std::fs::read(&path).unwrap(), f.body);
         assert!(path.starts_with(&cfg.root));
-        assert_eq!(std::fs::read(&f.exe).unwrap(), synthetic_binary(host(), 0), "nothing is swapped until the next start");
+        assert_eq!(
+            std::fs::read(&f.exe).unwrap(),
+            synthetic_binary(host(), 0),
+            "nothing is swapped until the next start"
+        );
         assert!(last_check_path(&cfg.root, host()).exists());
 
         // A second check reuses the staged generation without another download.
         let before = f.requests().await.len();
-        assert!(matches!(check_and_stage(&cfg, true).await.unwrap(), Outcome::Staged { .. }));
-        assert_eq!(f.requests().await.len(), before + 1, "only the feed was asked again");
+        assert!(matches!(
+            check_and_stage(&cfg, true).await.unwrap(),
+            Outcome::Staged { .. }
+        ));
+        assert_eq!(
+            f.requests().await.len(),
+            before + 1,
+            "only the feed was asked again"
+        );
 
         // And the next start applies it.
-        assert_eq!(apply_pending_update(&cfg), ApplyOutcome::Applied("0.0.2".into()));
+        assert_eq!(
+            apply_pending_update(&cfg),
+            ApplyOutcome::Applied("0.0.2".into())
+        );
         assert_eq!(std::fs::read(&f.exe).unwrap(), f.body);
         let _ = std::fs::remove_dir_all(&f.root);
     }
@@ -1815,7 +2246,10 @@ mod tests {
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
         std::fs::write(&exe, synthetic_binary(host(), 0)).unwrap();
         // Valid JSON the old code would have parsed and acted on.
-        let padded = format!(r#"{{"tag_name":"v0.0.2","html_url":"https://example.invalid","body":"{}","assets":[]}}"#, "x".repeat(MAX_FEED_BYTES));
+        let padded = format!(
+            r#"{{"tag_name":"v0.0.2","html_url":"https://example.invalid","body":"{}","assets":[]}}"#,
+            "x".repeat(MAX_FEED_BYTES)
+        );
         Mock::given(method("GET"))
             .and(path("/latest"))
             .respond_with(ResponseTemplate::new(200).set_body_string(padded.clone()))
@@ -1823,11 +2257,19 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/chunked"))
-            .respond_with(ResponseTemplate::new(200).insert_header("Transfer-Encoding", "chunked").set_body_string(padded))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Transfer-Encoding", "chunked")
+                    .set_body_string(padded),
+            )
             .mount(&server)
             .await;
         for feed_path in ["latest", "chunked"] {
-            let cfg = cfg_at(&root.join("update"), &exe, &format!("{}/{feed_path}", server.uri()));
+            let cfg = cfg_at(
+                &root.join("update"),
+                &exe,
+                &format!("{}/{feed_path}", server.uri()),
+            );
             match check_and_stage(&cfg, true).await {
                 Err(Error::FetchRejected(msg)) => assert!(msg.contains("release feed"), "{msg}"),
                 other => panic!("{feed_path}: an oversized feed must be refused, got {other:?}"),
@@ -1898,7 +2340,9 @@ mod tests {
         let stall = stalling_error_server(500, "").await;
         let cfg = cfg_at(&root.join("update"), &exe, &format!("{stall}/latest"));
         match tokio::time::timeout(QUICK, check_and_stage(&cfg, true)).await {
-            Ok(Err(Error::Config(msg))) => assert!(msg.contains("release feed answered http 500"), "{msg}"),
+            Ok(Err(Error::Config(msg))) => {
+                assert!(msg.contains("release feed answered http 500"), "{msg}")
+            }
             Ok(other) => panic!("a 500 feed must be Error::Config, got {other:?}"),
             Err(_) => panic!("the 500 feed body was read to the end instead of under a cap"),
         }
@@ -1906,7 +2350,9 @@ mod tests {
         let stall = stalling_error_server(403, "Retry-After: 120\r\n").await;
         let cfg = cfg_at(&root.join("update"), &exe, &format!("{stall}/latest"));
         match tokio::time::timeout(QUICK, check_and_stage(&cfg, true)).await {
-            Ok(Err(Error::RateLimited { retry_after })) => assert_eq!(retry_after, Some(Duration::from_secs(120))),
+            Ok(Err(Error::RateLimited { retry_after })) => {
+                assert_eq!(retry_after, Some(Duration::from_secs(120)))
+            }
             Ok(other) => panic!("a 403 feed must be Error::RateLimited, got {other:?}"),
             Err(_) => panic!("the 403 feed body was read to the end instead of under a cap"),
         }
@@ -1923,7 +2369,11 @@ mod tests {
             Ok(other) => panic!("a 500 binary must be Error::Config, got {other:?}"),
             Err(_) => panic!("the 500 binary body was read to the end instead of under a cap"),
         }
-        assert!(load_pending(&f.cfg().root, host(), "0.0.1").unwrap().is_empty());
+        assert!(
+            load_pending(&f.cfg().root, host(), "0.0.1")
+                .unwrap()
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&f.root);
     }
 
@@ -1936,8 +2386,18 @@ mod tests {
         let reqs = f.requests().await;
         assert_eq!(reqs.len(), 3, "feed, sums, binary");
         for r in &reqs {
-            assert!(r.headers.get("authorization").is_none(), "{} carried a token", r.url);
-            let ua = r.headers.get("user-agent").expect("ua").to_str().unwrap().to_string();
+            assert!(
+                r.headers.get("authorization").is_none(),
+                "{} carried a token",
+                r.url
+            );
+            let ua = r
+                .headers
+                .get("user-agent")
+                .expect("ua")
+                .to_str()
+                .unwrap()
+                .to_string();
             assert!(ua.starts_with("wftui/"), "{ua}");
         }
         let _ = std::fs::remove_dir_all(&f.root);
@@ -1949,7 +2409,10 @@ mod tests {
         let bad = format!("{}  {}\n", "0".repeat(64), host().asset_name("0.0.2"));
         let f = feed("v0.0.2", body, Some(bad), |_| {}).await;
         let cfg = f.cfg();
-        assert!(matches!(check_and_stage(&cfg, true).await, Err(Error::FetchRejected(_))));
+        assert!(matches!(
+            check_and_stage(&cfg, true).await,
+            Err(Error::FetchRejected(_))
+        ));
         assert!(load_pending(&cfg.root, host(), "0.0.1").unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&f.root);
     }
@@ -1966,12 +2429,21 @@ mod tests {
             let root = scratch("ratelimit");
             let exe = root.join("wftui");
             std::fs::write(&exe, b"x").unwrap();
-            let cfg = cfg_at(&root.join("update"), &exe, &format!("{}/latest", server.uri()));
+            let cfg = cfg_at(
+                &root.join("update"),
+                &exe,
+                &format!("{}/latest", server.uri()),
+            );
             match check_and_stage(&cfg, true).await {
-                Err(Error::RateLimited { retry_after }) => assert_eq!(retry_after, Some(Duration::from_secs(120))),
+                Err(Error::RateLimited { retry_after }) => {
+                    assert_eq!(retry_after, Some(Duration::from_secs(120)))
+                }
                 other => panic!("{status}: {other:?}"),
             }
-            assert!(last_check_path(&cfg.root, host()).exists(), "a refused request still spent quota");
+            assert!(
+                last_check_path(&cfg.root, host()).exists(),
+                "a refused request still spent quota"
+            );
             let _ = std::fs::remove_dir_all(&root);
         }
     }
@@ -1979,15 +2451,38 @@ mod tests {
     #[tokio::test]
     async fn check_refuses_prerelease_draft_and_older_tags() {
         let body = synthetic_binary(host(), 5);
-        let f = feed("v0.0.2", body.clone(), None, |r| r["prerelease"] = true.into()).await;
-        assert!(matches!(check_and_stage(&f.cfg(), true).await.unwrap(), Outcome::UpToDate { .. }));
+        let f = feed("v0.0.2", body.clone(), None, |r| {
+            r["prerelease"] = true.into()
+        })
+        .await;
+        assert!(matches!(
+            check_and_stage(&f.cfg(), true).await.unwrap(),
+            Outcome::UpToDate { .. }
+        ));
         let f = feed("v0.0.2", body.clone(), None, |r| r["draft"] = true.into()).await;
-        assert!(matches!(check_and_stage(&f.cfg(), true).await.unwrap(), Outcome::UpToDate { .. }));
+        assert!(matches!(
+            check_and_stage(&f.cfg(), true).await.unwrap(),
+            Outcome::UpToDate { .. }
+        ));
         let f = feed("v0.0.1", body.clone(), None, |_| {}).await;
-        assert_eq!(check_and_stage(&f.cfg(), true).await.unwrap(), Outcome::UpToDate { latest: "0.0.1".into() });
+        assert_eq!(
+            check_and_stage(&f.cfg(), true).await.unwrap(),
+            Outcome::UpToDate {
+                latest: "0.0.1".into()
+            }
+        );
         let f = feed("v0.0.0", body, None, |_| {}).await;
-        assert_eq!(check_and_stage(&f.cfg(), true).await.unwrap(), Outcome::UpToDate { latest: "0.0.0".into() });
-        assert_eq!(f.requests().await.len(), 1, "an older release downloads nothing");
+        assert_eq!(
+            check_and_stage(&f.cfg(), true).await.unwrap(),
+            Outcome::UpToDate {
+                latest: "0.0.0".into()
+            }
+        );
+        assert_eq!(
+            f.requests().await.len(),
+            1,
+            "an older release downloads nothing"
+        );
         let _ = std::fs::remove_dir_all(&f.root);
     }
 
@@ -2002,10 +2497,15 @@ mod tests {
         .await;
         Mock::given(method("GET"))
             .and(path("/dl/huge"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; MAX_BINARY_BYTES + 1]))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(vec![0u8; MAX_BINARY_BYTES + 1]),
+            )
             .mount(&f.server)
             .await;
-        assert!(matches!(check_and_stage(&f.cfg(), true).await, Err(Error::FetchRejected(_))));
+        assert!(matches!(
+            check_and_stage(&f.cfg(), true).await,
+            Err(Error::FetchRejected(_))
+        ));
         let _ = std::fs::remove_dir_all(&f.root);
     }
 
@@ -2038,7 +2538,12 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let Outcome::ManualInstall { version, staged, command } = out else {
+        let Outcome::ManualInstall {
+            version,
+            staged,
+            command,
+        } = out
+        else {
             panic!("{out:?}");
         };
         assert_eq!(version, "0.0.2");

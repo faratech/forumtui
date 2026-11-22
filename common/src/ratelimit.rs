@@ -316,7 +316,10 @@ mod tests {
         assert_eq!(gate.pending_wait(), Duration::ZERO);
         let start = Instant::now();
         gate.wait().await;
-        assert_eq!(Instant::now(), start, "refreshing the prerequisite costs no extra cooldown");
+        assert_eq!(
+            Instant::now(),
+            start,
+            "refreshing the prerequisite costs no extra cooldown"
+        );
     }
-
 }

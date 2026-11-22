@@ -320,7 +320,11 @@ mod tests {
 
         assert_eq!(hits.at(3, 2), Some(&Hit::Row(7)), "the row is on top");
         assert_eq!(hits.at(3, 1), Some(&Hit::Pane(HitPane::List)));
-        assert_eq!(hits.pane_at(3, 2), Some(HitPane::List), "the pane is under it");
+        assert_eq!(
+            hits.pane_at(3, 2),
+            Some(HitPane::List),
+            "the pane is under it"
+        );
         assert_eq!(hits.at(30, 2), None, "outside every rect");
     }
 
@@ -329,7 +333,11 @@ mod tests {
         let mut hits = HitMap::new(false);
         hits.push(Rect::new(0, 0, 10, 5), Hit::Pane(HitPane::List));
         hits.rows(Rect::new(0, 0, 10, 5), 0, 5, Hit::Row);
-        hits.push_around(Rect::new(0, 0, 10, 5), Rect::new(2, 2, 2, 2), Hit::CloseOverlay);
+        hits.push_around(
+            Rect::new(0, 0, 10, 5),
+            Rect::new(2, 2, 2, 2),
+            Hit::CloseOverlay,
+        );
         assert_eq!(hits.count(), 0);
         assert_eq!(hits.at(1, 1), None);
         assert!(!hits.enabled());
@@ -340,7 +348,11 @@ mod tests {
         let mut hits = HitMap::default();
         let area = Rect::new(4, 10, 20, 3);
         hits.rows(area, 5, 20, Hit::Row);
-        assert_eq!(hits.at(4, 10), Some(&Hit::Row(5)), "offset row is the first");
+        assert_eq!(
+            hits.at(4, 10),
+            Some(&Hit::Row(5)),
+            "offset row is the first"
+        );
         assert_eq!(hits.at(23, 12), Some(&Hit::Row(7)));
         assert_eq!(hits.at(4, 13), None, "past the area's bottom");
         assert_eq!(hits.at(3, 11), None, "left of the area");
@@ -353,7 +365,11 @@ mod tests {
         // Two-line rows, the Inbox's conversation shape.
         hits.list(area, 0, &[2, 2, 2, 2], Hit::Row);
         assert_eq!(hits.at(0, 0), Some(&Hit::Row(0)));
-        assert_eq!(hits.at(0, 1), Some(&Hit::Row(0)), "the meta line is the row");
+        assert_eq!(
+            hits.at(0, 1),
+            Some(&Hit::Row(0)),
+            "the meta line is the row"
+        );
         assert_eq!(hits.at(0, 2), Some(&Hit::Row(1)));
         assert_eq!(hits.at(0, 5), Some(&Hit::Row(2)));
         assert_eq!(hits.at(0, 6), None);

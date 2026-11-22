@@ -8,9 +8,15 @@ use super::*;
 impl App {
     pub(super) fn execute_action(&mut self, action: Action) {
         let submission = match &action {
-            Action::SubmitReply { thread_id, .. } => Some(common::drafts::DraftKey::ThreadReply(*thread_id)),
-            Action::SubmitThread { node_id, .. } => Some(common::drafts::DraftKey::NewThread(*node_id)),
-            Action::SubmitEdit { post_id, .. } => Some(common::drafts::DraftKey::EditPost(*post_id)),
+            Action::SubmitReply { thread_id, .. } => {
+                Some(common::drafts::DraftKey::ThreadReply(*thread_id))
+            }
+            Action::SubmitThread { node_id, .. } => {
+                Some(common::drafts::DraftKey::NewThread(*node_id))
+            }
+            Action::SubmitEdit { post_id, .. } => {
+                Some(common::drafts::DraftKey::EditPost(*post_id))
+            }
             _ => None,
         };
         if let Some(key) = submission
@@ -60,7 +66,9 @@ impl App {
                     && let Some(node) = tree.nodes.iter().find(|n| n.node_id == node_id)
                 {
                     if node.node_type == "Category" {
-                        if let Some(child) = screens::browse::category_forum(&tree.nodes, node.node_id) {
+                        if let Some(child) =
+                            screens::browse::category_forum(&tree.nodes, node.node_id)
+                        {
                             node_id = child.node_id;
                             title = child.title.clone();
                         } else {
@@ -175,7 +183,8 @@ impl App {
                         .mark_forum_read(node_id)
                         .await
                         .map_err(|e| TaskError::of(&e));
-                    tx.send(session_msg(generation, Msg::MarkedRead(result))).ok();
+                    tx.send(session_msg(generation, Msg::MarkedRead(result)))
+                        .ok();
                 });
             }
             Action::MarkAlertRead(id) => self.mark_alert_read(id),
@@ -189,8 +198,18 @@ impl App {
                 let tx = self.tx.clone();
                 let generation = self.session_generation;
                 self.spawn_write(async move {
-                    let result = api.react_post(post_id, 1).await.map_err(|e| TaskError::of(&e));
-                    tx.send(session_msg(generation, Msg::PostToggled { verb: PostVerb::Like, result })).ok();
+                    let result = api
+                        .react_post(post_id, 1)
+                        .await
+                        .map_err(|e| TaskError::of(&e));
+                    tx.send(session_msg(
+                        generation,
+                        Msg::PostToggled {
+                            verb: PostVerb::Like,
+                            result,
+                        },
+                    ))
+                    .ok();
                 });
             }
             Action::VotePost(post_id, vote_type) => {
@@ -203,7 +222,8 @@ impl App {
                         .vote_post(post_id, &vote_type)
                         .await
                         .map_err(|e| TaskError::of(&e));
-                    tx.send(session_msg(generation, Msg::PostToggled { verb, result })).ok();
+                    tx.send(session_msg(generation, Msg::PostToggled { verb, result }))
+                        .ok();
                 });
             }
             Action::OpenDrafts => self.open_drafts(),
@@ -266,12 +286,17 @@ impl App {
                 }
                 self.spawn_write(async move {
                     let result = App::upload_from_path(&api, &path, context, key.as_deref()).await;
-                    tx.send(session_msg(generation, Msg::AttachmentUploaded { composer, result })).ok();
+                    tx.send(session_msg(
+                        generation,
+                        Msg::AttachmentUploaded { composer, result },
+                    ))
+                    .ok();
                 });
             }
             Action::SubmitEdit { post_id, message } => {
                 let api = self.api.clone();
-                let key = self.compose_attachment_key_for(common::drafts::DraftKey::EditPost(post_id));
+                let key =
+                    self.compose_attachment_key_for(common::drafts::DraftKey::EditPost(post_id));
                 let tx = self.tx.clone();
                 let generation = self.session_generation;
                 self.spawn_write(async move {
@@ -279,7 +304,8 @@ impl App {
                         .edit_post(post_id, &message, key.as_deref())
                         .await
                         .map_err(|e| TaskError::of(&e));
-                    tx.send(session_msg(generation, Msg::PostEdited { post_id, result })).ok();
+                    tx.send(session_msg(generation, Msg::PostEdited { post_id, result }))
+                        .ok();
                 });
             }
             Action::DeletePost { post_id, thread_id } => {
@@ -294,7 +320,15 @@ impl App {
                         .delete_post(post_id, false)
                         .await
                         .map_err(|e| TaskError::of(&e));
-                    tx.send(session_msg(generation, Msg::PostDeleted { post_id, thread_id, result })).ok();
+                    tx.send(session_msg(
+                        generation,
+                        Msg::PostDeleted {
+                            post_id,
+                            thread_id,
+                            result,
+                        },
+                    ))
+                    .ok();
                 });
             }
             Action::MarkSolution { post_id, thread_id } => {
@@ -306,7 +340,15 @@ impl App {
                         .mark_solution(post_id)
                         .await
                         .map_err(|e| TaskError::of(&e));
-                    tx.send(session_msg(generation, Msg::SolutionMarked { post_id, thread_id, result })).ok();
+                    tx.send(session_msg(
+                        generation,
+                        Msg::SolutionMarked {
+                            post_id,
+                            thread_id,
+                            result,
+                        },
+                    ))
+                    .ok();
                 });
             }
             Action::StartReplyQuoting(thread, post) => {
@@ -350,10 +392,15 @@ impl App {
                         .reply(thread_id, &message, key.as_deref())
                         .await
                         .map_err(|e| TaskError::of(&e));
-                    tx.send(session_msg(generation, Msg::ReplySent { composer, result })).ok();
+                    tx.send(session_msg(generation, Msg::ReplySent { composer, result }))
+                        .ok();
                 });
             }
-            Action::SubmitThread { node_id, title, message } => {
+            Action::SubmitThread {
+                node_id,
+                title,
+                message,
+            } => {
                 let api = self.api.clone();
                 let tx = self.tx.clone();
                 let composer = common::drafts::DraftKey::NewThread(node_id);
@@ -364,7 +411,11 @@ impl App {
                         .create_thread(node_id, &title, &message, key.as_deref())
                         .await
                         .map_err(|e| TaskError::of(&e));
-                    tx.send(session_msg(generation, Msg::ThreadCreated { composer, result })).ok();
+                    tx.send(session_msg(
+                        generation,
+                        Msg::ThreadCreated { composer, result },
+                    ))
+                    .ok();
                 });
             }
             Action::SubmitConvoReply { id, message } => {
@@ -377,7 +428,11 @@ impl App {
                         .reply_conversation(id, &message)
                         .await
                         .map_err(|e| TaskError::of(&e));
-                    tx.send(session_msg(generation, Msg::ConvoReplySent { composer, result })).ok();
+                    tx.send(session_msg(
+                        generation,
+                        Msg::ConvoReplySent { composer, result },
+                    ))
+                    .ok();
                 });
             }
             Action::ResolveRecipients(names, _title, _body) => {
@@ -394,12 +449,23 @@ impl App {
                             .await
                             .map(|u| u.map(|u| u.user_id))
                             .map_err(|e| TaskError::of(&e));
-                        tx.send(session_msg(generation, Msg::RecipientResolved { name: name_clone, id })).ok();
+                        tx.send(session_msg(
+                            generation,
+                            Msg::RecipientResolved {
+                                name: name_clone,
+                                id,
+                            },
+                        ))
+                        .ok();
                     });
                 }
             }
             Action::LoginBegin => self.begin_login(),
-            Action::SetupSite { origin, client_id, name } => self.setup_site(&origin, &client_id, &name),
+            Action::SetupSite {
+                origin,
+                client_id,
+                name,
+            } => self.setup_site(&origin, &client_id, &name),
             Action::LoginPaste(text) => match &self.login_paste_tx {
                 Some(tx) if tx.send(text).is_ok() => {
                     if let Some(Screen::Login(ls)) = self.screens.last_mut() {
@@ -448,7 +514,9 @@ impl App {
                     text = sys;
                 }
                 if text.is_empty() {
-                    self.set_status("Nothing copied yet — drag, double-click, or use system clipboard.");
+                    self.set_status(
+                        "Nothing copied yet — drag, double-click, or use system clipboard.",
+                    );
                     return;
                 }
                 self.handle_paste(text);
@@ -486,8 +554,7 @@ impl App {
             kind: TaskErrorKind::Other,
         };
         let expanded = shellexpand_home(path);
-        let meta = std::fs::metadata(&expanded)
-            .map_err(|e| local(format!("{expanded}: {e}")))?;
+        let meta = std::fs::metadata(&expanded).map_err(|e| local(format!("{expanded}: {e}")))?;
         if !meta.is_file() {
             return Err(local(format!("{expanded} is not a file.")));
         }
@@ -498,8 +565,7 @@ impl App {
                 MAX_UPLOAD_BYTES / (1024 * 1024)
             )));
         }
-        let bytes = std::fs::read(&expanded)
-            .map_err(|e| local(format!("{expanded}: {e}")))?;
+        let bytes = std::fs::read(&expanded).map_err(|e| local(format!("{expanded}: {e}")))?;
         let filename = std::path::Path::new(&expanded)
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
@@ -532,7 +598,9 @@ impl App {
     ) -> Option<String> {
         self.screens.iter().rev().find_map(|s| match s {
             Screen::Compose(c)
-                if c.target.as_ref().is_some_and(|target| target.draft_key() == key) =>
+                if c.target
+                    .as_ref()
+                    .is_some_and(|target| target.draft_key() == key) =>
             {
                 c.attachment_key.clone()
             }
@@ -556,8 +624,8 @@ impl App {
         let id = view.thread.thread_id;
         // The client's own lists must agree without a refetch, the way the
         // conversation list already flips its row (#694).
-        let fully_read = view.page >= view.last_page.max(1)
-            && view.posts.iter().all(|p| p.post_date <= seen);
+        let fully_read =
+            view.page >= view.last_page.max(1) && view.posts.iter().all(|p| p.post_date <= seen);
         if fully_read {
             for screen in self.screens.iter_mut() {
                 let list = match screen {
@@ -591,7 +659,9 @@ impl App {
     /// Called once per tick rather than from the key handlers, so the wheel,
     /// the keys, `G`, and a click all feed it through one path.
     pub(super) fn autoload_more(&mut self) {
-        let Some(screen) = self.screens.last_mut() else { return };
+        let Some(screen) = self.screens.last_mut() else {
+            return;
+        };
         let list = match screen {
             Screen::Home(h) => &mut h.list,
             Screen::ThreadList(l) => l,
@@ -637,7 +707,15 @@ impl App {
         let session_generation = self.session_generation;
         self.spawn_session_task(async move {
             let result = api.conversations(page).await.map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::ConversationsLoaded { page, load_id, result })).ok();
+            tx.send(session_msg(
+                session_generation,
+                Msg::ConversationsLoaded {
+                    page,
+                    load_id,
+                    result,
+                },
+            ))
+            .ok();
         });
     }
 
@@ -652,7 +730,11 @@ impl App {
         let session_generation = self.session_generation;
         self.spawn_session_task(async move {
             let result = api.alerts(1).await.map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::AlertsLoaded { load_id, result })).ok();
+            tx.send(session_msg(
+                session_generation,
+                Msg::AlertsLoaded { load_id, result },
+            ))
+            .ok();
         });
     }
 
@@ -665,7 +747,11 @@ impl App {
                 .mark_conversation_read(id)
                 .await
                 .map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::ConversationMarked(id, result))).ok();
+            tx.send(session_msg(
+                session_generation,
+                Msg::ConversationMarked(id, result),
+            ))
+            .ok();
         });
     }
 
@@ -707,9 +793,21 @@ impl App {
                     })
                     .map_err(|e| TaskError::of(&e))
             } else {
-                api.forum(node_id, page).await.map_err(|e| TaskError::of(&e))
+                api.forum(node_id, page)
+                    .await
+                    .map_err(|e| TaskError::of(&e))
             };
-            tx.send(session_msg(session_generation, Msg::ForumLoaded { node_id, page, append, seq, result })).ok();
+            tx.send(session_msg(
+                session_generation,
+                Msg::ForumLoaded {
+                    node_id,
+                    page,
+                    append,
+                    seq,
+                    result,
+                },
+            ))
+            .ok();
         });
     }
 
@@ -734,7 +832,16 @@ impl App {
         let session_generation = self.session_generation;
         self.spawn_session_task(async move {
             let result = api.thread(id, page).await.map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::ThreadLoaded { id, page, load_id, result })).ok();
+            tx.send(session_msg(
+                session_generation,
+                Msg::ThreadLoaded {
+                    id,
+                    page,
+                    load_id,
+                    result,
+                },
+            ))
+            .ok();
         });
     }
 
@@ -743,8 +850,12 @@ impl App {
         let tx = self.tx.clone();
         let session_generation = self.session_generation;
         self.spawn_session_task(async move {
-            let result = api.mark_thread_read(id, date).await.map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::MarkedRead(result))).ok();
+            let result = api
+                .mark_thread_read(id, date)
+                .await
+                .map_err(|e| TaskError::of(&e));
+            tx.send(session_msg(session_generation, Msg::MarkedRead(result)))
+                .ok();
         });
     }
 
@@ -754,7 +865,8 @@ impl App {
         let session_generation = self.session_generation;
         self.spawn_session_task(async move {
             let result = api.mark_alert_read(id).await.map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::AlertMarked(result))).ok();
+            tx.send(session_msg(session_generation, Msg::AlertMarked(result)))
+                .ok();
         });
     }
 
@@ -769,7 +881,11 @@ impl App {
         let session_generation = self.session_generation;
         self.spawn_session_task(async move {
             let result = api.nodes().await.map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::NodesLoaded { load_id, result })).ok();
+            tx.send(session_msg(
+                session_generation,
+                Msg::NodesLoaded { load_id, result },
+            ))
+            .ok();
         });
     }
 
@@ -797,7 +913,17 @@ impl App {
                 .conversation(id, page)
                 .await
                 .map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::ConversationLoaded { id, page, load_id, mark_read, result })).ok();
+            tx.send(session_msg(
+                session_generation,
+                Msg::ConversationLoaded {
+                    id,
+                    page,
+                    load_id,
+                    mark_read,
+                    result,
+                },
+            ))
+            .ok();
         });
     }
 
@@ -816,7 +942,15 @@ impl App {
                 .search_member(user_id, &content, page)
                 .await
                 .map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::SearchDone { generation, page, result })).ok();
+            tx.send(session_msg(
+                session_generation,
+                Msg::SearchDone {
+                    generation,
+                    page,
+                    result,
+                },
+            ))
+            .ok();
         });
     }
 
@@ -832,7 +966,15 @@ impl App {
                 .search_advanced(&query)
                 .await
                 .map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::SearchDone { generation, page, result })).ok();
+            tx.send(session_msg(
+                session_generation,
+                Msg::SearchDone {
+                    generation,
+                    page,
+                    result,
+                },
+            ))
+            .ok();
         });
     }
 
@@ -855,7 +997,15 @@ impl App {
                 .media_list(category, page)
                 .await
                 .map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::MediaLoaded { page, load_id, result })).ok();
+            tx.send(session_msg(
+                session_generation,
+                Msg::MediaLoaded {
+                    page,
+                    load_id,
+                    result,
+                },
+            ))
+            .ok();
         });
     }
 
@@ -873,7 +1023,11 @@ impl App {
         let session_generation = self.session_generation;
         self.spawn_session_task(async move {
             let result = api.media_categories().await.map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::MediaCategoriesLoaded { load_id, result })).ok();
+            tx.send(session_msg(
+                session_generation,
+                Msg::MediaCategoriesLoaded { load_id, result },
+            ))
+            .ok();
         });
     }
 
@@ -892,7 +1046,15 @@ impl App {
         let session_generation = self.session_generation;
         self.spawn_session_task(async move {
             let result = api.resource(id).await.map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::ResourceViewLoaded { id, load_id, result })).ok();
+            tx.send(session_msg(
+                session_generation,
+                Msg::ResourceViewLoaded {
+                    id,
+                    load_id,
+                    result,
+                },
+            ))
+            .ok();
         });
     }
 
@@ -910,8 +1072,19 @@ impl App {
         let tx = self.tx.clone();
         let session_generation = self.session_generation;
         self.spawn_session_task(async move {
-            let result = api.resources_list(page).await.map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::ResourceLoaded { page, load_id, result })).ok();
+            let result = api
+                .resources_list(page)
+                .await
+                .map_err(|e| TaskError::of(&e));
+            tx.send(session_msg(
+                session_generation,
+                Msg::ResourceLoaded {
+                    page,
+                    load_id,
+                    result,
+                },
+            ))
+            .ok();
         });
     }
 
@@ -950,10 +1123,16 @@ impl App {
             // Decoration waits its turn behind at most a couple of siblings;
             // `image_gate` then spaces the ones that get through, in a lane of
             // its own so nothing here delays an interactive call (issue #543).
-            let Ok(permit) = slots.acquire_owned().await else { return; };
+            let Ok(permit) = slots.acquire_owned().await else {
+                return;
+            };
             let key = pending.store_key();
             let result = crate::images::load(&client, &disk, picker, &pending, permit, logo).await;
-            tx.send(session_msg(session_generation, Msg::ImageLoaded { key, result })).ok();
+            tx.send(session_msg(
+                session_generation,
+                Msg::ImageLoaded { key, result },
+            ))
+            .ok();
         });
     }
 
@@ -1002,7 +1181,8 @@ impl App {
         let session_generation = self.session_generation;
         self.spawn_session_task(async move {
             let result = api.ai_usage().await.map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::AiUsageLoaded(result))).ok();
+            tx.send(session_msg(session_generation, Msg::AiUsageLoaded(result)))
+                .ok();
         });
     }
 
@@ -1017,14 +1197,19 @@ impl App {
     pub(super) fn ask_ai(&mut self, question: String) {
         self.ask_generation = self.ask_generation.wrapping_add(1);
         let turn = self.ask_generation;
-        let Some(Screen::AskAi(a)) = self.screens.last_mut() else { return };
+        let Some(Screen::AskAi(a)) = self.screens.last_mut() else {
+            return;
+        };
         // chat.php can rebuild a conversation it lost from the transcript,
         // but only if it hears that one exists (`has_local_history`).
         let has_local_history = a
             .turns
             .iter()
             .any(|t| t.state == screens::AskTurnState::Done && !t.answer.trim().is_empty());
-        a.turns.push(screens::AskTurn { question: question.clone(), ..Default::default() });
+        a.turns.push(screens::AskTurn {
+            question: question.clone(),
+            ..Default::default()
+        });
         a.busy = true;
         a.turn_seq = turn;
         a.follow = true;
@@ -1052,14 +1237,22 @@ impl App {
             let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
             let forward = async {
                 while let Some(event) = incoming.recv().await {
-                    tx.send(session_msg(session_generation, Msg::AskAiEvent { turn, event })).ok();
+                    tx.send(session_msg(
+                        session_generation,
+                        Msg::AskAiEvent { turn, event },
+                    ))
+                    .ok();
                 }
             };
             // `ask_ai` drops its sender when it returns, which ends
             // `forward` after the last frame — so Done never overtakes one.
             let (result, ()) = tokio::join!(api.ask_ai(&request, events), forward);
             let result = result.map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::AskAiDone { turn, result })).ok();
+            tx.send(session_msg(
+                session_generation,
+                Msg::AskAiDone { turn, result },
+            ))
+            .ok();
         });
         // Session work like any other (`end_session` aborts it), and ours to
         // stop on Esc, a new chat or the screen leaving.
@@ -1120,7 +1313,9 @@ impl App {
         use common::ai::AiEvent;
         use screens::AskTurnState;
         let mut finished = false;
-        let Some(a) = self.ask_ai_screen(Some(turn)).filter(|a| a.busy) else { return };
+        let Some(a) = self.ask_ai_screen(Some(turn)).filter(|a| a.busy) else {
+            return;
+        };
         let Some(t) = a.turns.last_mut() else { return };
         match event {
             AiEvent::Delta(text) => t.answer.push_str(&text),
@@ -1144,7 +1339,11 @@ impl App {
                 a.busy = false;
                 finished = true;
             }
-            AiEvent::Failed { message, retry_after, .. } => {
+            AiEvent::Failed {
+                message,
+                retry_after,
+                ..
+            } => {
                 t.state = AskTurnState::Failed(match retry_after {
                     Some(d) => format!("{message} Try again in {}s.", d.as_secs().max(1)),
                     None => message,
@@ -1161,7 +1360,9 @@ impl App {
 
     pub(super) fn on_ask_done(&mut self, turn: u64, result: TaskResult<()>) {
         use screens::AskTurnState;
-        let Some(a) = self.ask_ai_screen(Some(turn)) else { return };
+        let Some(a) = self.ask_ai_screen(Some(turn)) else {
+            return;
+        };
         let Some(t) = a.turns.last_mut() else { return };
         match result {
             Ok(()) => {
@@ -1248,7 +1449,9 @@ impl App {
 /// What a refused turn says on its own row.
 fn ask_error_text(e: &TaskError) -> String {
     match (e.kind, e.code.as_deref()) {
-        (TaskErrorKind::Api(404), _) => "Ask the AI is not available on this site right now.".into(),
+        (TaskErrorKind::Api(404), _) => {
+            "Ask the AI is not available on this site right now.".into()
+        }
         (_, Some("member_required")) => "Sign in again to ask the assistant.".into(),
         (_, Some("conversation_busy")) => {
             "The previous answer is still being finished \u{2014} try again in a moment.".into()

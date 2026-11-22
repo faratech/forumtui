@@ -37,7 +37,9 @@ pub(crate) const QUICK_DIGITS: [&str; common::site::MAX_QUICK] =
 /// The quick destination a digit key names, if the site has that many.
 pub(crate) fn quick_for_digit(site: &SiteConfig, c: char) -> Option<&common::site::QuickNode> {
     let i = c.to_digit(10)? as usize;
-    (1..=site.quick.len()).contains(&i).then(|| &site.quick[i - 1])
+    (1..=site.quick.len())
+        .contains(&i)
+        .then(|| &site.quick[i - 1])
 }
 
 /// Both panes fit side by side from here up (DESIGN.md). Below it Home renders
@@ -176,9 +178,7 @@ pub(crate) fn thread_row(
     // same list as visible ones, so the row has to say which is which — the
     // struck-through title is the part the eye catches before any label.
     let title_style = match state {
-        ContentState::Deleted => theme
-            .dim()
-            .add_modifier(Modifier::CROSSED_OUT),
+        ContentState::Deleted => theme.dim().add_modifier(Modifier::CROSSED_OUT),
         ContentState::Moderated => theme.base().add_modifier(Modifier::ITALIC),
         ContentState::Visible if t.is_unread => theme.base().add_modifier(Modifier::BOLD),
         ContentState::Visible => theme.base(),
@@ -214,7 +214,9 @@ pub(crate) fn thread_row(
     if let Some(label) = state.label() {
         let chip = Span::styled(
             format!(" {label} "),
-            Style::new().fg(theme.error).add_modifier(Modifier::REVERSED),
+            Style::new()
+                .fg(theme.error)
+                .add_modifier(Modifier::REVERSED),
         );
         let w = chip.width();
         if w + 4 < tw {
@@ -306,7 +308,12 @@ fn quick_rows(site: &SiteConfig) -> Vec<(&'static str, String)> {
     if site.features.ask_ai {
         rows.push(("A", "Ask the AI".to_string()));
     }
-    rows.extend(site.quick.iter().zip(QUICK_DIGITS).map(|(q, d)| (d, q.label.clone())));
+    rows.extend(
+        site.quick
+            .iter()
+            .zip(QUICK_DIGITS)
+            .map(|(q, d)| (d, q.label.clone())),
+    );
     rows
 }
 
@@ -354,10 +361,7 @@ fn forum_rows(
             Line::from(vec![
                 Span::raw(format!(" {}", " ".repeat(indent))),
                 Span::styled(
-                    truncate(
-                        &n.title.to_uppercase(),
-                        width.saturating_sub(indent + 1),
-                    ),
+                    truncate(&n.title.to_uppercase(), width.saturating_sub(indent + 1)),
                     theme.dim().add_modifier(Modifier::BOLD),
                 ),
             ])
@@ -463,10 +467,7 @@ pub(crate) fn render_forum_panel(
     }
 
     let rows = forum_rows(s, current, theme, g, inner.width as usize);
-    let sel_row = rows
-        .iter()
-        .position(|r| r.node == Some(s.sel))
-        .unwrap_or(0);
+    let sel_row = rows.iter().position(|r| r.node == Some(s.sel)).unwrap_or(0);
     let height = inner.height as usize;
     let (start, end) = tree_window(rows.len(), height, sel_row, &mut s.scroll);
 
@@ -550,9 +551,16 @@ impl PostImages {
 
 /// Public thumbnails keep their cacheable URL; a full attachment fallback
 /// uses the authenticated API route when its browser link needs a cookie.
-pub(crate) fn attachment_image_key(att: &common::models::Attachment, origin: &str) -> Option<String> {
+pub(crate) fn attachment_image_key(
+    att: &common::models::Attachment,
+    origin: &str,
+) -> Option<String> {
     let fallback = images::attachment_url(att)?;
-    if att.thumbnail_url.as_deref().is_some_and(|url| !url.trim().is_empty()) {
+    if att
+        .thumbnail_url
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty())
+    {
         Some(fallback.to_string())
     } else {
         att.data_url(origin).or_else(|| Some(fallback.to_string()))
@@ -655,7 +663,11 @@ pub(crate) fn post_videos(post: Option<&Post>) -> Vec<(String, &'static str)> {
 /// `None` when the API gave nothing to paint — the caller then falls back to
 /// the browser, which is all that picture ever had.
 pub(crate) fn image_open_for_post(post: &Post, img: &PostImage) -> Option<Box<super::ImageOpen>> {
-    let key = img.full_key.clone().or_else(|| img.open_url.clone()).or_else(|| img.key.clone())?;
+    let key = img
+        .full_key
+        .clone()
+        .or_else(|| img.open_url.clone())
+        .or_else(|| img.key.clone())?;
     let mut meta = post.username.clone();
     if post.post_date > 0 {
         if !meta.is_empty() {
@@ -736,14 +748,7 @@ pub(crate) fn render_thread_panel(
     };
     let right = page_cap(s.page, s.pages_loaded, s.last_page);
     let bottom = list_range(s);
-    let block = chrome::panel(
-        theme,
-        g,
-        &title,
-        focused,
-        Some(&right),
-        bottom.as_deref(),
-    );
+    let block = chrome::panel(theme, g, &title, focused, Some(&right), bottom.as_deref());
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -779,8 +784,7 @@ pub(crate) fn render_thread_panel(
 
     let iw = inner.width as usize;
     let (head, list_area) = if gram == Grammar::Wide && inner.height > 1 {
-        let [h, rest] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+        let [h, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
         (Some(h), rest)
     } else {
         (None, inner)
@@ -795,14 +799,12 @@ pub(crate) fn render_thread_panel(
     // `ListItem`s — ratatui owns its widgets, so the borrow-free clone is the
     // cheapest shape it accepts.
     let items: Vec<ListItem> = {
-        let rows = s
-            .row_cache
-            .get(iw, threads_fingerprint(&s.threads), || {
-                s.threads
-                    .iter()
-                    .map(|t| thread_row(t, theme, g, &s.site, gram, iw))
-                    .collect()
-            });
+        let rows = s.row_cache.get(iw, threads_fingerprint(&s.threads), || {
+            s.threads
+                .iter()
+                .map(|t| thread_row(t, theme, g, &s.site, gram, iw))
+                .collect()
+        });
         rows.iter().map(|l| ListItem::new(l.clone())).collect()
     };
     let mut state = ListState::default().with_selected(Some(s.sel.min(s.threads.len() - 1)));
@@ -874,10 +876,14 @@ pub fn home_hints(s: &HomeState) -> Hints {
         ],
         0,
     );
-    creation_hints(hints, match s.focus {
-        Pane::Tree => forum_tree_creation_target(&s.tree).is_some_and(|node| node.thread_creation_permission() != Some(false)),
-        Pane::List => s.list.can_create_thread(),
-    })
+    creation_hints(
+        hints,
+        match s.focus {
+            Pane::Tree => forum_tree_creation_target(&s.tree)
+                .is_some_and(|node| node.thread_creation_permission() != Some(false)),
+            Pane::List => s.list.can_create_thread(),
+        },
+    )
 }
 
 pub fn home_key(s: &mut HomeState, key: KeyEvent) -> Action {
@@ -900,12 +906,7 @@ pub fn home_key(s: &mut HomeState, key: KeyEvent) -> Action {
             }
             let act = forum_tree_key(&mut s.tree, key);
             // A load lands in the right-hand pane, so the keyboard follows it.
-            if s.dual
-                && matches!(
-                    act,
-                    Action::OpenThreadList(..) | Action::OpenLatestThreads
-                )
-            {
+            if s.dual && matches!(act, Action::OpenThreadList(..) | Action::OpenLatestThreads) {
                 s.focus = Pane::List;
             }
             act
@@ -1011,8 +1012,10 @@ pub fn forum_tree_key(s: &mut ForumTreeState, key: KeyEvent) -> Action {
             // Path up to parent node in tree hierarchy
             if let Some(node) = s.nodes.get(s.sel)
                 && node.parent_node_id > 0
-                && let Some(parent_idx) =
-                    s.nodes.iter().position(|n| n.node_id == node.parent_node_id)
+                && let Some(parent_idx) = s
+                    .nodes
+                    .iter()
+                    .position(|n| n.node_id == node.parent_node_id)
             {
                 s.sel = parent_idx;
             }
@@ -1037,7 +1040,8 @@ pub fn forum_tree_key(s: &mut ForumTreeState, key: KeyEvent) -> Action {
                         .find(|(_, child)| child.node_type == "Forum")
                     {
                         s.sel = child_idx;
-                    } else if let Some((child_idx, _)) = category_descendants(&s.nodes, s.sel).next()
+                    } else if let Some((child_idx, _)) =
+                        category_descendants(&s.nodes, s.sel).next()
                     {
                         s.sel = child_idx;
                     } else {
@@ -1070,7 +1074,9 @@ pub fn forum_tree_key(s: &mut ForumTreeState, key: KeyEvent) -> Action {
             Action::LoadNodes
         }
         KeyCode::Char('N') => match forum_tree_creation_target(s) {
-            Some(node) if node.thread_creation_permission() != Some(false) => Action::StartNewThread(node.node_id),
+            Some(node) if node.thread_creation_permission() != Some(false) => {
+                Action::StartNewThread(node.node_id)
+            }
             Some(_) => Action::Notice("You cannot create a thread in this forum.".into()),
             None => Action::Notice("Pick a forum first.".into()),
         },
@@ -1101,7 +1107,9 @@ pub(crate) fn open_node_action(nodes: &[Node], id: u32, fallback_title: &str) ->
 /// built-in site's own wording, or a span sized to the list. Both halves are
 /// `'static` (a `Hint` is), so they come from a table rather than a format.
 pub(crate) fn quick_hint(site: &SiteConfig) -> Option<(&'static str, &'static str)> {
-    const SPANS: [&str; 9] = ["1", "1/2", "1/2/3", "1-4", "1-5", "1-6", "1-7", "1-8", "1-9"];
+    const SPANS: [&str; 9] = [
+        "1", "1/2", "1/2/3", "1-4", "1-5", "1-6", "1-7", "1-8", "1-9",
+    ];
     if site.is_builtin() && site.quick.len() == 3 {
         return Some(("1/2/3", "news/security/tutorials"));
     }
@@ -1121,7 +1129,9 @@ fn category_descendants(nodes: &[Node], index: usize) -> impl Iterator<Item = (u
     let mut rest = nodes.iter().enumerate().skip(index.saturating_add(1));
     let mut ended = id == 0;
     std::iter::from_fn(move || {
-        if ended { return None; }
+        if ended {
+            return None;
+        }
         let (index, node) = rest.next()?;
         if !members.contains(&node.parent_node_id) {
             ended = true;
@@ -1139,11 +1149,15 @@ pub(crate) fn category_forum(nodes: &[Node], id: u32) -> Option<&Node> {
 
 fn category_forum_at(nodes: &[Node], index: usize) -> Option<&Node> {
     let id = nodes.get(index)?.node_id;
-    if id == 0 { return None; }
+    if id == 0 {
+        return None;
+    }
     // Most categories begin with a forum; keep the per-frame hint lookup
     // allocation-free for that common shape.
     if let Some(child) = nodes.get(index + 1)
-        && child.parent_node_id == id && child.node_type == "Forum" && child.node_id != 0
+        && child.parent_node_id == id
+        && child.node_type == "Forum"
+        && child.node_id != 0
     {
         return Some(child);
     }
@@ -1169,11 +1183,8 @@ fn creation_hints(mut hints: Hints, allowed: bool) -> Hints {
 }
 
 pub fn forum_tree_hints(s: &ForumTreeState) -> Hints {
-    let mut keys: Vec<(&'static str, &'static str)> = vec![
-        ("Enter", "open"),
-        ("j/k", "move"),
-        ("h/l", "tree in/out"),
-    ];
+    let mut keys: Vec<(&'static str, &'static str)> =
+        vec![("Enter", "open"), ("j/k", "move"), ("h/l", "tree in/out")];
     keys.extend(quick_hint(&s.site));
     keys.extend([
         ("N", "new thread"),
@@ -1195,7 +1206,11 @@ pub fn forum_tree_hints(s: &ForumTreeState) -> Hints {
         ],
         0,
     );
-    creation_hints(hints, forum_tree_creation_target(s).is_some_and(|node| node.thread_creation_permission() != Some(false)))
+    creation_hints(
+        hints,
+        forum_tree_creation_target(s)
+            .is_some_and(|node| node.thread_creation_permission() != Some(false)),
+    )
 }
 
 pub fn render_forum_tree(
@@ -1213,9 +1228,7 @@ pub fn render_forum_tree(
 
 pub fn thread_list_key(s: &mut ThreadListState, key: KeyEvent) -> Action {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => {
-            Action::PopScreen
-        }
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => Action::PopScreen,
         KeyCode::Up | KeyCode::Char('k') => {
             if s.sel > 0 {
                 s.sel -= 1;
@@ -1272,13 +1285,9 @@ pub fn thread_list_key(s: &mut ThreadListState, key: KeyEvent) -> Action {
         },
         // node 0 is the synthetic "Latest posts" list: there is no real
         // forum to mark read or post a new thread into (issue #552).
-        KeyCode::Char('m') if s.node_id == 0 => {
-            Action::Notice("Pick a forum first.".into())
-        }
+        KeyCode::Char('m') if s.node_id == 0 => Action::Notice("Pick a forum first.".into()),
         KeyCode::Char('m') => Action::MarkForumRead(s.node_id),
-        KeyCode::Char('N') if s.node_id == 0 => {
-            Action::Notice("Pick a forum first.".into())
-        }
+        KeyCode::Char('N') if s.node_id == 0 => Action::Notice("Pick a forum first.".into()),
         KeyCode::Char('N') if !s.can_create_thread() => {
             Action::Notice("You cannot create a thread in this forum.".into())
         }
@@ -1501,13 +1510,17 @@ pub(crate) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<
     let mut end = 0;
     for span in spans {
         end += span.content.len();
-        if !span.content.is_empty() { ends.push((end, span.style)); }
+        if !span.content.is_empty() {
+            ends.push((end, span.style));
+        }
     }
     let mut span_index = 0;
     let mut logical = Vec::<Span<'static>>::new();
     let mut out = Vec::new();
     for (at, grapheme) in text.grapheme_indices(true) {
-        while ends[span_index].0 <= at { span_index += 1; }
+        while ends[span_index].0 <= at {
+            span_index += 1;
+        }
         if matches!(grapheme, "\n" | "\r\n" | "\r") {
             out.extend(wrap_logical_spans(&logical, width));
             logical.clear();
@@ -1671,7 +1684,12 @@ fn bbcode_lines(
     theme: &Theme,
     reveal_spoilers: bool,
 ) -> Vec<Vec<Span<'static>>> {
-    chunk_lines(&bbcode::render_at(src, origin), links, theme, reveal_spoilers)
+    chunk_lines(
+        &bbcode::render_at(src, origin),
+        links,
+        theme,
+        reveal_spoilers,
+    )
 }
 
 /// `bbcode_lines` over an already-parsed chunk stream. Split out so a screen
@@ -1704,13 +1722,19 @@ pub(crate) struct RuleWidth {
 
 impl Default for RuleWidth {
     fn default() -> Self {
-        RuleWidth { cells: 3, ascii: false }
+        RuleWidth {
+            cells: 3,
+            ascii: false,
+        }
     }
 }
 
 impl RuleWidth {
     pub fn of(cells: usize, g: &Glyphs) -> Self {
-        RuleWidth { cells, ascii: g.ascii }
+        RuleWidth {
+            cells,
+            ascii: g.ascii,
+        }
     }
 
     fn span(&self, theme: &Theme) -> Span<'static> {
@@ -1740,10 +1764,9 @@ pub(crate) fn chunk_lines_aligned(
     };
     for chunk in chunks {
         let chunk_align = match chunk {
-            Chunk::Text(_, st)
-            | Chunk::Link(_, _, st)
-            | Chunk::Attach(_, st)
-            | Chunk::Rule(st) => st.align,
+            Chunk::Text(_, st) | Chunk::Link(_, _, st) | Chunk::Attach(_, st) | Chunk::Rule(st) => {
+                st.align
+            }
             Chunk::Image { style, .. } => style.align,
         };
         if !matches!(chunk_align, common::bbcode::Align::Left) {
@@ -1768,7 +1791,10 @@ pub(crate) fn chunk_lines_aligned(
                         cur_align = chunk_align;
                     }
                     if !seg.is_empty() {
-                        current.push(Span::styled(seg.to_string(), style_from(theme, s, reveal_spoilers)));
+                        current.push(Span::styled(
+                            seg.to_string(),
+                            style_from(theme, s, reveal_spoilers),
+                        ));
                     }
                 }
             }
@@ -1783,7 +1809,10 @@ pub(crate) fn chunk_lines_aligned(
                         cur_align = chunk_align;
                     }
                     if !seg.is_empty() {
-                        current.push(Span::styled(seg.to_string(), style_from(theme, s, reveal_spoilers)));
+                        current.push(Span::styled(
+                            seg.to_string(),
+                            style_from(theme, s, reveal_spoilers),
+                        ));
                     }
                 }
                 // A link inside a hidden spoiler dims its marker too: the
@@ -1793,21 +1822,25 @@ pub(crate) fn chunk_lines_aligned(
                 } else {
                     link_style(theme)
                 };
-                current.push(Span::styled(
-                    format!(" [{}]", links.len()),
-                    marker_style,
-                ));
+                current.push(Span::styled(format!(" [{}]", links.len()), marker_style));
             }
             // The thread view has the real picture beside its own caption
             // (built from the API's attachment record), so here an image
             // reference stays what it has always been: the `[image]`
             // placeholder plus a numbered link for `o` / `1`-`9`.
-            Chunk::Image { url, link, style: s } => {
+            Chunk::Image {
+                url,
+                link,
+                style: s,
+            } => {
                 // #620: an image inside [URL=…] is anchored to that href —
                 // XF renders <a href=full><img src=thumb></a> — so the
                 // registered link opens the anchor, the picture still paints.
                 links.push(link.clone().unwrap_or_else(|| url.clone()));
-                current.push(Span::styled("[image]".to_string(), style_from(theme, s, reveal_spoilers)));
+                current.push(Span::styled(
+                    "[image]".to_string(),
+                    style_from(theme, s, reveal_spoilers),
+                ));
                 // The marker dims inside a hidden spoiler like the link
                 // marker does: an invisible picture must not invite o/1-9.
                 let marker_style = if s.spoiler && !reveal_spoilers {
@@ -1815,10 +1848,7 @@ pub(crate) fn chunk_lines_aligned(
                 } else {
                     link_style(theme)
                 };
-                current.push(Span::styled(
-                    format!(" [{}]", links.len()),
-                    marker_style,
-                ));
+                current.push(Span::styled(format!(" [{}]", links.len()), marker_style));
             }
             Chunk::Attach(id, s) => {
                 current.push(Span::styled(
@@ -1909,7 +1939,13 @@ impl ThreadViewState {
             offsets.push(lines.len());
             let number = self.post_number(i);
             let header_line = lines.len();
-            lines.push(post_header_line(post, number, theme, width, &self.site.bot_user_ids));
+            lines.push(post_header_line(
+                post,
+                number,
+                theme,
+                width,
+                &self.site.bot_user_ids,
+            ));
             // Only when the payload actually carries author details; a blank
             // dim row under every header just loosens the card for nothing.
             let meta = post_meta_line(post, theme, width);
@@ -1990,15 +2026,18 @@ impl ThreadViewState {
             // it, and what makes scrolling, `n`/`N` and the click map agree
             // about where the picture is.
             let push_image = |lines: &mut Vec<Line<'static>>,
-                                  slots: &mut Vec<Slot>,
-                                  image_lines: &mut Vec<(usize, usize)>,
-                                  img: &PostImage,
-                                  n: usize| {
+                              slots: &mut Vec<Slot>,
+                              image_lines: &mut Vec<(usize, usize)>,
+                              img: &PostImage,
+                              n: usize| {
                 let dims = match img.px {
                     Some((w, h)) => format!(" \u{00B7} {w}\u{00D7}{h}"),
                     None => String::new(),
                 };
-                let caption = format!("{} {}{dims} \u{00B7} {n} of {image_count}", g.image, img.label);
+                let caption = format!(
+                    "{} {}{dims} \u{00B7} {n} of {image_count}",
+                    g.image, img.label
+                );
                 // The caption row is a click target on every tier: on the
                 // text tier it is the only thing the picture has.
                 image_lines.push((lines.len(), n));
@@ -2114,7 +2153,10 @@ impl ThreadViewState {
                 lines.push(gutter(vec![
                     Span::styled(format!("{} ", g.play), link_style(theme)),
                     Span::styled(
-                        truncate(&format!("{site} video \u{2014} open"), body_w.saturating_sub(2)),
+                        truncate(
+                            &format!("{site} video \u{2014} open"),
+                            body_w.saturating_sub(2),
+                        ),
                         link_style(theme).add_modifier(Modifier::BOLD),
                     ),
                 ]));
@@ -2210,7 +2252,10 @@ fn thread_summary_line(
     if let Some(prefix) = &s.thread.prefix
         && !prefix.trim().is_empty()
     {
-        spans.push(chrome::chip(theme, &chrome::short_prefix(prefix, &s.site.prefix_strip)));
+        spans.push(chrome::chip(
+            theme,
+            &chrome::short_prefix(prefix, &s.site.prefix_strip),
+        ));
         spans.push(Span::raw(" "));
     }
     let mut meta = String::new();
@@ -2249,7 +2294,13 @@ fn thread_summary_line(
 /// timestamp + `#n` on the right.
 /// `bots` are the site's bot accounts: their posts wear an `AI` chip so a
 /// member never mistakes generated text for a human answer.
-fn post_header_line(post: &Post, number: u64, theme: &Theme, width: usize, bots: &[u32]) -> Line<'static> {
+fn post_header_line(
+    post: &Post,
+    number: u64,
+    theme: &Theme,
+    width: usize,
+    bots: &[u32],
+) -> Line<'static> {
     let mut spans = vec![
         Span::raw(" "),
         // Phase 3 paints an avatar image over exactly these four cells; the
@@ -2314,11 +2365,7 @@ fn post_meta_line(post: &Post, theme: &Theme, width: usize) -> Option<Line<'stat
 
 /// Left spans, then padding, then right spans — clipped to `width` with the
 /// left side losing cells first (the right side is short and load-bearing).
-fn justify(
-    left: Vec<Span<'static>>,
-    right: Vec<Span<'static>>,
-    width: usize,
-) -> Line<'static> {
+fn justify(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
     let lw: usize = left.iter().map(Span::width).sum();
     let rw: usize = right.iter().map(Span::width).sum();
     if rw == 0 {
@@ -2370,9 +2417,7 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
         return link_popup_key(s, key);
     }
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => {
-            Action::PopScreen
-        }
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => Action::PopScreen,
         KeyCode::Up | KeyCode::Char('k') => {
             s.scroll = s.scroll.saturating_sub(1);
             Action::None
@@ -2472,9 +2517,7 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
             Action::Notice("You cannot reply to this thread.".into())
         }
         KeyCode::Char('Q') => match s.posts.get(s.sel_post) {
-            Some(post) => {
-                Action::StartReplyQuoting(s.thread.clone(), Box::new(post.clone()))
-            }
+            Some(post) => Action::StartReplyQuoting(s.thread.clone(), Box::new(post.clone())),
             None => Action::Notice("No post selected to quote.".into()),
         },
         // `r` is taken by "reply", so retrying a failed load (or, while
@@ -2514,27 +2557,21 @@ pub fn thread_view_key(s: &mut ThreadViewState, key: KeyEvent) -> Action {
             }
         }
         KeyCode::Char('P') => Action::OpenProfile(s.thread.user_id, s.thread.username.clone()),
-        KeyCode::Char('l') => {
-            match s.posts.get(s.sel_post).or_else(|| s.posts.first()) {
-                Some(post) if post.can_react() => Action::ReactPost(post.post_id),
-                Some(_) => Action::Notice("You cannot react to this post.".into()),
-                None => Action::None,
-            }
-        }
-        KeyCode::Char('v') => {
-            match s.posts.get(s.sel_post) {
-                Some(post) if post.can_vote("up") => Action::VotePost(post.post_id, "up".into()),
-                Some(_) => Action::Notice("You cannot upvote this post.".into()),
-                None => Action::None,
-            }
-        }
-        KeyCode::Char('V') => {
-            match s.posts.get(s.sel_post) {
-                Some(post) if post.can_vote("down") => Action::VotePost(post.post_id, "down".into()),
-                Some(_) => Action::Notice("You cannot downvote this post.".into()),
-                None => Action::None,
-            }
-        }
+        KeyCode::Char('l') => match s.posts.get(s.sel_post).or_else(|| s.posts.first()) {
+            Some(post) if post.can_react() => Action::ReactPost(post.post_id),
+            Some(_) => Action::Notice("You cannot react to this post.".into()),
+            None => Action::None,
+        },
+        KeyCode::Char('v') => match s.posts.get(s.sel_post) {
+            Some(post) if post.can_vote("up") => Action::VotePost(post.post_id, "up".into()),
+            Some(_) => Action::Notice("You cannot upvote this post.".into()),
+            None => Action::None,
+        },
+        KeyCode::Char('V') => match s.posts.get(s.sel_post) {
+            Some(post) if post.can_vote("down") => Action::VotePost(post.post_id, "down".into()),
+            Some(_) => Action::Notice("You cannot downvote this post.".into()),
+            None => Action::None,
+        },
         KeyCode::Char('n') => {
             if s.sel_post + 1 < s.posts.len() {
                 s.sel_post += 1;
@@ -2669,7 +2706,11 @@ pub fn thread_view_hints(s: &ThreadViewState) -> Hints {
     // like/vote, page keys that may not even be live yet) describes actions
     // over content that never loaded — advertise the one key that works.
     if s.error.is_some() {
-        return Hints::with_short(&[("R", "retry"), ("Esc", "back")], &[("R", "retry"), ("Esc", "back")], 0);
+        return Hints::with_short(
+            &[("R", "retry"), ("Esc", "back")],
+            &[("R", "retry"), ("Esc", "back")],
+            0,
+        );
     }
     if s.link_popup {
         return Hints::with_short(
@@ -2714,12 +2755,25 @@ pub fn thread_view_hints(s: &ThreadViewState) -> Hints {
     }
     if let Some(post) = sel.filter(|p| can_mark_solution(s, p)) {
         // The call toggles, so the cap says which way this press goes.
-        keys.push(("S", if s.thread.solution_post_id() == Some(post.post_id) { "unmark solution" } else { "solution" }));
+        keys.push((
+            "S",
+            if s.thread.solution_post_id() == Some(post.post_id) {
+                "unmark solution"
+            } else {
+                "solution"
+            },
+        ));
     }
     keys.extend_from_slice(&[("j/k", "scroll"), ("n/N", "post")]);
-    if can_react { keys.push(("l", "like")); }
-    if can_upvote { keys.push(("v", "vote")); }
-    if can_downvote && !can_upvote { keys.push(("V", "downvote")); }
+    if can_react {
+        keys.push(("l", "like"));
+    }
+    if can_upvote {
+        keys.push(("v", "vote"));
+    }
+    if can_downvote && !can_upvote {
+        keys.push(("V", "downvote"));
+    }
     keys.extend_from_slice(&[
         ("o", "links"),
         ("x", if s.reveal_spoilers { "hide" } else { "reveal" }),
@@ -2727,11 +2781,17 @@ pub fn thread_view_hints(s: &ThreadViewState) -> Hints {
         ("Esc", "back"),
     ]);
     let mut short = Vec::with_capacity(8);
-    if can_reply { short.push(("r", "reply")); }
+    if can_reply {
+        short.push(("r", "reply"));
+    }
     short.extend_from_slice(&[("j/k", ""), ("n/N", "post")]);
-    if can_react { short.push(("l", "like")); }
+    if can_react {
+        short.push(("l", "like"));
+    }
     short.extend_from_slice(&[
-        ("o", "links"), ("x", if s.reveal_spoilers { "hide" } else { "reveal" }), ("Esc", "back"),
+        ("o", "links"),
+        ("x", if s.reveal_spoilers { "hide" } else { "reveal" }),
+        ("Esc", "back"),
     ]);
     // A permission change may make edit/delete/video the primary action.
     // Keep that same primary cap first in both width variants.
@@ -2740,7 +2800,11 @@ pub fn thread_view_hints(s: &ThreadViewState) -> Hints {
     {
         short.insert(0, *primary);
     }
-    Hints { keys, short, primary: 0 }
+    Hints {
+        keys,
+        short,
+        primary: 0,
+    }
 }
 
 pub fn thread_view_crumb(s: &ThreadViewState) -> String {
@@ -2856,14 +2920,13 @@ pub fn render_thread_view(
         if line >= s.lines.len() {
             break;
         }
-        let Some(post) = s
-            .post_line_offsets
-            .iter()
-            .rposition(|&start| start <= line)
-        else {
+        let Some(post) = s.post_line_offsets.iter().rposition(|&start| start <= line) else {
             continue;
         };
-        hits.push(Rect::new(inner.x, inner.y + row, inner.width, 1), Hit::Post(post));
+        hits.push(
+            Rect::new(inner.x, inner.y + row, inner.width, 1),
+            Hit::Post(post),
+        );
     }
     for &(line, n) in &s.link_lines {
         if line < s.scroll || line >= s.scroll + inner.height as usize {
@@ -2894,14 +2957,14 @@ pub fn render_thread_view(
             // a pasted log into a clickable link (#50). theme.link() never
             // omits it, and no body/code/dim style carries it.
             if span.style.fg == link_mark.fg
-                && span.style.add_modifier.contains(ratatui::style::Modifier::UNDERLINED)
+                && span
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)
                 && let Some(n) = link_marker_index(&span.content)
                 && let Some(url) = s.links.get(n - 1)
             {
-                hits.push(
-                    Rect::new(x, inner.y + row, w, 1),
-                    Hit::Link(url.clone()),
-                );
+                hits.push(Rect::new(x, inner.y + row, w, 1), Hit::Link(url.clone()));
             }
             x = x.saturating_add(w);
         }
@@ -2968,12 +3031,16 @@ pub fn render_thread_view(
     }
 
     if s.link_popup {
-        let popup_area = super::centered_box(
-            area,
-            area.width.min(70),
-            (s.links.len() as u16 + 4).min(20),
+        let popup_area =
+            super::centered_box(area, area.width.min(70), (s.links.len() as u16 + 4).min(20));
+        let popup = chrome::panel(
+            theme,
+            g,
+            "Links",
+            true,
+            Some("Enter open \u{00B7} Esc close"),
+            None,
         );
-        let popup = chrome::panel(theme, g, "Links", true, Some("Enter open \u{00B7} Esc close"), None);
         let p_inner = popup.inner(popup_area);
         f.render_widget(ratatui::widgets::Clear, popup_area);
         f.render_widget(popup, popup_area);
@@ -3104,7 +3171,14 @@ mod tests {
             discussion_open: true,
             ..Default::default()
         };
-        let row = text(&thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), gram, 78));
+        let row = text(&thread_row(
+            &t,
+            &theme,
+            &UNICODE,
+            &SiteConfig::windowsforum(),
+            gram,
+            78,
+        ));
         assert_eq!(row.chars().count(), 78);
         assert_eq!(col(&row, "HItest"), Some(56));
         // Replies are right-aligned in a 4-cell column ending at 69.
@@ -3123,7 +3197,14 @@ mod tests {
             discussion_open: true,
             ..Default::default()
         };
-        let line = thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), Grammar::Wide, 81);
+        let line = thread_row(
+            &t,
+            &theme,
+            &UNICODE,
+            &SiteConfig::windowsforum(),
+            Grammar::Wide,
+            81,
+        );
         let row = text(&line);
         assert_eq!(line.width(), 81, "{row}");
         assert_eq!(&row[..1], " ");
@@ -3150,7 +3231,14 @@ mod tests {
             discussion_open: true,
             ..Default::default()
         };
-        let line = thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), Grammar::Wide, 81);
+        let line = thread_row(
+            &t,
+            &theme,
+            &UNICODE,
+            &SiteConfig::windowsforum(),
+            Grammar::Wide,
+            81,
+        );
         assert_eq!(line.width(), 81, "{}", text(&line));
     }
 
@@ -3169,8 +3257,20 @@ mod tests {
         };
         for inner in 42usize..=120 {
             for gram in [Grammar::Narrow, Grammar::Wide] {
-                let line = thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), gram, inner);
-                assert_eq!(line.width(), inner, "state + prefix at inner {inner}: {}", text(&line));
+                let line = thread_row(
+                    &t,
+                    &theme,
+                    &UNICODE,
+                    &SiteConfig::windowsforum(),
+                    gram,
+                    inner,
+                );
+                assert_eq!(
+                    line.width(),
+                    inner,
+                    "state + prefix at inner {inner}: {}",
+                    text(&line)
+                );
             }
         }
     }
@@ -3187,12 +3287,29 @@ mod tests {
         };
         for inner in [40usize, 60, 71, 78, 81, 120] {
             for gram in [Grammar::Wide, Grammar::Narrow] {
-                let line = thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), gram, inner);
+                let line = thread_row(
+                    &t,
+                    &theme,
+                    &UNICODE,
+                    &SiteConfig::windowsforum(),
+                    gram,
+                    inner,
+                );
                 assert_eq!(line.width(), inner, "{gram:?} at inner {inner}");
             }
         }
-        let row = text(&thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), Grammar::Wide, 81));
-        assert!(row.contains('\u{2026}'), "long titles clip with an ellipsis");
+        let row = text(&thread_row(
+            &t,
+            &theme,
+            &UNICODE,
+            &SiteConfig::windowsforum(),
+            Grammar::Wide,
+            81,
+        ));
+        assert!(
+            row.contains('\u{2026}'),
+            "long titles clip with an ellipsis"
+        );
         // The author column clips too rather than pushing the age column.
         assert_eq!(col(&row, "Starwind"), Some(51));
         assert_eq!(row.chars().count(), 81);
@@ -3201,16 +3318,25 @@ mod tests {
     #[test]
     fn type_mark_covers_every_thread_kind_including_closed() {
         let theme = Theme::truecolor();
-        let open = Thread { discussion_open: true, ..Default::default() };
+        let open = Thread {
+            discussion_open: true,
+            ..Default::default()
+        };
         let mark = |t: &Thread| type_mark(t, &theme, &UNICODE).0;
 
         // A plain open discussion has no type glyph at all.
         assert_eq!(mark(&open), " ");
         // Closed threads are the last arm: everything else outranks them.
-        let closed = Thread { discussion_open: false, ..Default::default() };
+        let closed = Thread {
+            discussion_open: false,
+            ..Default::default()
+        };
         assert_eq!(mark(&closed), UNICODE.locked);
         assert_eq!(
-            mark(&Thread { sticky: true, ..closed.clone() }),
+            mark(&Thread {
+                sticky: true,
+                ..closed.clone()
+            }),
             UNICODE.sticky,
             "sticky outranks locked"
         );
@@ -3223,7 +3349,14 @@ mod tests {
             "article outranks locked"
         );
         // ...and it reaches the rendered row, dim, in the type column.
-        let row = text(&thread_row(&closed, &theme, &UNICODE, &SiteConfig::windowsforum(), Grammar::Wide, 81));
+        let row = text(&thread_row(
+            &closed,
+            &theme,
+            &UNICODE,
+            &SiteConfig::windowsforum(),
+            Grammar::Wide,
+            81,
+        ));
         assert_eq!(row.chars().nth(3), Some('\u{2298}'), "type column: {row}");
     }
 
@@ -3249,7 +3382,14 @@ mod tests {
             };
             for inner in 40usize..=120 {
                 for gram in [Grammar::Wide, Grammar::Narrow] {
-                    let line = thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), gram, inner);
+                    let line = thread_row(
+                        &t,
+                        &theme,
+                        &UNICODE,
+                        &SiteConfig::windowsforum(),
+                        gram,
+                        inner,
+                    );
                     if gram.title_width(inner) >= 4 {
                         assert_eq!(line.width(), inner, "{title:?} {gram:?} at inner {inner}");
                     } else {
@@ -3292,7 +3432,14 @@ mod tests {
             ..Default::default()
         };
         for inner in 0..40usize {
-            let line = thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), Grammar::Wide, inner);
+            let line = thread_row(
+                &t,
+                &theme,
+                &UNICODE,
+                &SiteConfig::windowsforum(),
+                Grammar::Wide,
+                inner,
+            );
             assert!(line.width() <= inner, "overflowed at inner {inner}");
         }
     }
@@ -3343,7 +3490,10 @@ mod tests {
         let mut s = base();
         s.page = 4;
         let act = thread_list_key(&mut s, KeyEvent::from(KeyCode::Char('[')));
-        assert!(matches!(act, Action::LoadForum(4, 1)), "[ steps back a window");
+        assert!(
+            matches!(act, Action::LoadForum(4, 1)),
+            "[ steps back a window"
+        );
 
         // The window can run past the end: nothing to turn to then.
         let mut s = base();
@@ -3479,9 +3629,18 @@ mod tests {
     #[test]
     fn the_quick_block_offers_ask_the_ai_only_where_the_site_has_it() {
         let theme = Theme::truecolor();
-        let mut s = ForumTreeState { nodes: sample_nodes(), ..Default::default() };
-        assert!(matches!(forum_tree_key(&mut s, key('A')), Action::OpenAskAi));
-        let mut h = HomeState { focus: Pane::List, ..Default::default() };
+        let mut s = ForumTreeState {
+            nodes: sample_nodes(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            forum_tree_key(&mut s, key('A')),
+            Action::OpenAskAi
+        ));
+        let mut h = HomeState {
+            focus: Pane::List,
+            ..Default::default()
+        };
         assert!(matches!(home_key(&mut h, key('A')), Action::OpenAskAi));
 
         let mut other = SiteConfig::blank("other");
@@ -3489,7 +3648,10 @@ mod tests {
         s.site = std::sync::Arc::new(other);
         let rows = forum_rows(&s, 0, &theme, &UNICODE, 35);
         assert!(!rows.iter().any(|r| text(&r.line).contains("Ask the AI")));
-        assert!(!matches!(forum_tree_key(&mut s, key('A')), Action::OpenAskAi));
+        assert!(!matches!(
+            forum_tree_key(&mut s, key('A')),
+            Action::OpenAskAi
+        ));
     }
 
     #[test]
@@ -3560,20 +3722,45 @@ mod tests {
         let mut s = home_with_data();
 
         let mut wide = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
-        wide.draw(|f| render_home(&mut s, f, f.area(), &theme, &UNICODE, &mut crate::hit::HitMap::default()))
-            .expect("draw");
+        wide.draw(|f| {
+            render_home(
+                &mut s,
+                f,
+                f.area(),
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            )
+        })
+        .expect("draw");
         assert!(s.dual);
         assert_eq!(s.tree_rect, Rect::new(0, 0, TREE_PANE_COLS, 24));
-        assert_eq!(s.list_rect, Rect::new(TREE_PANE_COLS, 0, 120 - TREE_PANE_COLS, 24));
+        assert_eq!(
+            s.list_rect,
+            Rect::new(TREE_PANE_COLS, 0, 120 - TREE_PANE_COLS, 24)
+        );
 
         // Narrow: one panel, the focused one (List here).
         let mut narrow = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
         narrow
-            .draw(|f| render_home(&mut s, f, f.area(), &theme, &UNICODE, &mut crate::hit::HitMap::default()))
+            .draw(|f| {
+                render_home(
+                    &mut s,
+                    f,
+                    f.area(),
+                    &theme,
+                    &UNICODE,
+                    &mut crate::hit::HitMap::default(),
+                )
+            })
             .expect("draw");
         assert!(!s.dual);
         assert_eq!(s.list_rect, Rect::new(0, 0, 80, 24));
-        assert_eq!(s.tree_rect, Rect::default(), "the hidden pane takes no wheel");
+        assert_eq!(
+            s.tree_rect,
+            Rect::default(),
+            "the hidden pane takes no wheel"
+        );
     }
 
     /// The list panel's row cache (#23): an unchanged frame must not
@@ -3605,26 +3792,45 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 8)).expect("terminal");
         let draw_once = |s: &mut Screen, term: &mut Terminal<TestBackend>| {
             term.draw(|f| {
-                s.render(f, f.area(), &theme, &UNICODE, &mut crate::hit::HitMap::default());
+                s.render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &UNICODE,
+                    &mut crate::hit::HitMap::default(),
+                );
             })
             .expect("draw");
         };
         draw_once(&mut s, &mut term);
-        let Screen::ThreadList(list) = &s else { panic!("thread list") };
+        let Screen::ThreadList(list) = &s else {
+            panic!("thread list")
+        };
         assert_eq!(list.row_cache.rebuilds(), 1);
         draw_once(&mut s, &mut term);
-        let Screen::ThreadList(list) = &s else { panic!("thread list") };
-        assert_eq!(list.row_cache.rebuilds(), 1, "an unchanged frame must not reformat");
+        let Screen::ThreadList(list) = &s else {
+            panic!("thread list")
+        };
+        assert_eq!(
+            list.row_cache.rebuilds(),
+            1,
+            "an unchanged frame must not reformat"
+        );
 
         if let Screen::ThreadList(list) = &mut s {
             list.threads[1].title = "Edited in place".into();
         }
         draw_once(&mut s, &mut term);
-        let Screen::ThreadList(list) = &s else { panic!("thread list") };
+        let Screen::ThreadList(list) = &s else {
+            panic!("thread list")
+        };
         assert_eq!(list.row_cache.rebuilds(), 2);
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("Edited in place"), "row must reflect the change: {text}");
+        assert!(
+            text.contains("Edited in place"),
+            "row must reflect the change: {text}"
+        );
     }
 
     /// Render a screen headless and return the rows as strings.
@@ -3633,7 +3839,13 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(w, h)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            screen.render(f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default());
+            screen.render(
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let buf = term.backend().buffer().clone();
@@ -3683,7 +3895,13 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            screen.render(f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default());
+            screen.render(
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let buf = term.backend().buffer().clone();
@@ -3710,11 +3928,7 @@ mod tests {
         for (i, r) in rows.iter().enumerate() {
             assert_eq!(r.chars().count(), 80, "row {i} is not the frame width");
         }
-        assert!(
-            rows[0].contains("Windows Help and Support"),
-            "{}",
-            rows[0]
-        );
+        assert!(rows[0].contains("Windows Help and Support"), "{}", rows[0]);
         // Narrow grammar: no column-header row, so row 1 is a thread already.
         assert!(!rows[1].contains("Started by"), "{}", rows[1]);
         assert!(rows[1].contains("How do I control"), "{}", rows[1]);
@@ -3733,7 +3947,15 @@ mod tests {
 
     #[test]
     fn home_renders_at_absurd_sizes_without_panicking() {
-        for (w, h) in [(120u16, 36u16), (110, 30), (109, 30), (80, 24), (40, 10), (20, 5), (4, 3)] {
+        for (w, h) in [
+            (120u16, 36u16),
+            (110, 30),
+            (109, 30),
+            (80, 24),
+            (40, 10),
+            (20, 5),
+            (4, 3),
+        ] {
             let mut screen = Screen::Home(home_with_data());
             let rows = render_rows(&mut screen, w, h);
             assert_eq!(rows.len(), h as usize);
@@ -3753,7 +3975,10 @@ mod tests {
 
         // Enter on a forum asks the app to load, and focus follows the load.
         let act = home_key(&mut h, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(act, Action::OpenThreadList(302, _)), "sel is the help forum");
+        assert!(
+            matches!(act, Action::OpenThreadList(302, _)),
+            "sel is the help forum"
+        );
         assert_eq!(h.focus, Pane::List);
 
         // h / Left return focus to the tree instead of popping the screen.
@@ -3767,28 +3992,49 @@ mod tests {
         for focus in [Pane::Tree, Pane::List] {
             let mut h = home_with_data();
             h.focus = focus;
-            assert!(matches!(home_key(&mut h, key('1')), Action::OpenThreadList(4, _)));
-            assert!(matches!(home_key(&mut h, key('2')), Action::OpenThreadList(84, _)));
+            assert!(matches!(
+                home_key(&mut h, key('1')),
+                Action::OpenThreadList(4, _)
+            ));
+            assert!(matches!(
+                home_key(&mut h, key('2')),
+                Action::OpenThreadList(84, _)
+            ));
             assert!(matches!(
                 home_key(&mut h, key('3')),
                 Action::OpenThreadList(305, _)
             ));
             let mut h = home_with_data();
             h.focus = focus;
-            assert!(matches!(home_key(&mut h, key('L')), Action::OpenLatestThreads));
+            assert!(matches!(
+                home_key(&mut h, key('L')),
+                Action::OpenLatestThreads
+            ));
             assert!(matches!(home_key(&mut h, key('q')), Action::Quit));
         }
         // `m` marks read in either pane: the pane's forum, or the one under
         // the tree cursor.
         let mut h = home_with_data();
         h.focus = Pane::Tree;
-        assert!(matches!(home_key(&mut h, key('m')), Action::MarkForumRead(302)));
+        assert!(matches!(
+            home_key(&mut h, key('m')),
+            Action::MarkForumRead(302)
+        ));
         // The list pane keeps its own verbs.
         let mut h = home_with_data();
         h.focus = Pane::List;
-        assert!(matches!(home_key(&mut h, key('m')), Action::MarkForumRead(302)));
-        assert!(matches!(home_key(&mut h, key('N')), Action::StartNewThread(302)));
-        assert!(matches!(home_key(&mut h, key('r')), Action::LoadForum(302, 1)));
+        assert!(matches!(
+            home_key(&mut h, key('m')),
+            Action::MarkForumRead(302)
+        ));
+        assert!(matches!(
+            home_key(&mut h, key('N')),
+            Action::StartNewThread(302)
+        ));
+        assert!(matches!(
+            home_key(&mut h, key('r')),
+            Action::LoadForum(302, 1)
+        ));
         assert!(matches!(
             home_key(&mut h, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Action::OpenThread(t) if t.thread_id == 1
@@ -3797,7 +4043,10 @@ mod tests {
         let mut h = home_with_data();
         h.focus = Pane::Tree;
         assert!(matches!(home_key(&mut h, key('r')), Action::LoadNodes));
-        assert!(matches!(home_key(&mut h, key('N')), Action::StartNewThread(302)));
+        assert!(matches!(
+            home_key(&mut h, key('N')),
+            Action::StartNewThread(302)
+        ));
     }
 
     /// Issue #552: "Latest posts" (node 0) has no real forum behind it — `N`
@@ -3806,18 +4055,43 @@ mod tests {
     /// either cap while node 0 is showing.
     #[test]
     fn n_and_m_on_latest_posts_refuse_with_a_hint_and_hide_from_the_bar() {
-        let mut list = ThreadListState { node_id: 0, title: "Latest posts".into(), ..Default::default() };
-        assert!(matches!(thread_list_key(&mut list, key('N')), Action::Notice(msg) if msg.contains("forum")));
-        assert!(matches!(thread_list_key(&mut list, key('m')), Action::Notice(msg) if msg.contains("forum")));
+        let mut list = ThreadListState {
+            node_id: 0,
+            title: "Latest posts".into(),
+            ..Default::default()
+        };
+        assert!(
+            matches!(thread_list_key(&mut list, key('N')), Action::Notice(msg) if msg.contains("forum"))
+        );
+        assert!(
+            matches!(thread_list_key(&mut list, key('m')), Action::Notice(msg) if msg.contains("forum"))
+        );
 
         let hints = thread_list_hints(&list);
-        assert!(!hints.keys.iter().any(|(k, _)| *k == "N" || *k == "m"), "{:?}", hints.keys);
-        assert!(!hints.short.iter().any(|(k, _)| *k == "N" || *k == "m"), "{:?}", hints.short);
+        assert!(
+            !hints.keys.iter().any(|(k, _)| *k == "N" || *k == "m"),
+            "{:?}",
+            hints.keys
+        );
+        assert!(
+            !hints.short.iter().any(|(k, _)| *k == "N" || *k == "m"),
+            "{:?}",
+            hints.short
+        );
 
         // A real forum keeps both keys, in the bar and in behavior.
-        let mut real = ThreadListState { node_id: 302, ..Default::default() };
-        assert!(matches!(thread_list_key(&mut real, key('N')), Action::StartNewThread(302)));
-        assert!(matches!(thread_list_key(&mut real, key('m')), Action::MarkForumRead(302)));
+        let mut real = ThreadListState {
+            node_id: 302,
+            ..Default::default()
+        };
+        assert!(matches!(
+            thread_list_key(&mut real, key('N')),
+            Action::StartNewThread(302)
+        ));
+        assert!(matches!(
+            thread_list_key(&mut real, key('m')),
+            Action::MarkForumRead(302)
+        ));
         let hints = thread_list_hints(&real);
         assert!(hints.keys.iter().any(|(k, _)| *k == "N"));
         assert!(hints.keys.iter().any(|(k, _)| *k == "m"));
@@ -3880,8 +4154,7 @@ mod tests {
                     post_id: 202,
                     user_id: 125_694,
                     username: "WindowsForum AI".into(),
-                    message: "Microsoft Edge supports a daily update-suppression window."
-                        .into(),
+                    message: "Microsoft Edge supports a daily update-suppression window.".into(),
                     reaction_score: 2,
                     vote_score: 1,
                     user: Some(User {
@@ -3925,16 +4198,13 @@ mod tests {
         s.rebuild_lines(&theme, &crate::glyph::detect());
 
         // Hidden by default: the spoiler run paints black-on-black...
-        let hidden = s
-            .lines
-            .iter()
-            .any(|l| {
-                l.spans.iter().any(|sp| {
-                    sp.style.bg == Some(ratatui::style::Color::Black)
-                        && sp.style.fg == Some(ratatui::style::Color::Black)
-                        && sp.content.contains("secret")
-                })
-            });
+        let hidden = s.lines.iter().any(|l| {
+            l.spans.iter().any(|sp| {
+                sp.style.bg == Some(ratatui::style::Color::Black)
+                    && sp.style.fg == Some(ratatui::style::Color::Black)
+                    && sp.content.contains("secret")
+            })
+        });
         assert!(hidden, "the spoiler body must be hidden by default");
 
         // ...and `x` reveals it with the text's own colours.
@@ -3942,26 +4212,26 @@ mod tests {
         assert!(s.reveal_spoilers, "the flag flipped");
         assert_eq!(s.width, 0, "the toggle must force rebuild_lines");
         s.rebuild_lines(&theme, &crate::glyph::detect());
-        let revealed = s
-            .lines
-            .iter()
-            .any(|l| {
-                l.spans.iter().any(|sp| {
-                    sp.content.contains("secret")
-                        && sp.style.bg != Some(ratatui::style::Color::Black)
-                })
-            });
-        assert!(revealed, "the spoiler body must be readable after x: {:#?}", {
-            let mut rows = Vec::new();
-            for l in &s.lines {
-                for sp in &l.spans {
-                    if sp.content.contains("secret") {
-                        rows.push((sp.content.to_string(), sp.style));
+        let revealed = s.lines.iter().any(|l| {
+            l.spans.iter().any(|sp| {
+                sp.content.contains("secret") && sp.style.bg != Some(ratatui::style::Color::Black)
+            })
+        });
+        assert!(
+            revealed,
+            "the spoiler body must be readable after x: {:#?}",
+            {
+                let mut rows = Vec::new();
+                for l in &s.lines {
+                    for sp in &l.spans {
+                        if sp.content.contains("secret") {
+                            rows.push((sp.content.to_string(), sp.style));
+                        }
                     }
                 }
+                rows
             }
-            rows
-        });
+        );
 
         // And `x` again re-hides.
         thread_view_key(&mut s, key('x'));
@@ -3969,8 +4239,7 @@ mod tests {
         s.rebuild_lines(&theme, &crate::glyph::detect());
         let hidden_again = s.lines.iter().any(|l| {
             l.spans.iter().any(|sp| {
-                sp.content.contains("secret")
-                    && sp.style.fg == Some(ratatui::style::Color::Black)
+                sp.content.contains("secret") && sp.style.fg == Some(ratatui::style::Color::Black)
             })
         });
         assert!(hidden_again, "x re-hides");
@@ -3979,9 +4248,19 @@ mod tests {
     #[test]
     fn thread_view_hints_name_the_spoiler_toggle() {
         let mut s = thread_view_fixture();
-        assert!(thread_view_hints(&s).keys.iter().any(|(k, d)| *k == "x" && *d == "reveal"));
+        assert!(
+            thread_view_hints(&s)
+                .keys
+                .iter()
+                .any(|(k, d)| *k == "x" && *d == "reveal")
+        );
         thread_view_key(&mut s, key('x'));
-        assert!(thread_view_hints(&s).keys.iter().any(|(k, d)| *k == "x" && *d == "hide"));
+        assert!(
+            thread_view_hints(&s)
+                .keys
+                .iter()
+                .any(|(k, d)| *k == "x" && *d == "hide")
+        );
     }
 
     #[test]
@@ -3992,8 +4271,14 @@ mod tests {
 
         let act = thread_view_key(&mut s, key(']'));
         assert!(matches!(&act, Action::LoadThread(101, 3)));
-        assert!(matches!(thread_view_key(&mut s, key(']')), Action::Notice(_)));
-        assert!(matches!(thread_view_key(&mut s, key('[')), Action::Notice(_)));
+        assert!(matches!(
+            thread_view_key(&mut s, key(']')),
+            Action::Notice(_)
+        ));
+        assert!(matches!(
+            thread_view_key(&mut s, key('[')),
+            Action::Notice(_)
+        ));
         s.loading = false;
         let act = thread_view_key(&mut s, key('['));
         assert!(matches!(&act, Action::LoadThread(101, 1)));
@@ -4002,10 +4287,16 @@ mod tests {
         // works once the reply lands.
         s.loading = true;
         let shift_r = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT);
-        assert!(matches!(thread_view_key(&mut s, shift_r), Action::Notice(_)));
+        assert!(matches!(
+            thread_view_key(&mut s, shift_r),
+            Action::Notice(_)
+        ));
         s.error = Some("timed out".into());
         assert!(
-            matches!(thread_view_key(&mut s, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Action::Notice(_)),
+            matches!(
+                thread_view_key(&mut s, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Action::Notice(_)
+            ),
             "Enter-retry must refuse while loading"
         );
         s.loading = false;
@@ -4029,7 +4320,11 @@ mod tests {
         assert!(all[0].contains("started by HItest"), "{}", all[0]);
         assert!(all[0].contains("686 views"), "{}", all[0]);
         assert!(all[0].contains("27 replies"), "{}", all[0]);
-        assert!(all[0].trim_end().ends_with("\u{2605} watching"), "{}", all[0]);
+        assert!(
+            all[0].trim_end().ends_with("\u{2605} watching"),
+            "{}",
+            all[0]
+        );
         assert_eq!(s.lines[0].width(), 118);
 
         // Post header: 4-cell avatar slot, bold name, AI + STAFF chips, #n.
@@ -4048,7 +4343,8 @@ mod tests {
         assert!(ai_header.contains(" STAFF "), "{ai_header}");
         assert!(ai_header.trim_end().ends_with("#2"), "{ai_header}");
         assert!(
-            all.iter().any(|l| l.contains("site assistant") && l.contains("48,102 posts")),
+            all.iter()
+                .any(|l| l.contains("site assistant") && l.contains("48,102 posts")),
             "meta line missing"
         );
 
@@ -4087,7 +4383,14 @@ mod tests {
         // The accent appears at render time on the selected post's rows only.
         let mut term = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
-            render_thread_view(&mut s, f, f.area(), &theme, &UNICODE, &mut crate::hit::HitMap::default());
+            render_thread_view(
+                &mut s,
+                f,
+                f.area(),
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let buf = term.backend().buffer().clone();
@@ -4104,7 +4407,10 @@ mod tests {
                 }
             }
         }
-        assert!(accent_rows > 0, "the selected post's gutter must paint accent");
+        assert!(
+            accent_rows > 0,
+            "the selected post's gutter must paint accent"
+        );
         assert!(faint_rows > 0, "the unselected post's gutter stays faint");
 
         // Issue #542's shape, under the new contract: `n` alone still moves
@@ -4114,7 +4420,10 @@ mod tests {
         s.width = 80; // pretend a previous render already settled this width
         thread_view_key(&mut s, key('n'));
         assert_eq!(s.sel_post, 1);
-        assert_eq!(s.width, 80, "a selection step must not invalidate the lines");
+        assert_eq!(
+            s.width, 80,
+            "a selection step must not invalidate the lines"
+        );
     }
 
     // ---------- inline images (phase 3) ----------
@@ -4180,12 +4489,19 @@ mod tests {
         assert!(all.iter().any(|l| l.contains("visible tail")), "{all:#?}");
         // The placeholder's [n] marker is dimmed, per the text path's own
         // rule - "an invisible picture must not invite o/1-9".
-        let marker_dim = s.lines.iter().find(|line| {
-            let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            joined.contains("[image]")
-        }).and_then(|line| {
-            line.spans.iter().find(|s| s.content == "[1]").map(|s| s.style)
-        });
+        let marker_dim = s
+            .lines
+            .iter()
+            .find(|line| {
+                let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                joined.contains("[image]")
+            })
+            .and_then(|line| {
+                line.spans
+                    .iter()
+                    .find(|s| s.content == "[1]")
+                    .map(|s| s.style)
+            });
         assert_eq!(
             marker_dim.map(|st| st.fg),
             Some(theme.dim().fg),
@@ -4218,26 +4534,42 @@ mod tests {
         // The visible picture keeps its display-order caption: two images,
         // the hidden one numbered first.
         assert!(joined.contains("2 of 2"), "{joined}");
-        assert!(!joined.contains("1 of 2"), "the hidden picture shows no caption: {joined}");
+        assert!(
+            !joined.contains("1 of 2"),
+            "the hidden picture shows no caption: {joined}"
+        );
     }
 
     #[test]
     fn text_tier_keeps_the_placeholder_line_and_says_which_digit_opens_it() {
         let theme = Theme::truecolor();
         let mut s = thread_view_with_attachments();
-        assert_eq!(s.images.tier, crate::images::Tier::Text, "default is tier 5");
+        assert_eq!(
+            s.images.tier,
+            crate::images::Tier::Text,
+            "default is tier 5"
+        );
         s.rebuild_lines(&theme, &UNICODE);
         let all: Vec<String> = s.lines.iter().map(text).collect();
 
         // The placeholder is unchanged, and `n of N` counts images only,
         // because the digits open images only.
         assert!(
-            all.iter().any(|l| l.contains("\u{25A3} winver command returns this.webp \u{00B7} 1152\u{00D7}720 \u{00B7} 1 of 2")),
+            all.iter().any(|l| l.contains(
+                "\u{25A3} winver command returns this.webp \u{00B7} 1152\u{00D7}720 \u{00B7} 1 of 2"
+            )),
             "{all:#?}"
         );
-        assert!(all.iter().any(|l| l.contains("second shot.png \u{00B7} 800\u{00D7}600 \u{00B7} 2 of 2")), "{all:#?}");
+        assert!(
+            all.iter()
+                .any(|l| l.contains("second shot.png \u{00B7} 800\u{00D7}600 \u{00B7} 2 of 2")),
+            "{all:#?}"
+        );
         // The log file is captioned but carries no index: no digit opens it.
-        let log = all.iter().find(|l| l.contains("dump.txt")).expect("log caption");
+        let log = all
+            .iter()
+            .find(|l| l.contains("dump.txt"))
+            .expect("log caption");
         assert!(!log.contains(" of "), "{log}");
 
         // The ThreadText.dc.html hint.
@@ -4255,9 +4587,14 @@ mod tests {
         let mut screen = Screen::ThreadView(s);
         let rows = render_rows(&mut screen, 120, 36);
         let joined = rows.join("\n");
-        assert!(joined.contains("winver command returns this.webp"), "{joined}");
+        assert!(
+            joined.contains("winver command returns this.webp"),
+            "{joined}"
+        );
         assert!(joined.contains("open them in your browser"), "{joined}");
-        let Screen::ThreadView(s) = &screen else { unreachable!() };
+        let Screen::ThreadView(s) = &screen else {
+            unreachable!()
+        };
         assert!(s.image_requests.is_empty(), "the text tier paints nothing");
     }
 
@@ -4273,8 +4610,14 @@ mod tests {
         let all: Vec<String> = s.lines.iter().map(text).collect();
 
         // Captions stay; the hint does not (there is a picture instead).
-        assert!(all.iter().any(|l| l.contains("winver command returns this.webp")));
-        assert!(!all.iter().any(|l| l.contains("open them in your browser")), "{all:#?}");
+        assert!(
+            all.iter()
+                .any(|l| l.contains("winver command returns this.webp"))
+        );
+        assert!(
+            !all.iter().any(|l| l.contains("open them in your browser")),
+            "{all:#?}"
+        );
 
         // Slots: the avatar (2x5 at column 1) then the two screenshots
         // (behind the gutter at column 3), never the log file.
@@ -4284,7 +4627,10 @@ mod tests {
         assert_eq!((avatar.x, avatar.cols, avatar.rows), (1, 5, 2));
 
         let shot = &s.image_slots[1];
-        assert_eq!(shot.key, "https://wf/thumb/1.png", "the thumbnail, not the full file");
+        assert_eq!(
+            shot.key, "https://wf/thumb/1.png",
+            "the thumbnail, not the full file"
+        );
         assert_eq!(shot.x, 3, "images sit behind the post gutter");
         assert_eq!(
             (shot.cols, shot.rows),
@@ -4299,7 +4645,9 @@ mod tests {
         // A frame turns the visible slots into absolute rects.
         let mut screen = Screen::ThreadView(s);
         let _ = render_rows(&mut screen, 120, 36);
-        let Screen::ThreadView(s) = &screen else { unreachable!() };
+        let Screen::ThreadView(s) = &screen else {
+            unreachable!()
+        };
         assert!(!s.image_requests.is_empty());
         let inner_x = 1u16; // panel border
         assert_eq!(s.image_requests[0].rect.x, inner_x + 1, "avatar column");
@@ -4329,7 +4677,9 @@ mod tests {
         // the border instead of being clipped by it.
         let mut screen = Screen::ThreadView(s);
         let _ = render_rows(&mut screen, 120, 20);
-        let Screen::ThreadView(s) = &screen else { unreachable!() };
+        let Screen::ThreadView(s) = &screen else {
+            unreachable!()
+        };
         let keys: Vec<&str> = s.image_requests.iter().map(|r| r.key.as_str()).collect();
         assert!(keys.contains(&"https://wf/thumb/1.png"), "{keys:?}");
         assert!(
@@ -4338,7 +4688,10 @@ mod tests {
         );
         for req in &s.image_requests {
             assert!(req.rect.y >= 1, "an image escaped the top border: {req:?}");
-            assert!(req.rect.bottom() <= 19, "an image escaped the bottom: {req:?}");
+            assert!(
+                req.rect.bottom() <= 19,
+                "an image escaped the bottom: {req:?}"
+            );
         }
     }
 
@@ -4352,8 +4705,7 @@ mod tests {
         let theme = Theme::truecolor();
         let mut s = thread_view_fixture();
         s.posts[0].attachments.clear();
-        s.posts[0].message =
-            "Before.\n[MEDIA=youtube]dQw4w9WgXcQ[/MEDIA]\nAfter.".into();
+        s.posts[0].message = "Before.\n[MEDIA=youtube]dQw4w9WgXcQ[/MEDIA]\nAfter.".into();
         s.width = 0;
         s.rebuild_lines(&theme, &UNICODE);
 
@@ -4366,10 +4718,20 @@ mod tests {
             .iter()
             .position(|l| l.contains("YouTube video \u{2014} open"))
             .unwrap_or_else(|| panic!("{text:#?}"));
-        let before = text.iter().position(|l| l.contains("Before.")).expect("before");
-        let after = text.iter().position(|l| l.contains("After.")).expect("after");
+        let before = text
+            .iter()
+            .position(|l| l.contains("Before."))
+            .expect("before");
+        let after = text
+            .iter()
+            .position(|l| l.contains("After."))
+            .expect("after");
         assert!(before < row && row < after, "{before} {row} {after}");
-        assert!(text[row].contains('\u{25B6}'), "the play glyph: {:?}", text[row]);
+        assert!(
+            text[row].contains('\u{25B6}'),
+            "the play glyph: {:?}",
+            text[row]
+        );
 
         // And the row is mapped, so a click can play THAT video.
         assert_eq!(s.video_lines, vec![(row, 0)], "{:?}", s.video_lines);
@@ -4382,7 +4744,10 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
             .collect();
-        assert!(ascii.iter().any(|l| l.contains("> YouTube video")), "{ascii:#?}");
+        assert!(
+            ascii.iter().any(|l| l.contains("> YouTube video")),
+            "{ascii:#?}"
+        );
     }
 
     /// Two videos get two rows, mapped to their own indices, in message
@@ -4416,7 +4781,10 @@ mod tests {
 
         let caps: Vec<&str> = thread_view_hints(&s).keys.iter().map(|(k, _)| *k).collect();
         assert!(!caps.contains(&"W"), "no video, no cap: {caps:?}");
-        assert!(matches!(thread_view_key(&mut s, key('W')), Action::Notice(_)));
+        assert!(matches!(
+            thread_view_key(&mut s, key('W')),
+            Action::Notice(_)
+        ));
 
         // The `[MEDIA]` tag this site's posts actually use.
         s.posts[0].message = "Look:\n[MEDIA=youtube]dQw4w9WgXcQ[/MEDIA]\nGood, isn't it".into();
@@ -4461,9 +4829,10 @@ mod tests {
     fn linked_image_to_video_does_not_register_as_post_video_and_desync_play_rows() {
         let post = Post {
             post_id: 1,
-            message: "[URL=https://youtu.be/linked-img][IMG]https://example.com/pic.png[/IMG][/URL] \
+            message:
+                "[URL=https://youtu.be/linked-img][IMG]https://example.com/pic.png[/IMG][/URL] \
                       https://youtu.be/real-video"
-                .into(),
+                    .into(),
             ..Default::default()
         };
         let found = post_videos(Some(&post));
@@ -4486,8 +4855,14 @@ mod tests {
         // rather than sending a write that cannot succeed.
         let caps: Vec<&str> = thread_view_hints(&s).keys.iter().map(|(k, _)| *k).collect();
         assert!(!caps.contains(&"e") && !caps.contains(&"D"), "{caps:?}");
-        assert!(matches!(thread_view_key(&mut s, key('e')), Action::Notice(_)));
-        assert!(matches!(thread_view_key(&mut s, key('D')), Action::Notice(_)));
+        assert!(matches!(
+            thread_view_key(&mut s, key('e')),
+            Action::Notice(_)
+        ));
+        assert!(matches!(
+            thread_view_key(&mut s, key('D')),
+            Action::Notice(_)
+        ));
 
         // Permitted: both caps appear.
         s.posts[0].can_edit = true;
@@ -4507,7 +4882,11 @@ mod tests {
     #[test]
     fn mark_solution_is_gated_and_advertised() {
         let caps = |s: &ThreadViewState| -> Vec<(String, String)> {
-            thread_view_hints(s).keys.iter().map(|(k, l)| (k.to_string(), l.to_string())).collect()
+            thread_view_hints(s)
+                .keys
+                .iter()
+                .map(|(k, l)| (k.to_string(), l.to_string()))
+                .collect()
         };
         let has_s = |s: &ThreadViewState| caps(s).iter().any(|(k, _)| k == "S");
         let mut s = thread_view_fixture();
@@ -4516,41 +4895,69 @@ mod tests {
         s.thread.discussion_type = "discussion".into();
         s.viewer_id = 10;
         assert!(!has_s(&s), "not a question thread");
-        assert!(matches!(thread_view_key(&mut s, key('S')), Action::Notice(_)));
+        assert!(matches!(
+            thread_view_key(&mut s, key('S')),
+            Action::Notice(_)
+        ));
 
         s.thread.discussion_type = "question".into();
-        s.thread.question = Some(common::models::QuestionData { allow_question_actions: "no".into(), ..Default::default() });
+        s.thread.question = Some(common::models::QuestionData {
+            allow_question_actions: "no".into(),
+            ..Default::default()
+        });
         assert!(!has_s(&s), "the forum disallows question actions");
-        assert!(matches!(thread_view_key(&mut s, key('S')), Action::Notice(_)));
+        assert!(matches!(
+            thread_view_key(&mut s, key('S')),
+            Action::Notice(_)
+        ));
 
         s.thread.question.as_mut().unwrap().allow_question_actions = "yes".into();
         s.viewer_id = 99;
         assert!(!has_s(&s), "a reader who neither asked nor moderates");
-        assert!(matches!(thread_view_key(&mut s, key('S')), Action::Notice(_)));
+        assert!(matches!(
+            thread_view_key(&mut s, key('S')),
+            Action::Notice(_)
+        ));
         s.viewer_id = 0;
-        assert!(matches!(thread_view_key(&mut s, key('S')), Action::Notice(_)), "signed out");
+        assert!(
+            matches!(thread_view_key(&mut s, key('S')), Action::Notice(_)),
+            "signed out"
+        );
 
         s.viewer_id = 10;
-        assert!(caps(&s).contains(&("S".into(), "solution".into())), "{:?}", caps(&s));
+        assert!(
+            caps(&s).contains(&("S".into(), "solution".into())),
+            "{:?}",
+            caps(&s)
+        );
         let post_id = s.posts[0].post_id;
-        assert!(matches!(thread_view_key(&mut s, key('S')), Action::MarkSolution { post_id: p, .. } if p == post_id));
+        assert!(
+            matches!(thread_view_key(&mut s, key('S')), Action::MarkSolution { post_id: p, .. } if p == post_id)
+        );
         s.thread.question.as_mut().unwrap().solution_post_id = post_id;
         s.thread.highlighted_post_ids.clear();
-        assert!(caps(&s).contains(&("S".into(), "unmark solution".into())), "the toggle says it un-marks");
+        assert!(
+            caps(&s).contains(&("S".into(), "unmark solution".into())),
+            "the toggle says it un-marks"
+        );
 
         s.viewer_id = 99;
         s.viewer_moderates = true;
         assert!(has_s(&s), "a moderator may mark any thread's solution");
         s.posts[0].message_state = "deleted".into();
         assert!(!has_s(&s), "a deleted post cannot be the solution");
-        assert!(matches!(thread_view_key(&mut s, key('S')), Action::Notice(_)));
+        assert!(matches!(
+            thread_view_key(&mut s, key('S')),
+            Action::Notice(_)
+        ));
     }
 
     #[test]
     fn new_thread_caps_and_keys_follow_node_and_forum_permissions() {
         let captured: serde_json::Value = serde_json::from_str(include_str!(
             "../../../common/src/testdata/thread_permissions.json"
-        )).unwrap();
+        ))
+        .unwrap();
         let original: Node = serde_json::from_value(captured["thread"]["Forum"].clone()).unwrap();
         let offers = |hints: Hints, allowed: bool| {
             assert_eq!(hints.keys.iter().any(|(key, _)| *key == "N"), allowed);
@@ -4559,48 +4966,126 @@ mod tests {
         for permission in [Some(false), Some(true), None] {
             let allowed = permission != Some(false);
             let mut node = original.clone();
-            node.parent_node_id = 1; node.depth = 1;
-            node.type_data = Some(common::models::NodeTypeData { can_create_thread: permission });
-            let nodes = vec![Node { node_id: 1, node_type: "Category".into(), ..Default::default() }, node];
+            node.parent_node_id = 1;
+            node.depth = 1;
+            node.type_data = Some(common::models::NodeTypeData {
+                can_create_thread: permission,
+            });
+            let nodes = vec![
+                Node {
+                    node_id: 1,
+                    node_type: "Category".into(),
+                    ..Default::default()
+                },
+                node,
+            ];
             for selected in [0, 1] {
-                let mut tree = ForumTreeState { nodes: nodes.clone(), sel: selected, ..Default::default() };
+                let mut tree = ForumTreeState {
+                    nodes: nodes.clone(),
+                    sel: selected,
+                    ..Default::default()
+                };
                 offers(forum_tree_hints(&tree), allowed);
-                assert_eq!(matches!(forum_tree_key(&mut tree, key('N')), Action::StartNewThread(id) if id == original.node_id), allowed);
-                let mut home = HomeState { tree, focus: Pane::Tree, ..Default::default() };
+                assert_eq!(
+                    matches!(forum_tree_key(&mut tree, key('N')), Action::StartNewThread(id) if id == original.node_id),
+                    allowed
+                );
+                let mut home = HomeState {
+                    tree,
+                    focus: Pane::Tree,
+                    ..Default::default()
+                };
                 offers(home_hints(&home), allowed);
-                assert_eq!(matches!(home_key(&mut home, key('N')), Action::StartNewThread(id) if id == original.node_id), allowed);
+                assert_eq!(
+                    matches!(home_key(&mut home, key('N')), Action::StartNewThread(id) if id == original.node_id),
+                    allowed
+                );
             }
-            let mut list = ThreadListState { node_id: original.node_id, can_create_thread: permission, ..Default::default() };
+            let mut list = ThreadListState {
+                node_id: original.node_id,
+                can_create_thread: permission,
+                ..Default::default()
+            };
             offers(thread_list_hints(&list), allowed);
-            assert_eq!(matches!(thread_list_key(&mut list, key('N')), Action::StartNewThread(_)), allowed);
-            let mut home = HomeState { list, focus: Pane::List, ..Default::default() };
+            assert_eq!(
+                matches!(
+                    thread_list_key(&mut list, key('N')),
+                    Action::StartNewThread(_)
+                ),
+                allowed
+            );
+            let mut home = HomeState {
+                list,
+                focus: Pane::List,
+                ..Default::default()
+            };
             offers(home_hints(&home), allowed);
-            assert_eq!(matches!(home_key(&mut home, key('N')), Action::StartNewThread(_)), allowed);
+            assert_eq!(
+                matches!(home_key(&mut home, key('N')), Action::StartNewThread(_)),
+                allowed
+            );
         }
-        let mut latest = ThreadListState { can_create_thread: Some(true), ..Default::default() };
+        let mut latest = ThreadListState {
+            can_create_thread: Some(true),
+            ..Default::default()
+        };
         offers(thread_list_hints(&latest), false);
-        assert!(matches!(thread_list_key(&mut latest, key('N')), Action::Notice(_)));
+        assert!(matches!(
+            thread_list_key(&mut latest, key('N')),
+            Action::Notice(_)
+        ));
     }
 
     fn disjoint_category_nodes() -> Vec<Node> {
         vec![
-            Node { node_id: 1, node_type: "Category".into(), ..Default::default() },
-            Node { node_id: 2, node_type: "Category".into(), ..Default::default() },
-            Node { node_id: 3, parent_node_id: 2, depth: 1, node_type: "Forum".into(), ..Default::default() },
+            Node {
+                node_id: 1,
+                node_type: "Category".into(),
+                ..Default::default()
+            },
+            Node {
+                node_id: 2,
+                node_type: "Category".into(),
+                ..Default::default()
+            },
+            Node {
+                node_id: 3,
+                parent_node_id: 2,
+                depth: 1,
+                node_type: "Forum".into(),
+                ..Default::default()
+            },
         ]
     }
 
     #[test]
     fn empty_category_new_thread_does_not_cross_subtrees() {
-        let mut tree = ForumTreeState { nodes: disjoint_category_nodes(), ..Default::default() };
-        assert!(matches!(forum_tree_key(&mut tree, key('N')), Action::Notice(_)));
-        assert!(!forum_tree_hints(&tree).keys.iter().any(|(key, _)| *key == "N"));
+        let mut tree = ForumTreeState {
+            nodes: disjoint_category_nodes(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            forum_tree_key(&mut tree, key('N')),
+            Action::Notice(_)
+        ));
+        assert!(
+            !forum_tree_hints(&tree)
+                .keys
+                .iter()
+                .any(|(key, _)| *key == "N")
+        );
     }
 
     #[test]
     fn empty_category_enter_and_right_do_not_cross_subtrees() {
-        let mut tree = ForumTreeState { nodes: disjoint_category_nodes(), ..Default::default() };
-        assert!(matches!(forum_tree_key(&mut tree, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Action::Notice(_)));
+        let mut tree = ForumTreeState {
+            nodes: disjoint_category_nodes(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            forum_tree_key(&mut tree, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::Notice(_)
+        ));
         assert_eq!(tree.sel, 0);
         forum_tree_key(&mut tree, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(tree.sel, 0);
@@ -4609,31 +5094,97 @@ mod tests {
     #[test]
     fn category_quick_open_stays_within_the_selected_subtree() {
         let mut nodes = disjoint_category_nodes();
-        assert!(matches!(open_node_action(&nodes, 1, "empty"), Action::Notice(_)));
-        nodes.insert(1, Node { node_id: 4, parent_node_id: 1, depth: 1, node_type: "Forum".into(), ..Default::default() });
-        assert!(matches!(open_node_action(&nodes, 1, "first"), Action::OpenThreadList(4, _)));
-        assert!(matches!(open_node_action(&nodes, 2, "second"), Action::OpenThreadList(3, _)),
-            "an earlier category's forum is not the selected category's child");
+        assert!(matches!(
+            open_node_action(&nodes, 1, "empty"),
+            Action::Notice(_)
+        ));
+        nodes.insert(
+            1,
+            Node {
+                node_id: 4,
+                parent_node_id: 1,
+                depth: 1,
+                node_type: "Forum".into(),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            open_node_action(&nodes, 1, "first"),
+            Action::OpenThreadList(4, _)
+        ));
+        assert!(
+            matches!(
+                open_node_action(&nodes, 2, "second"),
+                Action::OpenThreadList(3, _)
+            ),
+            "an earlier category's forum is not the selected category's child"
+        );
     }
 
     #[test]
     fn nested_category_resolution_uses_parent_links_even_without_depths() {
         for zero_depths in [false, true] {
             let mut nodes = vec![
-                Node { node_id: 1, node_type: "Category".into(), ..Default::default() },
-                Node { node_id: 2, parent_node_id: 1, depth: 1, node_type: "Category".into(), ..Default::default() },
-                Node { node_id: 3, parent_node_id: 2, depth: 2, node_type: "Forum".into(), ..Default::default() },
-                Node { node_id: 4, node_type: "Category".into(), ..Default::default() },
-                Node { node_id: 5, parent_node_id: 4, depth: 1, node_type: "Forum".into(), ..Default::default() },
+                Node {
+                    node_id: 1,
+                    node_type: "Category".into(),
+                    ..Default::default()
+                },
+                Node {
+                    node_id: 2,
+                    parent_node_id: 1,
+                    depth: 1,
+                    node_type: "Category".into(),
+                    ..Default::default()
+                },
+                Node {
+                    node_id: 3,
+                    parent_node_id: 2,
+                    depth: 2,
+                    node_type: "Forum".into(),
+                    ..Default::default()
+                },
+                Node {
+                    node_id: 4,
+                    node_type: "Category".into(),
+                    ..Default::default()
+                },
+                Node {
+                    node_id: 5,
+                    parent_node_id: 4,
+                    depth: 1,
+                    node_type: "Forum".into(),
+                    ..Default::default()
+                },
             ];
-            if zero_depths { for node in &mut nodes { node.depth = 0; } }
+            if zero_depths {
+                for node in &mut nodes {
+                    node.depth = 0;
+                }
+            }
             assert_eq!(category_forum(&nodes, 1).map(|node| node.node_id), Some(3));
             nodes.remove(2);
-            assert!(category_forum(&nodes, 1).is_none(), "nested empty category cannot borrow the next root's child");
-            let mut tree = ForumTreeState { nodes, sel: 1, ..Default::default() };
-            assert!(matches!(forum_tree_key(&mut tree, key('N')), Action::Notice(_)));
-            assert!(matches!(open_node_action(&tree.nodes, 1, "nested"), Action::Notice(_)));
-            assert!(matches!(forum_tree_key(&mut tree, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Action::Notice(_)));
+            assert!(
+                category_forum(&nodes, 1).is_none(),
+                "nested empty category cannot borrow the next root's child"
+            );
+            let mut tree = ForumTreeState {
+                nodes,
+                sel: 1,
+                ..Default::default()
+            };
+            assert!(matches!(
+                forum_tree_key(&mut tree, key('N')),
+                Action::Notice(_)
+            ));
+            assert!(matches!(
+                open_node_action(&tree.nodes, 1, "nested"),
+                Action::Notice(_)
+            ));
+            assert!(matches!(
+                forum_tree_key(&mut tree, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Action::Notice(_)
+            ));
             assert_eq!(tree.sel, 1);
         }
     }
@@ -4642,16 +5193,26 @@ mod tests {
     fn reply_reaction_and_vote_keys_follow_captured_api_permissions() {
         let reply: common::models::ThreadReply = serde_json::from_str(include_str!(
             "../../../common/src/testdata/thread_permissions.json"
-        )).unwrap();
+        ))
+        .unwrap();
         let mut s = thread_view_fixture();
         s.thread = reply.thread;
         s.posts = reply.posts;
         s.sel_post = 0;
         let hints = thread_view_hints(&s);
         for (cap, input) in [("r", 'r'), ("Q", 'Q'), ("l", 'l'), ("v", 'v'), ("V", 'V')] {
-            assert!(!hints.keys.iter().any(|(key, _)| *key == cap), "forbidden full cap {cap}");
-            assert!(!hints.short.iter().any(|(key, _)| *key == cap), "forbidden short cap {cap}");
-            assert!(matches!(thread_view_key(&mut s, key(input)), Action::Notice(_)), "forbidden key {cap}");
+            assert!(
+                !hints.keys.iter().any(|(key, _)| *key == cap),
+                "forbidden full cap {cap}"
+            );
+            assert!(
+                !hints.short.iter().any(|(key, _)| *key == cap),
+                "forbidden short cap {cap}"
+            );
+            assert!(
+                matches!(thread_view_key(&mut s, key(input)), Action::Notice(_)),
+                "forbidden key {cap}"
+            );
         }
 
         s.thread.discussion_open = false;
@@ -4661,18 +5222,45 @@ mod tests {
         s.posts[0].allowed_content_vote_types = Some(vec!["up".into()]);
         let hints = thread_view_hints(&s);
         for cap in ["r", "Q", "l", "v"] {
-            assert!(hints.keys.iter().any(|(key, _)| *key == cap), "permitted cap {cap}");
+            assert!(
+                hints.keys.iter().any(|(key, _)| *key == cap),
+                "permitted cap {cap}"
+            );
         }
-        assert!(matches!(thread_view_key(&mut s, key('r')), Action::StartReply(_)), "moderators can reply when the server says so");
-        assert!(matches!(thread_view_key(&mut s, key('Q')), Action::StartReplyQuoting(..)));
-        assert!(matches!(thread_view_key(&mut s, key('l')), Action::ReactPost(_)));
-        assert!(matches!(thread_view_key(&mut s, key('v')), Action::VotePost(_, direction) if direction == "up"));
-        assert!(matches!(thread_view_key(&mut s, key('V')), Action::Notice(_)));
+        assert!(
+            matches!(thread_view_key(&mut s, key('r')), Action::StartReply(_)),
+            "moderators can reply when the server says so"
+        );
+        assert!(matches!(
+            thread_view_key(&mut s, key('Q')),
+            Action::StartReplyQuoting(..)
+        ));
+        assert!(matches!(
+            thread_view_key(&mut s, key('l')),
+            Action::ReactPost(_)
+        ));
+        assert!(
+            matches!(thread_view_key(&mut s, key('v')), Action::VotePost(_, direction) if direction == "up")
+        );
+        assert!(matches!(
+            thread_view_key(&mut s, key('V')),
+            Action::Notice(_)
+        ));
 
         s.posts[0].allowed_content_vote_types = Some(vec!["down".into()]);
-        assert!(thread_view_hints(&s).keys.iter().any(|(key, _)| *key == "V"));
-        assert!(matches!(thread_view_key(&mut s, key('v')), Action::Notice(_)));
-        assert!(matches!(thread_view_key(&mut s, key('V')), Action::VotePost(_, direction) if direction == "down"));
+        assert!(
+            thread_view_hints(&s)
+                .keys
+                .iter()
+                .any(|(key, _)| *key == "V")
+        );
+        assert!(matches!(
+            thread_view_key(&mut s, key('v')),
+            Action::Notice(_)
+        ));
+        assert!(
+            matches!(thread_view_key(&mut s, key('V')), Action::VotePost(_, direction) if direction == "down")
+        );
     }
 
     #[test]
@@ -4683,76 +5271,144 @@ mod tests {
         s.posts[0].can_content_vote = None;
         s.posts[0].allowed_content_vote_types = None;
         for input in ['r', 'Q', 'l', 'v', 'V'] {
-            assert!(!matches!(thread_view_key(&mut s, key(input)), Action::Notice(_)), "legacy key {input}");
+            assert!(
+                !matches!(thread_view_key(&mut s, key(input)), Action::Notice(_)),
+                "legacy key {input}"
+            );
         }
     }
 
     #[tokio::test]
     async fn internal_attachment_viewer_fetches_api_bytes_and_preserves_browser_url() {
+        use wiremock::matchers::{header, method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use wiremock::matchers::{method, path, header, query_param};
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/attachments/private-png.7/"))
-            .respond_with(ResponseTemplate::new(403)).mount(&server).await;
-        Mock::given(method("GET")).and(path("/api/attachments/7/data"))
+        Mock::given(method("GET"))
+            .and(path("/attachments/private-png.7/"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/attachments/7/data"))
             .and(header("authorization", "Bearer test-image-access"))
             .and(query_param("hash", "temporary+hash"))
-            .respond_with(ResponseTemplate::new(200).insert_header("content-type", "image/png")
-                .set_body_bytes(vec![1, 2, 3])).mount(&server).await;
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(vec![1, 2, 3]),
+            )
+            .mount(&server)
+            .await;
         let root = std::env::temp_dir().join(format!(
-            "wftui-viewer-attachment-{}-{}", std::process::id(), server.address().port()
+            "wftui-viewer-attachment-{}-{}",
+            std::process::id(),
+            server.address().port()
         ));
         let client = common::api::WfApiClient::with_store(
-            common::token::Store::with_path(root.join("token.json")), server.uri(), "test-client"
-        ).unwrap();
-        client.set_tokens(common::token::TokenSet {
-            access_token: "test-image-access".into(), refresh_token: "test-refresh".into(),
-            expires_at: 9_999_999_999, scope: "attachment:read".into(),
-            origin: server.uri(), client_id: "test-client".into(),
-        }).await.unwrap();
-        let direct = format!("{}/attachments/private-png.7/?hash=temporary%2Bhash", server.uri());
-        let post = Post { post_id: 1, message: "[ATTACH]7[/ATTACH]".into(), attachments: vec![
-            common::models::Attachment { attachment_id: 7, filename: "private.png".into(),
-                direct_url: Some(direct.clone()), ..Default::default() }
-        ], ..Default::default() };
+            common::token::Store::with_path(root.join("token.json")),
+            server.uri(),
+            "test-client",
+        )
+        .unwrap();
+        client
+            .set_tokens(common::token::TokenSet {
+                access_token: "test-image-access".into(),
+                refresh_token: "test-refresh".into(),
+                expires_at: 9_999_999_999,
+                scope: "attachment:read".into(),
+                origin: server.uri(),
+                client_id: "test-client".into(),
+            })
+            .await
+            .unwrap();
+        let direct = format!(
+            "{}/attachments/private-png.7/?hash=temporary%2Bhash",
+            server.uri()
+        );
+        let post = Post {
+            post_id: 1,
+            message: "[ATTACH]7[/ATTACH]".into(),
+            attachments: vec![common::models::Attachment {
+                attachment_id: 7,
+                filename: "private.png".into(),
+                direct_url: Some(direct.clone()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
         let chunks = common::bbcode::render(&post.message);
         let images = post_images(&post, &chunks, &server.uri());
         let open = image_open_for_post(&post, &images.all[0]).unwrap();
-        assert_eq!(images.all[0].key.as_deref(), Some(open.key.as_str()), "inline full-file fallback uses the same API bytes");
+        assert_eq!(
+            images.all[0].key.as_deref(),
+            Some(open.key.as_str()),
+            "inline full-file fallback uses the same API bytes"
+        );
         assert!(client.image_uses_bearer(&open.key));
         assert_eq!(open.web_url.as_deref(), Some(direct.as_str()));
-        assert_eq!(client.fetch_bytes(&open.key, 1024).await.unwrap(), vec![1, 2, 3]);
+        assert_eq!(
+            client.fetch_bytes(&open.key, 1024).await.unwrap(),
+            vec![1, 2, 3]
+        );
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url.path(), "/api/attachments/7/data", "no doomed browser-route request");
+        assert_eq!(
+            requests[0].url.path(),
+            "/api/attachments/7/data",
+            "no doomed browser-route request"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn attachment_thumbnail_and_public_cdn_image_urls_stay_cacheable() {
-        let mut post = Post { post_id: 1, message: "[ATTACH]7[/ATTACH]".into(), attachments: vec![
-            common::models::Attachment { attachment_id: 7, filename: "picture.png".into(),
+        let mut post = Post {
+            post_id: 1,
+            message: "[ATTACH]7[/ATTACH]".into(),
+            attachments: vec![common::models::Attachment {
+                attachment_id: 7,
+                filename: "picture.png".into(),
                 thumbnail_url: Some("https://cdn.example/thumb.png".into()),
                 direct_url: Some("https://forum.example/attachments/picture-png.7/".into()),
-                ..Default::default() }
-        ], ..Default::default() };
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
         let chunks = common::bbcode::render(&post.message);
         let images = post_images(&post, &chunks, "https://forum.example");
-        assert_eq!(images.all[0].key.as_deref(), Some("https://cdn.example/thumb.png"));
+        assert_eq!(
+            images.all[0].key.as_deref(),
+            Some("https://cdn.example/thumb.png")
+        );
         let open = image_open_for_post(&post, &images.all[0]).unwrap();
         assert_eq!(open.key, "https://forum.example/api/attachments/7/data");
-        assert_eq!(open.web_url.as_deref(), Some("https://forum.example/attachments/picture-png.7/"));
-        post.attachments[0].direct_url = Some("https://cdn.example/full.png?hash=public-data-hash".into());
+        assert_eq!(
+            open.web_url.as_deref(),
+            Some("https://forum.example/attachments/picture-png.7/")
+        );
+        post.attachments[0].direct_url =
+            Some("https://cdn.example/full.png?hash=public-data-hash".into());
         let images = post_images(&post, &chunks, "https://forum.example");
-        assert_eq!(image_open_for_post(&post, &images.all[0]).unwrap().key,
-            "https://cdn.example/full.png?hash=public-data-hash");
+        assert_eq!(
+            image_open_for_post(&post, &images.all[0]).unwrap().key,
+            "https://cdn.example/full.png?hash=public-data-hash"
+        );
 
         post.message = "[IMG]https://forum.example/attachments/picture-png.7/[/IMG]".into();
         post.attachments.clear();
-        let images = post_images(&post, &common::bbcode::render(&post.message), "https://forum.example");
-        assert!(images.all[0].full_key.is_none(), "untrusted IMG links are not attachment metadata");
-        assert_eq!(image_open_for_post(&post, &images.all[0]).unwrap().key,
-            "https://forum.example/attachments/picture-png.7/");
+        let images = post_images(
+            &post,
+            &common::bbcode::render(&post.message),
+            "https://forum.example",
+        );
+        assert!(
+            images.all[0].full_key.is_none(),
+            "untrusted IMG links are not attachment metadata"
+        );
+        assert_eq!(
+            image_open_for_post(&post, &images.all[0]).unwrap().key,
+            "https://forum.example/attachments/picture-png.7/"
+        );
     }
 
     /// Deleting takes two presses, and anything else disarms it — a stray
@@ -4764,11 +5420,17 @@ mod tests {
         s.posts[0].can_soft_delete = true;
         s.sel_post = 0;
 
-        assert!(matches!(thread_view_key(&mut s, key('D')), Action::Notice(_)));
+        assert!(matches!(
+            thread_view_key(&mut s, key('D')),
+            Action::Notice(_)
+        ));
         assert_eq!(s.confirm_delete, Some(500), "the first press only arms it");
         // The bar says so while it is armed.
         assert!(
-            thread_view_hints(&s).keys.iter().any(|(k, d)| *k == "D" && *d == "confirm"),
+            thread_view_hints(&s)
+                .keys
+                .iter()
+                .any(|(k, d)| *k == "D" && *d == "confirm"),
             "the key bar must say it is waiting for confirmation"
         );
         assert!(matches!(
@@ -4782,7 +5444,10 @@ mod tests {
         assert_eq!(s.confirm_delete, Some(500));
         thread_view_key(&mut s, key('j'));
         assert_eq!(s.confirm_delete, None, "moving on disarms it");
-        assert!(matches!(thread_view_key(&mut s, key('D')), Action::Notice(_)));
+        assert!(matches!(
+            thread_view_key(&mut s, key('D')),
+            Action::Notice(_)
+        ));
     }
 
     /// #707: `Q` quotes the selected post into a reply, with the attribution
@@ -4809,13 +5474,19 @@ mod tests {
                     &post.message,
                 );
                 assert!(q.contains("post: 1008443, member: 143605"), "{q}");
-                assert!(!q.contains("inner"), "the source's nested quote is stripped: {q}");
+                assert!(
+                    !q.contains("inner"),
+                    "the source's nested quote is stripped: {q}"
+                );
             }
-            other => panic!("Q must quote the selected post, got {other:?}", other = match other {
-                Action::None => "None",
-                Action::Notice(_) => "Notice",
-                _ => "something else",
-            }),
+            other => panic!(
+                "Q must quote the selected post, got {other:?}",
+                other = match other {
+                    Action::None => "None",
+                    Action::Notice(_) => "Notice",
+                    _ => "something else",
+                }
+            ),
         }
 
         // A thread whose posts have not arrived yet refuses out loud rather
@@ -4852,18 +5523,29 @@ mod tests {
                 user: u,
                 ..Default::default()
             };
-            thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), Grammar::Wide, 100)
+            thread_row(
+                &t,
+                &theme,
+                &UNICODE,
+                &SiteConfig::windowsforum(),
+                Grammar::Wide,
+                100,
+            )
         };
         let struck = |line: &ratatui::text::Line<'static>| {
-            line.spans
-                .iter()
-                .any(|s| {
-                    s.content.contains("spammer")
-                        && s.style.add_modifier.contains(Modifier::CROSSED_OUT)
-                })
+            line.spans.iter().any(|s| {
+                s.content.contains("spammer")
+                    && s.style.add_modifier.contains(Modifier::CROSSED_OUT)
+            })
         };
-        assert!(struck(&row(Some(banned(true)))), "a banned author is struck");
-        assert!(!struck(&row(Some(banned(false)))), "an ordinary author is not");
+        assert!(
+            struck(&row(Some(banned(true)))),
+            "a banned author is struck"
+        );
+        assert!(
+            !struck(&row(Some(banned(false)))),
+            "an ordinary author is not"
+        );
         assert!(
             !struck(&row(None)),
             "no flag means not told, and the client says nothing"
@@ -4906,7 +5588,14 @@ mod tests {
                 is_unread: true,
                 ..Default::default()
             };
-            thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), Grammar::Wide, 100)
+            thread_row(
+                &t,
+                &theme,
+                &UNICODE,
+                &SiteConfig::windowsforum(),
+                Grammar::Wide,
+                100,
+            )
         };
 
         let deleted = row_of("deleted");
@@ -4930,7 +5619,10 @@ mod tests {
         // chip steals title cells.
         let visible = row_of("visible");
         let text: String = visible.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!text.contains("deleted") && !text.contains("awaiting"), "{text:?}");
+        assert!(
+            !text.contains("deleted") && !text.contains("awaiting"),
+            "{text:?}"
+        );
         let title = visible
             .spans
             .iter()
@@ -4948,7 +5640,14 @@ mod tests {
                     discussion_state: state.into(),
                     ..Default::default()
                 };
-                let row = thread_row(&t, &theme, &UNICODE, &SiteConfig::windowsforum(), Grammar::Wide, inner);
+                let row = thread_row(
+                    &t,
+                    &theme,
+                    &UNICODE,
+                    &SiteConfig::windowsforum(),
+                    Grammar::Wide,
+                    inner,
+                );
                 assert!(row.width() <= inner, "{state} overflowed at {inner}");
             }
         }
@@ -4975,9 +5674,16 @@ mod tests {
             .iter()
             .position(|l| l.contains("deleted"))
             .unwrap_or_else(|| panic!("{text:#?}"));
-        let body = text.iter().position(|l| l.contains("the body")).expect("body");
+        let body = text
+            .iter()
+            .position(|l| l.contains("the body"))
+            .expect("body");
         assert!(banner < body, "the state is stated before the body");
-        assert!(text[banner].contains("visible to moderators"), "{:?}", text[banner]);
+        assert!(
+            text[banner].contains("visible to moderators"),
+            "{:?}",
+            text[banner]
+        );
 
         // A visible post gets no banner at all.
         s.posts[0].message_state = "visible".into();
@@ -4988,7 +5694,10 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
             .collect();
-        assert!(!text.iter().any(|l| l.contains("visible to moderators")), "{text:#?}");
+        assert!(
+            !text.iter().any(|l| l.contains("visible to moderators")),
+            "{text:#?}"
+        );
     }
 
     /// #703: `[HR]` is a rule across the pane, not three dashes dropped
@@ -5012,15 +5721,27 @@ mod tests {
             .iter()
             .position(|l| l.contains("\u{2500}\u{2500}\u{2500}\u{2500}"))
             .unwrap_or_else(|| panic!("no rule in {text:#?}"));
-        let above = text.iter().position(|l| l.contains("above")).expect("above");
-        let below = text.iter().position(|l| l.contains("below")).expect("below");
-        assert!(above < rule_row && rule_row < below, "the rule separates them");
+        let above = text
+            .iter()
+            .position(|l| l.contains("above"))
+            .expect("above");
+        let below = text
+            .iter()
+            .position(|l| l.contains("below"))
+            .expect("below");
+        assert!(
+            above < rule_row && rule_row < below,
+            "the rule separates them"
+        );
 
         // It spans the body, not a fixed stub, and shares its row with
         // nothing but the gutter.
         let rule_text = &text[rule_row];
         let dashes = rule_text.chars().filter(|c| *c == '\u{2500}').count();
-        assert!(dashes > 20, "a rule spans the pane, got {dashes}: {rule_text:?}");
+        assert!(
+            dashes > 20,
+            "a rule spans the pane, got {dashes}: {rule_text:?}"
+        );
         assert!(
             !rule_text.contains("above") && !rule_text.contains("below"),
             "the rule owns its line: {rule_text:?}"
@@ -5035,7 +5756,9 @@ mod tests {
             .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
             .collect();
         assert!(
-            ascii.iter().any(|l| l.contains("-----") && !l.contains("above")),
+            ascii
+                .iter()
+                .any(|l| l.contains("-----") && !l.contains("above")),
             "{ascii:#?}"
         );
     }
@@ -5053,7 +5776,10 @@ mod tests {
                 .map(|r| r.iter().map(|s| s.content.as_ref()).collect())
                 .collect()
         };
-        assert_eq!(text(wrap_spans_aligned(&spans, 11, Align::Left)), vec!["abc"]);
+        assert_eq!(
+            text(wrap_spans_aligned(&spans, 11, Align::Left)),
+            vec!["abc"]
+        );
         assert_eq!(
             text(wrap_spans_aligned(&spans, 11, Align::Center)),
             vec!["    abc"],
@@ -5070,7 +5796,10 @@ mod tests {
         );
         // Every wrapped row of a centred paragraph is centred, and none of
         // them overflows the width.
-        let long = vec![Span::styled("one two three four five".to_string(), theme.base())];
+        let long = vec![Span::styled(
+            "one two three four five".to_string(),
+            theme.base(),
+        )];
         for row in wrap_spans_aligned(&long, 10, Align::Center) {
             let w: usize = row.iter().map(|s| cell_width(s.content.as_ref())).sum();
             assert!(w <= 10, "row overflowed: {w}");
@@ -5105,7 +5834,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(red, Some(Color::Rgb(255, 0, 0)), "the colour reaches the cell");
+        assert_eq!(
+            red,
+            Some(Color::Rgb(255, 0, 0)),
+            "the colour reaches the cell"
+        );
         assert!(highlighted, "highlight paints as XF's marker pen");
 
         // The centred line is padded, and the ones around it are not.
@@ -5138,8 +5871,7 @@ mod tests {
     fn a_referenced_attachment_renders_where_the_message_puts_it() {
         let theme = Theme::truecolor();
         let mut s = thread_view_with_attachments();
-        s.posts[0].message =
-            "Before the picture.\n[ATTACH]1[/ATTACH]\nAfter the picture.".into();
+        s.posts[0].message = "Before the picture.\n[ATTACH]1[/ATTACH]\nAfter the picture.".into();
         s.width = 0;
         s.rebuild_lines(&theme, &UNICODE);
 
@@ -5161,7 +5893,9 @@ mod tests {
         // The referenced one is not repeated at the bottom; the unreferenced
         // second image still is, after the body.
         assert_eq!(
-            text.iter().filter(|l| l.contains("winver command returns this")).count(),
+            text.iter()
+                .filter(|l| l.contains("winver command returns this"))
+                .count(),
             1,
             "a referenced attachment must not also be listed underneath"
         );
@@ -5326,10 +6060,19 @@ mod tests {
     fn chunk_lines_expands_tabs_instead_of_dropping_them() {
         let theme = Theme::truecolor();
         let mut links = Vec::new();
-        let lines = bbcode_lines("[CODE]Name\tValue[/CODE]", "https://x.example", &mut links, &theme, false);
+        let lines = bbcode_lines(
+            "[CODE]Name\tValue[/CODE]",
+            "https://x.example",
+            &mut links,
+            &theme,
+            false,
+        );
         assert_eq!(lines.len(), 1);
         let rendered: String = lines[0].iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(rendered, "Name    Value", "a tab must expand to spaces, not disappear");
+        assert_eq!(
+            rendered, "Name    Value",
+            "a tab must expand to spaces, not disappear"
+        );
 
         // Prove it actually paints that way, not just that the string looks
         // right — this is what would have caught the regression even if
@@ -5363,15 +6106,28 @@ mod tests {
         // must not regress.
         let out = wrap_spans(&[Span::raw("aaaaa bbbbb")], 5);
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].iter().map(|s| s.content.as_ref()).collect::<String>(), "aaaaa");
-        assert_eq!(out[1].iter().map(|s| s.content.as_ref()).collect::<String>(), "bbbbb");
+        assert_eq!(
+            out[0]
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "aaaaa"
+        );
+        assert_eq!(
+            out[1]
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "bbbbb"
+        );
 
         // Issue #579 (a round-6 regression in the #566 fix above): a
         // leading whitespace run *wider than the wrap width itself* must be
         // dropped as runoff, not opened onto its own blank row — `line` is
         // still empty at `used == 0`, so flushing it unconditionally pushed
         // an empty `Vec` before the real content.
-        let joined = |v: &Vec<Span<'static>>| v.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let joined =
+            |v: &Vec<Span<'static>>| v.iter().map(|s| s.content.as_ref()).collect::<String>();
         let out = wrap_spans(&[Span::raw(format!("{}x", " ".repeat(12)))], 10);
         assert_eq!(
             out.iter().map(joined).collect::<Vec<_>>(),
@@ -5400,7 +6156,8 @@ mod tests {
         let mut s = thread_view_fixture();
         s.posts[0].message = "[CODE]def f():\n    return 1[/CODE]".into();
         s.rebuild_lines(&theme, &UNICODE);
-        let text = |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let text =
+            |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
         assert!(
             s.lines.iter().any(|l| text(l).contains("    return 1")),
             "the four-space indentation must survive: {:?}",
@@ -5419,7 +6176,12 @@ mod tests {
             assert!(w <= 10);
         }
         let out = wrap_spans(&[Span::raw("abcdefghij")], 5);
-        assert_eq!(out.iter().map(|r| r.iter().map(|s| s.content.as_ref()).collect::<String>()).collect::<Vec<_>>(), ["abcde", "fghij"]);
+        assert_eq!(
+            out.iter()
+                .map(|r| r.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>(),
+            ["abcde", "fghij"]
+        );
         let out = wrap_spans(&[Span::raw("abcde ")], 5);
         assert_eq!(out.len(), 1, "wrap runoff does not add an empty row");
     }
@@ -5427,20 +6189,50 @@ mod tests {
     #[test]
     fn wrap_spans_keeps_presentation_and_zwj_graphemes_whole() {
         use unicode_segmentation::UnicodeSegmentation;
-        for src in ["abcd⚠\u{fe0f}e", "👨‍👩‍👧‍👦zzzz", "1234a\u{301}bc", "漢字⚠\u{fe0f}end", "abcd \u{301}e"] {
+        for src in [
+            "abcd⚠\u{fe0f}e",
+            "👨‍👩‍👧‍👦zzzz",
+            "1234a\u{301}bc",
+            "漢字⚠\u{fe0f}end",
+            "abcd \u{301}e",
+        ] {
             for width in 2..=10 {
                 let rows = wrap_spans(&[Span::raw(src)], width);
-                let text: Vec<String> = rows.iter().map(|r| r.iter().map(|s| s.content.as_ref()).collect()).collect();
+                let text: Vec<String> = rows
+                    .iter()
+                    .map(|r| r.iter().map(|s| s.content.as_ref()).collect())
+                    .collect();
                 assert_eq!(text.concat(), src, "no content is lost at width {width}");
                 let graphemes: Vec<&str> = text.iter().flat_map(|s| s.graphemes(true)).collect();
-                assert_eq!(graphemes, src.graphemes(true).collect::<Vec<_>>(), "cluster split at width {width}: {text:?}");
-                assert!(text.iter().all(|s| cell_width(s) <= width), "overflow at width {width}: {text:?}");
+                assert_eq!(
+                    graphemes,
+                    src.graphemes(true).collect::<Vec<_>>(),
+                    "cluster split at width {width}: {text:?}"
+                );
+                assert!(
+                    text.iter().all(|s| cell_width(s) <= width),
+                    "overflow at width {width}: {text:?}"
+                );
             }
         }
         let rows = wrap_spans(&[Span::raw("⚠\u{fe0f}⚠\u{fe0f}")], 1);
-        assert_eq!(rows.len(), 2, "an oversized final cluster does not add an empty row");
-        assert_eq!(rows.iter().flatten().map(|s| s.content.as_ref()).collect::<String>(), "⚠\u{fe0f}⚠\u{fe0f}");
-        assert!(rows.iter().flatten().all(|s| s.content.is_empty() || s.content == "⚠\u{fe0f}"));
+        assert_eq!(
+            rows.len(),
+            2,
+            "an oversized final cluster does not add an empty row"
+        );
+        assert_eq!(
+            rows.iter()
+                .flatten()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "⚠\u{fe0f}⚠\u{fe0f}"
+        );
+        assert!(
+            rows.iter()
+                .flatten()
+                .all(|s| s.content.is_empty() || s.content == "⚠\u{fe0f}")
+        );
     }
 
     #[test]
@@ -5449,12 +6241,19 @@ mod tests {
         // Two styles exercise the actual span renderer as well as the
         // wrapper; the first token used to occupy six cells in a five-cell
         // row and lose the presentation glyph at the Paragraph edge.
-        let spans = [Span::styled("abcd⚠\u{fe0f}e", theme.title()), Span::styled("FG", theme.dim())];
+        let spans = [
+            Span::styled("abcd⚠\u{fe0f}e", theme.title()),
+            Span::styled("FG", theme.dim()),
+        ];
         let rows = wrap_spans(&spans, 5);
         let mut term = Terminal::new(TestBackend::new(5, 4)).unwrap();
         term.draw(|f| {
-            f.render_widget(Paragraph::new(rows.iter().cloned().map(Line::from).collect::<Vec<_>>()), f.area());
-        }).unwrap();
+            f.render_widget(
+                Paragraph::new(rows.iter().cloned().map(Line::from).collect::<Vec<_>>()),
+                f.area(),
+            );
+        })
+        .unwrap();
         let buffer = term.backend().buffer();
         assert_eq!(buffer[(0, 0)].symbol(), "a");
         assert_eq!(buffer[(3, 0)].symbol(), "d");
@@ -5462,8 +6261,14 @@ mod tests {
         assert_eq!(buffer[(2, 1)].symbol(), "e");
         assert_eq!(buffer[(3, 1)].symbol(), "F");
         assert_eq!(buffer[(4, 1)].symbol(), "G");
-        assert_eq!(buffer[(0, 1)].fg, theme.title().fg.unwrap_or(ratatui::style::Color::Reset));
-        assert_eq!(buffer[(3, 1)].fg, theme.dim().fg.unwrap_or(ratatui::style::Color::Reset));
+        assert_eq!(
+            buffer[(0, 1)].fg,
+            theme.title().fg.unwrap_or(ratatui::style::Color::Reset)
+        );
+        assert_eq!(
+            buffer[(3, 1)].fg,
+            theme.dim().fg.unwrap_or(ratatui::style::Color::Reset)
+        );
     }
 
     #[test]
@@ -5471,16 +6276,34 @@ mod tests {
         let theme = Theme::truecolor();
         for parts in [
             ("abcd⚠", "\u{fe0f}e", "⚠\u{fe0f}", 5),
-            ("abcd👨", "\u{200d}👩\u{200d}👧\u{200d}👦e", "👨\u{200d}👩\u{200d}👧\u{200d}👦", 5),
+            (
+                "abcd👨",
+                "\u{200d}👩\u{200d}👧\u{200d}👦e",
+                "👨\u{200d}👩\u{200d}👧\u{200d}👦",
+                5,
+            ),
             ("abcda", "\u{301}e", "a\u{301}", 4),
         ] {
-            let spans = [Span::styled(parts.0, theme.title()), Span::styled(parts.1, theme.dim())];
+            let spans = [
+                Span::styled(parts.0, theme.title()),
+                Span::styled(parts.1, theme.dim()),
+            ];
             let rows = wrap_spans(&spans, parts.3);
             let mut terminal = Terminal::new(TestBackend::new(parts.3 as u16, 4)).unwrap();
-            terminal.draw(|f| f.render_widget(Paragraph::new(rows.into_iter().map(Line::from).collect::<Vec<_>>()), f.area())).unwrap();
+            terminal
+                .draw(|f| {
+                    f.render_widget(
+                        Paragraph::new(rows.into_iter().map(Line::from).collect::<Vec<_>>()),
+                        f.area(),
+                    )
+                })
+                .unwrap();
             let buffer = terminal.backend().buffer();
             assert_eq!(buffer[(0, 1)].symbol(), parts.2);
-            assert_eq!(buffer[(0, 1)].fg, theme.title().fg.unwrap_or(ratatui::style::Color::Reset));
+            assert_eq!(
+                buffer[(0, 1)].fg,
+                theme.title().fg.unwrap_or(ratatui::style::Color::Reset)
+            );
         }
     }
 
@@ -5494,7 +6317,10 @@ mod tests {
             ("", vec![""]),
         ] {
             let rows = wrap_spans(&[Span::raw(source)], 40);
-            let text: Vec<String> = rows.iter().map(|r| r.iter().map(|s| s.content.as_ref()).collect()).collect();
+            let text: Vec<String> = rows
+                .iter()
+                .map(|r| r.iter().map(|s| s.content.as_ref()).collect())
+                .collect();
             assert_eq!(text, expected, "{source:?}");
         }
         let rows = wrap_spans(&[Span::raw("first\r"), Span::raw("\nsecond")], 40);
@@ -5507,7 +6333,10 @@ mod tests {
             let source = format!("xx {token}");
             let width = cell_width(&source);
             let rows = wrap_spans(&[Span::raw(source.clone())], width);
-            let text: Vec<String> = rows.iter().map(|r| r.iter().map(|s| s.content.as_ref()).collect()).collect();
+            let text: Vec<String> = rows
+                .iter()
+                .map(|r| r.iter().map(|s| s.content.as_ref()).collect())
+                .collect();
             assert_eq!(text, [source], "a whole-span fit must not be wrapped early");
         }
     }
@@ -5527,7 +6356,8 @@ mod tests {
         }
 
         // Word wrapping: five 4-cell words do not fit three to a 10-cell line.
-        let words = "\u{6f22}\u{5b57} \u{6f22}\u{5b57} \u{6f22}\u{5b57} \u{6f22}\u{5b57} \u{6f22}\u{5b57}";
+        let words =
+            "\u{6f22}\u{5b57} \u{6f22}\u{5b57} \u{6f22}\u{5b57} \u{6f22}\u{5b57} \u{6f22}\u{5b57}";
         let out = wrap_spans(&[Span::raw(words)], 10);
         for l in &out {
             let w: usize = l.iter().map(Span::width).sum();
@@ -5565,7 +6395,11 @@ mod tests {
             &theme,
             false,
         );
-        assert_eq!(lines.len(), 1, "inline styling should remain on a single line");
+        assert_eq!(
+            lines.len(),
+            1,
+            "inline styling should remain on a single line"
+        );
         assert_eq!(links.len(), 1);
         assert_eq!(links[0], "https://example.com");
     }
@@ -5589,7 +6423,10 @@ mod tests {
     #[test]
     fn link_popup_clamps_out_of_bounds_selection() {
         let mut state = ThreadViewState {
-            links: vec!["https://example.com/1".into(), "https://example.com/2".into()],
+            links: vec![
+                "https://example.com/1".into(),
+                "https://example.com/2".into(),
+            ],
             sel_local: 10,
             link_popup: false,
             ..Default::default()
@@ -5615,7 +6452,10 @@ mod tests {
     #[test]
     fn thread_view_error_state_has_a_working_retry_and_state_aware_hints() {
         let mut state = ThreadViewState {
-            thread: Thread { thread_id: 42, ..Default::default() },
+            thread: Thread {
+                thread_id: 42,
+                ..Default::default()
+            },
             error: Some("connection reset".into()),
             page: 1,
             last_page: 0,
@@ -5636,7 +6476,10 @@ mod tests {
             matches!(act, Action::LoadThread(id, page) if id == 42 && page == 1),
             "R must retry the same page"
         );
-        assert!(state.loading, "R must set loading so the spinner shows while it retries");
+        assert!(
+            state.loading,
+            "R must set loading so the spinner shows while it retries"
+        );
 
         // Enter also retries while an error is showing.
         state.loading = false;
@@ -5648,8 +6491,14 @@ mod tests {
 
         let hints = thread_view_hints(&state);
         let names: Vec<&str> = hints.keys.iter().map(|(k, _)| *k).collect();
-        assert!(names.contains(&"R"), "the error hint bar must advertise R: {names:?}");
-        assert!(!names.contains(&"r"), "the dead ordinary key bar must not show while erroring: {names:?}");
+        assert!(
+            names.contains(&"R"),
+            "the error hint bar must advertise R: {names:?}"
+        );
+        assert!(
+            !names.contains(&"r"),
+            "the dead ordinary key bar must not show while erroring: {names:?}"
+        );
     }
 
     #[test]
@@ -5694,7 +6543,10 @@ mod tests {
         };
 
         // Enter on a Category steps into its first child forum, never opens it.
-        let act = forum_tree_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let act = forum_tree_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
         assert!(matches!(act, Action::None));
         assert_eq!(state.sel, 1);
 
@@ -5702,15 +6554,24 @@ mod tests {
         assert!(matches!(act, Action::None));
         assert_eq!(state.sel, 0);
 
-        let act = forum_tree_key(&mut state, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let act = forum_tree_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
         assert!(matches!(act, Action::None));
         assert_eq!(state.sel, 1);
 
-        let act = forum_tree_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let act = forum_tree_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
         assert!(matches!(act, Action::OpenThreadList(id, _) if id == 302));
 
         state.sel = 2;
-        let act = forum_tree_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let act = forum_tree_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
         assert!(matches!(act, Action::OpenUrl(url) if url == "https://example.com/docs"));
 
         state.sel = 0;
@@ -5810,8 +6671,14 @@ mod tests {
         assert!(matches!(act, Action::None));
         assert_eq!(state.sel_post, 0);
 
-        assert!(matches!(thread_view_key(&mut state, key('w')), Action::Notice(_)));
-        assert!(matches!(thread_view_key(&mut state, key('1')), Action::None));
+        assert!(matches!(
+            thread_view_key(&mut state, key('w')),
+            Action::Notice(_)
+        ));
+        assert!(matches!(
+            thread_view_key(&mut state, key('1')),
+            Action::None
+        ));
     }
 
     /// `post_header_line`'s `justify` used to clip the username by chars, not
@@ -5877,12 +6744,16 @@ mod tests {
             ..Default::default()
         };
         let act = thread_view_key(&mut state, key('u'));
-        assert!(matches!(act, Action::OpenUrl(ref url) if url == "https://windowsforum.com/posts/102/"));
+        assert!(
+            matches!(act, Action::OpenUrl(ref url) if url == "https://windowsforum.com/posts/102/")
+        );
 
         // Fallback to thread view_url when post view_url is missing
         state.posts[1].view_url = None;
         let act2 = thread_view_key(&mut state, key('u'));
-        assert!(matches!(act2, Action::OpenUrl(ref url) if url == "https://windowsforum.com/threads/10/"));
+        assert!(
+            matches!(act2, Action::OpenUrl(ref url) if url == "https://windowsforum.com/threads/10/")
+        );
     }
 
     #[test]

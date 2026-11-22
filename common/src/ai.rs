@@ -127,7 +127,11 @@ pub enum AiEvent {
     Delta(String),
     /// A step the assistant is taking ("Searching WindowsForum"). `id` pairs
     /// the start with its `done`.
-    Progress { id: String, label: String, done: bool },
+    Progress {
+        id: String,
+        label: String,
+        done: bool,
+    },
     /// A source the answer cited.
     Citation { url: String, title: String },
     /// The turn finished normally.
@@ -217,9 +221,17 @@ impl SseParser {
         if !self.done {
             self.done = true;
             out.push(if self.has_text {
-                failed("stream_truncated", "The answer was cut off before it finished.", true)
+                failed(
+                    "stream_truncated",
+                    "The answer was cut off before it finished.",
+                    true,
+                )
             } else {
-                failed("stream_no_terminal", "No answer came back from the assistant.", true)
+                failed(
+                    "stream_no_terminal",
+                    "No answer came back from the assistant.",
+                    true,
+                )
             });
         }
         out
@@ -247,7 +259,11 @@ impl SseParser {
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
             self.done = true;
-            out.push(failed("malformed_stream", "The assistant sent a malformed reply.", true));
+            out.push(failed(
+                "malformed_stream",
+                "The assistant sent a malformed reply.",
+                true,
+            ));
             return;
         };
         self.event(&v, out);
@@ -255,16 +271,21 @@ impl SseParser {
 
     /// Mark every held function-call step finished (#117).
     fn release_held_calls(&mut self, out: &mut Vec<AiEvent>) {
-        out.extend(
-            self.held_calls
-                .drain(..)
-                .map(|id| AiEvent::Progress { id, label: String::new(), done: true }),
-        );
+        out.extend(self.held_calls.drain(..).map(|id| AiEvent::Progress {
+            id,
+            label: String::new(),
+            done: true,
+        }));
     }
 
     fn event(&mut self, v: &serde_json::Value, out: &mut Vec<AiEvent>) {
         let ty = str_at(v, "type");
-        let text_of = |key: &str| v.get(key).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+        let text_of = |key: &str| {
+            v.get(key)
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
         match ty {
             "error" | "function_call_error" => {
                 let message = [str_at(v, "detail"), error_message(v), str_at(v, "message")]
@@ -321,7 +342,11 @@ impl SseParser {
                 }
             }
             "response.output_text.done" | "response.refusal.done" => {
-                let key = if ty == "response.output_text.done" { "text" } else { "refusal" };
+                let key = if ty == "response.output_text.done" {
+                    "text"
+                } else {
+                    "refusal"
+                };
                 let text = text_of(key);
                 if !self.has_text && !text.is_empty() {
                     self.has_text = true;
@@ -349,10 +374,17 @@ impl SseParser {
                 let kind = item.map(|i| str_at(i, "type")).unwrap_or_default();
                 if let Some(label) = progress_label(name).or_else(|| progress_label(kind)) {
                     let id = match item.map(|i| str_at(i, "id")).unwrap_or_default() {
-                        "" => format!("item_{}", v.get("output_index").and_then(|x| x.as_u64()).unwrap_or(0)),
+                        "" => format!(
+                            "item_{}",
+                            v.get("output_index").and_then(|x| x.as_u64()).unwrap_or(0)
+                        ),
                         id => id.to_string(),
                     };
-                    out.push(AiEvent::Progress { id, label: label.into(), done: false });
+                    out.push(AiEvent::Progress {
+                        id,
+                        label: label.into(),
+                        done: false,
+                    });
                 }
             }
             "response.output_item.done" => {
@@ -368,17 +400,29 @@ impl SseParser {
                     return;
                 }
                 if let Some(id) = id {
-                    out.push(AiEvent::Progress { id: id.into(), label: String::new(), done: true });
+                    out.push(AiEvent::Progress {
+                        id: id.into(),
+                        label: String::new(),
+                        done: true,
+                    });
                 }
             }
             _ => {
                 // `response.<tool>_call.<in_progress|searching|completed>`
-                let Some(rest) = ty.strip_prefix("response.") else { return };
-                let Some((call, phase)) = rest.rsplit_once('.') else { return };
-                if !call.ends_with("_call") || !matches!(phase, "in_progress" | "searching" | "completed") {
+                let Some(rest) = ty.strip_prefix("response.") else {
+                    return;
+                };
+                let Some((call, phase)) = rest.rsplit_once('.') else {
+                    return;
+                };
+                if !call.ends_with("_call")
+                    || !matches!(phase, "in_progress" | "searching" | "completed")
+                {
                     return;
                 }
-                let Some(label) = progress_label(call) else { return };
+                let Some(label) = progress_label(call) else {
+                    return;
+                };
                 let id = match str_at(v, "item_id") {
                     "" => format!("call_{call}"),
                     id => id.to_string(),
@@ -388,7 +432,11 @@ impl SseParser {
                 } else {
                     label
                 };
-                out.push(AiEvent::Progress { id, label: label.into(), done: phase == "completed" });
+                out.push(AiEvent::Progress {
+                    id,
+                    label: label.into(),
+                    done: phase == "completed",
+                });
             }
         }
     }
@@ -567,21 +615,35 @@ mod tests {
     fn the_captured_turn_parses_to_its_answer_and_completes() {
         let events = parse_in_chunks(FIXTURE.as_bytes(), 8192);
         let text = answer(&events);
-        assert!(text.starts_with("KB5044284 is the **October 8, 2024"), "{text}");
-        assert!(text.contains("](https://windowsforum.com/news/kb5044284-"), "{text}");
+        assert!(
+            text.starts_with("KB5044284 is the **October 8, 2024"),
+            "{text}"
+        );
+        assert!(
+            text.contains("](https://windowsforum.com/news/kb5044284-"),
+            "{text}"
+        );
         assert_eq!(events.last(), Some(&AiEvent::Completed));
         assert_eq!(
-            events.iter().filter(|e| matches!(e, AiEvent::Completed)).count(),
+            events
+                .iter()
+                .filter(|e| matches!(e, AiEvent::Completed))
+                .count(),
             1,
             "response.completed is not the chat's terminal event"
         );
-        assert!(!events.iter().any(|e| matches!(e, AiEvent::Failed { .. })), "{events:?}");
+        assert!(
+            !events.iter().any(|e| matches!(e, AiEvent::Failed { .. })),
+            "{events:?}"
+        );
         // Both tool calls (get_kb_article, search) announce themselves by
         // their item type, as the web client labels them.
         let steps: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                AiEvent::Progress { label, done: false, .. } => Some(label.as_str()),
+                AiEvent::Progress {
+                    label, done: false, ..
+                } => Some(label.as_str()),
                 _ => None,
             })
             .collect();
@@ -592,7 +654,11 @@ mod tests {
     fn chunking_never_changes_the_result_even_mid_utf8() {
         let whole = parse_in_chunks(FIXTURE.as_bytes(), FIXTURE.len());
         for size in [1, 2, 3, 7, 64, 1000] {
-            assert_eq!(parse_in_chunks(FIXTURE.as_bytes(), size), whole, "chunk size {size}");
+            assert_eq!(
+                parse_in_chunks(FIXTURE.as_bytes(), size),
+                whole,
+                "chunk size {size}"
+            );
         }
     }
 
@@ -606,14 +672,48 @@ mod tests {
         let delta = r#"data: {"type":"response.output_text.delta","delta":"Hi"}"#;
         let created = r#"data: {"type":"response.created","response":{"id":"resp_2"}}"#;
         let completed = r#"data: {"type":"chat.stream.completed"}"#;
-        let step = |done| AiEvent::Progress { id: "fc_1".into(), label: if done { String::new() } else { "Searching threads".into() }, done };
-        let run = |frames: &[&str]| parse_in_chunks(frames.iter().map(|f| format!("{f}\n\n")).collect::<String>().as_bytes(), 7);
+        let step = |done| AiEvent::Progress {
+            id: "fc_1".into(),
+            label: if done {
+                String::new()
+            } else {
+                "Searching threads".into()
+            },
+            done,
+        };
+        let run = |frames: &[&str]| {
+            parse_in_chunks(
+                frames
+                    .iter()
+                    .map(|f| format!("{f}\n\n"))
+                    .collect::<String>()
+                    .as_bytes(),
+                7,
+            )
+        };
 
-        assert_eq!(run(&[added, done, created, delta, completed]),
-            vec![step(false), step(true), AiEvent::Delta("Hi".into()), AiEvent::Completed]);
-        assert_eq!(run(&[added, done, delta, completed]),
-            vec![step(false), step(true), AiEvent::Delta("Hi".into()), AiEvent::Completed]);
-        assert_eq!(run(&[added, done, completed]), vec![step(false), step(true), AiEvent::Completed]);
+        assert_eq!(
+            run(&[added, done, created, delta, completed]),
+            vec![
+                step(false),
+                step(true),
+                AiEvent::Delta("Hi".into()),
+                AiEvent::Completed
+            ]
+        );
+        assert_eq!(
+            run(&[added, done, delta, completed]),
+            vec![
+                step(false),
+                step(true),
+                AiEvent::Delta("Hi".into()),
+                AiEvent::Completed
+            ]
+        );
+        assert_eq!(
+            run(&[added, done, completed]),
+            vec![step(false), step(true), AiEvent::Completed]
+        );
         // Not before the call's arguments are complete.
         assert_eq!(run(&[added, delta]).first(), Some(&step(false)));
         assert!(!run(&[added, delta]).contains(&step(true)));
@@ -623,14 +723,20 @@ mod tests {
     fn keepalives_crlf_and_done_are_understood() {
         let body = b": keepalive\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\r\n\r\ndata: [DONE]\n\n";
         let events = parse_in_chunks(body, 5);
-        assert_eq!(events, vec![AiEvent::Delta("Hi".into()), AiEvent::Completed]);
+        assert_eq!(
+            events,
+            vec![AiEvent::Delta("Hi".into()), AiEvent::Completed]
+        );
     }
 
     #[test]
     fn a_stream_that_stops_early_is_truncated_not_finished() {
         let body = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Half an\"}\n\n";
         let events = parse_in_chunks(body, 16);
-        assert!(matches!(&events[1], AiEvent::Failed { code, .. } if code == "stream_truncated"), "{events:?}");
+        assert!(
+            matches!(&events[1], AiEvent::Failed { code, .. } if code == "stream_truncated"),
+            "{events:?}"
+        );
         let events = parse_in_chunks(b"", 1);
         assert!(matches!(&events[0], AiEvent::Failed { code, .. } if code == "stream_no_terminal"));
     }
@@ -648,7 +754,8 @@ mod tests {
                 retry_after: Some(Duration::from_secs(7)),
             }]
         );
-        let body = b"data: {\"type\":\"error\",\"error\":{\"message\":\"Bad\"},\"status_code\":400}\n\n";
+        let body =
+            b"data: {\"type\":\"error\",\"error\":{\"message\":\"Bad\"},\"status_code\":400}\n\n";
         assert!(matches!(
             &parse_in_chunks(body, 64)[0],
             AiEvent::Failed { code, message, retryable: false, .. } if code == "error" && message == "Bad"
@@ -666,7 +773,10 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                AiEvent::Citation { url: "https://windowsforum.com/threads/1/".into(), title: "T".into() },
+                AiEvent::Citation {
+                    url: "https://windowsforum.com/threads/1/".into(),
+                    title: "T".into()
+                },
                 AiEvent::Completed
             ]
         );
@@ -701,13 +811,31 @@ mod tests {
         let form = req.form();
         assert!(form.contains(&("has_local_history".into(), "1".into())));
         req.history = (0..25)
-            .map(|i| (if i % 2 == 0 { Role::User } else { Role::Assistant }, "é".repeat(3000)))
+            .map(|i| {
+                (
+                    if i % 2 == 0 {
+                        Role::User
+                    } else {
+                        Role::Assistant
+                    },
+                    "é".repeat(3000),
+                )
+            })
             .collect();
         let form = req.form();
         assert!(!form.iter().any(|(k, _)| k == "has_local_history"));
-        assert_eq!(form.iter().filter(|(k, _)| k.ends_with("[role]")).count(), MAX_HISTORY_ITEMS);
-        assert!(form.iter().all(|(k, v)| !k.ends_with("[content]") || v.len() <= MAX_HISTORY_ITEM_BYTES));
-        assert_eq!(form[2], ("history[0][role]".to_string(), "assistant".to_string()));
+        assert_eq!(
+            form.iter().filter(|(k, _)| k.ends_with("[role]")).count(),
+            MAX_HISTORY_ITEMS
+        );
+        assert!(
+            form.iter()
+                .all(|(k, v)| !k.ends_with("[content]") || v.len() <= MAX_HISTORY_ITEM_BYTES)
+        );
+        assert_eq!(
+            form[2],
+            ("history[0][role]".to_string(), "assistant".to_string())
+        );
     }
 
     #[test]
@@ -724,11 +852,20 @@ mod tests {
             serde_json::from_str(include_str!("testdata/ask_ai_usage.json")).expect("usage");
         assert!(reply.usage.unlimited);
         assert_eq!(reply.usage.summary(), None);
-        let capped = AiUsage { remaining: Some(3), limit: Some(25), ..Default::default() };
+        let capped = AiUsage {
+            remaining: Some(3),
+            limit: Some(25),
+            ..Default::default()
+        };
         assert_eq!(capped.summary().as_deref(), Some("3 of 25 left today"));
-        let spent = AiUsage { allowed: Some(false), ..Default::default() };
+        let spent = AiUsage {
+            allowed: Some(false),
+            ..Default::default()
+        };
         assert_eq!(spent.summary().as_deref(), Some("daily limit reached"));
-        let down: UsageReply = serde_json::from_str(r#"{"usage":{"logged_in":true,"unavailable":true}}"#).expect("down");
+        let down: UsageReply =
+            serde_json::from_str(r#"{"usage":{"logged_in":true,"unavailable":true}}"#)
+                .expect("down");
         assert_eq!(down.usage.summary(), None);
     }
 }

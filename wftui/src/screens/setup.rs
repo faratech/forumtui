@@ -74,7 +74,8 @@ impl SetupState {
         let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
         // The registrable label: the one before the public suffix, unless
         // the host is a bare name — or an IP address, which has no name.
-        let numeric = !labels.is_empty() && labels.iter().all(|l| l.bytes().all(|b| b.is_ascii_digit()));
+        let numeric =
+            !labels.is_empty() && labels.iter().all(|l| l.bytes().all(|b| b.is_ascii_digit()));
         let pick = match labels.len() {
             0 => "",
             _ if numeric => host,
@@ -171,7 +172,11 @@ fn advance(s: &mut SetupState, by: usize) {
 }
 
 fn submit(s: &mut SetupState) -> Action {
-    let name = if s.name.trim().is_empty() { s.suggested_name() } else { s.name.trim().to_string() };
+    let name = if s.name.trim().is_empty() {
+        s.suggested_name()
+    } else {
+        s.name.trim().to_string()
+    };
     Action::SetupSite {
         origin: s.origin.trim().to_string(),
         client_id: s.client_id.trim().to_string(),
@@ -180,8 +185,20 @@ fn submit(s: &mut SetupState) -> Action {
 }
 
 pub fn setup_hints(s: &SetupState) -> Hints {
-    let submit = if s.field + 1 == FIELDS { ("Enter", "finish") } else { ("^S", "finish") };
-    Hints::new(&[submit, ("Tab", "next field"), ("^Y", "paste"), ("Esc", "quit")], 0)
+    let submit = if s.field + 1 == FIELDS {
+        ("Enter", "finish")
+    } else {
+        ("^S", "finish")
+    };
+    Hints::new(
+        &[
+            submit,
+            ("Tab", "next field"),
+            ("^Y", "paste"),
+            ("Esc", "quit"),
+        ],
+        0,
+    )
 }
 
 pub fn render_setup(
@@ -196,14 +213,25 @@ pub fn render_setup(
     let step = |n: &str, body: &str| {
         Line::from(vec![
             Span::raw(" "),
-            Span::styled(n.to_string(), Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                n.to_string(),
+                Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
             Span::styled(body.to_string(), theme.base()),
         ])
     };
-    let note = |body: &str| Line::from(vec![Span::raw("    "), Span::styled(body.to_string(), theme.dim())]);
+    let note = |body: &str| {
+        Line::from(vec![
+            Span::raw("    "),
+            Span::styled(body.to_string(), theme.dim()),
+        ])
+    };
     lines.push(Line::from(Span::styled(
-        format!(" Connect {} to a XenForo 2.3 forum.", common::site::PRODUCT_NAME),
+        format!(
+            " Connect {} to a XenForo 2.3 forum.",
+            common::site::PRODUCT_NAME
+        ),
         theme.base(),
     )));
     lines.push(Line::from(Span::raw("")));
@@ -224,7 +252,11 @@ pub fn render_setup(
         let tail: String = s.text(i).chars().skip(start).collect();
         let shown = chrome::take_cells(&tail, FIELD_WIDTH).to_string();
         let pad = FIELD_WIDTH.saturating_sub(chrome::cell_width(&shown));
-        let style = if active { theme.base().add_modifier(Modifier::UNDERLINED) } else { theme.dim() };
+        let style = if active {
+            theme.base().add_modifier(Modifier::UNDERLINED)
+        } else {
+            theme.dim()
+        };
         s.field_lines[i] = Some(lines.len());
         lines.push(Line::from(vec![
             Span::raw(" ".repeat(FIELD_COL)),
@@ -237,11 +269,20 @@ pub fn render_setup(
         lines.push(Line::from(Span::raw("")));
     }
     for e in &s.errors {
-        lines.push(Line::from(Span::styled(format!(" {e}"), Style::new().fg(theme.error))));
+        lines.push(Line::from(Span::styled(
+            format!(" {e}"),
+            Style::new().fg(theme.error),
+        )));
     }
     let height = (lines.len() as u16 + 2).min(area.height);
     let panel_area = super::centered_box(area, PANEL_WIDTH, height);
-    let block = solo_panel(theme, g, &format!("Set up {}", common::site::PRODUCT_NAME), None, None);
+    let block = solo_panel(
+        theme,
+        g,
+        &format!("Set up {}", common::site::PRODUCT_NAME),
+        None,
+        None,
+    );
     let inner = block.inner(panel_area);
     f.render_widget(block, panel_area);
     f.render_widget(Paragraph::new(lines), inner);
@@ -271,25 +312,60 @@ mod tests {
         for c in "https://forum.example.com".chars() {
             setup_key(&mut s, key(c));
         }
-        assert!(matches!(setup_key(&mut s, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)), Action::None));
+        assert!(matches!(
+            setup_key(&mut s, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Action::None
+        ));
         assert_eq!(s.field, 1);
         for c in "abc123".chars() {
             setup_key(&mut s, key(c));
         }
-        assert!(matches!(setup_key(&mut s, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Action::None), "Enter moves on until the last field");
+        assert!(
+            matches!(
+                setup_key(&mut s, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Action::None
+            ),
+            "Enter moves on until the last field"
+        );
         assert_eq!(s.field, 2);
         assert_eq!(s.name, "Example", "the name is suggested from the host");
         // `q` is a letter here, not quit; Esc is.
         setup_key(&mut s, key('q'));
         assert_eq!(s.name, "Exampleq");
-        setup_key(&mut s, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        let submitted = |a: Action| matches!(a, Action::SetupSite { origin, client_id, name }
-            if origin == "https://forum.example.com" && client_id == "abc123" && name == "Example");
-        assert!(submitted(setup_key(&mut s, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))));
-        assert!(submitted(setup_key(&mut s, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))), "^S submits from anywhere");
-        assert!(matches!(setup_key(&mut s, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), Action::Quit));
-        assert!(matches!(setup_key(&mut s, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)), Action::PasteClipboard));
-        assert!(matches!(setup_key(&mut s, KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)), Action::None));
+        setup_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        let submitted = |a: Action| {
+            matches!(a, Action::SetupSite { origin, client_id, name }
+            if origin == "https://forum.example.com" && client_id == "abc123" && name == "Example")
+        };
+        assert!(submitted(setup_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        )));
+        assert!(
+            submitted(setup_key(
+                &mut s,
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+            )),
+            "^S submits from anywhere"
+        );
+        assert!(matches!(
+            setup_key(&mut s, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::Quit
+        ));
+        assert!(matches!(
+            setup_key(
+                &mut s,
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)
+            ),
+            Action::PasteClipboard
+        ));
+        assert!(matches!(
+            setup_key(&mut s, KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)),
+            Action::None
+        ));
         assert_eq!(s.field, 1);
         let hints = setup_hints(&s);
         assert!(hints.keys.iter().any(|(k, _)| *k == "^S"));
@@ -314,27 +390,60 @@ mod tests {
     fn renders_inside_the_panel_with_the_caret_on_the_active_field() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        let mut s = SetupState { origin: "https://x.example".into(), errors: vec!["\"oauth_client_id\" is required".into()], ..Default::default() };
+        let mut s = SetupState {
+            origin: "https://x.example".into(),
+            errors: vec!["\"oauth_client_id\" is required".into()],
+            ..Default::default()
+        };
         s.cursors[0] = s.origin.chars().count();
         let theme = Theme::truecolor();
         for (w, h) in [(120u16, 36u16), (80, 24)] {
             let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
             term.draw(|f| {
                 let body = Rect::new(0, 1, w, h - 3);
-                render_setup(&mut s, f, body, &theme, &crate::glyph::UNICODE, &mut HitMap::default());
+                render_setup(
+                    &mut s,
+                    f,
+                    body,
+                    &theme,
+                    &crate::glyph::UNICODE,
+                    &mut HitMap::default(),
+                );
             })
             .unwrap();
             let buf = term.backend().buffer().clone();
-            let text: String = (0..h).map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>() + "\n").collect();
-            assert!(text.contains("Set up") && text.contains("Forum address") && text.contains("OAuth client ID"), "{text}");
+            let text: String = (0..h)
+                .map(|y| {
+                    (0..w)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                        + "\n"
+                })
+                .collect();
+            assert!(
+                text.contains("Set up")
+                    && text.contains("Forum address")
+                    && text.contains("OAuth client ID"),
+                "{text}"
+            );
             assert!(text.contains("is required"), "{text}");
             // The caret sits at the end of the typed address, on the field's
             // row, inside the panel.
             let pos = term.get_cursor_position().unwrap();
-            let row: String = (0..w).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
-            assert!(row.contains("https://x.example"), "caret row is the address field at {w}x{h}: {row:?}");
-            let before: String = (0..pos.x).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
-            assert!(before.trim_end().ends_with("https://x.example"), "{before:?}");
+            let row: String = (0..w)
+                .map(|x| buf[(x, pos.y)].symbol().to_string())
+                .collect();
+            assert!(
+                row.contains("https://x.example"),
+                "caret row is the address field at {w}x{h}: {row:?}"
+            );
+            let before: String = (0..pos.x)
+                .map(|x| buf[(x, pos.y)].symbol().to_string())
+                .collect();
+            assert!(
+                before.trim_end().ends_with("https://x.example"),
+                "{before:?}"
+            );
         }
     }
 }

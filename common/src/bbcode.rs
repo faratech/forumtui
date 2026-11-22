@@ -242,9 +242,16 @@ fn px_to_scale(px: f32) -> u8 {
 /// author asked for monospace on purpose.
 fn is_monospace_font(raw: &str) -> bool {
     let v = raw.replace("&quot;", "").to_ascii_lowercase();
-    ["monospace", "courier", "consolas", "menlo", "monaco", "mono"]
-        .iter()
-        .any(|f| v.contains(f))
+    [
+        "monospace",
+        "courier",
+        "consolas",
+        "menlo",
+        "monaco",
+        "mono",
+    ]
+    .iter()
+    .any(|f| v.contains(f))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -440,10 +447,7 @@ fn apply_frame(frame: &Frame, c: &mut FrameCounts, on: bool) {
             }
         }
         Frame::Highlight => bump!(highlight),
-        Frame::Link(_)
-        | Frame::Table
-        | Frame::TableRow
-        | Frame::TableCell => {}
+        Frame::Link(_) | Frame::Table | Frame::TableRow | Frame::TableCell => {}
     }
 }
 
@@ -669,9 +673,7 @@ pub fn video_site(url: &str) -> Option<&'static str> {
     if host_and_path.starts_with("vimeo.com/") {
         return Some("Vimeo");
     }
-    if host_and_path.starts_with("dailymotion.com/")
-        || host_and_path.starts_with("dai.ly/")
-    {
+    if host_and_path.starts_with("dailymotion.com/") || host_and_path.starts_with("dai.ly/") {
         return Some("Dailymotion");
     }
     None
@@ -824,7 +826,8 @@ pub fn render_at(src: &str, origin: &str) -> Vec<Chunk> {
                         // (#114), so it is the frame, never the verbatim body.
                         if is_rich(value.as_deref()) {
                             push_frame(&mut stack, &mut counts, &mut style, Frame::InlineCode);
-                        } else if let Some((inner, close_len)) = misses.split(src, rest, &tag_lower) {
+                        } else if let Some((inner, close_len)) = misses.split(src, rest, &tag_lower)
+                        {
                             let mut st = style.clone();
                             st.code = true;
                             flush_before_chunk(&mut out, &mut link_label, &style);
@@ -1137,8 +1140,7 @@ pub fn render_at(src: &str, origin: &str) -> Vec<Chunk> {
                                 .nth(1)
                                 .map(str::trim)
                                 .filter(|id| !id.is_empty());
-                            let url =
-                                id.map(|id| format!("{origin}/media/{id}/"));
+                            let url = id.map(|id| format!("{origin}/media/{id}/"));
                             if let Some(url) = url {
                                 let caption = inner.trim();
                                 let label = if caption.is_empty() {
@@ -1380,8 +1382,12 @@ fn is_rich(value: Option<&str>) -> bool {
 fn quote_plain_tag(tag: &str, name: &str) -> bool {
     let option = &tag[name.len() + 1..tag.len() - 1];
     match name {
-        "code" | "icode" => option.is_empty()
-            || option.strip_prefix('=').is_some_and(|v| !strip_quotes(v).eq_ignore_ascii_case("rich")),
+        "code" | "icode" => {
+            option.is_empty()
+                || option
+                    .strip_prefix('=')
+                    .is_some_and(|v| !strip_quotes(v).eq_ignore_ascii_case("rich"))
+        }
         "plain" | "php" | "html" => option.is_empty(),
         "url" | "email" => option.is_empty(),
         "img" => option.is_empty() || option.starts_with(char::is_whitespace),
@@ -1869,14 +1875,20 @@ fn flush_before_chunk(
     pending: &mut Option<(String, String, usize)>,
     style: &Style,
 ) {
-    let Some((label, href, _)) = pending.as_mut() else { return };
+    let Some((label, href, _)) = pending.as_mut() else {
+        return;
+    };
     let label = std::mem::take(label);
     if label.trim().is_empty() {
         if !label.is_empty() {
             out.push(Chunk::Text(label, style.clone()));
         }
     } else {
-        let target = if href.is_empty() { label.clone() } else { href.clone() };
+        let target = if href.is_empty() {
+            label.clone()
+        } else {
+            href.clone()
+        };
         out.push(Chunk::Link(label, target, style.clone()));
     }
 }
@@ -2023,7 +2035,11 @@ mod tests {
     fn machine_busy() -> bool {
         std::fs::read_to_string("/proc/loadavg")
             .ok()
-            .and_then(|s| s.split_whitespace().next().and_then(|f| f.parse::<f64>().ok()))
+            .and_then(|s| {
+                s.split_whitespace()
+                    .next()
+                    .and_then(|f| f.parse::<f64>().ok())
+            })
             .is_some_and(|load| {
                 let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
                 load > cpus as f64
@@ -2322,21 +2338,25 @@ mod tests {
             .collect();
         assert_eq!(
             urls,
-            ["https://forum.example/posts/5/", "https://forum.example/threads/7/", "https://forum.example/media/9/"]
+            [
+                "https://forum.example/posts/5/",
+                "https://forum.example/threads/7/",
+                "https://forum.example/media/9/"
+            ]
         );
-        assert!(!format!("{chunks:?}").contains("windowsforum"), "{chunks:?}");
+        assert!(
+            !format!("{chunks:?}").contains("windowsforum"),
+            "{chunks:?}"
+        );
     }
 
     #[test]
     fn gallery_embed_links_the_media_item() {
-        let captioned = render(
-            "[GALLERY=media, 33005]Windows Registry Explained: Hives[/GALLERY]",
-        );
+        let captioned = render("[GALLERY=media, 33005]Windows Registry Explained: Hives[/GALLERY]");
         match &captioned[0] {
             Chunk::Link(label, url, _) => {
                 assert_eq!(
-                    label,
-                    "Windows Registry Explained: Hives",
+                    label, "Windows Registry Explained: Hives",
                     "the caption is the label"
                 );
                 assert_eq!(url, "https://windowsforum.com/media/33005/");
@@ -2372,7 +2392,10 @@ mod tests {
         // #703: the rule is a chunk of its own now, not dashes in the text —
         // the renderer draws it across the pane.
         assert_eq!(
-            chunks.iter().filter(|c| matches!(c, Chunk::Rule(_))).count(),
+            chunks
+                .iter()
+                .filter(|c| matches!(c, Chunk::Rule(_)))
+                .count(),
             1,
             "{chunks:#?}"
         );
@@ -2380,7 +2403,10 @@ mod tests {
         // Search snippets go through `to_plain`, which must carry neither
         // the tag nor a stub of dashes.
         let plain = to_plain("[HR][/HR]rule");
-        assert!(!plain.contains("[/HR]") && !plain.contains('\u{2500}'), "{plain:?}");
+        assert!(
+            !plain.contains("[/HR]") && !plain.contains('\u{2500}'),
+            "{plain:?}"
+        );
         assert!(plain.contains("rule"), "{plain:?}");
     }
 
@@ -2644,14 +2670,36 @@ mod tests {
     #[test]
     fn bare_urls_keep_balanced_parentheses() {
         let links = |src: &str| -> Vec<String> {
-            render(src).into_iter().filter_map(|c| match c { Chunk::Link(_, u, _) => Some(u), _ => None }).collect()
+            render(src)
+                .into_iter()
+                .filter_map(|c| match c {
+                    Chunk::Link(_, u, _) => Some(u),
+                    _ => None,
+                })
+                .collect()
         };
-        assert_eq!(links("see https://en.wikipedia.org/wiki/X_(disambiguation) end"), ["https://en.wikipedia.org/wiki/X_(disambiguation)"]);
+        assert_eq!(
+            links("see https://en.wikipedia.org/wiki/X_(disambiguation) end"),
+            ["https://en.wikipedia.org/wiki/X_(disambiguation)"]
+        );
         let chunks = render("see https://en.wikipedia.org/wiki/X_(disambiguation) end");
-        assert_eq!(texts(&chunks).concat(), "see  end", "no stray paren: {chunks:?}");
-        assert_eq!(links("(see https://example.com/a) and"), ["https://example.com/a"]);
-        assert_eq!(texts(&render("(see https://example.com/a) and")).concat(), "(see ) and");
-        assert_eq!(links("https://x.example/a_(b)_(c))"), ["https://x.example/a_(b)_(c)"]);
+        assert_eq!(
+            texts(&chunks).concat(),
+            "see  end",
+            "no stray paren: {chunks:?}"
+        );
+        assert_eq!(
+            links("(see https://example.com/a) and"),
+            ["https://example.com/a"]
+        );
+        assert_eq!(
+            texts(&render("(see https://example.com/a) and")).concat(),
+            "(see ) and"
+        );
+        assert_eq!(
+            links("https://x.example/a_(b)_(c))"),
+            ["https://x.example/a_(b)_(c)"]
+        );
     }
 
     /// #116: XF draws ONE anchor around a [URL] body, so text after an image
@@ -2659,12 +2707,27 @@ mod tests {
     /// href-as-label link (#663).
     #[test]
     fn text_after_an_image_inside_a_url_keeps_the_link() {
-        let chunks = render("[URL=https://full.example/]text [IMG]https://t.example/a.png[/IMG] more[/URL] after");
-        let linked: Vec<(&str, &str)> = chunks.iter().filter_map(|c| match c {
-            Chunk::Link(l, u, _) => Some((l.as_str(), u.as_str())), _ => None,
-        }).collect();
-        assert_eq!(linked, [("text ", "https://full.example/"), (" more", "https://full.example/")], "{chunks:?}");
-        assert!(chunks.iter().any(|c| matches!(c, Chunk::Image { link: Some(l), .. } if l == "https://full.example/")));
+        let chunks = render(
+            "[URL=https://full.example/]text [IMG]https://t.example/a.png[/IMG] more[/URL] after",
+        );
+        let linked: Vec<(&str, &str)> = chunks
+            .iter()
+            .filter_map(|c| match c {
+                Chunk::Link(l, u, _) => Some((l.as_str(), u.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            linked,
+            [
+                ("text ", "https://full.example/"),
+                (" more", "https://full.example/")
+            ],
+            "{chunks:?}"
+        );
+        assert!(chunks.iter().any(
+            |c| matches!(c, Chunk::Image { link: Some(l), .. } if l == "https://full.example/")
+        ));
         assert_eq!(texts(&chunks).concat(), " after");
 
         for src in [
@@ -2672,8 +2735,16 @@ mod tests {
             "[URL=https://full.example/] [IMG]https://t.example/a.png[/IMG] [/URL]",
         ] {
             let chunks = render(src);
-            assert!(!chunks.iter().any(|c| matches!(c, Chunk::Link(..))), "{src}: phantom link in {chunks:?}");
-            assert!(chunks.iter().any(|c| matches!(c, Chunk::Image { link: Some(_), .. })), "{chunks:?}");
+            assert!(
+                !chunks.iter().any(|c| matches!(c, Chunk::Link(..))),
+                "{src}: phantom link in {chunks:?}"
+            );
+            assert!(
+                chunks
+                    .iter()
+                    .any(|c| matches!(c, Chunk::Image { link: Some(_), .. })),
+                "{chunks:?}"
+            );
         }
     }
 
@@ -2684,18 +2755,45 @@ mod tests {
     fn rich_code_renders_its_bbcode() {
         let chunks = render("[CODE=rich]\n[B]bold[/B] plain[/CODE]after");
         let all = texts(&chunks).concat();
-        assert!(!all.contains("[B]") && !all.contains("[rich code]"), "{all:?}");
+        assert!(
+            !all.contains("[B]") && !all.contains("[rich code]"),
+            "{all:?}"
+        );
         assert!(all.starts_with("[Rich (BB code)]\n"), "{all:?}");
-        let bold = chunks.iter().find_map(|c| match c { Chunk::Text(t, s) if t == "bold" => Some(s.clone()), _ => None }).expect("bold run");
+        let bold = chunks
+            .iter()
+            .find_map(|c| match c {
+                Chunk::Text(t, s) if t == "bold" => Some(s.clone()),
+                _ => None,
+            })
+            .expect("bold run");
         assert!(bold.bold && bold.code, "{bold:?}");
-        let plain = chunks.iter().find_map(|c| match c { Chunk::Text(t, s) if t.contains("plain") => Some(s.clone()), _ => None }).unwrap();
+        let plain = chunks
+            .iter()
+            .find_map(|c| match c {
+                Chunk::Text(t, s) if t.contains("plain") => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap();
         assert!(plain.code && !plain.bold);
-        let after = chunks.iter().find_map(|c| match c { Chunk::Text(t, s) if t.contains("after") => Some((t.clone(), s.clone())), _ => None }).unwrap();
+        let after = chunks
+            .iter()
+            .find_map(|c| match c {
+                Chunk::Text(t, s) if t.contains("after") => Some((t.clone(), s.clone())),
+                _ => None,
+            })
+            .unwrap();
         assert!(!after.1.code, "the block closes: {chunks:?}");
         assert!(all.contains("plain\nafter"), "{all:?}");
 
         let chunks = render("x [ICODE=\"rich\"][I]it[/I][/ICODE] y");
-        let it = chunks.iter().find_map(|c| match c { Chunk::Text(t, s) if t == "it" => Some(s.clone()), _ => None }).expect("italic run");
+        let it = chunks
+            .iter()
+            .find_map(|c| match c {
+                Chunk::Text(t, s) if t == "it" => Some(s.clone()),
+                _ => None,
+            })
+            .expect("italic run");
         assert!(it.italic && it.code, "{chunks:?}");
         assert_eq!(texts(&chunks).concat(), "x it y");
 
@@ -3087,8 +3185,8 @@ mod tests {
             // of a tag the parser stopped recognising.
             let plain = to_plain(body);
             for tag in [
-                "[HEADING", "[heading", "[COLOR", "[color", "[SIZE", "[size",
-                "[CENTER", "[center", "[B]", "[/B]", "[FONT", "[font",
+                "[HEADING", "[heading", "[COLOR", "[color", "[SIZE", "[size", "[CENTER", "[center",
+                "[B]", "[/B]", "[FONT", "[font",
             ] {
                 assert!(
                     !plain.contains(tag),
@@ -3096,7 +3194,10 @@ mod tests {
                 );
             }
         }
-        assert!(posts >= 10, "the corpus should hold real posts, got {posts}");
+        assert!(
+            posts >= 10,
+            "the corpus should hold real posts, got {posts}"
+        );
         assert!(
             styled >= posts,
             "these posts all carry styling tags: {styled} styled runs across {posts} posts"
@@ -3160,13 +3261,23 @@ mod tests {
         // own, whatever the text says.
         assert!(q.contains("Outer words."), "{q}");
         assert!(q.contains("After."), "{q}");
-        assert!(!q.contains("inner"), "the nested quote must be stripped: {q}");
-        assert_eq!(q.matches("[QUOTE").count(), 1, "exactly one quote block: {q}");
+        assert!(
+            !q.contains("inner"),
+            "the nested quote must be stripped: {q}"
+        );
+        assert_eq!(
+            q.matches("[QUOTE").count(),
+            1,
+            "exactly one quote block: {q}"
+        );
 
         // A username containing a comma would read as an attribute
         // separator and make the attributes malformed.
         let q = quote_block("Smith, John", 5, 6, "hi");
-        assert!(q.starts_with("[QUOTE=\"Smith  John, post: 5, member: 6\"]"), "{q}");
+        assert!(
+            q.starts_with("[QUOTE=\"Smith  John, post: 5, member: 6\"]"),
+            "{q}"
+        );
     }
 
     /// Stripping is by tag, nesting and all, and leaves everything else
@@ -3184,10 +3295,15 @@ mod tests {
             "a  b",
             "nested blocks go with their parent"
         );
-        assert_eq!(strip_quote_blocks("[quote]x[/quote]keep"), "keep", "case-insensitive");
+        assert_eq!(
+            strip_quote_blocks("[quote]x[/quote]keep"),
+            "keep",
+            "case-insensitive"
+        );
         // Everything that is not a quote survives byte for byte, including
         // the bracket-heavy things this forum's posts are full of.
-        let kept = "[B]bold[/B] [ICODE]C:\\Program Files (x86)[/ICODE] con2fb_map[i] \u{6f22}\u{5b57}";
+        let kept =
+            "[B]bold[/B] [ICODE]C:\\Program Files (x86)[/ICODE] con2fb_map[i] \u{6f22}\u{5b57}";
         assert_eq!(strip_quote_blocks(kept), kept);
         // An unclosed quote swallows the rest, as the parser does.
         assert_eq!(strip_quote_blocks("before [QUOTE]after"), "before");
@@ -3201,7 +3317,10 @@ mod tests {
     fn stripping_quotes_preserves_verbatim_samples_and_their_quote_closers() {
         for tag in ["CODE", "CODE=php", "ICODE", "PLAIN", "PHP", "HTML"] {
             let name = tag.split('=').next().unwrap();
-            for literal in ["[QUOTE]literal[/QUOTE]", "unmatched [/QUOTE] then [QUOTE]open"] {
+            for literal in [
+                "[QUOTE]literal[/QUOTE]",
+                "unmatched [/QUOTE] then [QUOTE]open",
+            ] {
                 let sample = format!("[{tag}]before {literal} after[/{name}]");
                 assert_eq!(strip_quote_blocks(&sample), sample, "{tag}");
                 let nested = format!("keep[QUOTE]remove {sample} all[/QUOTE]tail");
@@ -3220,7 +3339,10 @@ mod tests {
         assert_eq!(strip_quote_blocks(unclosed), unclosed);
         // An invalid option on a no-option plain tag does not make a real
         // quote opaque to XF's parser.
-        assert_eq!(strip_quote_blocks("[PLAIN=x][QUOTE]remove[/QUOTE]keep[/PLAIN]"), "[PLAIN=x]keep[/PLAIN]");
+        assert_eq!(
+            strip_quote_blocks("[PLAIN=x][QUOTE]remove[/QUOTE]keep[/PLAIN]"),
+            "[PLAIN=x]keep[/PLAIN]"
+        );
         let src = "[CODE]before [QUOTE]literal[/QUOTE] after[/CODE]";
         assert_eq!(
             quote_block("Alice", 7, 2, src),
@@ -3277,10 +3399,16 @@ mod tests {
     #[test]
     fn a_rule_is_its_own_chunk() {
         let chunks = render("above[HR]below");
-        let rules = chunks.iter().filter(|c| matches!(c, Chunk::Rule(_))).count();
+        let rules = chunks
+            .iter()
+            .filter(|c| matches!(c, Chunk::Rule(_)))
+            .count();
         assert_eq!(rules, 1, "{chunks:#?}");
         // It separates the two runs rather than joining them.
-        let rule_at = chunks.iter().position(|c| matches!(c, Chunk::Rule(_))).unwrap();
+        let rule_at = chunks
+            .iter()
+            .position(|c| matches!(c, Chunk::Rule(_)))
+            .unwrap();
         let text_before: String = chunks[..rule_at]
             .iter()
             .filter_map(|c| match c {
@@ -3306,7 +3434,10 @@ mod tests {
                 .count(),
             1
         );
-        assert!(!to_plain("a[HR]b").contains('\u{2500}'), "no dashes in a preview");
+        assert!(
+            !to_plain("a[HR]b").contains('\u{2500}'),
+            "no dashes in a preview"
+        );
     }
 
     /// Every colour spelling XF's editor and its users actually produce.
@@ -3318,14 +3449,42 @@ mod tests {
             ("red", Some(Rgb { r: 255, g: 0, b: 0 })),
             ("  Red ", Some(Rgb { r: 255, g: 0, b: 0 })),
             ("\"#00ff00\"", Some(Rgb { r: 0, g: 255, b: 0 })),
-            ("rgb(18, 52, 86)", Some(Rgb { r: 18, g: 52, b: 86 })),
-            ("rgba(18,52,86,0.5)", Some(Rgb { r: 18, g: 52, b: 86 })),
+            (
+                "rgb(18, 52, 86)",
+                Some(Rgb {
+                    r: 18,
+                    g: 52,
+                    b: 86,
+                }),
+            ),
+            (
+                "rgba(18,52,86,0.5)",
+                Some(Rgb {
+                    r: 18,
+                    g: 52,
+                    b: 86,
+                }),
+            ),
             ("rgb(100%, 0%, 0%)", Some(Rgb { r: 255, g: 0, b: 0 })),
-            ("rebeccapurple", Some(Rgb { r: 102, g: 51, b: 153 })),
+            (
+                "rebeccapurple",
+                Some(Rgb {
+                    r: 102,
+                    g: 51,
+                    b: 153,
+                }),
+            ),
             // CSS lime is #0f0; limegreen is the darker 50,205,50 — they
             // are different colours and were conflated (#44).
             ("lime", Some(Rgb { r: 0, g: 255, b: 0 })),
-            ("limegreen", Some(Rgb { r: 50, g: 205, b: 50 })),
+            (
+                "limegreen",
+                Some(Rgb {
+                    r: 50,
+                    g: 205,
+                    b: 50,
+                }),
+            ),
             ("nonsense", None),
             ("#12345", None),
             ("#éa", None),
@@ -3398,7 +3557,11 @@ mod tests {
         assert_eq!(parse_size("+0"), None);
         assert_eq!(parse_size("-1"), None, "an integer <= 0 is no size");
         assert_eq!(parse_size("0"), None);
-        assert_eq!(parse_size("200"), Some(7), "past the scale is the top of it");
+        assert_eq!(
+            parse_size("200"),
+            Some(7),
+            "past the scale is the top of it"
+        );
         assert_eq!(parse_size("9"), Some(7));
         assert_eq!(parse_size("\"3\""), Some(3));
         assert_eq!(parse_size("4"), Some(4));
@@ -3416,16 +3579,27 @@ mod tests {
     /// loose `==` reads two numeric strings as numbers).
     #[test]
     fn huge_and_zero_padded_sizes_follow_the_live_renderer() {
-        assert_eq!(parse_size("999999999999999999999999px"), Some(7), "XF: 36px");
+        assert_eq!(
+            parse_size("999999999999999999999999px"),
+            Some(7),
+            "XF: 36px"
+        );
         assert_eq!(parse_size("99999999999px"), Some(7));
         assert_eq!(parse_size("40px"), Some(7));
         assert_eq!(parse_size("999999999999999999999999"), None, "XF: no size");
-        assert_eq!(parse_size("9223372036854775807"), Some(7), "i64::MAX still round-trips");
+        assert_eq!(
+            parse_size("9223372036854775807"),
+            Some(7),
+            "i64::MAX still round-trips"
+        );
         assert_eq!(parse_size("9223372036854775808"), None);
         assert_eq!(parse_size("07"), Some(7), "XF: 26px");
         assert_eq!(parse_size("02"), Some(2));
         assert_eq!(parse_size("00"), None);
-        assert_eq!(style_of("[SIZE=999999999999999999999999px]big[/SIZE]", "big").size, Some(7));
+        assert_eq!(
+            style_of("[SIZE=999999999999999999999999px]big[/SIZE]", "big").size,
+            Some(7)
+        );
     }
 
     #[test]
@@ -3446,12 +3620,18 @@ mod tests {
             "[HEADING=9]nine[/HEADING]",
             "[HEADING=big]word[/HEADING]",
         ] {
-            let st = style_of(src, src.split(']').nth(1).unwrap().split('[').next().unwrap());
+            let st = style_of(
+                src,
+                src.split(']').nth(1).unwrap().split('[').next().unwrap(),
+            );
             assert_eq!(st.heading, None, "{src}");
             assert!(!st.bold, "a div is not bold either: {src}");
         }
         // Lowercase spelling is what most of this site's posts actually use.
-        assert_eq!(style_of("[heading=2]lower[/heading]", "lower").heading, Some(2));
+        assert_eq!(
+            style_of("[heading=2]lower[/heading]", "lower").heading,
+            Some(2)
+        );
 
         let hl = style_of("[HIGHLIGHT]look[/HIGHLIGHT]", "look");
         assert!(hl.highlight, "highlight is its own mark");
@@ -3478,7 +3658,10 @@ mod tests {
         // the highlight frame, not the innermost bold/italic.
         let inner = style_of("[I]a[HIGHLIGHT]b[/HIGHLIGHT]c[/I]", "c");
         assert!(inner.italic, "[/HIGHLIGHT] must not steal the italic frame");
-        assert!(!inner.highlight, "and the highlight still ends where it should");
+        assert!(
+            !inner.highlight,
+            "and the highlight still ends where it should"
+        );
         let outer = style_of("[I]a[HIGHLIGHT]b[/HIGHLIGHT]c[/I]", "a");
         assert!(outer.italic);
         assert!(!outer.highlight);
@@ -3534,7 +3717,6 @@ mod tests {
         assert_eq!(last.size, Some(7));
         assert_eq!(last.color, None, "the closed colour is gone");
     }
-
 
     /// Audit r6 #821: `plain_close` returns the index AFTER the `]` while
     /// `scan_attr_close` returns the index OF it, and the attribute arm's

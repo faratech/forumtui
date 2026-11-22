@@ -82,7 +82,9 @@ pub struct Node {
 
 impl Node {
     pub fn thread_creation_permission(&self) -> Option<bool> {
-        self.type_data.as_ref().and_then(|data| data.can_create_thread)
+        self.type_data
+            .as_ref()
+            .and_then(|data| data.can_create_thread)
     }
 }
 
@@ -112,7 +114,9 @@ pub struct Forum {
 
 impl Forum {
     pub fn thread_creation_permission(&self) -> Option<bool> {
-        self.type_data.as_ref().and_then(|data| data.can_create_thread)
+        self.type_data
+            .as_ref()
+            .and_then(|data| data.can_create_thread)
     }
 }
 
@@ -206,7 +210,11 @@ impl Thread {
     /// per-reader flag for the rest (the node permission), so the caller
     /// adds who the reader is.
     pub fn allows_question_actions(&self) -> bool {
-        self.is_question() && self.question.as_ref().is_some_and(|q| q.allow_question_actions == "yes")
+        self.is_question()
+            && self
+                .question
+                .as_ref()
+                .is_some_and(|q| q.allow_question_actions == "yes")
     }
 
     pub fn is_question(&self) -> bool {
@@ -275,7 +283,10 @@ impl Hash for Thread {
             .get("solution_post_id")
             .and_then(serde_json::Value::as_u64)
             .hash(state);
-        self.question.as_ref().map(|q| q.solution_post_id).hash(state);
+        self.question
+            .as_ref()
+            .map(|q| q.solution_post_id)
+            .hash(state);
         self.is_unread.hash(state);
         self.is_watching.hash(state);
         self.view_url.hash(state);
@@ -397,7 +408,9 @@ pub struct ConversationRecipient {
     pub username: String,
 }
 
-pub fn deserialize_recipients<'de, D>(deserializer: D) -> Result<Vec<ConversationRecipient>, D::Error>
+pub fn deserialize_recipients<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ConversationRecipient>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -567,7 +580,8 @@ impl Conversation {
             names.push(starter.to_string());
         }
         for r in &self.recipients {
-            if !r.username.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(&r.username)) {
+            if !r.username.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(&r.username))
+            {
                 names.push(r.username.clone());
             }
         }
@@ -802,10 +816,7 @@ impl<'de> serde::Deserialize<'de> for SearchHit {
                 .and_then(|t| t.as_str())
                 .unwrap_or("thread")
                 .to_string();
-            let content_id = val
-                .get("id")
-                .and_then(|id| id.as_u64())
-                .unwrap_or_default();
+            let content_id = val.get("id").and_then(|id| id.as_u64()).unwrap_or_default();
 
             let username = result_obj
                 .get("username")
@@ -1184,10 +1195,9 @@ where
     let one = |v: &serde_json::Value| -> Option<String> {
         match v {
             serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Object(o) => o
-                .get("tag")
-                .and_then(|t| t.as_str())
-                .map(|t| t.to_string()),
+            serde_json::Value::Object(o) => {
+                o.get("tag").and_then(|t| t.as_str()).map(|t| t.to_string())
+            }
             _ => None,
         }
     };
@@ -1292,21 +1302,34 @@ impl Attachment {
     /// emitted in their direct URL (AttachmentController::assertViewableAttachment).
     pub fn data_url(&self, origin: &str) -> Option<String> {
         let direct = self.open_url().filter(|url| !url.trim().is_empty())?;
-        if self.attachment_id == 0 { return None; }
+        if self.attachment_id == 0 {
+            return None;
+        }
         let direct = reqwest::Url::parse(direct).ok()?;
         let base = reqwest::Url::parse(origin).ok()?;
         let attachment_route = direct.path().starts_with("/attachments/")
             || (direct.path() == "/index.php"
-                && direct.query().is_some_and(|query| query.starts_with("attachments/")));
-        if direct.origin() != base.origin() || !attachment_route
-            || !direct.username().is_empty() || direct.password().is_some()
+                && direct
+                    .query()
+                    .is_some_and(|query| query.starts_with("attachments/")));
+        if direct.origin() != base.origin()
+            || !attachment_route
+            || !direct.username().is_empty()
+            || direct.password().is_some()
         {
             return None;
         }
         let mut url = reqwest::Url::parse(&format!(
-            "{}/api/attachments/{}/data", origin.trim_end_matches('/'), self.attachment_id
-        )).ok()?;
-        if let Some(hash) = direct.query_pairs().find(|(key, _)| key == "hash").map(|(_, value)| value.into_owned()) {
+            "{}/api/attachments/{}/data",
+            origin.trim_end_matches('/'),
+            self.attachment_id
+        ))
+        .ok()?;
+        if let Some(hash) = direct
+            .query_pairs()
+            .find(|(key, _)| key == "hash")
+            .map(|(_, value)| value.into_owned())
+        {
             url.query_pairs_mut().append_pair("hash", &hash);
         }
         Some(url.into())
@@ -1370,7 +1393,9 @@ impl Post {
 
     pub fn can_vote(&self, direction: &str) -> bool {
         self.can_content_vote != Some(false)
-            && self.allowed_content_vote_types.as_ref()
+            && self
+                .allowed_content_vote_types
+                .as_ref()
                 .is_none_or(|types| types.iter().any(|kind| kind == direction))
     }
 
@@ -1422,28 +1447,60 @@ mod tests {
     /// state a moderator would receive.
     #[test]
     fn media_and_resource_state_come_from_the_wire() {
-        let media: serde_json::Value = serde_json::from_str(include_str!("testdata/media_page.json")).unwrap();
-        let resources: serde_json::Value = serde_json::from_str(include_str!("testdata/resources_page.json")).unwrap();
+        let media: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/media_page.json")).unwrap();
+        let resources: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/resources_page.json")).unwrap();
         let mut m = media["media"][0].clone();
         let mut r = resources["resources"][0].clone();
-        assert_eq!(serde_json::from_value::<MediaItem>(m.clone()).unwrap().state(), ContentState::Visible);
-        assert_eq!(serde_json::from_value::<Resource>(r.clone()).unwrap().state(), ContentState::Visible);
-        for (wire, state) in [("deleted", ContentState::Deleted), ("moderated", ContentState::Moderated)] {
+        assert_eq!(
+            serde_json::from_value::<MediaItem>(m.clone())
+                .unwrap()
+                .state(),
+            ContentState::Visible
+        );
+        assert_eq!(
+            serde_json::from_value::<Resource>(r.clone())
+                .unwrap()
+                .state(),
+            ContentState::Visible
+        );
+        for (wire, state) in [
+            ("deleted", ContentState::Deleted),
+            ("moderated", ContentState::Moderated),
+        ] {
             m["media_state"] = wire.into();
             r["resource_state"] = wire.into();
-            assert_eq!(serde_json::from_value::<MediaItem>(m.clone()).unwrap().state(), state);
-            assert_eq!(serde_json::from_value::<Resource>(r.clone()).unwrap().state(), state);
+            assert_eq!(
+                serde_json::from_value::<MediaItem>(m.clone())
+                    .unwrap()
+                    .state(),
+                state
+            );
+            assert_eq!(
+                serde_json::from_value::<Resource>(r.clone())
+                    .unwrap()
+                    .state(),
+                state
+            );
         }
         m["media_state"] = serde_json::Value::Null;
-        assert_eq!(serde_json::from_value::<MediaItem>(m).unwrap().state(), ContentState::Visible);
+        assert_eq!(
+            serde_json::from_value::<MediaItem>(m).unwrap().state(),
+            ContentState::Visible
+        );
     }
 
     #[test]
     fn captured_thread_and_post_permissions_keep_explicit_server_refusals() {
         // Whole GET /threads/448647/?with_posts=1&page=1 response, captured
         // with API visitor 0. Personal values are redacted; every key stays.
-        let reply: ThreadReply = serde_json::from_str(include_str!("testdata/thread_permissions.json")).unwrap();
-        assert!(reply.thread.discussion_open, "an open thread can still forbid this reader's reply");
+        let reply: ThreadReply =
+            serde_json::from_str(include_str!("testdata/thread_permissions.json")).unwrap();
+        assert!(
+            reply.thread.discussion_open,
+            "an open thread can still forbid this reader's reply"
+        );
         assert_eq!(reply.thread.can_reply, Some(false));
         assert!(!reply.thread.can_reply());
         assert!(!reply.posts.is_empty());
@@ -1451,44 +1508,89 @@ mod tests {
             assert_eq!(post.can_react, Some(false));
             assert!(!post.can_react());
             assert_eq!(post.can_content_vote, Some(false));
-            assert_eq!(post.allowed_content_vote_types.as_deref(), Some(&["up".into(), "down".into()][..]));
+            assert_eq!(
+                post.allowed_content_vote_types.as_deref(),
+                Some(&["up".into(), "down".into()][..])
+            );
             assert!(!post.can_vote("up") && !post.can_vote("down"));
         }
     }
 
     #[test]
     fn captured_node_and_forum_type_data_keep_thread_creation_permission() {
-        let thread: serde_json::Value = serde_json::from_str(include_str!("testdata/thread_permissions.json")).unwrap();
+        let thread: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/thread_permissions.json")).unwrap();
         let node: Node = serde_json::from_value(thread["thread"]["Forum"].clone()).unwrap();
         assert_eq!(node.thread_creation_permission(), Some(false));
-        let reply: ForumReply = serde_json::from_str(include_str!("testdata/forum_permissions.json")).unwrap();
+        let reply: ForumReply =
+            serde_json::from_str(include_str!("testdata/forum_permissions.json")).unwrap();
         assert_eq!(reply.forum.node_id, node.node_id);
         assert_eq!(reply.forum.thread_creation_permission(), Some(false));
         for null in [false, true] {
             let mut value = thread["thread"]["Forum"].clone();
-            if null { value["type_data"]["can_create_thread"] = serde_json::Value::Null; }
-            else { value["type_data"].as_object_mut().unwrap().remove("can_create_thread"); }
-            assert_eq!(serde_json::from_value::<Node>(value.clone()).unwrap().thread_creation_permission(), None);
-            assert_eq!(serde_json::from_value::<Forum>(value.clone()).unwrap().thread_creation_permission(), None);
-            if null { value["type_data"] = serde_json::Value::Null; }
-            else { value.as_object_mut().unwrap().remove("type_data"); }
-            assert_eq!(serde_json::from_value::<Node>(value.clone()).unwrap().thread_creation_permission(), None);
-            assert_eq!(serde_json::from_value::<Forum>(value).unwrap().thread_creation_permission(), None);
+            if null {
+                value["type_data"]["can_create_thread"] = serde_json::Value::Null;
+            } else {
+                value["type_data"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("can_create_thread");
+            }
+            assert_eq!(
+                serde_json::from_value::<Node>(value.clone())
+                    .unwrap()
+                    .thread_creation_permission(),
+                None
+            );
+            assert_eq!(
+                serde_json::from_value::<Forum>(value.clone())
+                    .unwrap()
+                    .thread_creation_permission(),
+                None
+            );
+            if null {
+                value["type_data"] = serde_json::Value::Null;
+            } else {
+                value.as_object_mut().unwrap().remove("type_data");
+            }
+            assert_eq!(
+                serde_json::from_value::<Node>(value.clone())
+                    .unwrap()
+                    .thread_creation_permission(),
+                None
+            );
+            assert_eq!(
+                serde_json::from_value::<Forum>(value)
+                    .unwrap()
+                    .thread_creation_permission(),
+                None
+            );
         }
     }
 
     #[test]
     fn permission_flags_missing_or_null_preserve_compatibility() {
         for null in [false, true] {
-            let mut body: serde_json::Value = serde_json::from_str(include_str!("testdata/thread_permissions.json")).unwrap();
+            let mut body: serde_json::Value =
+                serde_json::from_str(include_str!("testdata/thread_permissions.json")).unwrap();
             let omit = |value: &mut serde_json::Value, names: &[&str]| {
                 for name in names {
-                    if null { value[*name] = serde_json::Value::Null; }
-                    else { value.as_object_mut().unwrap().remove(*name); }
+                    if null {
+                        value[*name] = serde_json::Value::Null;
+                    } else {
+                        value.as_object_mut().unwrap().remove(*name);
+                    }
                 }
             };
             omit(&mut body["thread"], &["can_reply"]);
-            omit(&mut body["posts"][0], &["can_react", "can_content_vote", "allowed_content_vote_types"]);
+            omit(
+                &mut body["posts"][0],
+                &[
+                    "can_react",
+                    "can_content_vote",
+                    "allowed_content_vote_types",
+                ],
+            );
             let reply: ThreadReply = serde_json::from_value(body).unwrap();
             assert!(reply.thread.can_reply());
             assert!(reply.posts[0].can_react());
@@ -1498,10 +1600,14 @@ mod tests {
 
     #[test]
     fn permission_flags_allow_moderator_exceptions_and_limit_vote_directions() {
-        let mut reply: ThreadReply = serde_json::from_str(include_str!("testdata/thread_permissions.json")).unwrap();
+        let mut reply: ThreadReply =
+            serde_json::from_str(include_str!("testdata/thread_permissions.json")).unwrap();
         reply.thread.discussion_open = false;
         reply.thread.can_reply = Some(true);
-        assert!(reply.thread.can_reply(), "a moderator's explicit permission wins over closed state");
+        assert!(
+            reply.thread.can_reply(),
+            "a moderator's explicit permission wins over closed state"
+        );
         let post = &mut reply.posts[0];
         post.can_react = Some(true);
         post.can_content_vote = Some(true);
@@ -1517,22 +1623,40 @@ mod tests {
     #[test]
     fn attachment_data_url_uses_the_forum_origin_and_keeps_temporary_upload_hashes() {
         let mut attachment = Attachment {
-            attachment_id: 7, filename: "private.png".into(),
+            attachment_id: 7,
+            filename: "private.png".into(),
             direct_url: Some("https://forum.example/attachments/private-png.7/".into()),
             ..Default::default()
         };
-        assert_eq!(attachment.data_url("https://forum.example").as_deref(),
-            Some("https://forum.example/api/attachments/7/data"));
+        assert_eq!(
+            attachment.data_url("https://forum.example").as_deref(),
+            Some("https://forum.example/api/attachments/7/data")
+        );
         attachment.direct_url = Some("https://forum.example/index.php?attachments/private-png.7/&hash=temporary%2Bhash&ignored=1".into());
-        assert_eq!(attachment.data_url("https://forum.example/").as_deref(),
-            Some("https://forum.example/api/attachments/7/data?hash=temporary%2Bhash"));
-        assert_eq!(attachment.open_url(), attachment.direct_url.as_deref(), "browser URL remains untouched");
-        for public in ["https://cdn.example/private.png?hash=public-file-hash", "https://forum.example/data/attachments/private.png"] {
+        assert_eq!(
+            attachment.data_url("https://forum.example/").as_deref(),
+            Some("https://forum.example/api/attachments/7/data?hash=temporary%2Bhash")
+        );
+        assert_eq!(
+            attachment.open_url(),
+            attachment.direct_url.as_deref(),
+            "browser URL remains untouched"
+        );
+        for public in [
+            "https://cdn.example/private.png?hash=public-file-hash",
+            "https://forum.example/data/attachments/private.png",
+        ] {
             attachment.direct_url = Some(public.into());
-            assert!(attachment.data_url("https://forum.example").is_none(), "public URL remains cacheable: {public}");
+            assert!(
+                attachment.data_url("https://forum.example").is_none(),
+                "public URL remains cacheable: {public}"
+            );
         }
         attachment.direct_url = None;
-        assert!(attachment.data_url("https://forum.example").is_none(), "missing byte URLs stay placeholders");
+        assert!(
+            attachment.data_url("https://forum.example").is_none(),
+            "missing byte URLs stay placeholders"
+        );
         attachment.direct_url = Some("https://forum.example/attachments/7/".into());
         attachment.attachment_id = 0;
         assert!(attachment.data_url("https://forum.example").is_none());
@@ -1540,40 +1664,72 @@ mod tests {
 
     #[tokio::test]
     async fn attachment_data_url_fetches_with_bearer_and_unassociated_upload_hash() {
+        use wiremock::matchers::{header, method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use wiremock::matchers::{method, path, header, query_param};
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/attachments/private-png.7/"))
-            .respond_with(ResponseTemplate::new(403)).mount(&server).await;
-        Mock::given(method("GET")).and(path("/api/attachments/7/data"))
+        Mock::given(method("GET"))
+            .and(path("/attachments/private-png.7/"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/attachments/7/data"))
             .and(header("authorization", "Bearer test-attachment-access"))
             .and(query_param("hash", "temporary+hash"))
-            .respond_with(ResponseTemplate::new(200).insert_header("content-type", "image/png")
-                .set_body_bytes(vec![1, 2, 3])).mount(&server).await;
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(vec![1, 2, 3]),
+            )
+            .mount(&server)
+            .await;
         let root = std::env::temp_dir().join(format!(
-            "wftui-model-attachment-{}-{}", std::process::id(), server.address().port()
+            "wftui-model-attachment-{}-{}",
+            std::process::id(),
+            server.address().port()
         ));
         let client = crate::api::WfApiClient::with_store(
-            crate::token::Store::with_path(root.join("token.json")), server.uri(), "test-client"
-        ).unwrap();
-        client.set_tokens(crate::token::TokenSet {
-            access_token: "test-attachment-access".into(), refresh_token: "test-refresh".into(),
-            expires_at: 9_999_999_999, scope: "attachment:read".into(),
-            origin: server.uri(), client_id: "test-client".into(),
-        }).await.unwrap();
+            crate::token::Store::with_path(root.join("token.json")),
+            server.uri(),
+            "test-client",
+        )
+        .unwrap();
+        client
+            .set_tokens(crate::token::TokenSet {
+                access_token: "test-attachment-access".into(),
+                refresh_token: "test-refresh".into(),
+                expires_at: 9_999_999_999,
+                scope: "attachment:read".into(),
+                origin: server.uri(),
+                client_id: "test-client".into(),
+            })
+            .await
+            .unwrap();
         let attachment = Attachment {
-            attachment_id: 7, filename: "private.png".into(),
-            direct_url: Some(format!("{}/attachments/private-png.7/?hash=temporary%2Bhash", server.uri())),
+            attachment_id: 7,
+            filename: "private.png".into(),
+            direct_url: Some(format!(
+                "{}/attachments/private-png.7/?hash=temporary%2Bhash",
+                server.uri()
+            )),
             ..Default::default()
         };
-        assert!(client.fetch_bytes(attachment.open_url().unwrap(), 1024).await.is_err(),
-            "a public attachment route has no browser session cookie");
+        assert!(
+            client
+                .fetch_bytes(attachment.open_url().unwrap(), 1024)
+                .await
+                .is_err(),
+            "a public attachment route has no browser session cookie"
+        );
         let url = attachment.data_url(&server.uri()).unwrap();
         assert!(client.image_uses_bearer(&url));
         assert_eq!(client.fetch_bytes(&url, 1024).await.unwrap(), vec![1, 2, 3]);
         let requests = server.received_requests().await.unwrap();
         assert!(requests[0].headers.get("authorization").is_none());
-        assert_eq!(requests[1].headers.get("authorization").unwrap(), "Bearer test-attachment-access");
+        assert_eq!(
+            requests[1].headers.get("authorization").unwrap(),
+            "Bearer test-attachment-access"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1713,10 +1869,17 @@ mod tests {
     /// `question`, and that is what gates the solution key.
     #[test]
     fn captured_question_thread_allows_question_actions() {
-        let reply: ThreadReply = serde_json::from_str(include_str!("testdata/thread_permissions.json")).unwrap();
+        let reply: ThreadReply =
+            serde_json::from_str(include_str!("testdata/thread_permissions.json")).unwrap();
         let thread = reply.thread;
         assert!(thread.is_question());
-        assert_eq!(thread.question.as_ref().map(|q| q.allow_question_actions.as_str()), Some("yes"));
+        assert_eq!(
+            thread
+                .question
+                .as_ref()
+                .map(|q| q.allow_question_actions.as_str()),
+            Some("yes")
+        );
         assert!(thread.allows_question_actions());
         let mut closed = thread.clone();
         closed.question.as_mut().unwrap().allow_question_actions = "no".into();
@@ -1816,7 +1979,10 @@ mod tests {
             hit.thread_id, None,
             "a profile-post comment id must not become a thread id"
         );
-        assert_eq!(hit.view_url.as_deref(), Some("https://windowsforum.com/profile-posts/575/"));
+        assert_eq!(
+            hit.view_url.as_deref(),
+            Some("https://windowsforum.com/profile-posts/575/")
+        );
 
         let media = serde_json::json!({
             "type": "xfmg_media",
@@ -1950,7 +2116,10 @@ mod tests {
         assert_eq!(ContentState::parse("deleted"), ContentState::Deleted);
         assert_eq!(ContentState::parse(""), ContentState::Visible);
         assert_eq!(ContentState::parse("something_new"), ContentState::Visible);
-        assert!(ContentState::Visible.label().is_none(), "no chip on normal content");
+        assert!(
+            ContentState::Visible.label().is_none(),
+            "no chip on normal content"
+        );
         assert_eq!(ContentState::Deleted.label(), Some("deleted"));
         assert_eq!(ContentState::Moderated.label(), Some("awaiting approval"));
     }
@@ -1976,7 +2145,6 @@ mod tests {
             serde_json::from_str(r#"{"post_id": 2, "message_state": "moderated"}"#).expect("post");
         assert_eq!(p.state(), ContentState::Moderated);
     }
-
 }
 
 /// One draft as the TuiLink relay reports it (#716).

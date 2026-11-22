@@ -66,28 +66,28 @@ pub struct Glyphs {
 }
 
 pub const UNICODE: Glyphs = Glyphs {
-    unread: "\u{25CF}",       // ●
+    unread: "\u{25CF}", // ●
     question: "?",
-    solved: "\u{2713}",       // ✓
-    sticky: "\u{00BB}",       // »
-    article: "\u{25AA}",      // ▪
-    locked: "\u{2298}",       // ⊘
-    gutter: "\u{2503}",       // ┃
-    heading: "\u{258C}",      // ▌
-    watching: "\u{2605}",     // ★
-    like: "\u{2661}",         // ♡
-    vote: "\u{25B2}",         // ▲
+    solved: "\u{2713}",                                        // ✓
+    sticky: "\u{00BB}",                                        // »
+    article: "\u{25AA}",                                       // ▪
+    locked: "\u{2298}",                                        // ⊘
+    gutter: "\u{2503}",                                        // ┃
+    heading: "\u{258C}",                                       // ▌
+    watching: "\u{2605}",                                      // ★
+    like: "\u{2661}",                                          // ♡
+    vote: "\u{25B2}",                                          // ▲
     spinner: ["\u{25D0}", "\u{25D3}", "\u{25D1}", "\u{25D2}"], // ◐ ◓ ◑ ◒
-    gate_on: "\u{25AE}",      // ▮
-    gate_off: "\u{25AF}",     // ▯
-    crumb: "\u{203A}",        // ›
-    more: "\u{25BE}",         // ▾
-    external: "\u{2197}",     // ↗
-    image: "\u{25A3}",        // ▣
-    play: "\u{25B6}",         // ▶
-    reply_alert: "\u{21A9}",  // ↩
+    gate_on: "\u{25AE}",                                       // ▮
+    gate_off: "\u{25AF}",                                      // ▯
+    crumb: "\u{203A}",                                         // ›
+    more: "\u{25BE}",                                          // ▾
+    external: "\u{2197}",                                      // ↗
+    image: "\u{25A3}",                                         // ▣
+    play: "\u{25B6}",                                          // ▶
+    reply_alert: "\u{21A9}",                                   // ↩
     mention: "@",
-    quote_alert: "\u{275D}",  // ❝
+    quote_alert: "\u{275D}", // ❝
     ascii: false,
 };
 
@@ -230,10 +230,7 @@ mod tests {
 
     #[test]
     fn border_type_follows_the_set() {
-        assert_eq!(
-            UNICODE.border_type(),
-            ratatui::widgets::BorderType::Rounded
-        );
+        assert_eq!(UNICODE.border_type(), ratatui::widgets::BorderType::Rounded);
         assert_eq!(ASCII.border_type(), ratatui::widgets::BorderType::Plain);
     }
 }

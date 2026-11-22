@@ -23,8 +23,8 @@ use ratatui::widgets::{Clear, Paragraph};
 use common::models::User;
 
 use crate::chrome::{self, Hints};
-use crate::hit::{Hit, HitMap};
 use crate::glyph::Glyphs;
+use crate::hit::{Hit, HitMap};
 use crate::theme::Theme;
 
 /// Palette panel width (DESIGN.md / `Overlays.dc.html`: 60 cells).
@@ -461,7 +461,10 @@ impl Palette {
         // Row 1: the rule under the query.
         if inner.height > 1 {
             f.render_widget(
-                Paragraph::new(Line::from(Span::styled("\u{2500}".repeat(w), theme.faint()))),
+                Paragraph::new(Line::from(Span::styled(
+                    "\u{2500}".repeat(w),
+                    theme.faint(),
+                ))),
                 Rect::new(inner.x, inner.y + 1, inner.width, 1),
             );
         }
@@ -473,7 +476,9 @@ impl Palette {
             let Some((idx, positions)) = self.filtered.get(self.scroll + slot) else {
                 break;
             };
-            let Some(item) = self.items.get(*idx) else { break };
+            let Some(item) = self.items.get(*idx) else {
+                break;
+            };
             let selected = self.scroll + slot == self.sel;
             // The index is into `filtered`, which is what `sel` indexes too,
             // so a click can just move the selection and run it.
@@ -695,7 +700,12 @@ pub fn which_key_cells(site: &common::site::SiteConfig) -> Vec<(&'static str, St
     let mut cells: Vec<(&'static str, String)> = site
         .quick
         .iter()
-        .map(|q| (static_letter(q.key), which_key_label(&q.label, &site.prefix_strip)))
+        .map(|q| {
+            (
+                static_letter(q.key),
+                which_key_label(&q.label, &site.prefix_strip),
+            )
+        })
         .collect();
     cells.push(("l", "latest".into()));
     cells.push(("i", "inbox".into()));
@@ -709,7 +719,13 @@ pub fn which_key_cells(site: &common::site::SiteConfig) -> Vec<(&'static str, St
     if site.features.ask_ai {
         cells.push(("k", "ask ai".into()));
     }
-    for (k, label) in [("d", "drafts"), ("h", "home"), ("p", "profile"), ("g", "top"), ("u", "update")] {
+    for (k, label) in [
+        ("d", "drafts"),
+        ("h", "home"),
+        ("p", "profile"),
+        ("g", "top"),
+        ("u", "update"),
+    ] {
         cells.push((k, label.into()));
     }
     cells
@@ -756,9 +772,7 @@ pub fn render_which_key(
     // Two border rows plus one per row of cells; for the built-in site that
     // is `WHICH_KEY_HEIGHT`, the DESIGN.md panel.
     let height = (rows.len() as u16 + 2).min(body.height);
-    let x = body
-        .x
-        .max(body.x + body.width.saturating_sub(width + 2));
+    let x = body.x.max(body.x + body.width.saturating_sub(width + 2));
     let y = body.y + body.height.saturating_sub(height + 1);
     let area = Rect::new(x, y, width, height);
     hits.push_around(body, area, Hit::CloseOverlay);
@@ -832,9 +846,7 @@ pub fn keys_card_status() -> &'static str {
 
 /// Hints that the MOVE and EVERYWHERE columns already teach; a screen's own
 /// group never repeats them.
-const CARD_GLOBAL_KEYS: [&str; 10] = [
-    "j/k", "n/N", "[ ]", "[/]", "Tab", "Esc", "q", "?", "/", "g",
-];
+const CARD_GLOBAL_KEYS: [&str; 10] = ["j/k", "n/N", "[ ]", "[/]", "Tab", "Esc", "q", "?", "/", "g"];
 
 /// Draw the `?` card: MOVE / <this screen's group> / EVERYWHERE / MOUSE &
 /// CLIPBOARD, two columns, 96 × 16 (`Help.dc.html`).
@@ -933,16 +945,23 @@ pub fn render_keys_card(
         mouse_row(
             theme,
             "click",
-            pick("select \u{b7} again or double opens", "select \u{b7} again opens"),
+            pick(
+                "select \u{b7} again or double opens",
+                "select \u{b7} again opens",
+            ),
         ),
-        mouse_row(theme, "right-click", pick("open in your browser", "open in web")),
-        mouse_row(theme, "drag", pick("select + copy on release", "select + copy")),
+        mouse_row(
+            theme,
+            "right-click",
+            pick("open in your browser", "open in web"),
+        ),
+        mouse_row(
+            theme,
+            "drag",
+            pick("select + copy on release", "select + copy"),
+        ),
         mouse_row(theme, "wheel", "scroll"),
-        vec![
-            Span::raw(" "),
-            cap("^C"),
-            txt(" copy selection".into()),
-        ],
+        vec![Span::raw(" "), cap("^C"), txt(" copy selection".into())],
         vec![
             Span::raw(" "),
             cap("^Y"),
@@ -972,10 +991,7 @@ pub fn render_keys_card(
         if used < half {
             spans.push(Span::raw(" ".repeat(half - used)));
         }
-        spans.extend(clip(
-            right.get(i).cloned().unwrap_or_default(),
-            full - half,
-        ));
+        spans.extend(clip(right.get(i).cloned().unwrap_or_default(), full - half));
         lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines), inner);
@@ -1102,14 +1118,30 @@ mod tests {
         for max in 1..=12usize {
             let spans = highlight(&theme, &title, &[], max);
             let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-            assert!(chrome::cell_width(&text) <= max, "max {max}: {text:?} is {} cells", chrome::cell_width(&text));
+            assert!(
+                chrome::cell_width(&text) <= max,
+                "max {max}: {text:?} is {} cells",
+                chrome::cell_width(&text)
+            );
             let body = text.trim_end_matches(ELLIPSIS);
-            assert!(title.starts_with(body), "max {max}: {body:?} is not a cluster-aligned prefix");
-            assert!(!body.ends_with('\u{200d}') && !body.ends_with("\u{1f468}") && !body.ends_with("\u{26a0}"), "max {max}: half a cluster: {body:?}");
+            assert!(
+                title.starts_with(body),
+                "max {max}: {body:?} is not a cluster-aligned prefix"
+            );
+            assert!(
+                !body.ends_with('\u{200d}')
+                    && !body.ends_with("\u{1f468}")
+                    && !body.ends_with("\u{26a0}"),
+                "max {max}: half a cluster: {body:?}"
+            );
         }
         // positions are char indices: index 3 is the ZWJ inside the family.
         let spans = highlight(&theme, &title, &[3], 40);
-        let lit: Vec<&str> = spans.iter().filter(|s| s.style == hit_style(&theme)).map(|s| s.content.as_ref()).collect();
+        let lit: Vec<&str> = spans
+            .iter()
+            .filter(|s| s.style == hit_style(&theme))
+            .map(|s| s.content.as_ref())
+            .collect();
         assert_eq!(lit, vec![family], "{spans:?}");
     }
     use crate::glyph::{ASCII, UNICODE};
@@ -1269,10 +1301,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(
-            p.items.last().expect("member").title.as_str(),
-            "@kemical"
-        );
+        assert_eq!(p.items.last().expect("member").title.as_str(), "@kemical");
     }
 
     #[test]
@@ -1281,27 +1310,39 @@ mod tests {
         let mut p = Prefix::default();
         assert!(!p.armed());
         assert_eq!(
-            p.resolve(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &quick),
+            p.resolve(
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+                &quick
+            ),
             PrefixEvent::NotArmed
         );
 
         p.arm();
         assert!(p.armed());
         assert_eq!(
-            p.resolve(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &quick),
+            p.resolve(
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+                &quick
+            ),
             PrefixEvent::Go(GoTarget::Quick(0))
         );
         assert!(!p.armed(), "resolving always disarms");
 
         p.arm();
         assert_eq!(
-            p.resolve(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &quick),
+            p.resolve(
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                &quick
+            ),
             PrefixEvent::Go(GoTarget::Top)
         );
 
         p.arm();
         assert_eq!(
-            p.resolve(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE), &quick),
+            p.resolve(
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+                &quick
+            ),
             PrefixEvent::Go(GoTarget::Update)
         );
 
@@ -1406,7 +1447,15 @@ mod tests {
                 press(&mut p, c);
             }
 
-            let shot_palette = shot(w, h, |f, body| p.render(f, body, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
+            let shot_palette = shot(w, h, |f, body| {
+                p.render(
+                    f,
+                    body,
+                    &theme,
+                    &UNICODE,
+                    &mut crate::hit::HitMap::default(),
+                )
+            });
             assert_boxed_in_body(&shot_palette, w, h, "Go to", "Enter go");
             let text = shot_palette.join("\n");
             assert!(text.contains("\u{203A} win"), "query line missing:\n{text}");
@@ -1418,16 +1467,39 @@ mod tests {
             assert!(text.contains("@WindowsForum AI"), "member row missing");
 
             let shot_which = shot(w, h, |f, body| {
-                render_which_key(f, body, &theme, &UNICODE, &which_key_cells(&common::site::SiteConfig::windowsforum()), &mut crate::hit::HitMap::default())
+                render_which_key(
+                    f,
+                    body,
+                    &theme,
+                    &UNICODE,
+                    &which_key_cells(&common::site::SiteConfig::windowsforum()),
+                    &mut crate::hit::HitMap::default(),
+                )
             });
             assert_boxed_in_body(&shot_which, w, h, "g \u{2026}", "Esc cancel");
             let text = shot_which.join("\n");
-            for word in ["news", "security", "tutorials", "inbox", "alerts", "top", "update"] {
+            for word in [
+                "news",
+                "security",
+                "tutorials",
+                "inbox",
+                "alerts",
+                "top",
+                "update",
+            ] {
                 assert!(text.contains(word), "which-key is missing {word}:\n{text}");
             }
 
             let shot_card = shot(w, h, |f, body| {
-                render_keys_card(f, body, &theme, &UNICODE, "THIS THREAD", &hints, &mut crate::hit::HitMap::default())
+                render_keys_card(
+                    f,
+                    body,
+                    &theme,
+                    &UNICODE,
+                    "THIS THREAD",
+                    &hints,
+                    &mut crate::hit::HitMap::default(),
+                )
             });
             assert_boxed_in_body(&shot_card, w, h, "Keys", "any key closes");
             let text = shot_card.join("\n");
@@ -1436,7 +1508,14 @@ mod tests {
             }
             // The MOUSE group teaches the pointer/touch gestures and the one
             // way to turn the whole layer off (beside Shift+drag).
-            for gesture in ["click", "right-click", "drag", "wheel", "Shift+drag", "WFTUI_MOUSE=0"] {
+            for gesture in [
+                "click",
+                "right-click",
+                "drag",
+                "wheel",
+                "Shift+drag",
+                "WFTUI_MOUSE=0",
+            ] {
                 assert!(
                     text.contains(gesture),
                     "the MOUSE group is missing {gesture}:\n{text}"
@@ -1470,7 +1549,13 @@ mod tests {
                 Rect::new(0, 30, 120, 1),
             );
             dim_body(f, body, &theme);
-            p.render(f, body, &theme, &UNICODE, &mut crate::hit::HitMap::default());
+            p.render(
+                f,
+                body,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("render");
         let buf = term.backend().buffer();
@@ -1501,7 +1586,9 @@ mod tests {
                 &theme,
                 &UNICODE,
                 "THIS THREAD",
-                &hints, &mut crate::hit::HitMap::default(),)
+                &hints,
+                &mut crate::hit::HitMap::default(),
+            )
         })
         .expect("render");
         let buf = term.backend().buffer();
@@ -1513,7 +1600,10 @@ mod tests {
                 })
             })
             .collect();
-        assert_eq!(accents, " r ", "only the primary cap is accented: {accents:?}");
+        assert_eq!(
+            accents, " r ",
+            "only the primary cap is accented: {accents:?}"
+        );
     }
 
     /// Every cap the which-key panel shows must resolve: a chord the panel
@@ -1523,32 +1613,61 @@ mod tests {
     fn every_which_key_cell_resolves_to_a_go_target() {
         let site = common::site::SiteConfig::windowsforum();
         let cells = which_key_cells(&site);
-        assert_eq!(which_key_rows(&cells).len() as u16 + 2, WHICH_KEY_HEIGHT, "the built-in panel is the DESIGN.md one");
+        assert_eq!(
+            which_key_rows(&cells).len() as u16 + 2,
+            WHICH_KEY_HEIGHT,
+            "the built-in panel is the DESIGN.md one"
+        );
         for (key, label) in &cells {
             let mut p = Prefix::default();
             p.arm();
             let c = key.chars().next().unwrap();
             assert!(
-                matches!(p.resolve(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &site.quick), PrefixEvent::Go(_)),
+                matches!(
+                    p.resolve(
+                        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                        &site.quick
+                    ),
+                    PrefixEvent::Go(_)
+                ),
                 "g {key} ({label}) is advertised but does not resolve"
             );
         }
         // The built-in chords resolve to the site's quick list, in order.
         let mut p = Prefix::default();
         p.arm();
-        assert_eq!(p.resolve(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &site.quick), PrefixEvent::Go(GoTarget::Quick(1)));
+        assert_eq!(
+            p.resolve(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+                &site.quick
+            ),
+            PrefixEvent::Go(GoTarget::Quick(1))
+        );
         // A site with no add-ons and no quick nodes: the fixed rows only.
         assert_eq!(
-            cells.iter().take(3).map(|(k, l)| format!("{k} {l}")).collect::<Vec<_>>(),
+            cells
+                .iter()
+                .take(3)
+                .map(|(k, l)| format!("{k} {l}"))
+                .collect::<Vec<_>>(),
             ["n news", "s security", "t tutorials"],
             "the built-in panel reads as it always did"
         );
         let plain = common::site::SiteConfig::blank("plain");
         let cells = which_key_cells(&plain);
-        assert_eq!(cells.iter().map(|(k, _)| *k).collect::<Vec<_>>(), ["l", "i", "a", "d", "h", "p", "g", "u"]);
+        assert_eq!(
+            cells.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            ["l", "i", "a", "d", "h", "p", "g", "u"]
+        );
         let mut p = Prefix::default();
         p.arm();
-        assert_eq!(p.resolve(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &plain.quick), PrefixEvent::Cancelled);
+        assert_eq!(
+            p.resolve(
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+                &plain.quick
+            ),
+            PrefixEvent::Cancelled
+        );
         assert_eq!(static_letter('q'), "q");
         assert_eq!(static_letter('Q'), "?");
     }
@@ -1566,8 +1685,23 @@ mod tests {
                         let body = Rect::new(0, 1, w, h.saturating_sub(3).max(1));
                         dim_body(f, body, &theme);
                         p.render(f, body, &theme, g, &mut crate::hit::HitMap::default());
-                        render_which_key(f, body, &theme, g, &which_key_cells(&common::site::SiteConfig::windowsforum()), &mut crate::hit::HitMap::default());
-                        render_keys_card(f, body, &theme, g, "THIS THREAD", &hints, &mut crate::hit::HitMap::default());
+                        render_which_key(
+                            f,
+                            body,
+                            &theme,
+                            g,
+                            &which_key_cells(&common::site::SiteConfig::windowsforum()),
+                            &mut crate::hit::HitMap::default(),
+                        );
+                        render_keys_card(
+                            f,
+                            body,
+                            &theme,
+                            g,
+                            "THIS THREAD",
+                            &hints,
+                            &mut crate::hit::HitMap::default(),
+                        );
                     })
                     .expect("render");
                 }
@@ -1575,4 +1709,3 @@ mod tests {
         }
     }
 }
-

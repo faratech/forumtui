@@ -8,20 +8,20 @@
 //! on a resource renders its page from the same BBCode the site renders.
 //! `o` is what opens the website.
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
-use ratatui::Frame;
 
-use super::browse::{chunk_lines_aligned, truncate, wrap_spans, wrap_spans_aligned, RuleWidth};
+use super::browse::{RuleWidth, chunk_lines_aligned, truncate, wrap_spans, wrap_spans_aligned};
 use super::{Action, DraftRow, HitMap, MediaItem, Resource};
-use crate::hit::{Hit, HitPane};
 use crate::chrome::{self, Hints};
 use crate::glyph::Glyphs;
+use crate::hit::{Hit, HitPane};
 use crate::images::{self, Request, Slot};
-use crate::theme::{fmt_age, Theme};
+use crate::theme::{Theme, fmt_age};
 use common::bbcode;
 use common::models::{ContentState, MediaCategory};
 
@@ -63,7 +63,13 @@ fn catalog_line(theme: &Theme, title: &str, right_text: &str, w: usize) -> Line<
 /// `catalog_line` for an item that has a content state (#127): a deleted or
 /// awaiting-approval item wears the same chip and title style a thread row
 /// does (#704), so a moderator can tell it from public content.
-fn stated_catalog_line(theme: &Theme, state: ContentState, title: &str, right_text: &str, w: usize) -> Line<'static> {
+fn stated_catalog_line(
+    theme: &Theme,
+    state: ContentState,
+    title: &str,
+    right_text: &str,
+    w: usize,
+) -> Line<'static> {
     // The metadata is untrusted too (for example, a long resource author or
     // title).  Truncate it before reserving the title column; otherwise a
     // narrow panel can overflow even though the left side is cell-aware.
@@ -78,7 +84,10 @@ fn stated_catalog_line(theme: &Theme, state: ContentState, title: &str, right_te
         spans.push(chip);
         spans.push(Span::raw(" "));
     }
-    let left = Span::styled(truncate(title, title_w), state_title_style(theme, state, theme.base()));
+    let left = Span::styled(
+        truncate(title, title_w),
+        state_title_style(theme, state, theme.base()),
+    );
     let used: usize = spans.iter().map(Span::width).sum::<usize>() + left.width();
     let pad = w.saturating_sub(used + right_w);
     spans.extend([left, Span::raw(" ".repeat(pad)), right]);
@@ -88,7 +97,12 @@ fn stated_catalog_line(theme: &Theme, state: ContentState, title: &str, right_te
 /// The state chip a thread row carries ahead of its prefix (#704).
 fn state_chip(theme: &Theme, state: ContentState) -> Option<Span<'static>> {
     state.label().map(|label| {
-        Span::styled(format!(" {label} "), Style::new().fg(theme.error).add_modifier(Modifier::REVERSED))
+        Span::styled(
+            format!(" {label} "),
+            Style::new()
+                .fg(theme.error)
+                .add_modifier(Modifier::REVERSED),
+        )
     })
 }
 
@@ -199,9 +213,10 @@ fn render_categories(
 
     let w = inner.width as usize;
     let mut items: Vec<ListItem> = Vec::with_capacity(s.categories.len() + 1);
-    items.push(ListItem::new(Line::from(vec![
-        Span::styled("All media", theme.base()),
-    ])));
+    items.push(ListItem::new(Line::from(vec![Span::styled(
+        "All media",
+        theme.base(),
+    )])));
     for c in &s.categories {
         // One level of indent per depth, the way the site's own category
         // list steps children in under their parent.
@@ -332,7 +347,10 @@ fn render_media_items(
             title_spans.push(chip);
             title_spans.push(Span::raw(" "));
         }
-        title_spans.push(Span::styled(truncate(&item.title, title_w), state_title_style(theme, state, title_style)));
+        title_spans.push(Span::styled(
+            truncate(&item.title, title_w),
+            state_title_style(theme, state, title_style),
+        ));
         let mut lines: Vec<Line<'static>> = vec![Line::from(title_spans)];
         let mut meta = item.username.clone();
         if item.media_date > 0 {
@@ -341,7 +359,10 @@ fn render_media_items(
             }
             meta.push_str(&fmt_age(item.media_date));
         }
-        lines.push(Line::from(Span::styled(truncate(&meta, text_w), theme.dim())));
+        lines.push(Line::from(Span::styled(
+            truncate(&meta, text_w),
+            theme.dim(),
+        )));
         let mut stats = String::new();
         if item.view_count > 0 {
             stats.push_str(&format!("{} views", item.view_count));
@@ -359,7 +380,10 @@ fn render_media_items(
             stats.push_str(&format!("{w}\u{d7}{h}"));
         }
         if !stats.is_empty() {
-            lines.push(Line::from(Span::styled(truncate(&stats, text_w), theme.faint())));
+            lines.push(Line::from(Span::styled(
+                truncate(&stats, text_w),
+                theme.faint(),
+            )));
         }
         let text_rows = (row_h as usize).min(lines.len());
         f.render_widget(
@@ -390,7 +414,7 @@ fn render_media_items(
                 s.image_requests.push(Request {
                     key: slot.key.clone(),
                     rect: Rect::new(inner.x + 1, top, cols, rows),
-                full: false,
+                    full: false,
                 });
             }
         }
@@ -607,10 +631,8 @@ pub fn rebuild_resource_lines(s: &mut super::ResourceViewState, theme: &Theme, g
 
     s.lines.push(Line::from(Span::raw("")));
     let rule = if g.ascii { "-" } else { "\u{2500}" };
-    s.lines.push(Line::from(Span::styled(
-        rule.repeat(width),
-        theme.faint(),
-    )));
+    s.lines
+        .push(Line::from(Span::styled(rule.repeat(width), theme.faint())));
     s.lines.push(Line::from(Span::raw("")));
 
     if r.description.is_empty() {
@@ -745,37 +767,63 @@ pub fn render_resource_view(
 fn image_caption(s: &super::ImageViewState, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     let mut caption = Vec::new();
     if !s.meta.is_empty() {
-        caption.push(Line::from(Span::styled(truncate(&s.meta, width as usize), theme.dim())));
+        caption.push(Line::from(Span::styled(
+            truncate(&s.meta, width as usize),
+            theme.dim(),
+        )));
     }
     if !s.description.is_empty() {
-        caption.extend(wrap_spans(
-            &[Span::styled(s.description.clone(), theme.base())], width as usize,
-        ).into_iter().take(3).map(Line::from));
+        caption.extend(
+            wrap_spans(
+                &[Span::styled(s.description.clone(), theme.base())],
+                width as usize,
+            )
+            .into_iter()
+            .take(3)
+            .map(Line::from),
+        );
     }
     caption
 }
 
 fn picture_request(s: &super::ImageViewState, inner: Rect, caption_rows: usize) -> Option<Request> {
-    if !s.images.inline() || inner.width == 0 || inner.height == 0 { return None; }
+    if !s.images.inline() || inner.width == 0 || inner.height == 0 {
+        return None;
+    }
     let cap_rows = (caption_rows as u16).min(inner.height.saturating_sub(1));
     let pic_rows = inner.height.saturating_sub(cap_rows);
     let key = s.key.clone()?;
     let (cols, rows) = images::fit_within(
-        inner.width, pic_rows, s.px.unwrap_or((16, 9)), s.images.font,
+        inner.width,
+        pic_rows,
+        s.px.unwrap_or((16, 9)),
+        s.images.font,
     );
     Some(Request {
         key,
-        rect: Rect::new(inner.x + inner.width.saturating_sub(cols) / 2, inner.y, cols, rows),
+        rect: Rect::new(
+            inner.x + inner.width.saturating_sub(cols) / 2,
+            inner.y,
+            cols,
+            rows,
+        ),
         full: true,
     })
 }
 
 impl super::ImageViewState {
     /// The exact demand used by both the app's status lookup and renderer.
-    pub(crate) fn image_request(&mut self, area: Rect, theme: &Theme, g: &Glyphs) -> Option<Request> {
+    pub(crate) fn image_request(
+        &mut self,
+        area: Rect,
+        theme: &Theme,
+        g: &Glyphs,
+    ) -> Option<Request> {
         let inner = chrome::panel(theme, g, &self.title, true, None, None).inner(area);
         self.prepared_caption = None;
-        if !self.images.inline() || inner.width == 0 || inner.height == 0 { return None; }
+        if !self.images.inline() || inner.width == 0 || inner.height == 0 {
+            return None;
+        }
         let caption = image_caption(self, theme, inner.width);
         let request = picture_request(self, inner, caption.len());
         self.prepared_caption = Some((inner.width, caption));
@@ -803,8 +851,12 @@ pub fn render_image_view(
     }
     hits.push(inner, Hit::Pane(HitPane::List));
 
-    let caption = s.prepared_caption.take().filter(|(width, _)| *width == inner.width)
-        .map(|(_, caption)| caption).unwrap_or_else(|| image_caption(s, theme, inner.width));
+    let caption = s
+        .prepared_caption
+        .take()
+        .filter(|(width, _)| *width == inner.width)
+        .map(|(_, caption)| caption)
+        .unwrap_or_else(|| image_caption(s, theme, inner.width));
     if let Some(request) = picture_request(s, inner, caption.len()) {
         // Keep demand stable while queued/loading or failed. The image store
         // suppresses duplicate workers and remembered failures; dropping this
@@ -956,7 +1008,10 @@ pub fn media_list_key(s: &mut super::MediaListState, key: KeyEvent) -> Action {
                 s.loading = true;
                 s.sel = 0;
                 s.scroll = 0;
-                Action::LoadMedia { category: id, page: 1 }
+                Action::LoadMedia {
+                    category: id,
+                    page: 1,
+                }
             }
             KeyCode::Char('R') | KeyCode::F(5) => Action::LoadMediaCategories,
             KeyCode::Char('q') => Action::PopScreen,
@@ -1043,7 +1098,10 @@ pub fn resource_view_key(s: &mut super::ResourceViewState, key: KeyEvent) -> Act
             Action::None
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            s.scroll = s.scroll.saturating_add(1).min(s.lines.len().saturating_sub(1));
+            s.scroll = s
+                .scroll
+                .saturating_add(1)
+                .min(s.lines.len().saturating_sub(1));
             Action::None
         }
         KeyCode::PageUp => {
@@ -1051,7 +1109,10 @@ pub fn resource_view_key(s: &mut super::ResourceViewState, key: KeyEvent) -> Act
             Action::None
         }
         KeyCode::PageDown => {
-            s.scroll = s.scroll.saturating_add(10).min(s.lines.len().saturating_sub(1));
+            s.scroll = s
+                .scroll
+                .saturating_add(10)
+                .min(s.lines.len().saturating_sub(1));
             Action::None
         }
         KeyCode::Char('R') | KeyCode::F(5) => {
@@ -1183,8 +1244,6 @@ pub fn image_view_hints(s: &super::ImageViewState) -> Hints {
     Hints::new(&keys, 0)
 }
 
-
-
 // ================= the drafts list (#716) =================
 
 /// Every unsent draft, in one place.
@@ -1226,7 +1285,11 @@ pub fn render_drafts(
         "Drafts",
         true,
         None,
-        if bottom.is_empty() { None } else { Some(bottom.as_str()) },
+        if bottom.is_empty() {
+            None
+        } else {
+            Some(bottom.as_str())
+        },
     );
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -1369,10 +1432,19 @@ mod tests {
         let mut s = super::super::DraftsState::default();
         assert!(s.rows.is_empty());
         let key = |code| KeyEvent::new(code, ratatui::crossterm::event::KeyModifiers::NONE);
-        assert!(matches!(drafts_key(&mut s, key(KeyCode::Char('q'))), Action::PopScreen));
-        assert!(matches!(drafts_key(&mut s, key(KeyCode::Left)), Action::PopScreen));
+        assert!(matches!(
+            drafts_key(&mut s, key(KeyCode::Char('q'))),
+            Action::PopScreen
+        ));
+        assert!(matches!(
+            drafts_key(&mut s, key(KeyCode::Left)),
+            Action::PopScreen
+        ));
         // With rows, q still only leaves; j/k still move.
-        assert!(matches!(drafts_key(&mut s, key(KeyCode::Char('j'))), Action::None));
+        assert!(matches!(
+            drafts_key(&mut s, key(KeyCode::Char('j'))),
+            Action::None
+        ));
     }
 
     use crate::glyph::UNICODE;
@@ -1380,11 +1452,14 @@ mod tests {
     use crate::screens::{
         ImageViewState, MediaListState, MediaPane, ResourceListState, ResourceViewState,
     };
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn inline_policy() -> Policy {
-        Policy { tier: Tier::Kitty, font: (10, 20) }
+        Policy {
+            tier: Tier::Kitty,
+            font: (10, 20),
+        }
     }
 
     /// Render headless and return the rows as plain strings (styling
@@ -1469,7 +1544,9 @@ mod tests {
             resource_date: 1_700_000_000,
             last_update: 1_700_000_000,
             view_url: Some("https://windowsforum.com/resources/handy.1/".into()),
-            current_download_url: Some("https://windowsforum.com/resources/handy.1/download".into()),
+            current_download_url: Some(
+                "https://windowsforum.com/resources/handy.1/download".into(),
+            ),
             download_count: 5678,
             view_count: 19017,
             rating_avg: Some(5.0),
@@ -1494,7 +1571,10 @@ mod tests {
         assert!(all.contains("All media"), "{all}");
         assert!(all.contains("Windows Forum"), "{all}");
         assert!(all.contains("18842"), "category counts: {all}");
-        assert!(all.contains("First shot") && all.contains("Second shot"), "{all}");
+        assert!(
+            all.contains("First shot") && all.contains("Second shot"),
+            "{all}"
+        );
         assert!(all.contains("18 views"), "row stats: {all}");
         assert!(all.contains("1536\u{d7}1024"), "row dimensions: {all}");
         assert!(all.contains("page 1 of 4"), "pagination cap: {all}");
@@ -1510,7 +1590,10 @@ mod tests {
         assert!(!s.dual);
         let all = rows.join("\n");
         assert!(all.contains("First shot"), "{all}");
-        assert!(!all.contains("Categories"), "the category pane must be hidden: {all}");
+        assert!(
+            !all.contains("Categories"),
+            "the category pane must be hidden: {all}"
+        );
     }
 
     /// On a graphics tier every visible row reserves its thumbnail, inside
@@ -1526,8 +1609,16 @@ mod tests {
         for req in &s.image_requests {
             assert!(req.rect.width <= THUMB_COLS, "{:?}", req.rect);
             assert!(req.rect.height <= ROW_H_IMAGE, "{:?}", req.rect);
-            assert!(req.rect.right() <= 120 && req.rect.bottom() <= 20, "{:?}", req.rect);
-            assert!(req.key.contains("/t/"), "the thumbnail, not the full image: {}", req.key);
+            assert!(
+                req.rect.right() <= 120 && req.rect.bottom() <= 20,
+                "{:?}",
+                req.rect
+            );
+            assert!(
+                req.key.contains("/t/"),
+                "the thumbnail, not the full image: {}",
+                req.key
+            );
         }
 
         let mut s = gallery();
@@ -1549,7 +1640,11 @@ mod tests {
         };
         assert_eq!(open.title, "First shot");
         assert!(open.key.ends_with("/data"), "the full image: {}", open.key);
-        assert!(open.meta.contains("op") && open.meta.contains("1536\u{d7}1024"), "{}", open.meta);
+        assert!(
+            open.meta.contains("op") && open.meta.contains("1536\u{d7}1024"),
+            "{}",
+            open.meta
+        );
         assert_eq!(open.px, Some((1536, 1024)));
 
         let mut s = gallery();
@@ -1579,17 +1674,33 @@ mod tests {
         media_list_key(&mut s, KeyEvent::from(KeyCode::Down));
         let act = media_list_key(&mut s, KeyEvent::from(KeyCode::Enter));
         assert!(
-            matches!(act, Action::LoadMedia { category: Some(11), page: 1 }),
+            matches!(
+                act,
+                Action::LoadMedia {
+                    category: Some(11),
+                    page: 1
+                }
+            ),
             "Enter must browse the selected category"
         );
         assert_eq!(s.category_title, "Windows Forum");
-        assert_eq!(s.focus, MediaPane::Items, "and hand the keyboard to the items");
+        assert_eq!(
+            s.focus,
+            MediaPane::Items,
+            "and hand the keyboard to the items"
+        );
 
         // Back up to "All media" and the scope clears again.
         media_list_key(&mut s, KeyEvent::from(KeyCode::Tab));
         media_list_key(&mut s, KeyEvent::from(KeyCode::Up));
         let act = media_list_key(&mut s, KeyEvent::from(KeyCode::Enter));
-        assert!(matches!(act, Action::LoadMedia { category: None, page: 1 }));
+        assert!(matches!(
+            act,
+            Action::LoadMedia {
+                category: None,
+                page: 1
+            }
+        ));
     }
 
     /// #697: Enter on a resource opens its page in the client; `o` is what
@@ -1603,7 +1714,10 @@ mod tests {
             ..Default::default()
         };
         let act = resources_list_key(&mut s, KeyEvent::from(KeyCode::Enter));
-        assert!(matches!(act, Action::OpenResource(150883)), "Enter opens it here");
+        assert!(
+            matches!(act, Action::OpenResource(150883)),
+            "Enter opens it here"
+        );
         let act = resources_list_key(&mut s, KeyEvent::from(KeyCode::Char('o')));
         assert!(matches!(act, Action::OpenUrl(_)), "o opens the website");
     }
@@ -1669,7 +1783,10 @@ mod tests {
         assert_eq!(s.image_requests.len(), 1, "one picture");
         let r = s.image_requests[0].rect;
         assert!(r.width > 40, "the viewer is not a thumbnail: {r:?}");
-        assert!(r.right() <= 100 && r.bottom() <= 30, "inside the pane: {r:?}");
+        assert!(
+            r.right() <= 100 && r.bottom() <= 30,
+            "inside the pane: {r:?}"
+        );
         let all = rows.join("\n");
         assert!(all.contains("First shot"), "title: {all}");
         assert!(all.contains("1536\u{d7}1024"), "caption: {all}");
@@ -1689,13 +1806,37 @@ mod tests {
 
     #[test]
     fn image_viewer_preserves_description_line_breaks() {
-        let mut s=ImageViewState{title:"photo".into(),description:"first line\nsecond line".into(),key:Some("https://example.invalid/photo.png".into()),images:inline_policy(),..Default::default()};
-        assert!(s.image_request(Rect::new(0, 0, 40, 12), &Theme::truecolor(), &UNICODE).is_some());
-        assert!(s.prepared_caption.is_some(), "status lookup prepares the shared layout once");
-        let rows=render_rows(40,12,|f,a,t,g,h|render_image_view(&mut s,f,a,t,g,h));
-        assert!(s.prepared_caption.is_none(), "render consumes the prepared caption");
-        assert!(rows.iter().any(|r|r.contains("first line")&&!r.contains("second line")),"description lines should stay separate");
-        assert!(rows.iter().any(|r|r.contains("second line")&&!r.contains("first line")));
+        let mut s = ImageViewState {
+            title: "photo".into(),
+            description: "first line\nsecond line".into(),
+            key: Some("https://example.invalid/photo.png".into()),
+            images: inline_policy(),
+            ..Default::default()
+        };
+        assert!(
+            s.image_request(Rect::new(0, 0, 40, 12), &Theme::truecolor(), &UNICODE)
+                .is_some()
+        );
+        assert!(
+            s.prepared_caption.is_some(),
+            "status lookup prepares the shared layout once"
+        );
+        let rows = render_rows(40, 12, |f, a, t, g, h| {
+            render_image_view(&mut s, f, a, t, g, h)
+        });
+        assert!(
+            s.prepared_caption.is_none(),
+            "render consumes the prepared caption"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("first line") && !r.contains("second line")),
+            "description lines should stay separate"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("second line") && !r.contains("first line"))
+        );
     }
 
     /// #701: the resource page's link rows are click targets, wherever the
@@ -1722,9 +1863,9 @@ mod tests {
 
         assert!(!s.links.is_empty(), "the body carried a link");
         let found = (0..24u16).any(|y| {
-            (0..90u16).any(|x| {
-                matches!(hits.at(x, y), Some(Hit::Link(u)) if u == "https://example.com/docs")
-            })
+            (0..90u16).any(
+                |x| matches!(hits.at(x, y), Some(Hit::Link(u)) if u == "https://example.com/docs"),
+            )
         });
         assert!(found, "the [1] url row must be clickable");
     }
@@ -1735,10 +1876,16 @@ mod tests {
     fn paging_is_bounded_and_refuses_while_loading() {
         let mut s = gallery();
         let act = media_list_key(&mut s, KeyEvent::from(KeyCode::Char(']')));
-        assert!(matches!(act, Action::LoadMedia { page: 2, .. }), "] fetches page 2");
+        assert!(
+            matches!(act, Action::LoadMedia { page: 2, .. }),
+            "] fetches page 2"
+        );
         assert!(s.loading);
         let act = media_list_key(&mut s, KeyEvent::from(KeyCode::Char(']')));
-        assert!(matches!(act, Action::Notice(_)), "a second ] refuses out loud");
+        assert!(
+            matches!(act, Action::Notice(_)),
+            "a second ] refuses out loud"
+        );
 
         let mut s = gallery();
         let act = media_list_key(&mut s, KeyEvent::from(KeyCode::Char('[')));
@@ -1779,12 +1926,19 @@ mod tests {
             term.draw(|f| draw(f, which)).expect("draw");
             let buf = term.backend().buffer().clone();
             let row_of = |needle: &str| -> Option<u16> {
-                (0..24u16).find(|&y| (0..70u16).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().contains(needle))
+                (0..24u16).find(|&y| {
+                    (0..70u16)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                        .contains(needle)
+                })
             };
             let style_at = |needle: &str, nth: usize| -> Modifier {
                 let mut seen = 0;
                 for y in 0..24u16 {
-                    let row: String = (0..70u16).map(|x| buf[(x, y)].symbol().to_string()).collect();
+                    let row: String = (0..70u16)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect();
                     if let Some(col) = row.find(needle) {
                         if seen == nth {
                             let x = chrome::cell_width(&row[..col]) as u16;
@@ -1795,14 +1949,37 @@ mod tests {
                 }
                 panic!("{needle:?} #{nth} not drawn (view {which})");
             };
-            let (first, second, third) = if which == 0 { ("First shot", "Second shot", "Third shot") } else { ("Handy tool", "Handy tool", "Handy tool") };
-            assert!(row_of(" deleted ").is_some(), "view {which}: no deleted chip");
-            assert!(row_of(" awaiting approval ").is_some(), "view {which}: no moderated chip");
-            assert_eq!(row_of(" deleted "), row_of(first), "view {which}: chip on the deleted item's row");
-            assert!(style_at(first, 0).contains(Modifier::CROSSED_OUT), "view {which}: deleted title struck");
-            assert!(style_at(second, if which == 0 { 0 } else { 1 }).contains(Modifier::ITALIC), "view {which}: moderated title italic");
+            let (first, second, third) = if which == 0 {
+                ("First shot", "Second shot", "Third shot")
+            } else {
+                ("Handy tool", "Handy tool", "Handy tool")
+            };
+            assert!(
+                row_of(" deleted ").is_some(),
+                "view {which}: no deleted chip"
+            );
+            assert!(
+                row_of(" awaiting approval ").is_some(),
+                "view {which}: no moderated chip"
+            );
+            assert_eq!(
+                row_of(" deleted "),
+                row_of(first),
+                "view {which}: chip on the deleted item's row"
+            );
+            assert!(
+                style_at(first, 0).contains(Modifier::CROSSED_OUT),
+                "view {which}: deleted title struck"
+            );
+            assert!(
+                style_at(second, if which == 0 { 0 } else { 1 }).contains(Modifier::ITALIC),
+                "view {which}: moderated title italic"
+            );
             let plain = style_at(third, if which == 0 { 0 } else { 2 });
-            assert!(!plain.contains(Modifier::CROSSED_OUT) && !plain.contains(Modifier::ITALIC), "view {which}: visible item unmarked");
+            assert!(
+                !plain.contains(Modifier::CROSSED_OUT) && !plain.contains(Modifier::ITALIC),
+                "view {which}: visible item unmarked"
+            );
         }
     }
 
@@ -1813,7 +1990,12 @@ mod tests {
     fn a_cjk_title_row_keeps_exact_width() {
         let theme = Theme::truecolor();
         for w in [20usize, 40, 60] {
-            let line = catalog_line(&theme, &"\u{6f22}\u{5b57}".repeat(30), "kemical \u{b7} 3d", w);
+            let line = catalog_line(
+                &theme,
+                &"\u{6f22}\u{5b57}".repeat(30),
+                "kemical \u{b7} 3d",
+                w,
+            );
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             assert_eq!(chrome::cell_width(&text), w, "width {w}");
         }
@@ -1823,12 +2005,7 @@ mod tests {
     fn an_overlong_catalog_meta_run_cannot_overflow_the_panel() {
         let theme = Theme::truecolor();
         for w in [1usize, 4, 10, 20] {
-            let line = catalog_line(
-                &theme,
-                "short",
-                &"\u{4f5c}\u{8005}".repeat(30),
-                w,
-            );
+            let line = catalog_line(&theme, "short", &"\u{4f5c}\u{8005}".repeat(30), w);
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             assert_eq!(chrome::cell_width(&text), w, "width {w}");
         }

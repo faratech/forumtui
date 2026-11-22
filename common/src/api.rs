@@ -35,7 +35,9 @@ impl VerifiedSession {
         tokens.origin = self.client.base.clone();
         tokens.client_id = self.client.client_id.clone();
         if !self.client.store.replace_if_matches(&expected, &tokens)? {
-            return Err(Error::Handshake("token file changed during verification; retry the session check".into()));
+            return Err(Error::Handshake(
+                "token file changed during verification; retry the session check".into(),
+            ));
         }
         *self.client.tokens.get_mut() = Some(tokens);
         *self.client.recovery_tokens.lock().expect("recovery cache") = None;
@@ -91,7 +93,11 @@ impl WfApiClient {
     /// The production client: the user's own token store and the configured
     /// site origin.
     pub fn new() -> Result<Self> {
-        Self::with_store(token::Store::new(), config::base_url(), config::oauth_client_id()?)
+        Self::with_store(
+            token::Store::new(),
+            config::base_url(),
+            config::oauth_client_id()?,
+        )
     }
 
     /// The client for a configured site: its own token store
@@ -164,8 +170,16 @@ impl WfApiClient {
         let content = Arc::new(crate::http::ContentPolicy::for_site(&base_url));
         Ok(WfApiClient {
             http: crate::http::build_with_ua(user_agent)?,
-            image_http: crate::http::build_public_with_ua(user_agent, content.clone(), crate::http::ContentLane::Strict)?,
-            own_image_http: crate::http::build_public_with_ua(user_agent, content.clone(), crate::http::ContentLane::OwnMedia)?,
+            image_http: crate::http::build_public_with_ua(
+                user_agent,
+                content.clone(),
+                crate::http::ContentLane::Strict,
+            )?,
+            own_image_http: crate::http::build_public_with_ua(
+                user_agent,
+                content.clone(),
+                crate::http::ContentLane::OwnMedia,
+            )?,
             content,
             tokens: Mutex::new(tokens),
             store,
@@ -253,7 +267,8 @@ impl WfApiClient {
                 stored.client_id,
                 self.base
             );
-            self.store.quarantine_as("foreign", &self.base, &self.client_id);
+            self.store
+                .quarantine_as("foreign", &self.base, &self.client_id);
             return Ok(None);
         }
         if guard.as_ref().is_some_and(|cur| {
@@ -266,31 +281,48 @@ impl WfApiClient {
             match cache.as_ref() {
                 Some(cached) if cached.source == stored => cached.current.clone(),
                 _ => {
-                    *cache = Some(RecoveryTokens { source: stored.clone(), current: stored.clone() });
+                    *cache = Some(RecoveryTokens {
+                        source: stored.clone(),
+                        current: stored.clone(),
+                    });
                     stored.clone()
                 }
             }
         };
         Ok(Some(Self {
-            http: self.http.clone(), image_http: self.image_http.clone(),
-            own_image_http: self.own_image_http.clone(), content: self.content.clone(),
+            http: self.http.clone(),
+            image_http: self.image_http.clone(),
+            own_image_http: self.own_image_http.clone(),
+            content: self.content.clone(),
             tokens: Mutex::new(Some(current)),
-            store: self.store.clone(), requests_paused: AtomicBool::new(false),
-            recovery_source: Some(stored), recovery_tokens: self.recovery_tokens.clone(),
-            base: self.base.clone(), client_id: self.client_id.clone(),
-            api_gate: self.api_gate.clone(), search_gate: self.search_gate.clone(),
-            write_gate: self.write_gate.clone(), image_gate: self.image_gate.clone(), ai_gate: self.ai_gate.clone(),
+            store: self.store.clone(),
+            requests_paused: AtomicBool::new(false),
+            recovery_source: Some(stored),
+            recovery_tokens: self.recovery_tokens.clone(),
+            base: self.base.clone(),
+            client_id: self.client_id.clone(),
+            api_gate: self.api_gate.clone(),
+            search_gate: self.search_gate.clone(),
+            write_gate: self.write_gate.clone(),
+            image_gate: self.image_gate.clone(),
+            ai_gate: self.ai_gate.clone(),
         }))
     }
 
-    pub fn pause_requests(&self) { self.requests_paused.store(true, Ordering::Release); }
+    pub fn pause_requests(&self) {
+        self.requests_paused.store(true, Ordering::Release);
+    }
 
-    pub fn requests_paused(&self) -> bool { self.requests_paused.load(Ordering::Acquire) }
+    pub fn requests_paused(&self) -> bool {
+        self.requests_paused.load(Ordering::Acquire)
+    }
 
     /// Only this constructor can create a verified replacement. Neither it nor
     /// a candidate refresh modifies the active client's credentials or store.
     pub async fn verify_recovery(self) -> Result<VerifiedSession> {
-        if self.recovery_source.is_none() { return Err(Error::Config("not a recovery candidate".into())); }
+        if self.recovery_source.is_none() {
+            return Err(Error::Config("not a recovery candidate".into()));
+        }
         let user = self.me().await?;
         Ok(VerifiedSession { client: self, user })
     }
@@ -357,7 +389,9 @@ impl WfApiClient {
     /// just rejected, or nothing at all) does the session end outright, with
     /// the original error returned and the dead token erased.
     pub async fn valid_token(&self) -> Result<String> {
-        if self.requests_paused() { return Err(Error::Throttled); }
+        if self.requests_paused() {
+            return Err(Error::Throttled);
+        }
         let mut guard = self.tokens.lock().await;
         let existing = guard.as_ref().ok_or(Error::NoToken)?.clone();
         if !existing.access_expired(OffsetDateTime::now_utc()) {
@@ -367,33 +401,36 @@ impl WfApiClient {
             *guard = None;
             // A malformed/legacy token set with no refresh grant must not
             // erase a newer sibling session that replaced the store.
-            if self.recovery_source.is_none() { let _ = self.store.erase_if_matches(&existing); }
+            if self.recovery_source.is_none() {
+                let _ = self.store.erase_if_matches(&existing);
+            }
             return Err(Error::NoToken);
         }
         let refresh_token = existing.refresh_token.clone();
         // Refresh is origin traffic too. Callers acquire their own dispatch
         // slots only AFTER this refresh and its token lock have completed.
         self.api_gate.wait().await;
-        let err = match oauth::refresh(&self.http, &self.base, &refresh_token, &self.client_id).await {
-            Ok(mut refreshed) => {
-                // RFC 6749 permits a refresh response to omit
-                // `refresh_token` when the grant is not rotated. Keeping the
-                // deserializer tolerant is useful for XF and compatible OAuth
-                // servers, but persisting that empty default would turn the
-                // next access-token expiry into a needless sign-out.
-                if refreshed.refresh_token.is_empty() {
-                    refreshed.refresh_token = refresh_token.clone();
+        let err =
+            match oauth::refresh(&self.http, &self.base, &refresh_token, &self.client_id).await {
+                Ok(mut refreshed) => {
+                    // RFC 6749 permits a refresh response to omit
+                    // `refresh_token` when the grant is not rotated. Keeping the
+                    // deserializer tolerant is useful for XF and compatible OAuth
+                    // servers, but persisting that empty default would turn the
+                    // next access-token expiry into a needless sign-out.
+                    if refreshed.refresh_token.is_empty() {
+                        refreshed.refresh_token = refresh_token.clone();
+                    }
+                    // Scope is also optional on a refresh response; retaining it
+                    // avoids silently losing the permissions associated with the
+                    // still-live grant.
+                    if refreshed.scope.is_empty() {
+                        refreshed.scope = existing.scope.clone();
+                    }
+                    return Ok(self.keep_refreshed(&mut guard, &existing, refreshed));
                 }
-                // Scope is also optional on a refresh response; retaining it
-                // avoids silently losing the permissions associated with the
-                // still-live grant.
-                if refreshed.scope.is_empty() {
-                    refreshed.scope = existing.scope.clone();
-                }
-                return Ok(self.keep_refreshed(&mut guard, &existing, refreshed));
-            }
-            Err(e) => e,
-        };
+                Err(e) => e,
+            };
         self.note_rate_limit(&err, &[&self.api_gate]);
         if !matches!(&err, Error::OAuth { code, .. } if code == "invalid_grant") {
             return Err(err);
@@ -428,7 +465,12 @@ impl WfApiClient {
     /// warning avoids stranding the revoked refresh token in the guard/the
     /// store, which would otherwise force a full browser re-login on the
     /// very next call (see issue #513).
-    fn keep_refreshed(&self, guard: &mut Option<TokenSet>, expected: &TokenSet, mut refreshed: TokenSet) -> String {
+    fn keep_refreshed(
+        &self,
+        guard: &mut Option<TokenSet>,
+        expected: &TokenSet,
+        mut refreshed: TokenSet,
+    ) -> String {
         refreshed.origin = self.base.clone();
         refreshed.client_id = self.client_id.clone();
         let access = refreshed.access_token.clone();
@@ -436,7 +478,8 @@ impl WfApiClient {
         if let Some(source) = &self.recovery_source {
             let mut cache = self.recovery_tokens.lock().expect("recovery cache");
             if let Some(cached) = cache.as_mut()
-                && &cached.source == source && &cached.current == expected
+                && &cached.source == source
+                && &cached.current == expected
             {
                 cached.current = refreshed;
             }
@@ -482,11 +525,11 @@ impl WfApiClient {
             // it only for this synchronous check avoids both a try_lock retry
             // loop and blocking logout/refresh across a long gate cooldown.
             let guard = self.tokens.lock().await;
-            if self.requests_paused() { return Err(Error::Throttled); }
+            if self.requests_paused() {
+                return Err(Error::Throttled);
+            }
             let current = guard.as_ref().ok_or(Error::NoToken)?;
-            if !current.access_expired(OffsetDateTime::now_utc())
-                && Gate::try_acquire_all(gates)
-            {
+            if !current.access_expired(OffsetDateTime::now_utc()) && Gate::try_acquire_all(gates) {
                 return Ok(current.access_token.clone());
             }
         }
@@ -495,8 +538,16 @@ impl WfApiClient {
     async fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, String)]) -> Result<T> {
         let token = self.dispatch_token(&[&self.api_gate]).await?;
         let url = format!("{}{path}", self.api_base());
-        let resp = self.http.get(url).query(query).bearer_auth(&token).send().await?;
-        decode(resp).await.inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate]))
+        let resp = self
+            .http
+            .get(url)
+            .query(query)
+            .bearer_auth(&token)
+            .send()
+            .await?;
+        decode(resp)
+            .await
+            .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate]))
     }
 
     /// One leg of a search is still search traffic. Keeping this separate
@@ -507,9 +558,17 @@ impl WfApiClient {
         path: &str,
         query: &[(&str, String)],
     ) -> Result<T> {
-        let token = self.dispatch_token(&[&self.api_gate, &self.search_gate]).await?;
+        let token = self
+            .dispatch_token(&[&self.api_gate, &self.search_gate])
+            .await?;
         let url = format!("{}{path}", self.api_base());
-        let resp = self.http.get(url).query(query).bearer_auth(&token).send().await?;
+        let resp = self
+            .http
+            .get(url)
+            .query(query)
+            .bearer_auth(&token)
+            .send()
+            .await?;
         decode(resp)
             .await
             .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate, &self.search_gate]))
@@ -523,9 +582,17 @@ impl WfApiClient {
         form: &[(&str, String)],
         success_penalty: Option<Duration>,
     ) -> Result<T> {
-        let token = self.dispatch_token(&[&self.api_gate, &self.write_gate]).await?;
+        let token = self
+            .dispatch_token(&[&self.api_gate, &self.write_gate])
+            .await?;
         let url = format!("{}{path}", self.api_base());
-        let resp = self.http.post(url).form(form).bearer_auth(&token).send().await?;
+        let resp = self
+            .http
+            .post(url)
+            .form(form)
+            .bearer_auth(&token)
+            .send()
+            .await?;
         let out = decode(resp).await;
         if out.is_ok() {
             self.write_gate.penalize(
@@ -542,7 +609,13 @@ impl WfApiClient {
     async fn post_unit(&self, path: &str, form: &[(&str, String)]) -> Result<()> {
         let token = self.dispatch_token(&[&self.api_gate]).await?;
         let url = format!("{}{path}", self.api_base());
-        let resp = self.http.post(url).form(form).bearer_auth(&token).send().await?;
+        let resp = self
+            .http
+            .post(url)
+            .form(form)
+            .bearer_auth(&token)
+            .send()
+            .await?;
         check_status(resp)
             .await
             .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate]))
@@ -553,9 +626,17 @@ impl WfApiClient {
     /// waiting before calling `post_unit` without this helper merely consumes
     /// the old slot and leaves the next edit immediately eligible (#718).
     async fn post_unit_write(&self, path: &str, form: &[(&str, String)]) -> Result<()> {
-        let token = self.dispatch_token(&[&self.api_gate, &self.write_gate]).await?;
+        let token = self
+            .dispatch_token(&[&self.api_gate, &self.write_gate])
+            .await?;
         let url = format!("{}{path}", self.api_base());
-        let resp = self.http.post(url).form(form).bearer_auth(&token).send().await?;
+        let resp = self
+            .http
+            .post(url)
+            .form(form)
+            .bearer_auth(&token)
+            .send()
+            .await?;
         let result = check_status(resp).await;
         match &result {
             Ok(()) => self
@@ -571,7 +652,9 @@ impl WfApiClient {
     /// the success penalty and Retry-After handling identical for every
     /// content mutation.
     async fn delete_unit_write(&self, path: &str, form: &[(&str, String)]) -> Result<()> {
-        let token = self.dispatch_token(&[&self.api_gate, &self.write_gate]).await?;
+        let token = self
+            .dispatch_token(&[&self.api_gate, &self.write_gate])
+            .await?;
         let url = format!("{}{}", self.api_base(), path);
         let resp = self
             .http
@@ -601,7 +684,13 @@ impl WfApiClient {
         }
         let token = self.dispatch_token(&[&self.api_gate]).await?;
         let url = format!("{}{path}", self.api_base());
-        let resp = self.http.post(url).form(form).bearer_auth(&token).send().await?;
+        let resp = self
+            .http
+            .post(url)
+            .form(form)
+            .bearer_auth(&token)
+            .send()
+            .await?;
         let reply: ToggleReply = decode(resp)
             .await
             .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate]))?;
@@ -633,7 +722,6 @@ impl WfApiClient {
         mime: &str,
         existing_key: Option<&str>,
     ) -> Result<(String, Attachment)> {
-
         // One key per post: mint it on the first file, reuse it after.
         let key = match existing_key {
             Some(k) => k.to_string(),
@@ -657,19 +745,20 @@ impl WfApiClient {
                     #[serde(alias = "attachment_key")]
                     key: String,
                 }
-                let new_key: NewKey = decode(key_resp)
-                    .await
-                    .inspect_err(|e| {
-                        self.note_rate_limit(e, &[&self.api_gate, &self.write_gate])
-                    })?;
+                let new_key: NewKey = decode(key_resp).await.inspect_err(|e| {
+                    self.note_rate_limit(e, &[&self.api_gate, &self.write_gate])
+                })?;
                 new_key.key
             }
         };
 
-        let token = self.dispatch_token(&[&self.api_gate, &self.write_gate]).await?;
+        let token = self
+            .dispatch_token(&[&self.api_gate, &self.write_gate])
+            .await?;
         let upload_url = format!("{}/attachments/", self.api_base());
-        let file_part =
-            reqwest::multipart::Part::bytes(bytes).file_name(filename).mime_str(mime)?;
+        let file_part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename)
+            .mime_str(mime)?;
         let form = reqwest::multipart::Form::new()
             .text("key", key.clone())
             .part("attachment", file_part);
@@ -787,15 +876,22 @@ impl WfApiClient {
         // media paths (#146); a proxied target is looked up here first,
         // since the proxy, not our resolver, resolves it (#147).
         let req = if self.image_uses_bearer(url) {
-            self.http.get(url).bearer_auth(self.dispatch_token(&[&self.image_gate]).await?)
+            self.http
+                .get(url)
+                .bearer_auth(self.dispatch_token(&[&self.image_gate]).await?)
         } else {
             use crate::http::ContentLane;
             let parsed = reqwest::Url::parse(url)
                 .map_err(|e| Error::FetchRejected(format!("unparseable image URL {url:?}: {e}")))?;
-            self.content.check_url(&parsed).map_err(|refusal| Error::FetchRejected(refusal.0))?;
+            self.content
+                .check_url(&parsed)
+                .map_err(|refusal| Error::FetchRejected(refusal.0))?;
             let lane = self.content.lane(&parsed);
             if lane == ContentLane::Strict {
-                self.content.preflight(&parsed).await.map_err(|refusal| Error::FetchRejected(refusal.0))?;
+                self.content
+                    .preflight(&parsed)
+                    .await
+                    .map_err(|refusal| Error::FetchRejected(refusal.0))?;
             }
             self.image_gate.wait().await;
             match lane {
@@ -803,12 +899,17 @@ impl WfApiClient {
                 ContentLane::OwnMedia => self.own_image_http.get(parsed),
             }
         };
-        let response = req.send().await.map_err(|e| match crate::http::non_public_refusal(&e) {
-            Some(refusal) => Error::FetchRejected(refusal.0.clone()),
-            None => Error::Http(e),
-        })?;
+        let response = req
+            .send()
+            .await
+            .map_err(|e| match crate::http::non_public_refusal(&e) {
+                Some(refusal) => Error::FetchRejected(refusal.0.clone()),
+                None => Error::Http(e),
+            })?;
         if !response.status().is_success() {
-            let err = check_status(response).await.expect_err("non-success response must be an error");
+            let err = check_status(response)
+                .await
+                .expect_err("non-success response must be an error");
             self.note_rate_limit(&err, &[&self.image_gate]);
             return Err(err);
         }
@@ -854,9 +955,14 @@ impl WfApiClient {
     /// cache: protected API bytes must not be reused across forum accounts.
     /// URL parsing normalizes host/scheme case, default ports and dot paths.
     pub fn image_uses_bearer(&self, url: &str) -> bool {
-        let Ok(api) = reqwest::Url::parse(&format!("{}/", self.api_base())) else { return false; };
-        let Ok(target) = reqwest::Url::parse(url) else { return false; };
-        target.username().is_empty() && target.password().is_none()
+        let Ok(api) = reqwest::Url::parse(&format!("{}/", self.api_base())) else {
+            return false;
+        };
+        let Ok(target) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        target.username().is_empty()
+            && target.password().is_none()
             && target.scheme() == api.scheme()
             && target.host_str() == api.host_str()
             && target.port_or_known_default() == api.port_or_known_default()
@@ -904,7 +1010,11 @@ pub(crate) async fn error_from_response(resp: reqwest::Response) -> Error {
         .ok()
         .and_then(|parsed| parsed.errors.into_iter().next())
     {
-        let max_page = first.params.get("max").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let max_page = first
+            .params
+            .get("max")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
         return Error::Api {
             code: first.code,
             message: first.message,
@@ -927,7 +1037,10 @@ pub(crate) async fn error_from_response(resp: reqwest::Response) -> Error {
 fn derive_node_depths(mut nodes: Vec<Node>) -> Vec<Node> {
     use std::collections::HashMap;
 
-    let parent_of: HashMap<u32, u32> = nodes.iter().map(|n| (n.node_id, n.parent_node_id)).collect();
+    let parent_of: HashMap<u32, u32> = nodes
+        .iter()
+        .map(|n| (n.node_id, n.parent_node_id))
+        .collect();
 
     for node in &mut nodes {
         let mut depth = 0u32;
@@ -985,8 +1098,12 @@ pub trait WfApi: Send + Sync {
     /// `attachment_key` ties files already uploaded under that key to this
     /// post (#709). XF requires the key's context to match: `thread_id` for
     /// a reply, `node_id` for a new thread, `post_id` for an edit.
-    async fn reply(&self, thread_id: u32, message: &str, attachment_key: Option<&str>)
-        -> Result<Post>;
+    async fn reply(
+        &self,
+        thread_id: u32,
+        message: &str,
+        attachment_key: Option<&str>,
+    ) -> Result<Post>;
     async fn create_thread(
         &self,
         node_id: u32,
@@ -1035,8 +1152,7 @@ pub trait WfApi: Send + Sync {
     ) -> Result<()>;
     async fn delete_draft(&self, xf_key: &str) -> Result<()>;
     /// Edit a post's message (#708). `POST /posts/{id}`.
-    async fn edit_post(&self, id: u32, message: &str, attachment_key: Option<&str>)
-        -> Result<()>;
+    async fn edit_post(&self, id: u32, message: &str, attachment_key: Option<&str>) -> Result<()>;
     /// Delete a post — soft by default, which is what XF's own UI does and
     /// what leaves the content recoverable (#708).
     async fn delete_post(&self, id: u32, hard: bool) -> Result<()>;
@@ -1112,8 +1228,11 @@ impl WfApi for WfApiClient {
     }
 
     async fn thread_posts(&self, id: u32, page: u32) -> Result<PostsReply> {
-        self.get(&format!("/threads/{id}/posts"), &[("page", page.to_string())])
-            .await
+        self.get(
+            &format!("/threads/{id}/posts"),
+            &[("page", page.to_string())],
+        )
+        .await
     }
 
     async fn reply(
@@ -1216,7 +1335,11 @@ impl WfApi for WfApiClient {
         // sent after the ordinary 3 s spacing and refused again. Only the AI
         // lane: the forum API was not what refused.
         let hold_ai_lane = |event: &crate::ai::AiEvent| {
-            if let crate::ai::AiEvent::Failed { retry_after: Some(wait), .. } = event {
+            if let crate::ai::AiEvent::Failed {
+                retry_after: Some(wait),
+                ..
+            } = event
+            {
                 self.ai_gate.penalize(*wait);
             }
         };
@@ -1281,12 +1404,7 @@ impl WfApi for WfApiClient {
             .inspect_err(|e| self.note_rate_limit(e, &[&self.api_gate]))
     }
 
-    async fn edit_post(
-        &self,
-        id: u32,
-        message: &str,
-        attachment_key: Option<&str>,
-    ) -> Result<()> {
+    async fn edit_post(&self, id: u32, message: &str, attachment_key: Option<&str>) -> Result<()> {
         // An edit is a write like any other: it goes through the write gate,
         // which is what keeps this client inside the zone's flood budget.
         let mut form = vec![("message", message.to_string())];
@@ -1306,15 +1424,18 @@ impl WfApi for WfApiClient {
     }
 
     async fn mark_solution(&self, id: u32) -> Result<()> {
-        self.post_unit_write(&format!("/posts/{id}/mark-solution"), &[]).await
+        self.post_unit_write(&format!("/posts/{id}/mark-solution"), &[])
+            .await
     }
 
     async fn mark_forum_read(&self, node_id: u32) -> Result<()> {
-        self.post_unit_path(&format!("/forums/{node_id}/mark-read")).await
+        self.post_unit_path(&format!("/forums/{node_id}/mark-read"))
+            .await
     }
 
     async fn conversations(&self, page: u32) -> Result<ConversationsReply> {
-        self.get("/conversations", &[("page", page.to_string())]).await
+        self.get("/conversations", &[("page", page.to_string())])
+            .await
     }
 
     async fn conversation(&self, id: u32, page: u32) -> Result<ConversationReply> {
@@ -1346,8 +1467,10 @@ impl WfApi for WfApiClient {
         message: &str,
     ) -> Result<Conversation> {
         // recipient_ids is int[] — XF form-decodes "recipient_ids[]=1&recipient_ids[]=2".
-        let mut form: Vec<(&str, String)> =
-            vec![("title", title.to_string()), ("message", message.to_string())];
+        let mut form: Vec<(&str, String)> = vec![
+            ("title", title.to_string()),
+            ("message", message.to_string()),
+        ];
         for id in recipient_ids {
             form.push(("recipient_ids[]", id.to_string()));
         }
@@ -1360,11 +1483,13 @@ impl WfApi for WfApiClient {
     }
 
     async fn mark_conversation_read(&self, id: u32) -> Result<()> {
-        self.post_unit_path(&format!("/conversations/{id}/mark-read")).await
+        self.post_unit_path(&format!("/conversations/{id}/mark-read"))
+            .await
     }
 
     async fn delete_conversation(&self, id: u32) -> Result<()> {
-        self.delete_unit_write(&format!("/conversations/{id}"), &[]).await
+        self.delete_unit_write(&format!("/conversations/{id}"), &[])
+            .await
     }
 
     async fn alerts(&self, page: u32) -> Result<AlertsReply> {
@@ -1396,7 +1521,9 @@ impl WfApi for WfApiClient {
             #[serde(default)]
             search: Option<SearchInfo>,
         }
-        let token = self.dispatch_token(&[&self.api_gate, &self.search_gate]).await?;
+        let token = self
+            .dispatch_token(&[&self.api_gate, &self.search_gate])
+            .await?;
         let url = format!("{}/search", self.api_base());
         let mut form: Vec<(&str, String)> = Vec::new();
         if !query.keywords.trim().is_empty() {
@@ -1486,7 +1613,9 @@ impl WfApi for WfApiClient {
             #[serde(default)]
             search: Option<SearchInfo>,
         }
-        let token = self.dispatch_token(&[&self.api_gate, &self.search_gate]).await?;
+        let token = self
+            .dispatch_token(&[&self.api_gate, &self.search_gate])
+            .await?;
         let url = format!("{}/search/member", self.api_base());
         let mut form: Vec<(&str, String)> = vec![("user_id", user_id.to_string())];
         if !content.is_empty() && content != "all" {
@@ -1571,26 +1700,51 @@ mod tests {
                 }).mount(&server).await;
             let me_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let calls = me_calls.clone();
-            Mock::given(method("GET")).and(path("/api/me"))
+            Mock::given(method("GET"))
+                .and(path("/api/me"))
                 .respond_with(move |_: &wiremock::Request| {
                     if calls.fetch_add(1, Ordering::SeqCst) == 0 && fail_first {
                         ResponseTemplate::new(503)
-                    } else { ResponseTemplate::new(200).set_body_json(serde_json::json!({"me":{"user_id":99}})) }
-                }).mount(&server).await;
+                    } else {
+                        ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({"me":{"user_id":99}}))
+                    }
+                })
+                .mount(&server)
+                .await;
             let client = logged_in_client("old-access").await;
             let mut source = client.token_set().await.unwrap();
-            source.access_token = "sibling-expired".into(); source.refresh_token = "one-use-r1".into(); source.expires_at = 1;
+            source.access_token = "sibling-expired".into();
+            source.refresh_token = "one-use-r1".into();
+            source.expires_at = 1;
             client.store.save(&source).unwrap();
             client.pause_requests();
-            let first = client.stored_session_candidate().await.unwrap().unwrap().verify_recovery().await;
+            let first = client
+                .stored_session_candidate()
+                .await
+                .unwrap()
+                .unwrap()
+                .verify_recovery()
+                .await;
             assert_eq!(first.is_err(), fail_first);
             drop(first); // Also model a verified verdict arriving after its generation timed out.
             assert_eq!(client.store.load().unwrap().unwrap(), source);
-            let verified = client.stored_session_candidate().await.unwrap().unwrap().verify_recovery().await.unwrap();
+            let verified = client
+                .stored_session_candidate()
+                .await
+                .unwrap()
+                .unwrap()
+                .verify_recovery()
+                .await
+                .unwrap();
             let (active, user) = verified.commit().unwrap();
             assert_eq!(user.user_id, 99);
             assert_eq!(active.valid_token().await.unwrap(), "rotated-private");
-            assert_eq!(refresh_calls.load(Ordering::SeqCst), 1, "one-use source is never spent twice");
+            assert_eq!(
+                refresh_calls.load(Ordering::SeqCst),
+                1,
+                "one-use source is never spent twice"
+            );
             assert_eq!(me_calls.load(Ordering::SeqCst), 2);
         }
     }
@@ -1603,40 +1757,69 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token":"verified-access", "refresh_token":"verified-refresh", "expires_in":7200
             }))).mount(&server).await;
-        Mock::given(method("GET")).and(path("/api/me"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"me":{"user_id":99,"username":"new member"}})))
-            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/me"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"me":{"user_id":99,"username":"new member"}}),
+                ),
+            )
+            .mount(&server)
+            .await;
         let client = logged_in_client("old-access").await;
         let mut sibling = client.token_set().await.unwrap();
-        sibling.access_token = "sibling-expired".into(); sibling.refresh_token = "sibling-refresh".into();
-        sibling.expires_at = OffsetDateTime::now_utc().unix_timestamp()-10;
+        sibling.access_token = "sibling-expired".into();
+        sibling.refresh_token = "sibling-refresh".into();
+        sibling.expires_at = OffsetDateTime::now_utc().unix_timestamp() - 10;
         client.store.save(&sibling).unwrap();
         client.pause_requests();
         let candidate = client.stored_session_candidate().await.unwrap().unwrap();
         assert!(Arc::ptr_eq(&candidate.api_gate, &client.api_gate));
         let verified = candidate.verify_recovery().await.unwrap();
         assert_eq!(client.token_set().await.unwrap().access_token, "old-access");
-        assert_eq!(client.store.load().unwrap().unwrap(), sibling, "candidate refresh stays private");
+        assert_eq!(
+            client.store.load().unwrap().unwrap(),
+            sibling,
+            "candidate refresh stays private"
+        );
         assert!(matches!(client.valid_token().await, Err(Error::Throttled)));
         let (active, user) = verified.commit().unwrap();
         assert_eq!(user.user_id, 99);
         assert_eq!(active.valid_token().await.unwrap(), "verified-access");
-        assert_eq!(active.store.load().unwrap().unwrap().refresh_token, "verified-refresh");
-        assert!(client.requests_paused(), "old tasks never inherit the verified grant");
+        assert_eq!(
+            active.store.load().unwrap().unwrap().refresh_token,
+            "verified-refresh"
+        );
+        assert!(
+            client.requests_paused(),
+            "old tasks never inherit the verified grant"
+        );
     }
 
     #[tokio::test]
     async fn verified_recovery_does_not_overwrite_a_newer_sibling_login() {
         let server = MockServer::start().await;
         let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-recovery-stale");
-        Mock::given(method("GET")).and(path("/api/me"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"me":{"user_id":99}})))
-            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/me"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"me":{"user_id":99}})),
+            )
+            .mount(&server)
+            .await;
         let client = logged_in_client("old-access").await;
         let mut sibling = client.token_set().await.unwrap();
-        sibling.access_token = "candidate".into(); sibling.refresh_token = "candidate-refresh".into();
+        sibling.access_token = "candidate".into();
+        sibling.refresh_token = "candidate-refresh".into();
         client.store.save(&sibling).unwrap();
-        let verified = client.stored_session_candidate().await.unwrap().unwrap().verify_recovery().await.unwrap();
+        let verified = client
+            .stored_session_candidate()
+            .await
+            .unwrap()
+            .unwrap()
+            .verify_recovery()
+            .await
+            .unwrap();
         sibling.access_token = "newest".into();
         client.store.save(&sibling).unwrap();
         assert!(verified.commit().is_err());
@@ -1648,18 +1831,22 @@ mod tests {
     async fn access_only_logout_and_expiry_clear_only_the_matching_store() {
         let _env = EnvGuard::hold("http://127.0.0.1:1", "/tmp/wftui-access-only");
         let client = logged_in_client("access-only").await;
-        let mut grant = client.token_set().await.unwrap(); grant.refresh_token.clear();
+        let mut grant = client.token_set().await.unwrap();
+        grant.refresh_token.clear();
         client.set_tokens(grant.clone()).await.unwrap();
         assert!(client.take_tokens().await.unwrap().is_some());
         assert!(client.store.load().unwrap().is_none());
-        let restarted = WfApiClient::with_store(client.store.clone(), client.base_url(), client.client_id()).unwrap();
+        let restarted =
+            WfApiClient::with_store(client.store.clone(), client.base_url(), client.client_id())
+                .unwrap();
         assert!(!restarted.has_tokens().await);
         grant.expires_at = 1;
         client.set_tokens(grant.clone()).await.unwrap();
         assert!(matches!(client.valid_token().await, Err(Error::NoToken)));
         assert!(client.store.load().unwrap().is_none());
         client.set_tokens(grant.clone()).await.unwrap();
-        let mut newer = grant; newer.access_token = "newer-access-only".into();
+        let mut newer = grant;
+        newer.access_token = "newer-access-only".into();
         client.store.save(&newer).unwrap();
         assert!(matches!(client.valid_token().await, Err(Error::NoToken)));
         assert_eq!(client.store.load().unwrap().unwrap(), newer);
@@ -1754,7 +1941,9 @@ mod tests {
             "refusing to write a fixture token set into the real config dir: {:?}",
             c.store_path()
         );
-        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
+        c.set_tokens(TokenSet {
+            origin: String::new(),
+            client_id: String::new(),
             access_token: token.into(),
             refresh_token: "refresh-1".into(),
             expires_at: OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -1817,7 +2006,10 @@ mod tests {
                 crate::site::config_path(),
             ] {
                 assert!(path.starts_with(&dir), "escaped the scratch dir: {path:?}");
-                assert!(!path.starts_with(&real), "resolved the real config dir: {path:?}");
+                assert!(
+                    !path.starts_with(&real),
+                    "resolved the real config dir: {path:?}"
+                );
             }
             let c = WfApiClient::new().unwrap();
             assert!(c.store_path().starts_with(&dir), "{:?}", c.store_path());
@@ -1826,7 +2018,10 @@ mod tests {
                 !c.base_url().contains("windowsforum.com"),
                 "a test client must never be pointed at the live site"
             );
-            assert!(!c.has_tokens().await, "a scratch config dir holds no session");
+            assert!(
+                !c.has_tokens().await,
+                "a scratch config dir holds no session"
+            );
         }
 
         // Poisoned: the config dir is a plain FILE, so a store under it can
@@ -1848,7 +2043,9 @@ mod tests {
             );
             assert!(
                 store
-                    .save(&TokenSet { origin: String::new(), client_id: String::new(),
+                    .save(&TokenSet {
+                        origin: String::new(),
+                        client_id: String::new(),
                         access_token: "guard".into(),
                         refresh_token: "guard".into(),
                         expires_at: 0,
@@ -1964,7 +2161,14 @@ mod tests {
         // call would still sleep the full 30 s.
         open_gates(&mut c);
         let (key2, _) = c
-            .upload_attachment("post", &[], "b.png".into(), vec![2], "image/png", Some(&key))
+            .upload_attachment(
+                "post",
+                &[],
+                "b.png".into(),
+                vec![2],
+                "image/png",
+                Some(&key),
+            )
             .await
             .unwrap();
         assert_eq!(key2, key, "the second file joins the first one's key");
@@ -1988,10 +2192,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/media/7/data"))
             .and(wiremock::matchers::header("authorization", "Bearer tok-1"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(png.clone(), "image/png"),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(png.clone(), "image/png"))
             .mount(&server)
             .await;
         // Anywhere else on the same host: it must NOT.
@@ -2029,19 +2230,31 @@ mod tests {
         let _env = EnvGuard::hold("http://127.0.0.1:1", "/tmp/wftui-image-auth-scope");
         let mut client = WfApiClient::with_store(
             token::Store::with_path(std::env::temp_dir().join("wftui-image-auth-scope/token.json")),
-            "https://forum.example", "fixture-client",
-        ).unwrap();
+            "https://forum.example",
+            "fixture-client",
+        )
+        .unwrap();
         client.base = "HTTPS://FORUM.EXAMPLE:443".into();
-        for url in ["https://forum.example/api/media/7/data", "HTTPS://FORUM.EXAMPLE:443/api/media/7/data"] {
+        for url in [
+            "https://forum.example/api/media/7/data",
+            "HTTPS://FORUM.EXAMPLE:443/api/media/7/data",
+        ] {
             assert!(client.image_uses_bearer(url), "equivalent origin: {url}");
         }
         for url in [
-            "https://forum.example:444/api/media/7/data", "http://forum.example/api/media/7/data",
-            "https://forum.example.evil/api/media/7/data", "https://forum.example@evil.example/api/media/7/data",
-            "https://user@forum.example/api/media/7/data", "https://forum.example/api-elsewhere/media/7/data",
-            "https://forum.example/api/../public/7.png", "https://forum.example/api/%2e%2e/public/7.png",
+            "https://forum.example:444/api/media/7/data",
+            "http://forum.example/api/media/7/data",
+            "https://forum.example.evil/api/media/7/data",
+            "https://forum.example@evil.example/api/media/7/data",
+            "https://user@forum.example/api/media/7/data",
+            "https://forum.example/api-elsewhere/media/7/data",
+            "https://forum.example/api/../public/7.png",
+            "https://forum.example/api/%2e%2e/public/7.png",
         ] {
-            assert!(!client.image_uses_bearer(url), "outside API authentication scope: {url}");
+            assert!(
+                !client.image_uses_bearer(url),
+                "outside API authentication scope: {url}"
+            );
         }
         // Configuration currently accepts origins only. Keep this helper's
         // path boundary correct without broadening that configuration policy.
@@ -2058,12 +2271,25 @@ mod tests {
         let server = MockServer::start().await;
         let origin = server.uri().replacen("http://", "HTTP://", 1);
         let _env = EnvGuard::hold(&origin, "/tmp/wftui-image-auth-case");
-        Mock::given(method("GET")).and(path("/api/media/7/data"))
-            .and(wiremock::matchers::header("authorization", "Bearer tok-case"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(vec![0x89u8, b'P', b'N', b'G'], "image/png"))
-            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/media/7/data"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer tok-case",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(vec![0x89u8, b'P', b'N', b'G'], "image/png"),
+            )
+            .mount(&server)
+            .await;
         let client = logged_in_client("tok-case").await;
-        assert!(client.fetch_bytes(&format!("{}/api/media/7/data", server.uri()), 1024).await.is_ok());
+        assert!(
+            client
+                .fetch_bytes(&format!("{}/api/media/7/data", server.uri()), 1024)
+                .await
+                .is_ok()
+        );
     }
 
     /// #680/#696/#697: both catalog envelopes, against **captured live
@@ -2087,7 +2313,6 @@ mod tests {
     /// Captured verbatim from the live TuiLink relay (#716), not written by
     /// hand — the same rule as every other fixture here.
     const DRAFTS_JSON: &str = include_str!("testdata/drafts.json");
-
 
     /// #716: the relay's envelope, against a body captured from production.
     #[tokio::test]
@@ -2157,7 +2382,9 @@ mod tests {
 
         let c = logged_in_client("tok-1").await;
         let before = c.write_gate.pending_wait();
-        c.save_draft("thread-7", "hello", "", None).await.expect("save");
+        c.save_draft("thread-7", "hello", "", None)
+            .await
+            .expect("save");
         assert!(
             c.write_gate.pending_wait() <= before,
             "a draft must not consume the 30s write cool-down a real post needs"
@@ -2178,7 +2405,9 @@ mod tests {
         }
     }
 
-    async fn collect(mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::ai::AiEvent>) -> Vec<crate::ai::AiEvent> {
+    async fn collect(
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::ai::AiEvent>,
+    ) -> Vec<crate::ai::AiEvent> {
         let mut out = Vec::new();
         while let Some(e) = rx.recv().await {
             out.push(e);
@@ -2194,9 +2423,16 @@ mod tests {
             .and(path("/api/wf-tui-ai"))
             .and(header("X-WF-Turn-Id", "tuiTurn1"))
             .and(header("authorization", "Bearer tok-1"))
-            .and(wiremock::matchers::body_string_contains("conversation_id=tuiC0nv"))
-            .and(wiremock::matchers::body_string_contains("message=What+is+KB5044284%3F"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(AI_STREAM, "text/event-stream; charset=utf-8"))
+            .and(wiremock::matchers::body_string_contains(
+                "conversation_id=tuiC0nv",
+            ))
+            .and(wiremock::matchers::body_string_contains(
+                "message=What+is+KB5044284%3F",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(AI_STREAM, "text/event-stream; charset=utf-8"),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -2214,7 +2450,10 @@ mod tests {
             })
             .collect();
         assert!(text.starts_with("KB5044284 is the"), "{text}");
-        assert!(c.ai_gate.pending_wait() > Duration::ZERO, "a turn spends the AI lane");
+        assert!(
+            c.ai_gate.pending_wait() > Duration::ZERO,
+            "a turn spends the AI lane"
+        );
         assert!(
             c.write_gate.pending_wait() == Duration::ZERO,
             "a question is not a forum write and must not arm the 30 s cool-down"
@@ -2243,7 +2482,10 @@ mod tests {
         let c = logged_in_client("tok-1").await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let err = c.ask_ai(&ai_request(), tx).await.expect_err("429");
-        assert!(matches!(err, Error::RateLimited { retry_after: Some(d) } if d == Duration::from_secs(9)), "{err:?}");
+        assert!(
+            matches!(err, Error::RateLimited { retry_after: Some(d) } if d == Duration::from_secs(9)),
+            "{err:?}"
+        );
         assert!(c.ai_gate.pending_wait() >= Duration::from_secs(8));
     }
 
@@ -2265,9 +2507,19 @@ mod tests {
         let c = logged_in_client("tok-1").await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         c.ask_ai(&ai_request(), tx).await.unwrap();
-        assert!(matches!(rx.recv().await, Some(crate::ai::AiEvent::Failed { retry_after: Some(d), .. }) if d == Duration::from_secs(60)));
-        assert!(c.ai_gate.pending_wait() >= Duration::from_secs(55), "{:?}", c.ai_gate.pending_wait());
-        assert!(c.api_gate.pending_wait() < Duration::from_secs(5), "navigation is not held: {:?}", c.api_gate.pending_wait());
+        assert!(
+            matches!(rx.recv().await, Some(crate::ai::AiEvent::Failed { retry_after: Some(d), .. }) if d == Duration::from_secs(60))
+        );
+        assert!(
+            c.ai_gate.pending_wait() >= Duration::from_secs(55),
+            "{:?}",
+            c.ai_gate.pending_wait()
+        );
+        assert!(
+            c.api_gate.pending_wait() < Duration::from_secs(5),
+            "navigation is not held: {:?}",
+            c.api_gate.pending_wait()
+        );
     }
 
     /// The relay reports chat.php's refusals in XF's envelope with
@@ -2288,7 +2540,10 @@ mod tests {
         let c = logged_in_client("tok-1").await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let err = c.ask_ai(&ai_request(), tx).await.expect_err("409");
-        assert!(matches!(&err, Error::Api { code, status: 409, .. } if code == "history_required"), "{err:?}");
+        assert!(
+            matches!(&err, Error::Api { code, status: 409, .. } if code == "history_required"),
+            "{err:?}"
+        );
     }
 
     /// Dropping the receiver is how the app cancels a turn: the call must
@@ -2306,7 +2561,9 @@ mod tests {
         let c = logged_in_client("tok-1").await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         drop(rx);
-        c.ask_ai(&ai_request(), tx).await.expect("a cancelled turn is not an error");
+        c.ask_ai(&ai_request(), tx)
+            .await
+            .expect("a cancelled turn is not an error");
     }
 
     #[tokio::test]
@@ -2315,7 +2572,9 @@ mod tests {
         let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-aiusage");
         Mock::given(method("GET"))
             .and(path("/api/wf-tui-ai"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(AI_USAGE_JSON, "application/json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(AI_USAGE_JSON, "application/json"),
+            )
             .mount(&server)
             .await;
 
@@ -2332,8 +2591,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/media"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(MEDIA_PAGE_JSON, "application/json"),
+                ResponseTemplate::new(200).set_body_raw(MEDIA_PAGE_JSON, "application/json"),
             )
             .mount(&server)
             .await;
@@ -2344,7 +2602,11 @@ mod tests {
         assert_eq!(m.media_id, 35691);
         assert!(m.is_image(), "media_type: {:?}", m.media_type);
         assert_eq!(m.px(), Some((1536, 1024)));
-        assert!(m.thumbnail_url.as_deref().is_some_and(|u| u.contains("/xfmg/thumbnail/")));
+        assert!(
+            m.thumbnail_url
+                .as_deref()
+                .is_some_and(|u| u.contains("/xfmg/thumbnail/"))
+        );
         assert!(m.media_url.as_deref().is_some_and(|u| u.ends_with("/data")));
         assert_eq!(m.username, "WindowsForum AI");
         assert_eq!(m.category_id, 11);
@@ -2359,14 +2621,17 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/media-categories/11/content"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(MEDIA_PAGE_JSON, "application/json"),
+                ResponseTemplate::new(200).set_body_raw(MEDIA_PAGE_JSON, "application/json"),
             )
             .mount(&server)
             .await;
         let c = logged_in_client("tok-1").await;
         let reply = c.media_list(Some(11), 1).await.unwrap();
-        assert_eq!(reply.media.len(), 1, "the category route must be the one called");
+        assert_eq!(
+            reply.media.len(),
+            1,
+            "the category route must be the one called"
+        );
     }
 
     #[tokio::test]
@@ -2376,8 +2641,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/resources"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(RESOURCES_PAGE_JSON, "application/json"),
+                ResponseTemplate::new(200).set_body_raw(RESOURCES_PAGE_JSON, "application/json"),
             )
             .mount(&server)
             .await;
@@ -2386,7 +2650,10 @@ mod tests {
         assert_eq!(reply.resources.len(), 1);
         let r = &reply.resources[0];
         assert_eq!(r.resource_id, 1);
-        assert_eq!(r.tag_line, "Windows diagnostic collector for support and troubleshooting");
+        assert_eq!(
+            r.tag_line,
+            "Windows diagnostic collector for support and troubleshooting"
+        );
         assert_eq!(r.download_count, 5678);
         assert_eq!(r.version, "2.5.8");
         // The whole point of #696: this is `rating_avg` on the wire.
@@ -2483,7 +2750,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stored_session_candidate_takes_a_siblings_rotated_token_only_once() {        let _env = EnvGuard::hold("http://127.0.0.1:1", "/tmp/wftui-test-adopt");
+    async fn stored_session_candidate_takes_a_siblings_rotated_token_only_once() {
+        let _env = EnvGuard::hold("http://127.0.0.1:1", "/tmp/wftui-test-adopt");
         let client = logged_in_client("access-1").await;
 
         // Same token set on disk as in memory: nothing to adopt.
@@ -2492,16 +2760,26 @@ mod tests {
         // A sibling instance refreshes and rewrites the store.
         let store = token::Store::new();
         store
-            .save(&TokenSet { origin: client.base_url().into(), client_id: client.client_id().into(),
+            .save(&TokenSet {
+                origin: client.base_url().into(),
+                client_id: client.client_id().into(),
                 access_token: "access-2".into(),
                 refresh_token: "refresh-2".into(),
                 expires_at: OffsetDateTime::now_utc().unix_timestamp() + 3600,
                 scope: "test".into(),
             })
             .unwrap();
-        let candidate = client.stored_session_candidate().await.unwrap().expect("candidate");
+        let candidate = client
+            .stored_session_candidate()
+            .await
+            .unwrap()
+            .expect("candidate");
         assert_eq!(candidate.valid_token().await.unwrap(), "access-2");
-        assert_eq!(client.valid_token().await.unwrap(), "access-1", "candidate is not active");
+        assert_eq!(
+            client.valid_token().await.unwrap(),
+            "access-1",
+            "candidate is not active"
+        );
         // Preparing again never publishes the replacement.
         assert!(client.stored_session_candidate().await.unwrap().is_some());
 
@@ -2569,7 +2847,12 @@ mod tests {
 
         let c = logged_in_client("tok-1").await;
         match c.me().await {
-            Err(Error::Api { code, message, status: 403, .. }) => {
+            Err(Error::Api {
+                code,
+                message,
+                status: 403,
+                ..
+            }) => {
                 assert_eq!(code, "http_error");
                 assert!(
                     message.len() < 80_000,
@@ -2695,7 +2978,9 @@ mod tests {
             .await;
         let c = logged_in_client("tok-1").await;
         match c.nodes().await.unwrap_err() {
-            Error::RateLimited { retry_after: Some(d) } => assert_eq!(d.as_secs(), 7),
+            Error::RateLimited {
+                retry_after: Some(d),
+            } => assert_eq!(d.as_secs(), 7),
             other => panic!("wrong error: {other}"),
         }
     }
@@ -2713,15 +2998,20 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/nodes"))
             .respond_with(
-                ResponseTemplate::new(429)
-                    .insert_header("Retry-After", "18446744073709551615"),
+                ResponseTemplate::new(429).insert_header("Retry-After", "18446744073709551615"),
             )
             .mount(&server)
             .await;
         let c = logged_in_client("tok-1").await;
         match c.nodes().await.unwrap_err() {
-            Error::RateLimited { retry_after: Some(d) } => {
-                assert_eq!(d, Duration::from_secs(3600), "must clamp, not pass the raw value through")
+            Error::RateLimited {
+                retry_after: Some(d),
+            } => {
+                assert_eq!(
+                    d,
+                    Duration::from_secs(3600),
+                    "must clamp, not pass the raw value through"
+                )
             }
             other => panic!("wrong error: {other}"),
         }
@@ -2741,7 +3031,10 @@ mod tests {
             .mount(&server)
             .await;
         let c = logged_in_client("tok-1").await;
-        assert!(c.api_gate.pending_wait() < Duration::from_secs(1), "no penalty yet");
+        assert!(
+            c.api_gate.pending_wait() < Duration::from_secs(1),
+            "no penalty yet"
+        );
         c.nodes().await.unwrap_err();
         let waited = c.api_gate.pending_wait();
         assert!(
@@ -2767,7 +3060,9 @@ mod tests {
         c.image_gate = Arc::new(Gate::new(0));
         let url = format!("{}/thumb-429.png", server.uri());
         match c.fetch_bytes(&url, 1024).await.unwrap_err() {
-            Error::RateLimited { retry_after: Some(d) } => assert_eq!(d.as_secs(), 12),
+            Error::RateLimited {
+                retry_after: Some(d),
+            } => assert_eq!(d.as_secs(), 12),
             other => panic!("wrong error: {other}"),
         }
         assert!(
@@ -2852,7 +3147,10 @@ mod tests {
         let mut c = logged_in_client("tok-1").await;
         c.api_gate = Arc::new(Gate::new(0));
         c.write_gate = Arc::new(Gate::new(0));
-        assert!(matches!(c.delete_post(8, false).await, Err(Error::RateLimited { .. })));
+        assert!(matches!(
+            c.delete_post(8, false).await,
+            Err(Error::RateLimited { .. })
+        ));
         assert!(c.api_gate.pending_wait() >= Duration::from_secs(11));
         assert!(c.write_gate.pending_wait() >= Duration::from_secs(11));
     }
@@ -2864,9 +3162,11 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/search"))
             .and(wiremock::matchers::body_string_contains("keywords=rust"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"success": true, "search": {"search_id": 77}}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"success": true, "search": {"search_id": 77}}),
+                ),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -2948,12 +3248,24 @@ mod tests {
             .await;
 
         let http = crate::http::build().unwrap();
-        crate::oauth::revoke(&http, &server.uri(), "refresh-1", Some("refresh_token"), "test-client")
-            .await
-            .expect("refresh-token revoke");
-        crate::oauth::revoke(&http, &server.uri(), "tok-1", Some("access_token"), "test-client")
-            .await
-            .expect("access-token revoke");
+        crate::oauth::revoke(
+            &http,
+            &server.uri(),
+            "refresh-1",
+            Some("refresh_token"),
+            "test-client",
+        )
+        .await
+        .expect("refresh-token revoke");
+        crate::oauth::revoke(
+            &http,
+            &server.uri(),
+            "tok-1",
+            Some("access_token"),
+            "test-client",
+        )
+        .await
+        .expect("access-token revoke");
     }
 
     /// Logout needs the refresh token, which `valid_token` never hands out.
@@ -2964,7 +3276,10 @@ mod tests {
         let c = logged_in_client("tok-1").await;
         let set = c.token_set().await.expect("a stored token set");
         assert_eq!(set.access_token, "tok-1");
-        assert!(!set.refresh_token.is_empty(), "the refresh token must be reachable");
+        assert!(
+            !set.refresh_token.is_empty(),
+            "the refresh token must be reachable"
+        );
         c.forget_tokens().await.unwrap();
         assert!(c.token_set().await.is_none());
     }
@@ -2990,14 +3305,17 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/me"))
             .and(header("Authorization", "Bearer tok-2"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"me": {"user_id": 1, "username": "me"}}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"me": {"user_id": 1, "username": "me"}})),
+            )
             .mount(&server)
             .await;
 
         let c = WfApiClient::new().unwrap();
-        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
+        c.set_tokens(TokenSet {
+            origin: String::new(),
+            client_id: String::new(),
             access_token: "expired".into(),
             refresh_token: "refresh-1".into(),
             expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
@@ -3014,7 +3332,11 @@ mod tests {
             .unwrap();
         assert_eq!(stored.access_token, "tok-2");
         assert_eq!(stored.refresh_token, "refresh-2");
-        assert_eq!(stored.origin, server.uri(), "a refreshed grant is stamped with its site");
+        assert_eq!(
+            stored.origin,
+            server.uri(),
+            "a refreshed grant is stamped with its site"
+        );
         assert_eq!(stored.client_id, "test-client");
     }
 
@@ -3028,7 +3350,9 @@ mod tests {
         let dir = env.dir.to_string_lossy().to_string();
         Mock::given(method("POST"))
             .and(path("/api/oauth2/token"))
-            .and(wiremock::matchers::body_string_contains("client_id=site-client-9"))
+            .and(wiremock::matchers::body_string_contains(
+                "client_id=site-client-9",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "tok-2", "refresh_token": "refresh-2",
                 "expires_in": 7200, "token_type": "bearer", "scope": "test"
@@ -3038,15 +3362,18 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/me"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"me": {"user_id": 1, "username": "me"}}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"me": {"user_id": 1, "username": "me"}})),
+            )
             .mount(&server)
             .await;
         let store = token::Store::with_path(std::path::PathBuf::from(&dir).join("token.json"));
         let c = WfApiClient::with_store(store, server.uri(), "site-client-9").unwrap();
         assert_eq!(c.client_id(), "site-client-9");
-        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
+        c.set_tokens(TokenSet {
+            origin: String::new(),
+            client_id: String::new(),
             access_token: "expired".into(),
             refresh_token: "refresh-1".into(),
             expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
@@ -3078,8 +3405,16 @@ mod tests {
                 client_id: "other-client".into(),
             })
             .unwrap();
-        let c = WfApiClient::with_store(token::Store::with_path(path.clone()), "http://127.0.0.1:1", "mine").unwrap();
-        assert!(!c.has_tokens().await, "a foreign grant must not become this client's session");
+        let c = WfApiClient::with_store(
+            token::Store::with_path(path.clone()),
+            "http://127.0.0.1:1",
+            "mine",
+        )
+        .unwrap();
+        assert!(
+            !c.has_tokens().await,
+            "a foreign grant must not become this client's session"
+        );
         assert!(!path.exists(), "the foreign store is moved aside");
         assert!(dir.join("token.json.foreign").exists());
 
@@ -3094,17 +3429,48 @@ mod tests {
                 client_id: "other-client".into(),
             })
             .unwrap();
-        let c = WfApiClient::with_store(token::Store::with_path(path.clone()), "http://127.0.0.1:1", "mine").unwrap();
+        let c = WfApiClient::with_store(
+            token::Store::with_path(path.clone()),
+            "http://127.0.0.1:1",
+            "mine",
+        )
+        .unwrap();
         assert!(!c.has_tokens().await);
 
         // Legacy: no origin recorded — accepted, and stamped on the next save.
-        std::fs::write(&path, r#"{"access_token":"a","refresh_token":"r","expires_at":9999999999,"scope":"s"}"#).unwrap();
-        let c = WfApiClient::with_store(token::Store::with_path(path.clone()), "http://127.0.0.1:1", "mine").unwrap();
-        assert!(!c.has_tokens().await, "a legacy grant cannot belong to an arbitrary forum");
-        std::fs::write(&path, r#"{"access_token":"a","refresh_token":"r","expires_at":9999999999,"scope":"s"}"#).unwrap();
-        let c = WfApiClient::with_store(token::Store::with_path(path.clone()), config::BASE_URL, config::DEFAULT_OAUTH_CLIENT_ID).unwrap();
-        assert!(c.has_tokens().await, "the built-in site retains legacy compatibility");
-        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
+        std::fs::write(
+            &path,
+            r#"{"access_token":"a","refresh_token":"r","expires_at":9999999999,"scope":"s"}"#,
+        )
+        .unwrap();
+        let c = WfApiClient::with_store(
+            token::Store::with_path(path.clone()),
+            "http://127.0.0.1:1",
+            "mine",
+        )
+        .unwrap();
+        assert!(
+            !c.has_tokens().await,
+            "a legacy grant cannot belong to an arbitrary forum"
+        );
+        std::fs::write(
+            &path,
+            r#"{"access_token":"a","refresh_token":"r","expires_at":9999999999,"scope":"s"}"#,
+        )
+        .unwrap();
+        let c = WfApiClient::with_store(
+            token::Store::with_path(path.clone()),
+            config::BASE_URL,
+            config::DEFAULT_OAUTH_CLIENT_ID,
+        )
+        .unwrap();
+        assert!(
+            c.has_tokens().await,
+            "the built-in site retains legacy compatibility"
+        );
+        c.set_tokens(TokenSet {
+            origin: String::new(),
+            client_id: String::new(),
             access_token: "b".into(),
             refresh_token: "r2".into(),
             expires_at: 9_999_999_999,
@@ -3112,8 +3478,14 @@ mod tests {
         })
         .await
         .unwrap();
-        let stored = token::Store::with_path(path.clone()).load().unwrap().unwrap();
-        assert_eq!((stored.origin.as_str(), stored.client_id.as_str()), (config::BASE_URL, config::DEFAULT_OAUTH_CLIENT_ID));
+        let stored = token::Store::with_path(path.clone())
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (stored.origin.as_str(), stored.client_id.as_str()),
+            (config::BASE_URL, config::DEFAULT_OAUTH_CLIENT_ID)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3129,7 +3501,9 @@ mod tests {
         let dir = env.dir.to_string_lossy().to_string();
         Mock::given(method("POST"))
             .and(path("/api/oauth2/token"))
-            .and(wiremock::matchers::body_string_contains("grant_type=refresh_token"))
+            .and(wiremock::matchers::body_string_contains(
+                "grant_type=refresh_token",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "tok-2",
                 "expires_in": 7200
@@ -3148,7 +3522,9 @@ mod tests {
             .await;
 
         let c = WfApiClient::new().unwrap();
-        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
+        c.set_tokens(TokenSet {
+            origin: String::new(),
+            client_id: String::new(),
             access_token: "expired".into(),
             refresh_token: "refresh-1".into(),
             expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
@@ -3199,7 +3575,9 @@ mod tests {
             .await;
 
         let c = WfApiClient::new().unwrap();
-        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
+        c.set_tokens(TokenSet {
+            origin: String::new(),
+            client_id: String::new(),
             access_token: "expired".into(),
             refresh_token: "refresh-1".into(),
             expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
@@ -3222,7 +3600,10 @@ mod tests {
         // endpoint again — if the guard had kept the old (now-revoked)
         // refresh_token, this would retry with it and the mock's `expect(1)`
         // would fail on drop.
-        let token2 = c.valid_token().await.expect("must reuse the in-memory token");
+        let token2 = c
+            .valid_token()
+            .await
+            .expect("must reuse the in-memory token");
         assert_eq!(token2, "tok-2");
 
         let _ = std::fs::remove_file(dir);
@@ -3256,7 +3637,9 @@ mod tests {
         // This process's refresh token is the one that gets rejected.
         Mock::given(method("POST"))
             .and(path("/api/oauth2/token"))
-            .and(wiremock::matchers::body_string_contains("refresh_token=refresh-1"))
+            .and(wiremock::matchers::body_string_contains(
+                "refresh_token=refresh-1",
+            ))
             .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
                 "errors": [{"code": "invalid_grant", "message": "Invalid refresh token"}]
             })))
@@ -3275,7 +3658,9 @@ mod tests {
             .await;
 
         let c = WfApiClient::new().unwrap();
-        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
+        c.set_tokens(TokenSet {
+            origin: String::new(),
+            client_id: String::new(),
             access_token: "expired".into(),
             refresh_token: "refresh-1".into(),
             expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
@@ -3288,7 +3673,9 @@ mod tests {
         // shared machine. Either way `valid_token` must not adopt it.
         let store = token::Store::with_path(std::path::PathBuf::from(dir).join("token.json"));
         store
-            .save(&TokenSet { origin: c.base_url().into(), client_id: c.client_id().into(),
+            .save(&TokenSet {
+                origin: c.base_url().into(),
+                client_id: c.client_id().into(),
                 access_token: "access-2".into(),
                 refresh_token: "refresh-2".into(),
                 expires_at: OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -3297,14 +3684,24 @@ mod tests {
             .unwrap();
 
         let err = c.valid_token().await.expect_err("must not adopt silently");
-        assert!(matches!(err, Error::NoToken), "expected NoToken, got {err:?}");
+        assert!(
+            matches!(err, Error::NoToken),
+            "expected NoToken, got {err:?}"
+        );
         // No call went out under the foreign identity, and no write can
         // follow: the in-memory session is gone.
-        assert!(!c.has_tokens().await, "the live session must be cleared, not swapped");
+        assert!(
+            !c.has_tokens().await,
+            "the live session must be cleared, not swapped"
+        );
         // The store is untouched — the foreign set is still there for the
         // app-level recheck (which verifies identity via `/me`) to adopt.
         assert_eq!(
-            store.load().unwrap().expect("the store must survive").refresh_token,
+            store
+                .load()
+                .unwrap()
+                .expect("the store must survive")
+                .refresh_token,
             "refresh-2"
         );
     }
@@ -3322,7 +3719,9 @@ mod tests {
         let dir = env.dir.to_string_lossy().to_string();
         Mock::given(method("POST"))
             .and(path("/api/oauth2/token"))
-            .and(wiremock::matchers::body_string_contains("refresh_token=refresh-1"))
+            .and(wiremock::matchers::body_string_contains(
+                "refresh_token=refresh-1",
+            ))
             .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
                 "errors": [{"code": "invalid_grant", "message": "Invalid refresh token"}]
             })))
@@ -3338,7 +3737,9 @@ mod tests {
             .await;
 
         let c = WfApiClient::new().unwrap();
-        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
+        c.set_tokens(TokenSet {
+            origin: String::new(),
+            client_id: String::new(),
             access_token: "expired".into(),
             refresh_token: "refresh-1".into(),
             expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
@@ -3348,7 +3749,9 @@ mod tests {
         .unwrap();
         let store = token::Store::with_path(std::path::PathBuf::from(dir).join("token.json"));
         store
-            .save(&TokenSet { origin: c.base_url().into(), client_id: c.client_id().into(),
+            .save(&TokenSet {
+                origin: c.base_url().into(),
+                client_id: c.client_id().into(),
                 access_token: "access-2".into(),
                 refresh_token: "refresh-2".into(),
                 expires_at: OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -3357,7 +3760,10 @@ mod tests {
             .unwrap();
 
         let result = c.nodes().await;
-        assert!(matches!(result, Err(Error::NoToken)), "expected NoToken, got {result:?}");
+        assert!(
+            matches!(result, Err(Error::NoToken)),
+            "expected NoToken, got {result:?}"
+        );
     }
 
     /// The other half of #568: when the store holds the *same* refresh token
@@ -3380,7 +3786,9 @@ mod tests {
             .await;
 
         let c = WfApiClient::new().unwrap();
-        c.set_tokens(TokenSet { origin: String::new(), client_id: String::new(),
+        c.set_tokens(TokenSet {
+            origin: String::new(),
+            client_id: String::new(),
             access_token: "expired".into(),
             refresh_token: "refresh-1".into(),
             expires_at: OffsetDateTime::now_utc().unix_timestamp() - 10,
@@ -3464,12 +3872,18 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/search"))
             .and(wiremock::matchers::body_string_contains("keywords=windows"))
-            .and(wiremock::matchers::body_string_contains("c%5Busers%5D=Alice"))
-            .and(wiremock::matchers::body_string_contains("search_type=thread"))
-            .and(wiremock::matchers::body_string_contains("order=date"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"success": true, "search": {"search_id": 88}}),
+            .and(wiremock::matchers::body_string_contains(
+                "c%5Busers%5D=Alice",
             ))
+            .and(wiremock::matchers::body_string_contains(
+                "search_type=thread",
+            ))
+            .and(wiremock::matchers::body_string_contains("order=date"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"success": true, "search": {"search_id": 88}}),
+                ),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -3505,9 +3919,11 @@ mod tests {
             .and(path("/api/search/member"))
             .and(wiremock::matchers::body_string_contains("user_id=42"))
             .and(wiremock::matchers::body_string_contains("content=thread"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"success": true, "search": {"search_id": 99}}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"success": true, "search": {"search_id": 99}}),
+                ),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -3669,8 +4085,14 @@ mod tests {
         let c = logged_in_client("tok-1").await;
         let user = c.user(77).await.unwrap();
         let avatars = user.avatar_urls.unwrap();
-        assert_eq!(avatars.s.as_deref(), Some("https://windowsforum.com/data/avatars/s/0/77.jpg"));
-        assert_eq!(avatars.o.as_deref(), Some("https://windowsforum.com/data/avatars/o/0/77.jpg"));
+        assert_eq!(
+            avatars.s.as_deref(),
+            Some("https://windowsforum.com/data/avatars/s/0/77.jpg")
+        );
+        assert_eq!(
+            avatars.o.as_deref(),
+            Some("https://windowsforum.com/data/avatars/o/0/77.jpg")
+        );
     }
 
     #[tokio::test]
@@ -3778,7 +4200,10 @@ mod tests {
         let server = MockServer::start().await;
         let _env = EnvGuard::hold("https://forum.example", "/tmp/wftui-t-fetch-ssrf");
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(vec![0x89u8, b'P', b'N', b'G'], "image/png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(vec![0x89u8, b'P', b'N', b'G'], "image/png"),
+            )
             .expect(0)
             .mount(&server)
             .await;
@@ -3816,7 +4241,10 @@ mod tests {
         let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-fetch-ssrf-hop");
         Mock::given(method("GET"))
             .and(path("/data/hop.png"))
-            .respond_with(ResponseTemplate::new(302).insert_header("Location", "https://169.254.169.254/latest/meta-data/"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", "https://169.254.169.254/latest/meta-data/"),
+            )
             .mount(&server)
             .await;
         let c = logged_in_client("tok-1").await;
@@ -3832,11 +4260,19 @@ mod tests {
         /// routed through `proxy` if one is given. A test never sets the
         /// process-wide proxy variables, because every other test's
         /// clients would read them too.
-        fn with_content_policy(mut self, policy: crate::http::ContentPolicy, proxy: Option<&str>) -> Self {
+        fn with_content_policy(
+            mut self,
+            policy: crate::http::ContentPolicy,
+            proxy: Option<&str>,
+        ) -> Self {
             use crate::http::ContentLane;
             let policy = Arc::new(policy);
             let build = |lane| {
-                let mut b = crate::http::content_client_builder(&config::user_agent(), policy.clone(), lane);
+                let mut b = crate::http::content_client_builder(
+                    &config::user_agent(),
+                    policy.clone(),
+                    lane,
+                );
                 if let Some(p) = proxy {
                     b = b.proxy(reqwest::Proxy::all(p).unwrap());
                 }
@@ -3864,26 +4300,57 @@ mod tests {
         let forum = MockServer::start().await;
         let other = MockServer::start().await;
         let _env = EnvGuard::hold(&forum.uri(), "/tmp/wftui-t-fetch-own-media");
-        Mock::given(method("GET")).and(path("/data/a.png")).respond_with(png()).expect(1).mount(&forum).await;
+        Mock::given(method("GET"))
+            .and(path("/data/a.png"))
+            .respond_with(png())
+            .expect(1)
+            .mount(&forum)
+            .await;
         Mock::given(method("GET"))
             .and(path("/data/hop.png"))
             .respond_with(ResponseTemplate::new(302).insert_header("Location", "/admin.php"))
             .expect(1)
             .mount(&forum)
             .await;
-        Mock::given(method("GET")).and(path("/admin.php")).respond_with(png()).expect(0).mount(&forum).await;
-        Mock::given(method("GET")).respond_with(png()).expect(0).mount(&other).await;
+        Mock::given(method("GET"))
+            .and(path("/admin.php"))
+            .respond_with(png())
+            .expect(0)
+            .mount(&forum)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(png())
+            .expect(0)
+            .mount(&other)
+            .await;
         let (port, other_port) = (forum.address().port(), other.address().port());
-        let policy = crate::http::ContentPolicy::with_proxy_env(&format!("http://forum.example:{port}"), |_| None)
-            .with_fixed_dns("forum.example", &["127.0.0.1"]);
-        let c = logged_in_client("tok-1").await.with_content_policy(policy, None);
+        let policy = crate::http::ContentPolicy::with_proxy_env(
+            &format!("http://forum.example:{port}"),
+            |_| None,
+        )
+        .with_fixed_dns("forum.example", &["127.0.0.1"]);
+        let c = logged_in_client("tok-1")
+            .await
+            .with_content_policy(policy, None);
 
-        let bytes = c.fetch_bytes(&format!("http://forum.example:{port}/data/a.png"), 1024).await.unwrap();
+        let bytes = c
+            .fetch_bytes(&format!("http://forum.example:{port}/data/a.png"), 1024)
+            .await
+            .unwrap();
         assert_eq!(&bytes[..4], b"\x89PNG");
         for (u, why) in [
-            (format!("http://forum.example:{port}/admin.php"), "non-public"),
-            (format!("http://forum.example:{other_port}/data/a.png"), "non-public"),
-            (format!("http://forum.example:{port}/data/hop.png"), "own media"),
+            (
+                format!("http://forum.example:{port}/admin.php"),
+                "non-public",
+            ),
+            (
+                format!("http://forum.example:{other_port}/data/a.png"),
+                "non-public",
+            ),
+            (
+                format!("http://forum.example:{port}/data/hop.png"),
+                "own media",
+            ),
         ] {
             match c.fetch_bytes(&u, 1024).await {
                 Err(Error::FetchRejected(msg)) => assert!(msg.contains(why), "{u}: {msg}"),
@@ -3905,9 +4372,18 @@ mod tests {
         let proxy = MockServer::start().await;
         let _env = EnvGuard::hold(&proxy.uri(), "/tmp/wftui-t-fetch-proxy");
         for ok in ["/data/a.png", "/b.png", "/d.png"] {
-            Mock::given(method("GET")).and(path(ok)).respond_with(png()).expect(1).mount(&proxy).await;
+            Mock::given(method("GET"))
+                .and(path(ok))
+                .respond_with(png())
+                .expect(1)
+                .mount(&proxy)
+                .await;
         }
-        Mock::given(method("GET")).respond_with(png()).expect(0).mount(&proxy).await;
+        Mock::given(method("GET"))
+            .respond_with(png())
+            .expect(0)
+            .mount(&proxy)
+            .await;
         let proxy_url = format!("http://proxy.corp.example:{}", proxy.address().port());
         let policy = crate::http::ContentPolicy::with_proxy_env("http://forum.example", |name| {
             matches!(name, "HTTPS_PROXY" | "HTTP_PROXY").then(|| proxy_url.clone())
@@ -3916,13 +4392,25 @@ mod tests {
         .with_fixed_dns("cdn.example", &["8.8.8.8"])
         .with_fixed_dns("intranet.example", &["10.0.0.5"])
         .with_fixed_dns("proxy-only.example", &[]);
-        let c = logged_in_client("tok-1").await.with_content_policy(policy, Some(&proxy_url));
+        let c = logged_in_client("tok-1")
+            .await
+            .with_content_policy(policy, Some(&proxy_url));
 
-        for u in ["http://forum.example/data/a.png", "http://cdn.example/b.png", "http://proxy-only.example/d.png"] {
-            let bytes = c.fetch_bytes(u, 1024).await.unwrap_or_else(|e| panic!("{u} through the proxy: {e:?}"));
+        for u in [
+            "http://forum.example/data/a.png",
+            "http://cdn.example/b.png",
+            "http://proxy-only.example/d.png",
+        ] {
+            let bytes = c
+                .fetch_bytes(u, 1024)
+                .await
+                .unwrap_or_else(|e| panic!("{u} through the proxy: {e:?}"));
             assert_eq!(&bytes[..4], b"\x89PNG", "{u}");
         }
-        for u in ["http://intranet.example/c.png".to_string(), format!("{proxy_url}/e.png")] {
+        for u in [
+            "http://intranet.example/c.png".to_string(),
+            format!("{proxy_url}/e.png"),
+        ] {
             match c.fetch_bytes(&u, 1024).await {
                 Err(Error::FetchRejected(msg)) => assert!(msg.contains("refusing"), "{u}: {msg}"),
                 other => panic!("{u} must be refused, got {other:?}"),
@@ -4017,8 +4505,14 @@ mod tests {
             .mount(&server)
             .await;
         let c = logged_in_client("tok-1").await;
-        match c.attachment_data(9, config::MAX_ATTACHMENT_BYTES).await.unwrap_err() {
-            Error::RateLimited { retry_after: Some(d) } => assert_eq!(d.as_secs(), 12),
+        match c
+            .attachment_data(9, config::MAX_ATTACHMENT_BYTES)
+            .await
+            .unwrap_err()
+        {
+            Error::RateLimited {
+                retry_after: Some(d),
+            } => assert_eq!(d.as_secs(), 12),
             other => panic!("wrong error: {other:?}"),
         }
         assert!(
@@ -4075,7 +4569,14 @@ mod tests {
         let c = logged_in_client("tok-1").await;
         let before = c.write_gate.pending_wait();
         let (key, attachment) = c
-            .upload_attachment("post", &[], "shot.png".into(), vec![1, 2, 3], "image/png", None)
+            .upload_attachment(
+                "post",
+                &[],
+                "shot.png".into(),
+                vec![1, 2, 3],
+                "image/png",
+                None,
+            )
             .await
             .unwrap();
         // The key is what ties the upload to the post that follows it.
@@ -4112,13 +4613,24 @@ mod tests {
 
         let c = logged_in_client("tok-1").await;
         let result = c
-            .upload_attachment("post", &[], "shot.png".into(), vec![1, 2, 3], "image/png", None)
+            .upload_attachment(
+                "post",
+                &[],
+                "shot.png".into(),
+                vec![1, 2, 3],
+                "image/png",
+                None,
+            )
             .await;
-        assert!(result.is_err(), "a shapeless success must not yield an attachment: {result:?}");
+        assert!(
+            result.is_err(),
+            "a shapeless success must not yield an attachment: {result:?}"
+        );
     }
 
     #[tokio::test]
-    async fn react_and_vote_report_the_servers_delete_action_as_a_removal() {        let server = MockServer::start().await;
+    async fn react_and_vote_report_the_servers_delete_action_as_a_removal() {
+        let server = MockServer::start().await;
         let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-t-react-del");
         // Sending the reaction/type that is already set is XF's *undo*; the
         // body is the only thing that says so (issue #538).
@@ -4163,36 +4675,73 @@ mod tests {
             .expect(1).mount(&server).await;
         let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = arrivals.clone();
-        Mock::given(method("GET")).and(path("/api/resources"))
+        Mock::given(method("GET"))
+            .and(path("/api/resources"))
             .respond_with(move |_: &wiremock::Request| {
                 observed.lock().unwrap().push(std::time::Instant::now());
-                ResponseTemplate::new(200).set_body_raw(include_str!("testdata/resources_page.json"), "application/json")
-            }).expect(4).mount(&server).await;
+                ResponseTemplate::new(200).set_body_raw(
+                    include_str!("testdata/resources_page.json"),
+                    "application/json",
+                )
+            })
+            .expect(4)
+            .mount(&server)
+            .await;
         let client = logged_in_client("expired").await;
         client.tokens.lock().await.as_mut().unwrap().expires_at = 0;
         let results = tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(client.resources_list(1), client.resources_list(1), client.resources_list(1), client.resources_list(1))
-        }).await.expect("concurrent dispatches must make progress");
-        results.0.unwrap(); results.1.unwrap(); results.2.unwrap(); results.3.unwrap();
+            tokio::join!(
+                client.resources_list(1),
+                client.resources_list(1),
+                client.resources_list(1),
+                client.resources_list(1)
+            )
+        })
+        .await
+        .expect("concurrent dispatches must make progress");
+        results.0.unwrap();
+        results.1.unwrap();
+        results.2.unwrap();
+        results.3.unwrap();
         let arrivals = arrivals.lock().unwrap();
         assert_eq!(arrivals.len(), 4);
-        assert!(arrivals.windows(2).all(|pair| pair[1] - pair[0] >= Duration::from_millis(220)), "requests bunched after refresh");
+        assert!(
+            arrivals
+                .windows(2)
+                .all(|pair| pair[1] - pair[0] >= Duration::from_millis(220)),
+            "requests bunched after refresh"
+        );
     }
 
     #[tokio::test]
     async fn refresh_rate_limit_preserves_retry_after_and_delays_waiting_refreshes() {
         let server = MockServer::start().await;
         let _env = EnvGuard::hold(&server.uri(), "/tmp/wftui-refresh-retry");
-        Mock::given(method("POST")).and(path("/api/oauth2/token"))
-            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "5")
-                .set_body_json(serde_json::json!({"error":"temporarily_unavailable"})))
-            .expect(1).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/oauth2/token"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "5")
+                    .set_body_json(serde_json::json!({"error":"temporarily_unavailable"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
         let client = logged_in_client("expired").await;
         client.tokens.lock().await.as_mut().unwrap().expires_at = 0;
-        assert!(matches!(client.valid_token().await, Err(Error::RateLimited { retry_after: Some(delay) }) if delay == Duration::from_secs(5)));
+        assert!(
+            matches!(client.valid_token().await, Err(Error::RateLimited { retry_after: Some(delay) }) if delay == Duration::from_secs(5))
+        );
         assert!(client.api_gate.pending_wait() >= Duration::from_secs(4));
-        assert!(tokio::time::timeout(Duration::from_millis(350), client.valid_token()).await.is_err());
-        assert!(client.has_tokens().await, "a rate limit must keep the session");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(350), client.valid_token())
+                .await
+                .is_err()
+        );
+        assert!(
+            client.has_tokens().await,
+            "a rate limit must keep the session"
+        );
     }
 
     #[tokio::test]
@@ -4214,8 +4763,12 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), client.dispatch_token(&gates)),
             expire_while_waiting,
         );
-        assert_eq!(result.expect("an unsent request must not add another 30-second cooldown").unwrap(), "fresh");
+        assert_eq!(
+            result
+                .expect("an unsent request must not add another 30-second cooldown")
+                .unwrap(),
+            "fresh"
+        );
         assert!(client.write_gate.pending_wait() >= Duration::from_secs(29));
     }
-
 }

@@ -77,7 +77,11 @@ impl App {
             }
             return;
         }
-        let capture = self.screens.last().map(|s| s.input_capture()).unwrap_or(false);
+        let capture = self
+            .screens
+            .last()
+            .map(|s| s.input_capture())
+            .unwrap_or(false);
         // `Ctrl+K` / `:` / `g` / `G` only when no input field owns the keyboard
         // (`^K` is BBCode `[ICODE]` in the composer) and only once there is a
         // session to navigate — the login screen is a gate, not a place.
@@ -203,7 +207,8 @@ impl App {
         }
         // The palette owns the keyboard while it is up, so it owns pastes too.
         if let Some(palette) = self.palette.as_mut() {
-            let sanitized = crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], " "));
+            let sanitized =
+                crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], " "));
             crate::editor::insert_str(&mut palette.query, &mut palette.cursor, &sanitized);
             palette.after_paste();
             return;
@@ -212,7 +217,8 @@ impl App {
             match screen {
                 // The Setup screen: whichever field has the caret.
                 Screen::Setup(ss) => {
-                    let sanitized = crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], ""));
+                    let sanitized =
+                        crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], ""));
                     let (field, cursor) = ss.text_mut(ss.field);
                     crate::editor::insert_str(field, cursor, &sanitized);
                     self.set_status(format!("Pasted {} characters", text.chars().count()));
@@ -220,41 +226,58 @@ impl App {
                 // The sign-in paste field: a redirect URL is exactly what a
                 // bracketed paste or `^Y` carries here.
                 Screen::Login(ls) if matches!(ls.stage, screens::LoginStage::Pasting { .. }) => {
-                    let sanitized = crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], ""));
+                    let sanitized =
+                        crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], ""));
                     crate::editor::insert_str(&mut ls.paste, &mut ls.paste_cursor, &sanitized);
                     self.set_status("Pasted — press Enter to submit");
                 }
                 Screen::Compose(cs) => {
                     if let Some(path) = cs.file_prompt.as_mut() {
-                        let sanitized = crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], " "));
+                        let sanitized = crate::editor::normalize_control_chars(
+                            &text.replace(['\r', '\n'], " "),
+                        );
                         crate::editor::insert_str(path, &mut cs.file_prompt_cursor, &sanitized);
                     } else if cs.title_field {
-                        let sanitized =
-                            crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], " "));
+                        let sanitized = crate::editor::normalize_control_chars(
+                            &text.replace(['\r', '\n'], " "),
+                        );
                         crate::editor::insert_str(&mut cs.title, &mut cs.title_cursor, &sanitized);
                     } else {
-                        let sanitized = crate::editor::normalize_control_chars(&text.replace('\r', ""));
+                        let sanitized =
+                            crate::editor::normalize_control_chars(&text.replace('\r', ""));
                         crate::editor::insert_str(&mut cs.body, &mut cs.body_cursor, &sanitized);
                         cs.body_epoch += 1;
                     }
                     self.set_status(format!("Pasted {} characters", text.chars().count()));
                 }
                 Screen::Search(ss) => {
-                    let sanitized = crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], " "));
+                    let sanitized =
+                        crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], " "));
                     if ss.active_field == 1 {
-                        crate::editor::insert_str(&mut ss.author, &mut ss.author_cursor, &sanitized);
+                        crate::editor::insert_str(
+                            &mut ss.author,
+                            &mut ss.author_cursor,
+                            &sanitized,
+                        );
                     } else {
                         crate::editor::insert_str(&mut ss.query, &mut ss.query_cursor, &sanitized);
                     }
-                    self.set_status(format!("Pasted {} characters into search", text.chars().count()));
+                    self.set_status(format!(
+                        "Pasted {} characters into search",
+                        text.chars().count()
+                    ));
                 }
                 // The question field is one line: a pasted error log or
                 // command output arrives as one question, not as Enters.
                 Screen::AskAi(a) => {
-                    let sanitized = crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], " "));
+                    let sanitized =
+                        crate::editor::normalize_control_chars(&text.replace(['\r', '\n'], " "));
                     a.input_mode = true;
                     crate::editor::insert_str(&mut a.input, &mut a.cursor, &sanitized);
-                    self.set_status(format!("Pasted {} characters into the question", text.chars().count()));
+                    self.set_status(format!(
+                        "Pasted {} characters into the question",
+                        text.chars().count()
+                    ));
                 }
                 Screen::NewConversation(ncs) => {
                     match ncs.field {
@@ -327,9 +350,10 @@ impl App {
         match me.kind {
             K::Down(MouseButton::Left, ..) => {
                 let now = std::time::Instant::now();
-                let is_rapid = self.last_click_instant.is_some_and(|t| {
-                    now.duration_since(t) < Duration::from_millis(400)
-                }) && self.last_click_pos.0.abs_diff(pos.0) <= 2
+                let is_rapid = self
+                    .last_click_instant
+                    .is_some_and(|t| now.duration_since(t) < Duration::from_millis(400))
+                    && self.last_click_pos.0.abs_diff(pos.0) <= 2
                     && self.last_click_pos.1 == pos.1;
 
                 if is_rapid {
@@ -432,9 +456,7 @@ impl App {
                     if !text.is_empty() {
                         let n = text.chars().count();
                         self.copy_text(&text);
-                        self.set_status(format!(
-                            "Copied {n} chars to your clipboard (and Ctrl+Y)"
-                        ));
+                        self.set_status(format!("Copied {n} chars to your clipboard (and Ctrl+Y)"));
                     }
                 }
             }

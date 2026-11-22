@@ -64,7 +64,6 @@ pub(crate) fn paint_selection_gutter(
     }
 }
 
-
 /// Cached list rows (#23): the list renderers used to format every row on
 /// every frame — `truncate`, chip, width measure, pad — though only a pane's
 /// worth are on screen, and while anything loads those frames come eight a
@@ -86,7 +85,12 @@ impl<R: Clone> Default for RowCache<R> {
     fn default() -> Self {
         // Width 0 never matches a real render (the renderers return before
         // building rows when the pane has none), so the first frame rebuilds.
-        Self { width: 0, fingerprint: 0, rebuild_count: 0, rows: Vec::new() }
+        Self {
+            width: 0,
+            fingerprint: 0,
+            rebuild_count: 0,
+            rows: Vec::new(),
+        }
     }
 }
 
@@ -120,10 +124,14 @@ pub enum LoginStage {
     /// A link is on screen and the flow is waiting for the code: the relay
     /// poll (`TuiLink`), the loopback listener (`Loopback`), or the user's
     /// paste (`Paste`). Never `Auto` — that is resolved before the link.
-    Waiting { mode: LoginMode },
+    Waiting {
+        mode: LoginMode,
+    },
     /// The paste field is open: the keyboard belongs to it until Enter or
     /// Esc. `mode` is the flow underneath, so Esc knows where to go back.
-    Pasting { mode: LoginMode },
+    Pasting {
+        mode: LoginMode,
+    },
 }
 
 impl LoginStage {
@@ -405,7 +413,10 @@ pub fn home_state(loading: bool) -> Screen {
 
 #[derive(Debug, Clone)]
 pub enum ComposeTarget {
-    ThreadReply { thread_id: u32, thread_title: String },
+    ThreadReply {
+        thread_id: u32,
+        thread_title: String,
+    },
     /// Editing a post already posted (#708). The thread is carried so the
     /// view can be refreshed on the page the post is actually on.
     EditPost {
@@ -413,7 +424,9 @@ pub enum ComposeTarget {
         thread_id: u32,
         thread_title: String,
     },
-    NewThread { node_id: u32 },
+    NewThread {
+        node_id: u32,
+    },
     ConversationReply {
         conversation_id: u32,
         conversation_title: String,
@@ -432,9 +445,9 @@ impl ComposeTarget {
             ComposeTarget::ThreadReply { thread_id, .. } => DraftKey::ThreadReply(*thread_id),
             ComposeTarget::EditPost { post_id, .. } => DraftKey::EditPost(*post_id),
             ComposeTarget::NewThread { node_id } => DraftKey::NewThread(*node_id),
-            ComposeTarget::ConversationReply { conversation_id, .. } => {
-                DraftKey::ConversationReply(*conversation_id)
-            }
+            ComposeTarget::ConversationReply {
+                conversation_id, ..
+            } => DraftKey::ConversationReply(*conversation_id),
         }
     }
 }
@@ -918,7 +931,10 @@ pub struct DraftsState {
     pub sel: usize,
     /// The built rows (label + optional preview), keyed by width + data
     /// fingerprint (#23).
-    pub row_cache: RowCache<(ratatui::text::Line<'static>, Option<ratatui::text::Line<'static>>)>,
+    pub row_cache: RowCache<(
+        ratatui::text::Line<'static>,
+        Option<ratatui::text::Line<'static>>,
+    )>,
 }
 
 /// The resource page (#697): one resource rendered in the client, from the
@@ -1115,7 +1131,10 @@ pub enum Action {
     OpenResources,
     /// Fetch one page of the media / resource catalogs (#680), optionally
     /// scoped to a gallery category (#697).
-    LoadMedia { category: Option<u32>, page: u32 },
+    LoadMedia {
+        category: Option<u32>,
+        page: u32,
+    },
     LoadResources(u32),
     /// Switch the Inbox list tab through the app-owned transition so Alerts
     /// viewed state and badge accounting stay in sync.
@@ -1128,7 +1147,10 @@ pub enum Action {
     /// Show one picture full size in the client (#697).
     OpenImage(Box<ImageOpen>),
     /// Play a video inside the client (#711).
-    PlayVideo { url: String, title: String },
+    PlayVideo {
+        url: String,
+        title: String,
+    },
     /// One page of a member's threads/posts (issue #548). `content` is
     /// XenForo's `content` parameter for `/search/member`: "thread" or "post".
     LoadMemberContent {
@@ -1148,24 +1170,50 @@ pub enum Action {
     /// Edit, delete or mark-as-solution the selected post (#708). Each is
     /// offered only where the API said this reader may.
     StartEditPost(Thread, Box<Post>),
-    SubmitEdit { post_id: u32, message: String },
+    SubmitEdit {
+        post_id: u32,
+        message: String,
+    },
     /// Upload a file into the draft (#709). The context comes from what is
     /// being written, because XF requires the key's context to match.
-    UploadAttachment { path: String, context: AttachContext },
-    DeletePost { post_id: u32, thread_id: u32 },
-    MarkSolution { post_id: u32, thread_id: u32 },
+    UploadAttachment {
+        path: String,
+        context: AttachContext,
+    },
+    DeletePost {
+        post_id: u32,
+        thread_id: u32,
+    },
+    MarkSolution {
+        post_id: u32,
+        thread_id: u32,
+    },
     StartReplyConversation(Conversation),
     StartNewThread(u32),
     StartNewConversation(Option<String>),
-    SubmitReply { thread_id: u32, message: String },
-    SubmitThread { node_id: u32, title: String, message: String },
-    SubmitConvoReply { id: u32, message: String },
+    SubmitReply {
+        thread_id: u32,
+        message: String,
+    },
+    SubmitThread {
+        node_id: u32,
+        title: String,
+        message: String,
+    },
+    SubmitConvoReply {
+        id: u32,
+        message: String,
+    },
     ResolveRecipients(Vec<String>, String, String),
     LoginBegin,
     /// The Setup screen's submit: the forum the generic edition should
     /// connect to. The app validates, writes `config.json`, adopts the
     /// site and starts sign-in — or hands the errors back to the screen.
-    SetupSite { origin: String, client_id: String, name: String },
+    SetupSite {
+        origin: String,
+        client_id: String,
+        name: String,
+    },
     /// The paste field's Enter: the redirected URL or the bare code.
     LoginPaste(String),
     /// `m` on the sign-in screen: next login mode (auto → tuilink →
@@ -1275,7 +1323,11 @@ impl Screen {
         }
     }
 
-    pub fn set_image_policy(&mut self, policy: crate::images::Policy, sizes: &crate::images::Sizes) {
+    pub fn set_image_policy(
+        &mut self,
+        policy: crate::images::Policy,
+        sizes: &crate::images::Sizes,
+    ) {
         match self {
             Screen::ThreadView(s) => {
                 if s.images != policy {
@@ -1538,9 +1590,7 @@ impl Screen {
             Screen::ThreadList(l) => l.loading,
             Screen::ThreadView(v) => v.loading,
             Screen::Inbox(i) => {
-                i.convos.loading
-                    || i.alerts.loading
-                    || i.view.as_ref().is_some_and(|v| v.loading)
+                i.convos.loading || i.alerts.loading || i.view.as_ref().is_some_and(|v| v.loading)
             }
             Screen::ConversationView(v) => v.loading,
             Screen::Search(s) => s.loading,
@@ -1567,8 +1617,16 @@ impl Screen {
     pub fn web_url(&self) -> Option<String> {
         match self {
             Screen::Home(h) => match h.focus {
-                Pane::Tree => h.tree.nodes.get(h.tree.sel).and_then(|n| n.view_url.clone()),
-                Pane::List => h.list.threads.get(h.list.sel).and_then(|t| t.view_url.clone()),
+                Pane::Tree => h
+                    .tree
+                    .nodes
+                    .get(h.tree.sel)
+                    .and_then(|n| n.view_url.clone()),
+                Pane::List => h
+                    .list
+                    .threads
+                    .get(h.list.sel)
+                    .and_then(|t| t.view_url.clone()),
             },
             Screen::ForumTree(t) => t.nodes.get(t.sel).and_then(|n| n.view_url.clone()),
             Screen::ThreadList(l) => l.threads.get(l.sel).and_then(|t| t.view_url.clone()),
@@ -1580,9 +1638,10 @@ impl Screen {
             Screen::Inbox(ib) => match ib.focus {
                 // With the view pane focused, "open on the site" means the
                 // conversation on screen — the list may not even be drawn.
-                InboxPane::View => {
-                    ib.view.as_ref().and_then(|v| v.conversation.view_url.clone())
-                }
+                InboxPane::View => ib
+                    .view
+                    .as_ref()
+                    .and_then(|v| v.conversation.view_url.clone()),
                 InboxPane::List => match ib.tab {
                     InboxTab::Conversations => ib
                         .convos
@@ -1666,13 +1725,11 @@ impl Screen {
             // The fields own Esc: it quits, since nothing is behind this
             // screen yet (`setup_key`).
             Screen::Setup(_) => EscIntent::Screen,
-            Screen::Compose(c) if c.busy || c.uploading => EscIntent::Blocked(
-                if c.uploading {
-                    "Uploading\u{2026} Esc cannot cancel it \u{2014} wait for the result."
-                } else {
-                    "Sending\u{2026} Esc cannot cancel it \u{2014} wait for the result."
-                },
-            ),
+            Screen::Compose(c) if c.busy || c.uploading => EscIntent::Blocked(if c.uploading {
+                "Uploading\u{2026} Esc cannot cancel it \u{2014} wait for the result."
+            } else {
+                "Sending\u{2026} Esc cannot cancel it \u{2014} wait for the result."
+            }),
             // Issue #597: `busy` now spans the create write too, so Esc is
             // blocked for the whole lifecycle — it used to pop the screen out
             // from under an in-flight `create_conversation`.
@@ -1951,19 +2008,10 @@ pub(crate) fn solo_panel(
     chrome::panel(theme, g, title, true, right, bottom)
 }
 
-pub(crate) fn centered_box(
-    area: Rect,
-    width: u16,
-    height: u16,
-) -> Rect {
+pub(crate) fn centered_box(area: Rect, width: u16, height: u16) -> Rect {
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
-    Rect::new(
-        x,
-        y,
-        width.min(area.width),
-        height.min(area.height),
-    )
+    Rect::new(x, y, width.min(area.width), height.min(area.height))
 }
 
 #[allow(dead_code)]
@@ -2240,7 +2288,11 @@ mod dispatch_tests {
     #[test]
     fn every_screen_supplies_a_non_empty_crumb() {
         for s in all_screens() {
-            assert!(!s.crumb().trim().is_empty(), "{} has an empty crumb", s.title());
+            assert!(
+                !s.crumb().trim().is_empty(),
+                "{} has an empty crumb",
+                s.title()
+            );
         }
     }
 
@@ -2291,8 +2343,14 @@ mod dispatch_tests {
             },
             view: Some(ConversationViewState {
                 conversation: convo(3, "https://wf/c.3/"),
-                messages: vec![ConversationMessage::default(), ConversationMessage::default()],
-                lines: vec![ratatui::text::Line::raw("one"), ratatui::text::Line::raw("two")],
+                messages: vec![
+                    ConversationMessage::default(),
+                    ConversationMessage::default(),
+                ],
+                lines: vec![
+                    ratatui::text::Line::raw("one"),
+                    ratatui::text::Line::raw("two"),
+                ],
                 ..Default::default()
             }),
             ..Default::default()
@@ -2313,13 +2371,17 @@ mod dispatch_tests {
         // View focus: G/g g scroll the open conversation and leave the list
         // alone; the URL names the conversation on screen.
         {
-            let Screen::Inbox(ib) = &mut inbox else { panic!("inbox") };
+            let Screen::Inbox(ib) = &mut inbox else {
+                panic!("inbox")
+            };
             ib.focus = InboxPane::View;
             ib.convos.sel = 0;
         }
         inbox.goto_bottom();
         {
-            let Screen::Inbox(ib) = &inbox else { panic!("inbox") };
+            let Screen::Inbox(ib) = &inbox else {
+                panic!("inbox")
+            };
             assert_eq!(ib.convos.sel, 0, "the hidden list must not move");
             let Some(v) = &ib.view else { panic!("view") };
             assert_eq!(v.sel_msg, 1, "view focus: G selects the last message");
@@ -2332,9 +2394,15 @@ mod dispatch_tests {
         );
         inbox.goto_top();
         {
-            let Screen::Inbox(ib) = &inbox else { panic!("inbox") };
+            let Screen::Inbox(ib) = &inbox else {
+                panic!("inbox")
+            };
             let Some(v) = &ib.view else { panic!("view") };
-            assert_eq!((v.sel_msg, v.scroll), (0, 0), "view focus: g g returns to the top");
+            assert_eq!(
+                (v.sel_msg, v.scroll),
+                (0, 0),
+                "view focus: g g returns to the top"
+            );
         }
     }
 
@@ -2446,7 +2514,9 @@ mod dispatch_tests {
 
         fn login_waiting() -> Screen {
             let login = LoginState {
-                stage: LoginStage::Waiting { mode: LoginMode::TuiLink },
+                stage: LoginStage::Waiting {
+                    mode: LoginMode::TuiLink,
+                },
                 url: "https://windowsforum.com/tui-start/abc123".into(),
                 ..Default::default()
             };
@@ -2461,8 +2531,38 @@ mod dispatch_tests {
             },
             Case {
                 name: "Home",
-                factory: || Screen::Home(HomeState {
-                    tree: ForumTreeState {
+                factory: || {
+                    Screen::Home(HomeState {
+                        tree: ForumTreeState {
+                            nodes: vec![Node {
+                                node_id: 4,
+                                title: "Windows News".into(),
+                                node_type: "Forum".into(),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                        list: ThreadListState {
+                            node_id: 4,
+                            title: "Windows News".into(),
+                            threads: vec![Thread {
+                                thread_id: 1,
+                                title: "A thread".into(),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                        focus: Pane::List,
+                        ..Default::default()
+                    })
+                },
+                // `j/k` is a compound label; `Tab` switches panes in place.
+                skip: &["j/k", "Tab"],
+            },
+            Case {
+                name: "ForumTree",
+                factory: || {
+                    Screen::ForumTree(ForumTreeState {
                         nodes: vec![Node {
                             node_id: 4,
                             title: "Windows News".into(),
@@ -2470,8 +2570,14 @@ mod dispatch_tests {
                             ..Default::default()
                         }],
                         ..Default::default()
-                    },
-                    list: ThreadListState {
+                    })
+                },
+                skip: &["j/k", "h/l", "1/2/3"],
+            },
+            Case {
+                name: "ThreadList",
+                factory: || {
+                    Screen::ThreadList(ThreadListState {
                         node_id: 4,
                         title: "Windows News".into(),
                         threads: vec![Thread {
@@ -2480,57 +2586,29 @@ mod dispatch_tests {
                             ..Default::default()
                         }],
                         ..Default::default()
-                    },
-                    focus: Pane::List,
-                    ..Default::default()
-                }),
-                // `j/k` is a compound label; `Tab` switches panes in place.
-                skip: &["j/k", "Tab"],
-            },
-            Case {
-                name: "ForumTree",
-                factory: || Screen::ForumTree(ForumTreeState {
-                    nodes: vec![Node {
-                        node_id: 4,
-                        title: "Windows News".into(),
-                        node_type: "Forum".into(),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }),
-                skip: &["j/k", "h/l", "1/2/3"],
-            },
-            Case {
-                name: "ThreadList",
-                factory: || Screen::ThreadList(ThreadListState {
-                    node_id: 4,
-                    title: "Windows News".into(),
-                    threads: vec![Thread {
-                        thread_id: 1,
-                        title: "A thread".into(),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }),
+                    })
+                },
                 skip: &["j/k", "[/]"],
             },
             Case {
                 name: "ThreadView",
-                factory: || Screen::ThreadView(ThreadViewState {
-                    thread: Thread {
-                        thread_id: 1,
-                        title: "A thread".into(),
-                        view_url: Some("https://windowsforum.com/threads/1/".into()),
+                factory: || {
+                    Screen::ThreadView(ThreadViewState {
+                        thread: Thread {
+                            thread_id: 1,
+                            title: "A thread".into(),
+                            view_url: Some("https://windowsforum.com/threads/1/".into()),
+                            ..Default::default()
+                        },
+                        posts: vec![Post {
+                            post_id: 9,
+                            username: "HItest".into(),
+                            message: "hello".into(),
+                            ..Default::default()
+                        }],
                         ..Default::default()
-                    },
-                    posts: vec![Post {
-                        post_id: 9,
-                        username: "HItest".into(),
-                        message: "hello".into(),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }),
+                    })
+                },
                 skip: &[
                     "j/k", "n/N", "1-9",
                     // `x` only flips `reveal_spoilers` — screen state, no
@@ -2544,40 +2622,42 @@ mod dispatch_tests {
             },
             Case {
                 name: "ThreadView (links popup)",
-                factory: || Screen::ThreadView(ThreadViewState {
-                    thread: Thread {
-                        thread_id: 1,
-                        title: "A thread".into(),
-                        view_url: Some("https://windowsforum.com/threads/1/".into()),
+                factory: || {
+                    Screen::ThreadView(ThreadViewState {
+                        thread: Thread {
+                            thread_id: 1,
+                            title: "A thread".into(),
+                            view_url: Some("https://windowsforum.com/threads/1/".into()),
+                            ..Default::default()
+                        },
+                        posts: vec![Post {
+                            post_id: 9,
+                            username: "HItest".into(),
+                            message: "hello".into(),
+                            ..Default::default()
+                        }],
+                        links: vec!["https://windowsforum.com/threads/1/".into()],
+                        link_popup: true,
                         ..Default::default()
-                    },
-                    posts: vec![Post {
-                        post_id: 9,
-                        username: "HItest".into(),
-                        message: "hello".into(),
-                        ..Default::default()
-                    }],
-                    links: vec!["https://windowsforum.com/threads/1/".into()],
-                    link_popup: true,
-                    ..Default::default()
-                }),
+                    })
+                },
                 skip: &["j/k", "Esc"],
             },
             Case {
                 name: "Compose",
-                factory: || Screen::Compose(ComposeState {
-                    target: Some(ComposeTarget::ThreadReply {
-                        thread_id: 1,
-                        thread_title: "A thread".into(),
-                    }),
-                    body: "draft".into(),
-                    ..Default::default()
-                }),
+                factory: || {
+                    Screen::Compose(ComposeState {
+                        target: Some(ComposeTarget::ThreadReply {
+                            thread_id: 1,
+                            thread_title: "A thread".into(),
+                        }),
+                        body: "draft".into(),
+                        ..Default::default()
+                    })
+                },
                 skip: &[
                     // `^F` opens the file prompt: screen state, no Action (#709).
-                    "^F",
-                    
-                    "Tab",
+                    "^F", "Tab",
                     // `^O` only flips the narrow-layout preview toggle —
                     // screen state, no `Action` (see its arm in
                     // `compose_key`).
@@ -2597,34 +2677,36 @@ mod dispatch_tests {
             },
             Case {
                 name: "Inbox",
-                factory: || Screen::Inbox(InboxState {
-                    convos: ConversationsState {
-                        conversations: vec![Conversation {
-                            conversation_id: 3,
-                            title: "A DM".into(),
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    },
-                    alerts: AlertsState {
-                        alerts: vec![Alert {
-                            alert_id: 1,
-                            username: "kemical".into(),
-                            content_type: "post_quote".into(),
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    },
-                    view: Some(ConversationViewState {
-                        conversation: Conversation {
-                            conversation_id: 3,
-                            title: "A DM".into(),
+                factory: || {
+                    Screen::Inbox(InboxState {
+                        convos: ConversationsState {
+                            conversations: vec![Conversation {
+                                conversation_id: 3,
+                                title: "A DM".into(),
+                                ..Default::default()
+                            }],
                             ..Default::default()
                         },
+                        alerts: AlertsState {
+                            alerts: vec![Alert {
+                                alert_id: 1,
+                                username: "kemical".into(),
+                                content_type: "post_quote".into(),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                        view: Some(ConversationViewState {
+                            conversation: Conversation {
+                                conversation_id: 3,
+                                title: "A DM".into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }),
                         ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
+                    })
+                },
                 skip: &[
                     "Tab",
                     // The List pane's own `on_key` has no `Esc` arm at all
@@ -2641,81 +2723,91 @@ mod dispatch_tests {
                 // the Alerts tab: no view pane, so `r reply` must not be
                 // advertised at all (it used to be a silent no-op there).
                 name: "Inbox (no view pane)",
-                factory: || Screen::Inbox(InboxState {
-                    convos: ConversationsState {
-                        conversations: vec![Conversation {
-                            conversation_id: 3,
-                            title: "A DM".into(),
+                factory: || {
+                    Screen::Inbox(InboxState {
+                        convos: ConversationsState {
+                            conversations: vec![Conversation {
+                                conversation_id: 3,
+                                title: "A DM".into(),
+                                ..Default::default()
+                            }],
                             ..Default::default()
-                        }],
-                        ..Default::default()
-                    },
-                    alerts: AlertsState {
-                        alerts: vec![Alert {
-                            alert_id: 1,
-                            username: "kemical".into(),
-                            content_type: "post_quote".into(),
+                        },
+                        alerts: AlertsState {
+                            alerts: vec![Alert {
+                                alert_id: 1,
+                                username: "kemical".into(),
+                                content_type: "post_quote".into(),
+                                ..Default::default()
+                            }],
                             ..Default::default()
-                        }],
+                        },
+                        view: None,
                         ..Default::default()
-                    },
-                    view: None,
-                    ..Default::default()
-                }),
+                    })
+                },
                 skip: &["Tab", "Esc"],
             },
             Case {
                 // The Media Gallery catalog: with items present Enter/o open
                 // the selected media page; R refreshes.
                 name: "MediaGallery",
-                factory: || Screen::MediaGallery(MediaListState {
-                    items: vec![MediaItem {
-                        media_id: 33005,
-                        title: "Registry Explained".into(),
-                        username: "op".into(),
-                        view_url: Some("https://windowsforum.com/media/registry.33005/".into()),
+                factory: || {
+                    Screen::MediaGallery(MediaListState {
+                        items: vec![MediaItem {
+                            media_id: 33005,
+                            title: "Registry Explained".into(),
+                            username: "op".into(),
+                            view_url: Some("https://windowsforum.com/media/registry.33005/".into()),
+                            ..Default::default()
+                        }],
+                        page: 1,
+                        last_page: 2,
                         ..Default::default()
-                    }],
-                    page: 1,
-                    last_page: 2,
-                    ..Default::default()
-                }),
+                    })
+                },
                 skip: &["Esc"],
             },
             Case {
                 // The Resource Manager catalog: same shape, resources carry
                 // tag lines and download counts.
                 name: "Drafts",
-                factory: || Screen::Drafts(DraftsState {
-                    rows: vec![DraftRow {
-                        key: common::drafts::DraftKey::ThreadReply(7),
-                        label: "A thread".into(),
-                        preview: "half a reply".into(),
-                        saved_at: 1_700_000_000,
-                        shared: true,
-                    }],
-                    sel: 0,
-                    ..Default::default()
-                }),
+                factory: || {
+                    Screen::Drafts(DraftsState {
+                        rows: vec![DraftRow {
+                            key: common::drafts::DraftKey::ThreadReply(7),
+                            label: "A thread".into(),
+                            preview: "half a reply".into(),
+                            saved_at: 1_700_000_000,
+                            shared: true,
+                        }],
+                        sel: 0,
+                        ..Default::default()
+                    })
+                },
                 // Esc is the app's (pop the screen), like every other
                 // pushable list here.
                 skip: &["Esc"],
             },
             Case {
                 name: "Resources",
-                factory: || Screen::Resources(ResourceListState {
-                    items: vec![Resource {
-                        resource_id: 150883,
-                        title: "Handy tool".into(),
-                        tag_line: "does things".into(),
-                        username: "author".into(),
-                        view_url: Some("https://windowsforum.com/resources/handy.150883/".into()),
+                factory: || {
+                    Screen::Resources(ResourceListState {
+                        items: vec![Resource {
+                            resource_id: 150883,
+                            title: "Handy tool".into(),
+                            tag_line: "does things".into(),
+                            username: "author".into(),
+                            view_url: Some(
+                                "https://windowsforum.com/resources/handy.150883/".into(),
+                            ),
+                            ..Default::default()
+                        }],
+                        page: 1,
+                        last_page: 1,
                         ..Default::default()
-                    }],
-                    page: 1,
-                    last_page: 1,
-                    ..Default::default()
-                }),
+                    })
+                },
                 skip: &["Esc"],
             },
             Case {
@@ -2730,11 +2822,15 @@ mod dispatch_tests {
                 // A stock site: the loopback listener is up and `p` opens
                 // the paste field — screen state, no `Action`.
                 name: "Login (Waiting, loopback)",
-                factory: || Screen::Login(LoginState {
-                    stage: LoginStage::Waiting { mode: LoginMode::Loopback },
-                    url: "http://127.0.0.1:1/oauth2/authorize?x=y".into(),
-                    ..Default::default()
-                }),
+                factory: || {
+                    Screen::Login(LoginState {
+                        stage: LoginStage::Waiting {
+                            mode: LoginMode::Loopback,
+                        },
+                        url: "http://127.0.0.1:1/oauth2/authorize?x=y".into(),
+                        ..Default::default()
+                    })
+                },
                 skip: &["p"],
             },
             Case {
@@ -2742,26 +2838,32 @@ mod dispatch_tests {
                 // (and ^S anywhere) submits, Tab is a field switch, Esc
                 // quits, ^Y pastes.
                 name: "Setup",
-                factory: || Screen::Setup(setup::SetupState {
-                    origin: "https://forum.example.com".into(),
-                    client_id: "abc".into(),
-                    name: "Example".into(),
-                    field: 2,
-                    ..Default::default()
-                }),
+                factory: || {
+                    Screen::Setup(setup::SetupState {
+                        origin: "https://forum.example.com".into(),
+                        client_id: "abc".into(),
+                        name: "Example".into(),
+                        field: 2,
+                        ..Default::default()
+                    })
+                },
                 skip: &["Tab"],
             },
             Case {
                 // The paste field owns the keyboard: Enter submits what was
                 // pasted, Esc closes the field (screen state).
                 name: "Login (Pasting)",
-                factory: || Screen::Login(LoginState {
-                    stage: LoginStage::Pasting { mode: LoginMode::Paste },
-                    url: "http://127.0.0.1:1/oauth2/authorize?x=y".into(),
-                    paste: "http://127.0.0.1/callback?code=abc&state=st".into(),
-                    paste_cursor: 0,
-                    ..Default::default()
-                }),
+                factory: || {
+                    Screen::Login(LoginState {
+                        stage: LoginStage::Pasting {
+                            mode: LoginMode::Paste,
+                        },
+                        url: "http://127.0.0.1:1/oauth2/authorize?x=y".into(),
+                        paste: "http://127.0.0.1/callback?code=abc&state=st".into(),
+                        paste_cursor: 0,
+                        ..Default::default()
+                    })
+                },
                 skip: &["Esc"],
             },
             Case {
@@ -2769,15 +2871,17 @@ mod dispatch_tests {
                 // advertises `^X` to discard it, and only then — so the cap
                 // needs its own state here or nothing would ever press it.
                 name: "Compose (resumed draft)",
-                factory: || Screen::Compose(ComposeState {
-                    target: Some(ComposeTarget::ThreadReply {
-                        thread_id: 1,
-                        thread_title: "A thread".into(),
-                    }),
-                    body: "recovered words".into(),
-                    resumed: true,
-                    ..Default::default()
-                }),
+                factory: || {
+                    Screen::Compose(ComposeState {
+                        target: Some(ComposeTarget::ThreadReply {
+                            thread_id: 1,
+                            thread_title: "A thread".into(),
+                        }),
+                        body: "recovered words".into(),
+                        resumed: true,
+                        ..Default::default()
+                    })
+                },
                 skip: &["^F", "Tab", "^O", "^Y"],
             },
             Case {
@@ -2785,13 +2889,15 @@ mod dispatch_tests {
                 // are screen-state toggles (no `Action`), like the
                 // ThreadReply compose; `^S` with a non-empty draft submits.
                 name: "Compose (new thread)",
-                factory: || Screen::Compose(ComposeState {
-                    target: Some(ComposeTarget::NewThread { node_id: 4 }),
-                    title: "A title".into(),
-                    body: "A body".into(),
-                    title_field: true,
-                    ..Default::default()
-                }),
+                factory: || {
+                    Screen::Compose(ComposeState {
+                        target: Some(ComposeTarget::NewThread { node_id: 4 }),
+                        title: "A title".into(),
+                        body: "A body".into(),
+                        title_field: true,
+                        ..Default::default()
+                    })
+                },
                 // `^F` opens the file prompt — screen state, no `Action` of
                 // its own, like `^O`'s preview toggle (#709).
                 skip: &["Tab", "^O", "^Y", "^F"],
@@ -2801,27 +2907,29 @@ mod dispatch_tests {
                 // opens the open message's author — the bar's keys must work
                 // from this pane, not just the list's.
                 name: "Inbox (view focused)",
-                factory: || Screen::Inbox(InboxState {
-                    focus: InboxPane::View,
-                    view: Some(ConversationViewState {
-                        conversation: Conversation {
-                            conversation_id: 3,
-                            title: "A DM".into(),
-                            username: "kemical".into(),
+                factory: || {
+                    Screen::Inbox(InboxState {
+                        focus: InboxPane::View,
+                        view: Some(ConversationViewState {
+                            conversation: Conversation {
+                                conversation_id: 3,
+                                title: "A DM".into(),
+                                username: "kemical".into(),
+                                ..Default::default()
+                            },
+                            messages: vec![ConversationMessage {
+                                message_id: 1,
+                                user_id: 7,
+                                username: "kemical".into(),
+                                ..Default::default()
+                            }],
+                            lines: vec![ratatui::text::Line::raw("hello")],
+                            msg_line_offsets: vec![0],
                             ..Default::default()
-                        },
-                        messages: vec![ConversationMessage {
-                            message_id: 1,
-                            user_id: 7,
-                            username: "kemical".into(),
-                            ..Default::default()
-                        }],
-                        lines: vec![ratatui::text::Line::raw("hello")],
-                        msg_line_offsets: vec![0],
+                        }),
                         ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
+                    })
+                },
                 skip: &["Tab", "Esc", "x"],
             },
             Case {
@@ -2829,31 +2937,35 @@ mod dispatch_tests {
                 // `R` refreshes — and `r` is hidden (no view pane; see
                 // "Inbox (no view pane)").
                 name: "Inbox (Alerts tab)",
-                factory: || Screen::Inbox(InboxState {
-                    tab: InboxTab::Alerts,
-                    alerts: AlertsState {
-                        alerts: vec![Alert {
-                            alert_id: 1,
-                            username: "kemical".into(),
-                            content_type: "post_quote".into(),
+                factory: || {
+                    Screen::Inbox(InboxState {
+                        tab: InboxTab::Alerts,
+                        alerts: AlertsState {
+                            alerts: vec![Alert {
+                                alert_id: 1,
+                                username: "kemical".into(),
+                                content_type: "post_quote".into(),
+                                ..Default::default()
+                            }],
                             ..Default::default()
-                        }],
+                        },
+                        view: None,
                         ..Default::default()
-                    },
-                    view: None,
-                    ..Default::default()
-                }),
+                    })
+                },
                 skip: &["Tab", "Esc"],
             },
             Case {
                 // Typing in the query field: only the editor's own keys are
                 // advertised (the browse-mode caps type text there).
                 name: "Search (input mode)",
-                factory: || Screen::Search(SearchState {
-                    query: "edge".into(),
-                    input_mode: true,
-                    ..Default::default()
-                }),
+                factory: || {
+                    Screen::Search(SearchState {
+                        query: "edge".into(),
+                        input_mode: true,
+                        ..Default::default()
+                    })
+                },
                 // `Esc` leaves edit mode — screen state, no `Action`.
                 skip: &["Esc"],
             },
@@ -2862,33 +2974,37 @@ mod dispatch_tests {
                 // threads/posts through search_member; with no results,
                 // "Enter open" is not advertised at all.
                 name: "Search (member mode)",
-                factory: || Screen::Search(SearchState {
-                    query: "by: kemical (thread)".into(),
-                    member: Some((42, "thread".into())),
-                    content_type: 1,
-                    ..Default::default()
-                }),
+                factory: || {
+                    Screen::Search(SearchState {
+                        query: "by: kemical (thread)".into(),
+                        member: Some((42, "thread".into())),
+                        content_type: 1,
+                        ..Default::default()
+                    })
+                },
                 // `Esc` pops; `i` clears the label and flips into query edit
                 // — screen state, no `Action`.
                 skip: &["Esc", "i"],
             },
             Case {
                 name: "ConversationView",
-                factory: || Screen::ConversationView(ConversationViewState {
-                    conversation: Conversation {
-                        conversation_id: 3,
-                        title: "A DM".into(),
-                        username: "HItest".into(),
+                factory: || {
+                    Screen::ConversationView(ConversationViewState {
+                        conversation: Conversation {
+                            conversation_id: 3,
+                            title: "A DM".into(),
+                            username: "HItest".into(),
+                            ..Default::default()
+                        },
+                        messages: vec![ConversationMessage {
+                            message_id: 1,
+                            user_id: 7,
+                            username: "kemical".into(),
+                            ..Default::default()
+                        }],
                         ..Default::default()
-                    },
-                    messages: vec![ConversationMessage {
-                        message_id: 1,
-                        user_id: 7,
-                        username: "kemical".into(),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }),
+                    })
+                },
                 skip: &[
                     "j/k", "n/N", "[/]",
                     // `x` only flips `reveal_spoilers` — screen state, no
@@ -2898,27 +3014,31 @@ mod dispatch_tests {
             },
             Case {
                 name: "NewConversation",
-                factory: || Screen::NewConversation(NewConversationState {
-                    field: 2,
-                    recipients: "kemical".into(),
-                    title: "hi".into(),
-                    body: "hello".into(),
-                    ..Default::default()
-                }),
+                factory: || {
+                    Screen::NewConversation(NewConversationState {
+                        field: 2,
+                        recipients: "kemical".into(),
+                        title: "hi".into(),
+                        body: "hello".into(),
+                        ..Default::default()
+                    })
+                },
                 skip: &["Tab"],
             },
             Case {
                 name: "Search",
-                factory: || Screen::Search(SearchState {
-                    query: "edge update".into(),
-                    results: vec![SearchHit {
-                        content_type: "thread".into(),
-                        content_id: 1,
-                        title: "A hit".into(),
+                factory: || {
+                    Screen::Search(SearchState {
+                        query: "edge update".into(),
+                        results: vec![SearchHit {
+                            content_type: "thread".into(),
+                            content_id: 1,
+                            title: "A hit".into(),
+                            ..Default::default()
+                        }],
                         ..Default::default()
-                    }],
-                    ..Default::default()
-                }),
+                    })
+                },
                 skip: &[
                     "[ ]",
                     // `i` only flips into query-edit mode — screen state,
@@ -2930,80 +3050,95 @@ mod dispatch_tests {
                 // The resource page: j/k scroll (no Action), d downloads,
                 // o opens the site, R refetches.
                 name: "ResourceView",
-                factory: || Screen::ResourceView(ResourceViewState {
-                    id: 1,
-                    resource: Some(Resource {
-                        resource_id: 1,
-                        title: "Handy tool".into(),
-                        view_url: Some("https://windowsforum.com/resources/x.1/".into()),
-                        current_download_url: Some(
-                            "https://windowsforum.com/resources/x.1/download".into(),
-                        ),
+                factory: || {
+                    Screen::ResourceView(ResourceViewState {
+                        id: 1,
+                        resource: Some(Resource {
+                            resource_id: 1,
+                            title: "Handy tool".into(),
+                            view_url: Some("https://windowsforum.com/resources/x.1/".into()),
+                            current_download_url: Some(
+                                "https://windowsforum.com/resources/x.1/download".into(),
+                            ),
+                            ..Default::default()
+                        }),
+                        lines: vec![ratatui::text::Line::raw("body")],
                         ..Default::default()
-                    }),
-                    lines: vec![ratatui::text::Line::raw("body")],
-                    ..Default::default()
-                }),
+                    })
+                },
                 // `j/k` is a compound label, and scrolling is screen state
                 // with no `Action` of its own.
                 skip: &["j/k", "Esc"],
             },
             Case {
                 name: "ImageView",
-                factory: || Screen::ImageView(ImageViewState {
-                    title: "A picture".into(),
-                    key: Some("https://data.windowsforum.com/x.jpg".into()),
-                    web_url: Some("https://windowsforum.com/media/x.1/".into()),
-                    ..Default::default()
-                }),
+                factory: || {
+                    Screen::ImageView(ImageViewState {
+                        title: "A picture".into(),
+                        key: Some("https://data.windowsforum.com/x.jpg".into()),
+                        web_url: Some("https://windowsforum.com/media/x.1/".into()),
+                        ..Default::default()
+                    })
+                },
                 skip: &["Esc"],
             },
             Case {
                 // Typing: Enter asks, ^N starts over.
                 name: "AskAi (typing)",
-                factory: || Screen::AskAi(AskAiState {
-                    input: "why is my pc slow".into(),
-                    cursor: 17,
-                    input_mode: true,
-                    ..Default::default()
-                }),
+                factory: || {
+                    Screen::AskAi(AskAiState {
+                        input: "why is my pc slow".into(),
+                        cursor: 17,
+                        input_mode: true,
+                        ..Default::default()
+                    })
+                },
                 // `Esc` only leaves the field for the transcript — screen
                 // state, no `Action` (see `ask::input_key`).
                 skip: &["Esc"],
             },
             Case {
                 name: "AskAi (reading)",
-                factory: || Screen::AskAi(AskAiState {
-                    turns: vec![AskTurn {
-                        question: "q".into(),
-                        answer: "See [x](https://windowsforum.com/threads/1/)".into(),
-                        state: AskTurnState::Done,
+                factory: || {
+                    Screen::AskAi(AskAiState {
+                        turns: vec![AskTurn {
+                            question: "q".into(),
+                            answer: "See [x](https://windowsforum.com/threads/1/)".into(),
+                            state: AskTurnState::Done,
+                            ..Default::default()
+                        }],
+                        links: vec!["https://windowsforum.com/threads/1/".into()],
                         ..Default::default()
-                    }],
-                    links: vec!["https://windowsforum.com/threads/1/".into()],
-                    ..Default::default()
-                }),
+                    })
+                },
                 // `i` only moves the keyboard into the field; `Esc` on an
                 // idle transcript is the app's pop (`esc_intent` is `App`).
                 skip: &["i", "j/k", "Esc"],
             },
             Case {
                 name: "Profile",
-                factory: || Screen::Profile(ProfileState {
-                    title: "HItest".into(),
-                    user: Some(User {
-                        user_id: 7,
-                        username: "HItest".into(),
-                        view_url: Some("https://windowsforum.com/members/hitest.7/".into()),
+                factory: || {
+                    Screen::Profile(ProfileState {
+                        title: "HItest".into(),
+                        user: Some(User {
+                            user_id: 7,
+                            username: "HItest".into(),
+                            view_url: Some("https://windowsforum.com/members/hitest.7/".into()),
+                            ..Default::default()
+                        }),
                         ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
+                    })
+                },
                 skip: &[],
             },
         ];
 
-        for Case { name, factory, skip } in cases {
+        for Case {
+            name,
+            factory,
+            skip,
+        } in cases
+        {
             let hints = factory().hints();
             for (label, _desc) in &hints.keys {
                 if GLOBAL_NAV.contains(label) || skip.contains(label) {
@@ -3033,8 +3168,7 @@ mod dispatch_tests {
         for (w, h) in [(120u16, 36u16), (80, 24), (40, 10), (20, 5)] {
             for theme in [Theme::truecolor(), Theme::ansi16(), Theme::mono()] {
                 for g in [&UNICODE, &ASCII] {
-                    let mut term =
-                        Terminal::new(TestBackend::new(w, h)).expect("test terminal");
+                    let mut term = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
                     for mut s in all_screens() {
                         term.draw(|f| {
                             let area = f.area();

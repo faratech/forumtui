@@ -1,11 +1,11 @@
 //! Login, compose, search, profile screens.
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
-use ratatui::Frame;
 
 use std::collections::HashSet;
 
@@ -13,15 +13,16 @@ use common::bbcode;
 use common::models::{Attachment, SearchHit};
 
 use super::{
+    Action, ComposeTarget, LoginStage,
     browse::{chunk_lines, truncate, wrap_spans},
-    link_style, solo_panel, Action, ComposeTarget, LoginStage,
+    link_style, solo_panel,
 };
-use common::site::LoginMode;
 use crate::chrome::{self, Hints};
 use crate::glyph::Glyphs;
 use crate::hit::{Hit, HitMap};
 use crate::images;
-use crate::theme::{fmt_time, Theme};
+use crate::theme::{Theme, fmt_time};
+use common::site::LoginMode;
 
 // ================= login =================
 
@@ -133,8 +134,13 @@ pub fn login_hints(s: &super::LoginState) -> Hints {
         return Hints::new(&[("q", "quit")], 0);
     }
     match &s.stage {
-        LoginStage::Idle => Hints::new(&[("Enter", "begin sign-in"), mode_hint(s), ("q", "quit")], 0),
-        LoginStage::Waiting { mode: LoginMode::Loopback | LoginMode::Paste } => Hints::new(
+        LoginStage::Idle => Hints::new(
+            &[("Enter", "begin sign-in"), mode_hint(s), ("q", "quit")],
+            0,
+        ),
+        LoginStage::Waiting {
+            mode: LoginMode::Loopback | LoginMode::Paste,
+        } => Hints::new(
             &[
                 ("p", "paste code"),
                 ("c", "copy link"),
@@ -156,7 +162,11 @@ pub fn login_hints(s: &super::LoginState) -> Hints {
             0,
         ),
         LoginStage::Pasting { .. } => Hints::new(
-            &[("Enter", "submit"), ("Esc", "cancel"), ("^Y", "paste clipboard")],
+            &[
+                ("Enter", "submit"),
+                ("Esc", "cancel"),
+                ("^Y", "paste clipboard"),
+            ],
             0,
         ),
     }
@@ -180,7 +190,8 @@ const PASTE_LABEL: &str = "Paste: ";
 /// caret in view (`editor::hwindow`, the single-line rule the file prompt
 /// and the palette use).
 fn paste_window(text: &str, cursor: usize) -> (String, usize) {
-    let width = (LOGIN_PANEL_WIDTH as usize).saturating_sub(2 + STEP_BODY_COL + PASTE_LABEL.len() + 1);
+    let width =
+        (LOGIN_PANEL_WIDTH as usize).saturating_sub(2 + STEP_BODY_COL + PASTE_LABEL.len() + 1);
     let (start, caret) = crate::editor::hwindow(text, cursor, width);
     let tail: String = text.chars().skip(start).collect();
     (chrome::take_cells(&tail, width).to_string(), caret)
@@ -225,7 +236,10 @@ fn login_mark_rows(theme: &Theme, g: &Glyphs, mark: &str) -> Vec<Vec<Span<'stati
     let fill = Style::new().bg(theme.chrome_fg);
     let top = vec![
         pad(),
-        Span::styled(format!("\u{2597}{}\u{2596}", "\u{2584}".repeat(inside)), white),
+        Span::styled(
+            format!("\u{2597}{}\u{2596}", "\u{2584}".repeat(inside)),
+            white,
+        ),
     ];
     let label = vec![
         pad(),
@@ -245,7 +259,10 @@ fn login_mark_rows(theme: &Theme, g: &Glyphs, mark: &str) -> Vec<Vec<Span<'stati
         pad(),
         // The last glyph is a full block, not a rounded quarter-block: the
         // one corner that stays square, matching wf-logo.png exactly.
-        Span::styled(format!("\u{259D}{}\u{2588}", "\u{2580}".repeat(inside)), white),
+        Span::styled(
+            format!("\u{259D}{}\u{2588}", "\u{2580}".repeat(inside)),
+            white,
+        ),
     ];
     vec![blank(), top, label, card, bottom, blank()]
 }
@@ -255,7 +272,10 @@ fn brand_name_spans(theme: &Theme, brand: &common::site::Brand) -> Vec<Span<'sta
     let (bold, rest) = brand.split();
     let mut spans = Vec::new();
     if !bold.is_empty() {
-        spans.push(Span::styled(bold.to_string(), theme.base().add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(
+            bold.to_string(),
+            theme.base().add_modifier(Modifier::BOLD),
+        ));
     }
     if !rest.is_empty() {
         spans.push(Span::styled(rest.to_string(), theme.base()));
@@ -270,13 +290,20 @@ fn brand_name_spans(theme: &Theme, brand: &common::site::Brand) -> Vec<Span<'sta
 /// address the browser lands on.
 fn login_typing_hint(stage: &LoginStage) -> &'static str {
     match stage {
-        LoginStage::Idle | LoginStage::Waiting { mode: LoginMode::TuiLink } => "Nothing to type here.",
+        LoginStage::Idle
+        | LoginStage::Waiting {
+            mode: LoginMode::TuiLink,
+        } => "Nothing to type here.",
         LoginStage::Waiting { .. } => "Or press p to paste the address.",
         LoginStage::Pasting { .. } => "Paste the address, then Enter.",
     }
 }
 
-fn login_text_rows(theme: &Theme, brand: &common::site::Brand, stage: &LoginStage) -> Vec<Option<Vec<Span<'static>>>> {
+fn login_text_rows(
+    theme: &Theme,
+    brand: &common::site::Brand,
+    stage: &LoginStage,
+) -> Vec<Option<Vec<Span<'static>>>> {
     vec![
         None,
         Some(brand_name_spans(theme, brand)),
@@ -294,11 +321,18 @@ fn login_text_rows(theme: &Theme, brand: &common::site::Brand, stage: &LoginStag
 /// logo's columns (the app paints `assets/wf-logo.png` over them) with the
 /// same copy beside them, at the same `TEXT_COL` as the block-mark version so
 /// nothing else on the screen moves.
-fn login_logo_lines(theme: &Theme, brand: &common::site::Brand, stage: &LoginStage) -> Vec<Line<'static>> {
+fn login_logo_lines(
+    theme: &Theme,
+    brand: &common::site::Brand,
+    stage: &LoginStage,
+) -> Vec<Line<'static>> {
     let mut rows: Vec<Option<Vec<Span<'static>>>> = vec![None; images::LOGO_ROWS as usize];
     rows[1] = Some(brand_name_spans(theme, brand));
     rows[2] = Some(vec![Span::styled("for your terminal", theme.dim())]);
-    rows[4] = Some(vec![Span::styled("Sign in with your browser.", theme.base())]);
+    rows[4] = Some(vec![Span::styled(
+        "Sign in with your browser.",
+        theme.base(),
+    )]);
     rows[5] = Some(vec![Span::styled(login_typing_hint(stage), theme.dim())]);
     rows.into_iter()
         .map(|text| {
@@ -311,9 +345,18 @@ fn login_logo_lines(theme: &Theme, brand: &common::site::Brand, stage: &LoginSta
         .collect()
 }
 
-fn login_brand_lines(theme: &Theme, g: &Glyphs, brand: &common::site::Brand, stage: &LoginStage) -> Vec<Line<'static>> {
+fn login_brand_lines(
+    theme: &Theme,
+    g: &Glyphs,
+    brand: &common::site::Brand,
+    stage: &LoginStage,
+) -> Vec<Line<'static>> {
     // "[ WF ]" (mark + 4) in ASCII; the bubble chip (mark + 7) in Unicode.
-    let box_w = if g.ascii { brand.mark.len() + 4 } else { brand.mark.len() + 7 };
+    let box_w = if g.ascii {
+        brand.mark.len() + 4
+    } else {
+        brand.mark.len() + 7
+    };
     let gap = TEXT_COL.saturating_sub(MARK_PAD + box_w);
     login_mark_rows(theme, g, &brand.mark)
         .into_iter()
@@ -331,7 +374,10 @@ fn login_brand_lines(theme: &Theme, g: &Glyphs, brand: &common::site::Brand, sta
 fn login_step_line(theme: &Theme, n: &str, body: &str) -> Line<'static> {
     Line::from(vec![
         Span::raw(" ".repeat(STEP_NUM_COL)),
-        Span::styled(n.to_string(), Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            n.to_string(),
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  "),
         Span::styled(body.to_string(), theme.base()),
     ])
@@ -399,7 +445,10 @@ pub fn render_login(
 
             lines.push(Line::from(vec![
                 Span::raw(" ".repeat(STEP_BODY_COL)),
-                Span::styled(format!("{tl}{}{tr}", rule.repeat(link_inner)), theme.faint()),
+                Span::styled(
+                    format!("{tl}{}{tr}", rule.repeat(link_inner)),
+                    theme.faint(),
+                ),
             ]));
             let pad_after = link_inner.saturating_sub(2 + chrome::cell_width(&shown));
             // Which line of the panel carries the link, so the frame can put
@@ -426,7 +475,10 @@ pub fn render_login(
             ]));
             lines.push(Line::from(vec![
                 Span::raw(" ".repeat(STEP_BODY_COL)),
-                Span::styled(format!("{bl}{}{br}", rule.repeat(link_inner)), theme.faint()),
+                Span::styled(
+                    format!("{bl}{}{br}", rule.repeat(link_inner)),
+                    theme.faint(),
+                ),
             ]));
             let copied_text = format!(
                 "copied to your clipboard \u{b7} also in {}/login-url.txt",
@@ -456,10 +508,18 @@ pub fn render_login(
                         "3",
                         "The browser lands on a 127.0.0.1 address that will not load:",
                     ));
-                    lines.push(login_step_line(theme, " ", "paste that address (or just the code) here"));
+                    lines.push(login_step_line(
+                        theme,
+                        " ",
+                        "paste that address (or just the code) here",
+                    ));
                 }
                 LoginMode::Loopback => {
-                    lines.push(login_step_line(theme, "3", "The browser comes back here on its own"));
+                    lines.push(login_step_line(
+                        theme,
+                        "3",
+                        "The browser comes back here on its own",
+                    ));
                     lines.push(login_step_line(
                         theme,
                         " ",
@@ -467,7 +527,11 @@ pub fn render_login(
                     ));
                 }
                 _ => {
-                    lines.push(login_step_line(theme, "3", "This window finishes on its own"));
+                    lines.push(login_step_line(
+                        theme,
+                        "3",
+                        "This window finishes on its own",
+                    ));
                 }
             }
             if let LoginStage::Pasting { .. } = &s.stage {
@@ -509,7 +573,13 @@ pub fn render_login(
 
     let height = (lines.len() as u16 + 2).min(area.height);
     let panel_area = super::centered_box(area, LOGIN_PANEL_WIDTH, height);
-    let block = solo_panel(theme, g, &format!("Sign in to {}", s.site.brand.name), None, None);
+    let block = solo_panel(
+        theme,
+        g,
+        &format!("Sign in to {}", s.site.brand.name),
+        None,
+        None,
+    );
     let inner = block.inner(panel_area);
     f.render_widget(block, panel_area);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -551,7 +621,7 @@ pub fn render_login(
                 images::LOGO_COLS,
                 images::LOGO_ROWS,
             ),
-                full: false,
+            full: false,
         });
     }
 }
@@ -635,8 +705,7 @@ pub fn compose_key(s: &mut super::ComposeState, key: KeyEvent) -> Action {
                 return Action::None;
             }
             KeyCode::Right => {
-                s.file_prompt_cursor =
-                    (s.file_prompt_cursor + 1).min(path.chars().count());
+                s.file_prompt_cursor = (s.file_prompt_cursor + 1).min(path.chars().count());
                 s.file_prompt = Some(path);
                 return Action::None;
             }
@@ -951,7 +1020,11 @@ fn compose_page(s: &super::ComposeState) -> isize {
 }
 
 fn compose_move_vertical(s: &mut super::ComposeState, delta: isize) {
-    let width = if s.body_width == 0 { 1 } else { s.body_width as usize };
+    let width = if s.body_width == 0 {
+        1
+    } else {
+        s.body_width as usize
+    };
     // Through the cache (issue #678): on a pasted log this used to re-wrap
     // every row of the draft per arrow key.
     s.wrap.sync(&s.body, width, s.body_epoch);
@@ -975,7 +1048,14 @@ pub fn compose_hints(s: &super::ComposeState) -> Hints {
     let tab_desc = if is_new_thread { "field" } else { "indent" };
     let mut keys: Vec<(&str, &str)> = vec![("^S", primary), ("^O", "preview on/off")];
     if can_attach {
-        keys.push(("^F", if s.uploading { "uploading\u{2026}" } else { "attach" }));
+        keys.push((
+            "^F",
+            if s.uploading {
+                "uploading\u{2026}"
+            } else {
+                "attach"
+            },
+        ));
     }
     if s.resumed {
         keys.push(("^X", "discard draft"));
@@ -1059,9 +1139,15 @@ fn compose_header_lines(s: &super::ComposeState, theme: &Theme, width: u16) -> V
         }) => conversation_title.clone(),
         _ => String::new(),
     };
-    let mut meta = vec![Span::styled("To ", theme.dim()), Span::styled(label, theme.base())];
+    let mut meta = vec![
+        Span::styled("To ", theme.dim()),
+        Span::styled(label, theme.base()),
+    ];
     if !s.author.is_empty() {
-        meta.push(Span::styled(format!(" \u{b7} as {}", s.author), theme.dim()));
+        meta.push(Span::styled(
+            format!(" \u{b7} as {}", s.author),
+            theme.dim(),
+        ));
     }
     if let Some(n) = s.reply_number {
         meta.push(Span::styled(format!(" \u{b7} post #{n}"), theme.dim()));
@@ -1240,7 +1326,10 @@ fn draw_editor_panel(
     } else if s.uploading {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("{} Uploading\u{2026}", chrome::spinner(g, chrome::spinner_tick())),
+                format!(
+                    "{} Uploading\u{2026}",
+                    chrome::spinner(g, chrome::spinner_tick())
+                ),
                 theme.dim(),
             ))),
             chunks[3],
@@ -1250,7 +1339,12 @@ fn draw_editor_panel(
     }
     let title_focused = is_new_thread && s.title_field;
     f.render_widget(
-        caps_line(theme, s.body.chars().count(), chunks[4].width, title_focused),
+        caps_line(
+            theme,
+            s.body.chars().count(),
+            chunks[4].width,
+            title_focused,
+        ),
         chunks[4],
     );
     // The BBCode caps are click targets only when they are live — with the
@@ -1270,8 +1364,8 @@ fn draw_editor_panel(
     if is_new_thread && s.title_field {
         let (_, cur_col) = compose_title_window(s, chunks[0].width);
         let label_w = chrome::cell_width(COMPOSE_TITLE_LABEL) as u16;
-        let cur_x = (chunks[0].x + label_w + cur_col)
-            .min(chunks[0].x + chunks[0].width.saturating_sub(1));
+        let cur_x =
+            (chunks[0].x + label_w + cur_col).min(chunks[0].x + chunks[0].width.saturating_sub(1));
         f.set_cursor_position((cur_x, chunks[0].y));
     } else if s.file_prompt.is_some() {
         // The prompt set the cursor on its own row above; the body's caret
@@ -1282,8 +1376,11 @@ fn draw_editor_panel(
             (body_area.x + caret_col as u16).min(body_area.x + body_area.width.saturating_sub(1));
         // Subtract in `usize` and narrow after: the result is at most one
         // pane height even for a 70,000-row draft (issue #558).
-        let screen_row = caret_row.saturating_sub(s.body_scroll).min(u16::MAX as usize) as u16;
-        let cur_y = (body_area.y + screen_row).min(body_area.y + body_area.height.saturating_sub(1));
+        let screen_row = caret_row
+            .saturating_sub(s.body_scroll)
+            .min(u16::MAX as usize) as u16;
+        let cur_y =
+            (body_area.y + screen_row).min(body_area.y + body_area.height.saturating_sub(1));
         f.set_cursor_position((cur_x, cur_y));
     }
 }
@@ -1371,7 +1468,8 @@ impl PreviewCache {
     /// true. A key already in `requested` is exempt: draw_preview_panel
     /// keeps painting it every frame regardless, at no extra cost.
     fn settled(&self) -> bool {
-        self.last_edit.is_none_or(|t| t.elapsed() >= Self::EDIT_SETTLE)
+        self.last_edit
+            .is_none_or(|t| t.elapsed() >= Self::EDIT_SETTLE)
     }
 }
 
@@ -1410,7 +1508,11 @@ pub(crate) fn url_label(url: &str) -> String {
 /// `None` means "not an image this client can show" — an `[ATTACH]` id the
 /// draft does not carry, or an attachment that is not an image — and the
 /// reference then renders as the plain text placeholder it always did.
-fn resolve_image(r: &bbcode::ImageRef, attachments: &[Attachment], origin: &str) -> Option<PreviewImage> {
+fn resolve_image(
+    r: &bbcode::ImageRef,
+    attachments: &[Attachment],
+    origin: &str,
+) -> Option<PreviewImage> {
     match r {
         bbcode::ImageRef::Url(url) => Some(PreviewImage {
             key: url.clone(),
@@ -1459,7 +1561,10 @@ fn build_preview(
     let mut run_start = 0usize;
 
     for (i, chunk) in chunks.iter().enumerate() {
-        let Some(img) = chunk.image_ref().and_then(|r| resolve_image(&r, attachments, origin)) else {
+        let Some(img) = chunk
+            .image_ref()
+            .and_then(|r| resolve_image(&r, attachments, origin))
+        else {
             continue;
         };
         push_wrapped(&mut lines, &chunks[run_start..i], &mut links, theme, w);
@@ -1532,9 +1637,12 @@ fn draw_preview_panel(
         return;
     }
 
-    let chunks =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
-            .split(inner);
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .split(inner);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled("as it will appear", theme.dim()))),
         chunks[0],
@@ -1575,7 +1683,10 @@ fn draw_preview_panel(
     // of the draft, and cloning the whole list put a 70 000-line paste
     // through ~70 000 line clones per frame (issue #26).
     let visible = (body.height as usize).min(s.preview_cache.lines.len());
-    f.render_widget(Paragraph::new(s.preview_cache.lines[..visible].to_vec()), body);
+    f.render_widget(
+        Paragraph::new(s.preview_cache.lines[..visible].to_vec()),
+        body,
+    );
 
     // Translate the reserved slots into absolute screen rects for the app to
     // paint. A slot that does not fit whole is dropped and its caption left
@@ -1612,7 +1723,7 @@ fn draw_preview_panel(
         s.image_requests.push(images::Request {
             key: slot.key.clone(),
             rect: Rect::new(x as u16, y as u16, slot.cols, slot.rows),
-                full: false,
+            full: false,
         });
     }
     if newly_requested > 0 {
@@ -1654,12 +1765,7 @@ pub fn render_compose(
 /// Focus field `field` (0 = the new-thread Title, 1 = the body) and put the
 /// caret under the pointer, through the same visual-row model the renderer
 /// drew it with (`Hit::Field`).
-pub(crate) fn compose_click_field(
-    s: &mut super::ComposeState,
-    field: usize,
-    col: u16,
-    row: u16,
-) {
+pub(crate) fn compose_click_field(s: &mut super::ComposeState, field: usize, col: u16, row: u16) {
     if s.busy {
         return;
     }
@@ -1670,8 +1776,7 @@ pub(crate) fn compose_click_field(
         let x = col
             .saturating_sub(s.title_rect.x)
             .saturating_sub(label as u16);
-        s.title_cursor =
-            crate::editor::field_caret_at(&s.title, s.title_cursor, room, x as usize);
+        s.title_cursor = crate::editor::field_caret_at(&s.title, s.title_cursor, room, x as usize);
         return;
     }
     s.title_field = false;
@@ -1881,7 +1986,11 @@ pub fn search_key(s: &mut super::SearchState, key: KeyEvent) -> Action {
                 // their posts, through `search_member` (issue #548).
                 if let Some((user_id, content)) = &s.member {
                     let user_id = *user_id;
-                    let content = if content == "thread" { "post" } else { "thread" };
+                    let content = if content == "thread" {
+                        "post"
+                    } else {
+                        "thread"
+                    };
                     s.member = Some((user_id, content.to_string()));
                     s.content_type = if content == "thread" { 1 } else { 2 };
                     s.query = member_label(&s.query, content);
@@ -2322,7 +2431,10 @@ fn render_query_row(s: &mut super::SearchState, f: &mut Frame, area: Rect, theme
         let (visible, caret) = chrome::field_window(&s.query, s.query_cursor, query_room);
         used += chrome::cell_width(&visible);
         query_caret = caret;
-        spans.push(Span::styled(visible, theme.base().add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(
+            visible,
+            theme.base().add_modifier(Modifier::BOLD),
+        ));
     }
 
     s.query_rect = Rect::new(area.x, area.y, (prompt_w + query_room).min(w) as u16, 1);
@@ -2332,12 +2444,7 @@ fn render_query_row(s: &mut super::SearchState, f: &mut Frame, area: Rect, theme
         let pad = w.saturating_sub(used + right_w);
         spans.push(Span::raw(" ".repeat(pad)));
         author_x = area.x + (used + pad + chrome::cell_width(AUTHOR_LABEL)) as u16;
-        s.author_rect = Rect::new(
-            area.x + (used + pad) as u16,
-            area.y,
-            author_w as u16,
-            1,
-        );
+        s.author_rect = Rect::new(area.x + (used + pad) as u16, area.y, author_w as u16, 1);
         spans.push(Span::styled(author_label, theme.dim()));
         if show_forum {
             spans.push(Span::raw(" ".repeat(GAP)));
@@ -2424,7 +2531,10 @@ fn search_hit_lines(
     words: &[String],
     width: u16,
 ) -> Vec<Line<'static>> {
-    let mut left = vec![Span::styled(format!("{:>8}  ", hit.content_type), theme.dim())];
+    let mut left = vec![Span::styled(
+        format!("{:>8}  ", hit.content_type),
+        theme.dim(),
+    )];
     left.extend(highlight_query_words(theme, &hit.title, words));
 
     let mut right_text = String::new();
@@ -2494,12 +2604,13 @@ pub(crate) fn search_click_field(
         let x = col
             .saturating_sub(s.author_rect.x)
             .saturating_sub(label as u16) as usize;
-        s.author_cursor =
-            crate::editor::field_caret_at(&s.author, s.author_cursor, AUTHOR_VIEW, x);
+        s.author_cursor = crate::editor::field_caret_at(&s.author, s.author_cursor, AUTHOR_VIEW, x);
     } else {
         let prompt = chrome::cell_width(PROMPT);
         let room = (s.query_rect.width as usize).saturating_sub(prompt);
-        let x = col.saturating_sub(s.query_rect.x).saturating_sub(prompt as u16) as usize;
+        let x = col
+            .saturating_sub(s.query_rect.x)
+            .saturating_sub(prompt as u16) as usize;
         s.query_cursor = crate::editor::field_caret_at(&s.query, s.query_cursor, room, x);
     }
     super::Action::None
@@ -2565,10 +2676,16 @@ pub fn render_search(
     }
 
     if s.loading {
-        f.render_widget(Paragraph::new(Span::styled("Searching\u{2026}", theme.dim())), sections[5]);
+        f.render_widget(
+            Paragraph::new(Span::styled("Searching\u{2026}", theme.dim())),
+            sections[5],
+        );
     } else if let Some(err) = &s.error {
         f.render_widget(
-            Paragraph::new(Span::styled(format!("Error: {err}"), Style::new().fg(theme.error))),
+            Paragraph::new(Span::styled(
+                format!("Error: {err}"),
+                Style::new().fg(theme.error),
+            )),
             sections[5],
         );
     } else if s.results.is_empty() {
@@ -2598,11 +2715,16 @@ pub fn render_search(
             .enumerate()
             .map(|(i, hit): (usize, &SearchHit)| {
                 let snippet = s.snippets.get(i).map(String::as_str).unwrap_or("");
-                ListItem::new(search_hit_lines(theme, hit, snippet, &words, sections[5].width))
+                ListItem::new(search_hit_lines(
+                    theme,
+                    hit,
+                    snippet,
+                    &words,
+                    sections[5].width,
+                ))
             })
             .collect();
-        let mut state =
-            ListState::default().with_selected(Some(s.sel.min(s.results.len() - 1)));
+        let mut state = ListState::default().with_selected(Some(s.sel.min(s.results.len() - 1)));
         // A hit is one line, or two once it has a snippet — the same shape
         // `search_hit_lines` just built, so a click lands on the row the eye
         // is on.
@@ -2758,7 +2880,10 @@ pub fn render_profile(
         user_spans.push(chrome::chip(theme, "STAFF"));
     }
     if !user.custom_title.is_empty() {
-        user_spans.push(Span::styled(format!(" — {}", user.custom_title), theme.dim()));
+        user_spans.push(Span::styled(
+            format!(" — {}", user.custom_title),
+            theme.dim(),
+        ));
     }
 
     let rule = if g.ascii { "-" } else { "\u{2500}" };
@@ -2827,7 +2952,6 @@ pub fn render_profile(
     }
 
     f.render_widget(Paragraph::new(lines), inner);
-
 }
 
 #[cfg(test)]
@@ -2835,12 +2959,16 @@ mod tests {
     use super::*;
     use crate::glyph::UNICODE;
     use crate::screens::ComposeState;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     /// Render a screen state headless and return its rows as plain strings
     /// (styling dropped), for substring/column assertions.
-    fn render_rows(w: u16, h: u16, draw: impl FnOnce(&mut ratatui::Frame, ratatui::layout::Rect)) -> Vec<String> {
+    fn render_rows(
+        w: u16,
+        h: u16,
+        draw: impl FnOnce(&mut ratatui::Frame, ratatui::layout::Rect),
+    ) -> Vec<String> {
         let mut term = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
         term.draw(|f| {
             let area = f.area();
@@ -2849,29 +2977,40 @@ mod tests {
         .expect("draw");
         let buf = term.backend().buffer().clone();
         (0..h)
-            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
             .collect()
     }
 
     /// Render a compose screen headless, returning its rows *and* where the
     /// terminal cursor was left — the caret is the whole point of the editor
     /// fixes, and it is invisible in the cell dump.
-    fn render_compose_probe(
-        s: &mut ComposeState,
-        w: u16,
-        h: u16,
-    ) -> (Vec<String>, (u16, u16)) {
+    fn render_compose_probe(s: &mut ComposeState, w: u16, h: u16) -> (Vec<String>, (u16, u16)) {
         let theme = Theme::truecolor();
         let mut term = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
         term.draw(|f| {
             let area = f.area();
-            render_compose(s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default());
+            render_compose(
+                s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
         let buf = term.backend().buffer().clone();
         let rows = (0..h)
-            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
             .collect();
         (rows, (pos.x, pos.y))
     }
@@ -2900,14 +3039,24 @@ mod tests {
         let mut s = reply_state(body.trim_end_matches('\n'));
         let (rows, (cx, cy)) = render_compose_probe(&mut s, 80, 24);
         let screen = rows.join("\n");
-        assert!(screen.contains("line 39"), "the caret's own line is off screen:\n{screen}");
-        assert!(!screen.contains("line 00"), "the pane did not scroll:\n{screen}");
+        assert!(
+            screen.contains("line 39"),
+            "the caret's own line is off screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("line 00"),
+            "the pane did not scroll:\n{screen}"
+        );
         let caret_row = rows
             .iter()
             .position(|r| r.contains("line 39"))
             .expect("last line on screen") as u16;
         // x = panel border (1) + the 7 cells of "line 39".
-        assert_eq!((cx, cy), (1 + 7, caret_row), "caret is not at the end of the last line");
+        assert_eq!(
+            (cx, cy),
+            (1 + 7, caret_row),
+            "caret is not at the end of the last line"
+        );
 
         // Same probe, past the u16 row ceiling — see the #558 test below.
 
@@ -2949,7 +3098,11 @@ mod tests {
             .position(|r| r.contains("line 70000"))
             .expect("last line on screen") as u16;
         // x = panel border (1) + the 10 cells of "line 70000".
-        assert_eq!((cx, cy), (1 + 10, caret_row), "caret is not at the end of the last line");
+        assert_eq!(
+            (cx, cy),
+            (1 + 10, caret_row),
+            "caret is not at the end of the last line"
+        );
     }
 
     /// Issue #523: Up/Down did not exist in the body branch at all, and a run
@@ -2961,12 +3114,21 @@ mod tests {
         assert_eq!(s.body_cursor, 20, "cursor starts at the end");
 
         compose_key(&mut s, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(s.body_cursor, 11, "Up lands on the short line, clamped to its end");
+        assert_eq!(
+            s.body_cursor, 11,
+            "Up lands on the short line, clamped to its end"
+        );
         compose_key(&mut s, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(s.body_cursor, 8, "the sticky column survives the short line");
+        assert_eq!(
+            s.body_cursor, 8,
+            "the sticky column survives the short line"
+        );
         compose_key(&mut s, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         compose_key(&mut s, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(s.body_cursor, 20, "Down returns to column 8 of the last line");
+        assert_eq!(
+            s.body_cursor, 20,
+            "Down returns to column 8 of the last line"
+        );
 
         // Any other key ends the run: the column is re-read from the caret.
         compose_key(&mut s, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
@@ -2994,7 +3156,11 @@ mod tests {
         let w = s.body_width as usize;
         assert_eq!(w, 78);
         compose_key(&mut s, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(s.body_cursor, 78 + 44, "Up moves one wrapped row, same column");
+        assert_eq!(
+            s.body_cursor,
+            78 + 44,
+            "Up moves one wrapped row, same column"
+        );
         compose_key(&mut s, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(s.body_cursor, 44);
     }
@@ -3017,18 +3183,31 @@ mod tests {
             ..Default::default()
         };
         s.set_results(vec![
-            hit("First", "[B]Edge[/B] updated again, see https://example.com/a"),
+            hit(
+                "First",
+                "[B]Edge[/B] updated again, see https://example.com/a",
+            ),
             hit("Second", "plain body"),
         ]);
         assert_eq!(s.snippets.len(), 2);
-        assert_eq!(s.snippets[0], "Edge updated again, see https://example.com/a");
+        assert_eq!(
+            s.snippets[0],
+            "Edge updated again, see https://example.com/a"
+        );
 
         // Poison the cache: whatever the renderer draws must come from it,
         // not from a fresh parse of the message.
         s.snippets[0] = "FROM-THE-CACHE".into();
         let theme = Theme::truecolor();
         let rows = render_rows(100, 20, |f, area| {
-            render_search(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default())
+            render_search(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            )
         });
         let screen = rows.join("\n");
         assert!(
@@ -3048,7 +3227,14 @@ mod tests {
         };
         let theme = Theme::truecolor();
         let rows = render_rows(100, 20, |f, area| {
-            render_search(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default())
+            render_search(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            )
         });
         let screen = rows.join("\n");
         assert!(screen.contains("Error: boom"), "screen:\n{screen}");
@@ -3063,9 +3249,15 @@ mod tests {
     #[test]
     fn search_chip_hint_matches_the_actual_mode() {
         let browse = super::super::SearchState::default();
-        assert_eq!(search_chip_hint(&browse), "t type \u{b7} o order \u{b7} a author");
+        assert_eq!(
+            search_chip_hint(&browse),
+            "t type \u{b7} o order \u{b7} a author"
+        );
 
-        let input = super::super::SearchState { input_mode: true, ..Default::default() };
+        let input = super::super::SearchState {
+            input_mode: true,
+            ..Default::default()
+        };
         assert_eq!(search_chip_hint(&input), "Tab switch field \u{b7} Esc done");
 
         let member = super::super::SearchState {
@@ -3096,7 +3288,10 @@ mod tests {
                 assert!(
                     line.width() <= width as usize,
                     "width {width}: {:?}",
-                    line.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
                 );
             }
         }
@@ -3120,12 +3315,21 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default());
+            render_compose(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
         let buf = term.backend().buffer().clone();
-        let cells: Vec<String> = (0..80).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
+        let cells: Vec<String> = (0..80)
+            .map(|x| buf[(x, pos.y)].symbol().to_string())
+            .collect();
         let text_start = cells
             .iter()
             .position(|c| c == "\u{6f22}")
@@ -3147,8 +3351,14 @@ mod tests {
             ..Default::default()
         };
         compose_key(&mut s, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(!s.title_field, "Enter in title field should advance to body");
-        assert!(s.body.is_empty(), "Enter in title should not push newline to body");
+        assert!(
+            !s.title_field,
+            "Enter in title field should advance to body"
+        );
+        assert!(
+            s.body.is_empty(),
+            "Enter in title should not push newline to body"
+        );
     }
 
     #[test]
@@ -3165,7 +3375,10 @@ mod tests {
         };
         compose_key(&mut s, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(!s.title_field, "Reply mode should never focus title");
-        compose_key(&mut s, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        compose_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
         assert_eq!(s.body, "    a");
         assert!(s.title.is_empty());
     }
@@ -3211,12 +3424,24 @@ mod tests {
             body_cursor: 5,
             ..Default::default()
         };
-        compose_key(&mut s, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-        assert_eq!(s.title_cursor, 0, "Ctrl+A in the title field must still move home");
+        compose_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            s.title_cursor, 0,
+            "Ctrl+A in the title field must still move home"
+        );
 
         s.title_field = false;
-        compose_key(&mut s, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-        assert_eq!(s.body_cursor, 0, "Ctrl+A in the body field must still move home");
+        compose_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            s.body_cursor, 0,
+            "Ctrl+A in the body field must still move home"
+        );
     }
 
     /// Issue #605: `compose_hints` used to advertise `Tab field` for every
@@ -3233,7 +3458,11 @@ mod tests {
         };
         let hints = compose_hints(&new_thread);
         assert_eq!(
-            hints.keys.iter().find(|(cap, _)| *cap == "Tab").map(|(_, d)| *d),
+            hints
+                .keys
+                .iter()
+                .find(|(cap, _)| *cap == "Tab")
+                .map(|(_, d)| *d),
             Some("field"),
             "new-thread Tab really does switch field"
         );
@@ -3247,7 +3476,11 @@ mod tests {
         };
         let hints = compose_hints(&reply);
         assert_eq!(
-            hints.keys.iter().find(|(cap, _)| *cap == "Tab").map(|(_, d)| *d),
+            hints
+                .keys
+                .iter()
+                .find(|(cap, _)| *cap == "Tab")
+                .map(|(_, d)| *d),
             Some("indent"),
             "a reply's Tab really does insert spaces, not switch a field"
         );
@@ -3263,13 +3496,25 @@ mod tests {
             ..Default::default()
         };
         for c in ['b', 'i', 'k', 'q', 'u'] {
-            let act = compose_key(&mut s, KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
-            assert!(matches!(act, Action::Notice(_)), "^{c} in the title must notice, not act");
+            let act = compose_key(
+                &mut s,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL),
+            );
+            assert!(
+                matches!(act, Action::Notice(_)),
+                "^{c} in the title must notice, not act"
+            );
             assert_eq!(s.title, "hello world", "^{c} must never alter the title");
         }
         // Ctrl+A/E/W keep working in the title.
-        compose_key(&mut s, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-        assert_eq!(s.title_cursor, 0, "Ctrl+A in the title must still move home");
+        compose_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            s.title_cursor, 0,
+            "Ctrl+A in the title must still move home"
+        );
     }
 
     #[test]
@@ -3300,7 +3545,10 @@ mod tests {
         assert_eq!(s.body_cursor, 4);
 
         // Insert character inside
-        compose_key(&mut s, KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
+        compose_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+        );
         assert_eq!(s.body, "hellXo ");
         assert_eq!(s.body_cursor, 5);
 
@@ -3330,17 +3578,30 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_search(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default());
+            render_search(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
         let buf = term.backend().buffer().clone();
-        let cells: Vec<String> = (0..80).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
+        let cells: Vec<String> = (0..80)
+            .map(|x| buf[(x, pos.y)].symbol().to_string())
+            .collect();
         let text_start = cells
             .iter()
             .position(|c| c == "\u{6f22}")
             .expect("query text on screen") as u16;
-        assert_eq!(pos.x, text_start + 4, "query caret must move 4 cells, not 2");
+        assert_eq!(
+            pos.x,
+            text_start + 4,
+            "query caret must move 4 cells, not 2"
+        );
 
         let mut s = crate::screens::SearchState {
             query: "x".into(),
@@ -3353,17 +3614,30 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_search(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default());
+            render_search(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
         let buf = term.backend().buffer().clone();
-        let cells: Vec<String> = (0..120).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
+        let cells: Vec<String> = (0..120)
+            .map(|x| buf[(x, pos.y)].symbol().to_string())
+            .collect();
         let text_start = cells
             .iter()
             .position(|c| c == "\u{6f22}")
             .expect("author text on screen") as u16;
-        assert_eq!(pos.x, text_start + 4, "author caret must move 4 cells, not 2");
+        assert_eq!(
+            pos.x,
+            text_start + 4,
+            "author caret must move 4 cells, not 2"
+        );
     }
 
     /// Issue #606: the new-thread Title had no horizontal viewport. Past the
@@ -3390,7 +3664,11 @@ mod tests {
         // The caret sits just past the last visible character, inside the pane.
         // Char position, not byte: the panel border is a 3-byte box glyph.
         let z = row.chars().position(|c| c == 'Z').expect("Z on screen") as u16;
-        assert_eq!(cx, z + 1, "caret must follow the text, not the border: {row}");
+        assert_eq!(
+            cx,
+            z + 1,
+            "caret must follow the text, not the border: {row}"
+        );
         assert!(cx < 119, "caret must stay inside the panel: {cx}");
     }
 
@@ -3413,18 +3691,34 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_search(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default());
+            render_search(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let pos = term.get_cursor_position().expect("cursor");
         let buf = term.backend().buffer().clone();
-        let row: String = (0..80).map(|x| buf[(x, pos.y)].symbol().to_string()).collect();
-        assert!(row.contains("author kemical"), "author field must be drawn: {row}");
+        let row: String = (0..80)
+            .map(|x| buf[(x, pos.y)].symbol().to_string())
+            .collect();
+        assert!(
+            row.contains("author kemical"),
+            "author field must be drawn: {row}"
+        );
         let start = row
             .char_indices()
             .position(|(i, _)| row[i..].starts_with("kemical"))
             .expect("author text") as u16;
-        assert_eq!(pos.x, start + 7, "caret must sit at the end of the author: {row}");
+        assert_eq!(
+            pos.x,
+            start + 7,
+            "caret must sit at the end of the author: {row}"
+        );
         assert!(pos.x < 79, "caret must stay inside the panel: {}", pos.x);
     }
 
@@ -3471,10 +3765,22 @@ mod tests {
         assert_eq!(s.active_field, 1);
 
         // Typing in author field
-        search_key(&mut s, KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE));
-        search_key(&mut s, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
-        search_key(&mut s, KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-        search_key(&mut s, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE),
+        );
+        search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
+        search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        );
+        search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
         assert_eq!(s.author, "Mike");
         assert_eq!(s.author_cursor, 4);
 
@@ -3488,12 +3794,18 @@ mod tests {
 
         // 't' toggles content type
         let initial_type = s.content_type;
-        search_key(&mut s, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        );
         assert_eq!(s.content_type, (initial_type + 1) % 3);
 
         // 'o' toggles order
         let initial_order = s.order;
-        search_key(&mut s, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+        );
         assert_eq!(s.order, 1 - initial_order);
     }
 
@@ -3543,7 +3855,11 @@ mod tests {
         // Posts, so no mode can 403 with `missing_scope`.
         let plain = std::sync::Arc::new(common::site::SiteConfig::blank("plain"));
         assert_eq!(content_types(&plain), vec![0, 1, 2]);
-        let mut s = crate::screens::SearchState { query: "edge".into(), site: plain, ..Default::default() };
+        let mut s = crate::screens::SearchState {
+            query: "edge".into(),
+            site: plain,
+            ..Default::default()
+        };
         let mut seen = Vec::new();
         for _ in 0..3 {
             s.loading = false;
@@ -3575,14 +3891,20 @@ mod tests {
         // ']' / '[' page the member's content, not a keyword search.
         // (`s.loading` is reset between presses: the fetch these actions
         // start sets it until the reply lands — see the double-fire test.)
-        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        let act = search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+        );
         assert!(
             matches!(&act, Action::LoadMemberContent { user_id, content, page }
                 if *user_id == 42 && content == "thread" && *page == 3),
             "] must ask for the member's next page"
         );
         s.loading = false;
-        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        let act = search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+        );
         assert!(
             matches!(&act, Action::LoadMemberContent { user_id, content, page }
                 if *user_id == 42 && content == "thread" && *page == 1),
@@ -3592,7 +3914,10 @@ mod tests {
 
         // 't' flips threads <-> posts through the same endpoint, from page 1,
         // and relabels the screen.
-        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        let act = search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        );
         assert!(
             matches!(&act, Action::LoadMemberContent { user_id, content, page }
                 if *user_id == 42 && content == "post" && *page == 1),
@@ -3602,26 +3927,42 @@ mod tests {
         assert_eq!(s.query, "by: kemical (post)");
         assert_eq!(s.content_type, 2, "the chip row must follow the real mode");
         s.loading = false;
-        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
-        assert!(
-            matches!(&act, Action::LoadMemberContent { content, .. } if content == "thread")
+        let act = search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
         );
+        assert!(matches!(&act, Action::LoadMemberContent { content, .. } if content == "thread"));
         s.loading = false;
 
         // 'o' (order) and 'a' (author) do not exist for member content: they
         // must refuse out loud, never re-run the label as a keyword search.
         let order = s.order;
-        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
-        assert!(matches!(act, Action::Notice(_)), "o must refuse in member mode");
+        let act = search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+        );
+        assert!(
+            matches!(act, Action::Notice(_)),
+            "o must refuse in member mode"
+        );
         assert_eq!(s.order, order, "the order flag must not move either");
-        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        assert!(matches!(act, Action::Notice(_)), "a must refuse in member mode");
+        let act = search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
+        assert!(
+            matches!(act, Action::Notice(_)),
+            "a must refuse in member mode"
+        );
         assert!(!s.input_mode, "author editing stays closed in member mode");
         assert!(!search_hints(&s).keys.iter().any(|(k, _)| *k == "o"));
 
         // 'i' starts a genuine keyword search: the label is cleared and, once
         // submitted, the screen leaves member mode for good.
-        search_key(&mut s, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
         assert!(s.input_mode);
         assert!(s.query.is_empty(), "the label must never become the query");
         for c in "wsl".chars() {
@@ -3633,7 +3974,10 @@ mod tests {
             "a typed query is a keyword search again"
         );
         assert!(s.member.is_none(), "submitting a query leaves member mode");
-        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        let act = search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+        );
         assert!(
             matches!(act, Action::RunSearchQuery(_)),
             "and the ordinary search keys work again"
@@ -3666,7 +4010,10 @@ mod tests {
         // Enter in that state refuses out loud instead of searching for a
         // label, and member mode survives (#548).
         let act = search_key(&mut s, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(&act, Action::Notice(n) if n.contains("Type something")), "Enter must refuse an empty field, not search");
+        assert!(
+            matches!(&act, Action::Notice(n) if n.contains("Type something")),
+            "Enter must refuse an empty field, not search"
+        );
         assert!(s.member.is_some(), "member mode survives");
 
         // A caret-placement click while already editing keeps the typed
@@ -3706,7 +4053,6 @@ mod tests {
         assert_eq!(s.query, "windows", "a real query is kept, not cleared");
     }
 
-
     /// A fetch sets `loading` until its reply lands, and the page/toggle
     /// keys must not fire a second request into that window — behind the
     /// 3 s `search_gate` each duplicate delays the user's next real search.
@@ -3724,37 +4070,79 @@ mod tests {
             ..Default::default()
         };
 
-        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        let act = search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+        );
         assert!(matches!(&act, Action::LoadMemberContent { page: 3, .. }));
-        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
-        assert!(matches!(act, Action::Notice(_)), "] must refuse while loading");
-        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
-        assert!(matches!(act, Action::Notice(_)), "[ must refuse while loading");
-        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
-        assert!(matches!(act, Action::Notice(_)), "t must refuse while loading");
+        let act = search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+        );
+        assert!(
+            matches!(act, Action::Notice(_)),
+            "] must refuse while loading"
+        );
+        let act = search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+        );
+        assert!(
+            matches!(act, Action::Notice(_)),
+            "[ must refuse while loading"
+        );
+        let act = search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        );
+        assert!(
+            matches!(act, Action::Notice(_)),
+            "t must refuse while loading"
+        );
 
         // The reply lands (loading clears) and paging works again.
         s.loading = false;
-        let act = search_key(&mut s, KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        let act = search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+        );
         assert!(matches!(&act, Action::LoadMemberContent { page: 3, .. }));
 
         // The submit path refuses too: type into the input row while a load
         // is in flight, then press Enter.
         s.loading = true;
-        search_key(&mut s, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
-        search_key(&mut s, KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
-        search_key(&mut s, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
-        search_key(&mut s, KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
+        search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+        );
+        search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        );
+        search_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+        );
         let act = search_key(&mut s, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(act, Action::Notice(_)), "submit must refuse while loading");
-        assert!(s.input_mode, "the refused submit must not close the input row");
+        assert!(
+            matches!(act, Action::Notice(_)),
+            "submit must refuse while loading"
+        );
+        assert!(
+            s.input_mode,
+            "the refused submit must not close the input row"
+        );
     }
 
     #[test]
     fn profile_key_shortcuts() {
-        use common::models::User;
         use super::profile_key;
         use crate::screens::ProfileState;
+        use common::models::User;
 
         let user = User {
             user_id: 42,
@@ -3769,24 +4157,43 @@ mod tests {
         };
 
         // 't': member threads
-        let act = profile_key(&mut s, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
-        assert!(matches!(act, Action::OpenMemberContent { user_id, username, content } if user_id == 42 && username == "SysAdmin" && content == "thread"));
+        let act = profile_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        );
+        assert!(
+            matches!(act, Action::OpenMemberContent { user_id, username, content } if user_id == 42 && username == "SysAdmin" && content == "thread")
+        );
 
         // 'p': member posts
-        let act = profile_key(&mut s, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
-        assert!(matches!(act, Action::OpenMemberContent { user_id, username, content } if user_id == 42 && username == "SysAdmin" && content == "post"));
+        let act = profile_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+        assert!(
+            matches!(act, Action::OpenMemberContent { user_id, username, content } if user_id == 42 && username == "SysAdmin" && content == "post")
+        );
 
         // 'd': direct message (rebound from `c`, which the global nav
         // intercepted — issue #613)
-        let act = profile_key(&mut s, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        let act = profile_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
         assert!(matches!(act, Action::StartNewConversation(Some(name)) if name == "SysAdmin"));
 
         // 'o': open on web
-        let act = profile_key(&mut s, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        let act = profile_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+        );
         assert!(matches!(act, Action::OpenUrl(url) if url.contains("sysadmin.42")));
 
         // 'y': copy link
-        let act = profile_key(&mut s, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let act = profile_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
         assert!(matches!(act, Action::OscCopy(url) if url.contains("sysadmin.42")));
     }
 
@@ -3854,7 +4261,16 @@ mod tests {
     fn compose_shows_two_panels_wide_and_one_narrow() {
         let theme = Theme::truecolor();
         let mut s = sample_reply();
-        let rows = render_rows(120, 36, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
+        let rows = render_rows(120, 36, |f, area| {
+            render_compose(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            )
+        });
         assert!(rows[0].contains(" Reply "), "{}", rows[0]);
         assert!(rows[0].contains(" Preview "), "{}", rows[0]);
         let all = rows.join("\n");
@@ -3865,7 +4281,16 @@ mod tests {
 
         // Narrow: the editor alone (preview defaults to off).
         let mut s = sample_reply();
-        let rows = render_rows(80, 24, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
+        let rows = render_rows(80, 24, |f, area| {
+            render_compose(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            )
+        });
         assert!(rows[0].contains(" Reply "), "{}", rows[0]);
         assert!(!rows[0].contains(" Preview "), "{}", rows[0]);
 
@@ -3874,7 +4299,16 @@ mod tests {
             preview: true,
             ..sample_reply()
         };
-        let rows = render_rows(80, 24, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
+        let rows = render_rows(80, 24, |f, area| {
+            render_compose(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            )
+        });
         assert!(rows[0].contains(" Preview "), "{}", rows[0]);
         assert!(!rows[0].contains(" Reply "), "{}", rows[0]);
         assert!(rows.join("\n").contains("as it will appear"));
@@ -3890,7 +4324,16 @@ mod tests {
     fn compose_preview_keeps_the_same_indentation_the_editor_shows() {
         let theme = Theme::truecolor();
         let mut s = reply_state("[CODE]def f():\n    return 1[/CODE]");
-        let rows = render_rows(120, 24, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
+        let rows = render_rows(120, 24, |f, area| {
+            render_compose(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            )
+        });
         assert!(rows[0].contains(" Reply "), "{}", rows[0]);
         assert!(rows[0].contains(" Preview "), "{}", rows[0]);
         assert!(
@@ -3901,7 +4344,8 @@ mod tests {
         // Everything left of the editor/preview divider (column 72) is the
         // Reply panel; everything from the divider on is the Preview panel.
         assert!(
-            rows.iter().any(|r| r.get(72..).is_some_and(|right| right.contains("return 1"))),
+            rows.iter()
+                .any(|r| r.get(72..).is_some_and(|right| right.contains("return 1"))),
             "the preview must show the same body, indentation included:\n{}",
             rows.join("\n")
         );
@@ -3923,7 +4367,10 @@ mod tests {
     #[test]
     fn url_labels_prefer_the_file_name_and_fall_back_to_the_host() {
         assert_eq!(url_label("https://cdn.example/a/b/shot.png"), "shot.png");
-        assert_eq!(url_label("https://cdn.example/a/b/shot.png?w=800#x"), "shot.png");
+        assert_eq!(
+            url_label("https://cdn.example/a/b/shot.png?w=800#x"),
+            "shot.png"
+        );
         assert_eq!(url_label("https://imgur.com/a/xyz/"), "imgur.com");
         assert_eq!(url_label("https://imgur.com/a/xyz"), "imgur.com");
         assert_eq!(url_label("https://example.com"), "example.com");
@@ -3942,13 +4389,25 @@ mod tests {
         let refs = bbcode::image_refs(r#"[ATTACH type="full"]77[/ATTACH] [ATTACH]78[/ATTACH]"#);
         assert_eq!(refs.len(), 2);
 
-        let resolved = resolve_image(&refs[0], std::slice::from_ref(&att), "https://windowsforum.com").expect("77 resolves");
+        let resolved = resolve_image(
+            &refs[0],
+            std::slice::from_ref(&att),
+            "https://windowsforum.com",
+        )
+        .expect("77 resolves");
         assert_eq!(resolved.key, "https://wf/attachments/77/thumb");
         assert_eq!(resolved.label, "screenshot.png");
         assert_eq!(resolved.px, Some((1200, 800)));
 
         // An id the draft does not carry stays a text placeholder.
-        assert!(resolve_image(&refs[1], std::slice::from_ref(&att), "https://windowsforum.com").is_none());
+        assert!(
+            resolve_image(
+                &refs[1],
+                std::slice::from_ref(&att),
+                "https://windowsforum.com"
+            )
+            .is_none()
+        );
         // …and with no attachment list at all (today's compose screen),
         // nothing but `[IMG]` URLs can resolve.
         assert!(resolve_image(&refs[0], &[], "https://windowsforum.com").is_none());
@@ -3956,16 +4415,36 @@ mod tests {
 
     #[test]
     fn a_fresh_attachment_preview_uses_api_bytes_and_preserves_its_upload_hash() {
-        let mut attachment = Attachment { attachment_id: 77, filename: "screenshot.png".into(),
-            direct_url: Some("https://forum.example/attachments/screenshot-png.77/?hash=upload-hash".into()),
+        let mut attachment = Attachment {
+            attachment_id: 77,
+            filename: "screenshot.png".into(),
+            direct_url: Some(
+                "https://forum.example/attachments/screenshot-png.77/?hash=upload-hash".into(),
+            ),
             ..Default::default()
         };
         let reference = bbcode::ImageRef::Attachment(77);
-        let image = resolve_image(&reference, std::slice::from_ref(&attachment), "https://forum.example").unwrap();
-        assert_eq!(image.key, "https://forum.example/api/attachments/77/data?hash=upload-hash");
+        let image = resolve_image(
+            &reference,
+            std::slice::from_ref(&attachment),
+            "https://forum.example",
+        )
+        .unwrap();
+        assert_eq!(
+            image.key,
+            "https://forum.example/api/attachments/77/data?hash=upload-hash"
+        );
         attachment.thumbnail_url = Some("https://cdn.example/thumb.png".into());
-        let image = resolve_image(&reference, std::slice::from_ref(&attachment), "https://forum.example").unwrap();
-        assert_eq!(image.key, "https://cdn.example/thumb.png", "a public thumbnail stays cacheable");
+        let image = resolve_image(
+            &reference,
+            std::slice::from_ref(&attachment),
+            "https://forum.example",
+        )
+        .unwrap();
+        assert_eq!(
+            image.key, "https://cdn.example/thumb.png",
+            "a public thumbnail stays cacheable"
+        );
     }
 
     #[test]
@@ -3976,7 +4455,16 @@ mod tests {
             body: img_draft("https://cdn.example/shot.png"),
             ..sample_reply()
         };
-        let rows = render_rows(80, 24, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
+        let rows = render_rows(80, 24, |f, area| {
+            render_compose(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            )
+        });
         let all = rows.join("\n");
         assert!(all.contains("\u{25a3} shot.png"), "no caption line: {all}");
         assert!(!all.contains("[image]"), "the placeholder survived: {all}");
@@ -3998,7 +4486,16 @@ mod tests {
             body: img_draft(url),
             ..sample_reply()
         };
-        let rows = render_rows(80, 30, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
+        let rows = render_rows(80, 30, |f, area| {
+            render_compose(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            )
+        });
         let all = rows.join("\n");
         // Nothing is known about a bare URL until its bytes arrive.
         assert!(all.contains("\u{25a3} loading\u{2026}"), "{all}");
@@ -4012,7 +4509,11 @@ mod tests {
             "{} exceeds 40 % of {pane}",
             req.rect.width
         );
-        assert!(req.rect.height <= crate::images::MAX_ROWS, "{}", req.rect.height);
+        assert!(
+            req.rect.height <= crate::images::MAX_ROWS,
+            "{}",
+            req.rect.height
+        );
 
         // The text after the reference is below the reserved rows, not under
         // them: the line list accounts for the image.
@@ -4047,12 +4548,33 @@ mod tests {
             body: img_draft(url),
             ..sample_reply()
         };
-        let _ = render_rows(80, 30, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
+        let _ = render_rows(80, 30, |f, area| {
+            render_compose(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            )
+        });
         // What `Msg::ImageLoaded` teaches the store, the app stamps here.
         s.image_sizes.insert(url.to_string(), (1200, 800));
-        let rows = render_rows(80, 30, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
+        let rows = render_rows(80, 30, |f, area| {
+            render_compose(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            )
+        });
         let all = rows.join("\n");
-        assert!(all.contains("\u{25a3} shot.png \u{b7} 1200\u{d7}800"), "{all}");
+        assert!(
+            all.contains("\u{25a3} shot.png \u{b7} 1200\u{d7}800"),
+            "{all}"
+        );
         assert!(!all.contains("loading"), "{all}");
     }
 
@@ -4066,8 +4588,20 @@ mod tests {
             ..sample_reply()
         };
         // Tall enough for the caption, too short for the twelve reserved rows.
-        let rows = render_rows(80, 10, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
-        assert!(rows.join("\n").contains("\u{25a3} loading\u{2026}"), "{rows:?}");
+        let rows = render_rows(80, 10, |f, area| {
+            render_compose(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            )
+        });
+        assert!(
+            rows.join("\n").contains("\u{25a3} loading\u{2026}"),
+            "{rows:?}"
+        );
         assert!(
             s.image_requests.is_empty(),
             "a half-visible image was still requested: {:?}",
@@ -4086,7 +4620,16 @@ mod tests {
             ..sample_reply()
         };
         let draw = |s: &mut ComposeState, theme: &Theme| {
-            render_rows(80, 30, |f, area| render_compose(s, f, area, theme, &UNICODE, &mut crate::hit::HitMap::default()));
+            render_rows(80, 30, |f, area| {
+                render_compose(
+                    s,
+                    f,
+                    area,
+                    theme,
+                    &UNICODE,
+                    &mut crate::hit::HitMap::default(),
+                )
+            });
         };
         // The composer opened with this reference already in the draft —
         // not a live edit in progress — so the very first build is exempt
@@ -4106,7 +4649,10 @@ mod tests {
         // (and, being already `requested`, keeps painting with no wait).
         s.body.push('!');
         draw(&mut s, &theme);
-        assert!(!s.preview_cache.is_fresh("", s.preview_cache.width, s.images, 0));
+        assert!(
+            !s.preview_cache
+                .is_fresh("", s.preview_cache.width, s.images, 0)
+        );
         assert!(
             s.preview_cache.requested.contains(url),
             "a keystroke re-requested an image already in flight"
@@ -4120,7 +4666,11 @@ mod tests {
         s.body = img_draft(url);
         draw(&mut s, &theme);
         assert!(s.preview_cache.requested.contains(url));
-        assert_eq!(s.image_requests.len(), 1, "it still paints, it just does not re-ask");
+        assert_eq!(
+            s.image_requests.len(),
+            1,
+            "it still paints, it just does not re-ask"
+        );
     }
 
     /// Issue #530: typing a URL character by character between an existing
@@ -4139,7 +4689,16 @@ mod tests {
             ..sample_reply()
         };
         let draw = |s: &mut ComposeState, theme: &Theme| {
-            render_rows(80, 30, |f, area| render_compose(s, f, area, theme, &UNICODE, &mut crate::hit::HitMap::default()));
+            render_rows(80, 30, |f, area| {
+                render_compose(
+                    s,
+                    f,
+                    area,
+                    theme,
+                    &UNICODE,
+                    &mut crate::hit::HitMap::default(),
+                )
+            });
         };
 
         let target = "https://example.com/a/b/c.png";
@@ -4174,7 +4733,16 @@ mod tests {
             body: "[IMG]data:image/png;base64,AAAA[/IMG]".into(),
             ..sample_reply()
         };
-        let rows = render_rows(80, 30, |f, area| render_compose(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
+        let rows = render_rows(80, 30, |f, area| {
+            render_compose(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            )
+        });
         assert!(s.image_requests.is_empty(), "{:?}", s.image_requests);
         // Nothing is dropped: it still renders as the placeholder it was.
         assert!(rows.join("\n").contains("[image]"), "{rows:?}");
@@ -4188,22 +4756,48 @@ mod tests {
     /// every poll/exchange failure) with no link yet to copy or open.
     #[test]
     fn login_hints_hide_copy_and_open_while_idle_and_notice_instead_of_silently_ignoring() {
-        let idle = crate::screens::LoginState { stage: LoginStage::Idle, ..Default::default() };
+        let idle = crate::screens::LoginState {
+            stage: LoginStage::Idle,
+            ..Default::default()
+        };
         let hints = login_hints(&idle);
         for (cap, _) in hints.keys.iter().chain(hints.short.iter()) {
             assert!(*cap != "c" && *cap != "o", "Idle must not advertise {cap}");
         }
 
         let mut s = idle;
-        let act = login_key(&mut s, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
-        assert!(matches!(act, Action::Notice(_)), "c in Idle must notice, not silently no-op");
-        let act = login_key(&mut s, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
-        assert!(matches!(act, Action::Notice(_)), "o in Idle must notice, not silently no-op");
+        let act = login_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
+        assert!(
+            matches!(act, Action::Notice(_)),
+            "c in Idle must notice, not silently no-op"
+        );
+        let act = login_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+        );
+        assert!(
+            matches!(act, Action::Notice(_)),
+            "o in Idle must notice, not silently no-op"
+        );
 
-        let waiting = crate::screens::LoginState { stage: LoginStage::Waiting { mode: LoginMode::TuiLink }, ..Default::default() };
+        let waiting = crate::screens::LoginState {
+            stage: LoginStage::Waiting {
+                mode: LoginMode::TuiLink,
+            },
+            ..Default::default()
+        };
         let hints = login_hints(&waiting);
-        assert!(hints.keys.iter().any(|(cap, _)| *cap == "c"), "Waiting must still advertise c");
-        assert!(hints.keys.iter().any(|(cap, _)| *cap == "o"), "Waiting must still advertise o");
+        assert!(
+            hints.keys.iter().any(|(cap, _)| *cap == "c"),
+            "Waiting must still advertise c"
+        );
+        assert!(
+            hints.keys.iter().any(|(cap, _)| *cap == "o"),
+            "Waiting must still advertise o"
+        );
     }
 
     #[test]
@@ -4211,11 +4805,15 @@ mod tests {
         let theme = Theme::truecolor();
         for (w, h) in [(120u16, 36u16), (80, 24)] {
             let mut s = crate::screens::LoginState {
-                stage: LoginStage::Waiting { mode: LoginMode::TuiLink },
+                stage: LoginStage::Waiting {
+                    mode: LoginMode::TuiLink,
+                },
                 url: "https://windowsforum.com/tui-start/k7Qx2p".into(),
                 ..Default::default()
             };
-            let rows = render_rows(w, h, |f, area| render_login(&mut s, f, area, &theme, &UNICODE, &mut HitMap::default()));
+            let rows = render_rows(w, h, |f, area| {
+                render_login(&mut s, f, area, &theme, &UNICODE, &mut HitMap::default())
+            });
             let all = rows.join("\n");
             assert!(all.contains('\u{2588}'), "no mark glyph at {w}x{h}: {all}");
             assert!(
@@ -4238,7 +4836,9 @@ mod tests {
         let url = "https://forum.example.com/oauth2/authorize?client_id=public-client-id&redirect_uri=http%3A%2F%2F127.0.0.1%3A9420%2Fcallback&response_type=code&scope=node%3Aread&state=st9&code_challenge=111111111111111111111111111111111111111111111111111&code_challenge_method=S256".to_string();
         assert!(url.chars().count() > 150);
         let mut s = crate::screens::LoginState {
-            stage: LoginStage::Waiting { mode: LoginMode::Loopback },
+            stage: LoginStage::Waiting {
+                mode: LoginMode::Loopback,
+            },
             url,
             ..Default::default()
         };
@@ -4265,23 +4865,44 @@ mod tests {
             crate::images::Tier::Iterm2,
         ] {
             let mut s = crate::screens::LoginState {
-                stage: LoginStage::Waiting { mode: LoginMode::TuiLink },
+                stage: LoginStage::Waiting {
+                    mode: LoginMode::TuiLink,
+                },
                 url: "https://windowsforum.com/tui-start/k7Qx2p".into(),
-                images: crate::images::Policy { tier, font: (10, 20) },
+                images: crate::images::Policy {
+                    tier,
+                    font: (10, 20),
+                },
                 ..Default::default()
             };
-            let rows =
-                render_rows(120, 36, |f, area| render_login(&mut s, f, area, &theme, &UNICODE, &mut HitMap::default()));
+            let rows = render_rows(120, 36, |f, area| {
+                render_login(&mut s, f, area, &theme, &UNICODE, &mut HitMap::default())
+            });
             let all = rows.join("\n");
-            assert!(!all.contains('\u{2588}'), "{tier:?} still draws the block mark: {all}");
+            assert!(
+                !all.contains('\u{2588}'),
+                "{tier:?} still draws the block mark: {all}"
+            );
             // The copy beside it is untouched.
             assert!(all.contains("WindowsForum"), "{all}");
             assert!(all.contains("for your terminal"), "{all}");
-            assert!(all.contains("https://windowsforum.com/tui-start/k7Qx2p"), "{all}");
+            assert!(
+                all.contains("https://windowsforum.com/tui-start/k7Qx2p"),
+                "{all}"
+            );
 
-            assert_eq!(s.image_requests.len(), 1, "{tier:?}: {:?}", s.image_requests);
+            assert_eq!(
+                s.image_requests.len(),
+                1,
+                "{tier:?}: {:?}",
+                s.image_requests
+            );
             let req = &s.image_requests[0];
-            assert_eq!(req.key, crate::images::LOGO_KEY, "the logo is embedded, not fetched");
+            assert_eq!(
+                req.key,
+                crate::images::LOGO_KEY,
+                "the logo is embedded, not fetched"
+            );
             assert_eq!(req.rect.width, crate::images::LOGO_COLS);
             assert_eq!(req.rect.height, crate::images::LOGO_ROWS);
         }
@@ -4289,15 +4910,24 @@ mod tests {
         // Tier 4 (half-blocks) and tier 5 (text) keep the crafted mark.
         for tier in [crate::images::Tier::Halfblocks, crate::images::Tier::Text] {
             let mut s = crate::screens::LoginState {
-                stage: LoginStage::Waiting { mode: LoginMode::TuiLink },
+                stage: LoginStage::Waiting {
+                    mode: LoginMode::TuiLink,
+                },
                 url: "https://windowsforum.com/tui-start/k7Qx2p".into(),
-                images: crate::images::Policy { tier, font: (10, 20) },
+                images: crate::images::Policy {
+                    tier,
+                    font: (10, 20),
+                },
                 ..Default::default()
             };
-            let rows =
-                render_rows(120, 36, |f, area| render_login(&mut s, f, area, &theme, &UNICODE, &mut HitMap::default()));
+            let rows = render_rows(120, 36, |f, area| {
+                render_login(&mut s, f, area, &theme, &UNICODE, &mut HitMap::default())
+            });
             let all = rows.join("\n");
-            assert!(all.contains('\u{2588}'), "{tier:?} lost the block mark: {all}");
+            assert!(
+                all.contains('\u{2588}'),
+                "{tier:?} lost the block mark: {all}"
+            );
             assert!(s.image_requests.is_empty(), "{tier:?} asked for an image");
         }
     }
@@ -4334,7 +4964,16 @@ mod tests {
         };
 
         let width = 120u16;
-        let rows = render_rows(width, 36, |f, area| render_search(&mut s, f, area, &theme, &UNICODE, &mut crate::hit::HitMap::default()));
+        let rows = render_rows(width, 36, |f, area| {
+            render_search(
+                &mut s,
+                f,
+                area,
+                &theme,
+                &UNICODE,
+                &mut crate::hit::HitMap::default(),
+            )
+        });
         let all = rows.join("\n");
         assert!(all.contains("HItest"), "{all}");
         assert!(all.contains("kemical"), "{all}");
@@ -4358,7 +4997,9 @@ mod tests {
         let theme = Theme::truecolor();
         let mut hits = HitMap::default();
         let mut s = super::super::LoginState {
-            stage: super::super::LoginStage::Waiting { mode: LoginMode::TuiLink },
+            stage: super::super::LoginStage::Waiting {
+                mode: LoginMode::TuiLink,
+            },
             url: "https://windowsforum.com/tui-start/abc123".into(),
             ..Default::default()
         };
@@ -4369,9 +5010,9 @@ mod tests {
         })
         .expect("draw");
         let found = (0..30u16).any(|y| {
-            (0..100u16).any(|x| {
-                matches!(hits.at(x, y), Some(Hit::Link(u)) if u.contains("/tui-start/abc123"))
-            })
+            (0..100u16).any(
+                |x| matches!(hits.at(x, y), Some(Hit::Link(u)) if u.contains("/tui-start/abc123")),
+            )
         });
         assert!(found, "the sign-in link must be clickable");
     }
@@ -4408,7 +5049,10 @@ mod tests {
         // Esc abandons it without touching the draft.
         compose_key(&mut s, ctrl('f'));
         compose_key(&mut s, plain('x'));
-        assert!(matches!(compose_key(&mut s, KeyEvent::from(KeyCode::Esc)), Action::None));
+        assert!(matches!(
+            compose_key(&mut s, KeyEvent::from(KeyCode::Esc)),
+            Action::None
+        ));
         assert!(s.file_prompt.is_none());
         assert_eq!(s.body, "draft");
 
@@ -4430,18 +5074,29 @@ mod tests {
         let row = rows[pos.1 as usize].as_str();
         // The caret row IS the prompt row: label plus the windowed tail
         // (the body's caret must not take the cursor back).
-        assert!(row.contains("Attach file:"), "the caret sits on the prompt row: {row}");
-        assert!(row.contains("overflows.png"), "the tail follows the caret: {row}");
+        assert!(
+            row.contains("Attach file:"),
+            "the caret sits on the prompt row: {row}"
+        );
+        assert!(
+            row.contains("overflows.png"),
+            "the tail follows the caret: {row}"
+        );
         assert!(!row.contains("C:"), "the head is scrolled away: {row}");
-        assert!(pos.0 < w.saturating_sub(1), "the caret stays inside the pane");
+        assert!(
+            pos.0 < w.saturating_sub(1),
+            "the caret stays inside the pane"
+        );
 
         // Mid-string edit: the window moves with the caret.
         s.file_prompt_cursor = 20;
         let (rows, pos) = render_compose_probe(&mut s, w, 24);
         let row = rows[pos.1 as usize].as_str();
-        assert!(row.contains("someone"), "an early caret shows the head: {row}");
+        assert!(
+            row.contains("someone"),
+            "an early caret shows the head: {row}"
+        );
     }
-
 
     /// A conversation takes attachments under a content type this client
     /// does not upload to, so the key is neither advertised nor accepted
@@ -4460,7 +5115,10 @@ mod tests {
         let caps: Vec<&str> = compose_hints(&s).keys.iter().map(|(k, _)| *k).collect();
         assert!(!caps.contains(&"^F"), "{caps:?}");
         assert!(matches!(
-            compose_key(&mut s, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+            compose_key(
+                &mut s,
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)
+            ),
             Action::Notice(_)
         ));
     }

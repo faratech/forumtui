@@ -23,16 +23,26 @@ pub(super) enum UpdateState {
     UpToDate,
     Failed(String),
     /// Downloaded and verified; the next start applies it.
-    Staged { version: String },
+    Staged {
+        version: String,
+    },
     /// Newer, but this binary is not replaceable in place (MSIX); the
     /// release page is the way.
-    Available { version: String, html_url: String },
+    Available {
+        version: String,
+        html_url: String,
+    },
     /// Staged, but the install dir is not this user's: `command` is the
     /// install-then-rename line to run by hand.
-    Manual { version: String, command: String },
+    Manual {
+        version: String,
+        command: String,
+    },
     /// This start swapped the binary. The process is still the old image,
     /// so it neither re-checks nor pretends to be current.
-    JustApplied { version: String },
+    JustApplied {
+        version: String,
+    },
 }
 
 impl App {
@@ -57,13 +67,19 @@ impl App {
         }
         match self.update.clone() {
             UpdateState::JustApplied { version } => {
-                self.set_hint(format!("Update v{version} applied — restart wftui to run it."));
+                self.set_hint(format!(
+                    "Update v{version} applied — restart wftui to run it."
+                ));
             }
             UpdateState::Staged { version } => {
-                self.set_hint(format!("Update v{version} downloaded — restart wftui to apply it."));
+                self.set_hint(format!(
+                    "Update v{version} downloaded — restart wftui to apply it."
+                ));
             }
             UpdateState::Manual { version, command } => {
-                self.set_hint(format!("Update v{version} downloaded; install it with: {command}"));
+                self.set_hint(format!(
+                    "Update v{version} downloaded; install it with: {command}"
+                ));
             }
             UpdateState::Available { html_url, .. } => self.open_url(&html_url),
             UpdateState::Checking => self.set_status("Already checking for updates…"),
@@ -88,7 +104,12 @@ impl App {
             let result = update::check_and_stage(&cfg, forced)
                 .await
                 .map_err(|e| e.to_string());
-            tx.send(Msg::UpdateChecked { generation, forced, result }).ok();
+            tx.send(Msg::UpdateChecked {
+                generation,
+                forced,
+                result,
+            })
+            .ok();
         });
         self.update_task = Some(task.abort_handle());
     }
@@ -117,19 +138,34 @@ impl App {
             Ok(Outcome::UpToDate { .. }) => {
                 self.update = UpdateState::UpToDate;
                 if forced {
-                    self.set_status(format!("wftui v{} is up to date.", self.update_cfg.current_version));
+                    self.set_status(format!(
+                        "wftui v{} is up to date.",
+                        self.update_cfg.current_version
+                    ));
                 }
             }
             Ok(Outcome::Staged { version, .. }) => {
-                self.set_hint(format!("Update v{version} downloaded — restart wftui to apply it."));
+                self.set_hint(format!(
+                    "Update v{version} downloaded — restart wftui to apply it."
+                ));
                 self.update = UpdateState::Staged { version };
             }
-            Ok(Outcome::Available { version, html_url, why }) => {
-                self.set_hint(format!("wftui v{version} is available ({why}) — g u opens the release page."));
+            Ok(Outcome::Available {
+                version,
+                html_url,
+                why,
+            }) => {
+                self.set_hint(format!(
+                    "wftui v{version} is available ({why}) — g u opens the release page."
+                ));
                 self.update = UpdateState::Available { version, html_url };
             }
-            Ok(Outcome::ManualInstall { version, command, .. }) => {
-                self.set_hint(format!("Update v{version} downloaded; install it with: {command}"));
+            Ok(Outcome::ManualInstall {
+                version, command, ..
+            }) => {
+                self.set_hint(format!(
+                    "Update v{version} downloaded; install it with: {command}"
+                ));
                 self.update = UpdateState::Manual { version, command };
             }
             Err(e) => {
@@ -161,7 +197,9 @@ impl App {
             UpdateState::Staged { version } | UpdateState::JustApplied { version } => {
                 format!("Update v{version} ready, restart to apply")
             }
-            UpdateState::Available { version, .. } => format!("Update v{version}, open release page"),
+            UpdateState::Available { version, .. } => {
+                format!("Update v{version}, open release page")
+            }
             UpdateState::Manual { version, .. } => format!("Update v{version}, install by hand"),
             _ => "Check for updates".to_string(),
         };

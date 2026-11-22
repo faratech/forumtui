@@ -1,8 +1,8 @@
 [package]
 name = "wftui"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 publish = false
 license = "MIT"
 description = "Forum Terminal (TUI): a terminal client for XenForo forums (Linux + Windows)"

@@ -380,12 +380,20 @@ mod tests {
         assert!(!inner.chars().any(char::is_control), "injected: {t:?}");
         // The injected sequence's bytes are gone; what remains of the title
         // text ("Windows ]0;pwned Forum tabs") is inert, printable text.
-        assert!(inner.starts_with("Windows ") && inner.ends_with("Forum tabs"), "{t:?}");
+        assert!(
+            inner.starts_with("Windows ") && inner.ends_with("Forum tabs"),
+            "{t:?}"
+        );
 
         let h = hyperlink_in_mux("https://x.test/a\u{7}b", "click\u{1b}me", Multiplexer::None);
         assert!(!h.contains('\u{7}'), "{h:?}");
-        let payload = h.trim_start_matches("\x1b]8;;").trim_end_matches("\x1b]8;;\x1b\\");
-        assert!(payload.starts_with("https://x.test/ab\x1b\\clickme"), "{h:?}");
+        let payload = h
+            .trim_start_matches("\x1b]8;;")
+            .trim_end_matches("\x1b]8;;\x1b\\");
+        assert!(
+            payload.starts_with("https://x.test/ab\x1b\\clickme"),
+            "{h:?}"
+        );
     }
 
     /// #648: an OSC 52 payload far past what terminals accept is not
@@ -395,10 +403,16 @@ mod tests {
         assert!(clipboard_in_mux("small", Multiplexer::None).starts_with("\x1b]52;c;"));
         let huge = "x".repeat(MAX_CLIPBOARD_BYTES + 1);
         for mux in [Multiplexer::None, Multiplexer::Tmux, Multiplexer::Screen] {
-            assert!(clipboard_in_mux(&huge, mux).is_empty(), "over-cap payload must not be emitted");
+            assert!(
+                clipboard_in_mux(&huge, mux).is_empty(),
+                "over-cap payload must not be emitted"
+            );
         }
         let at_cap = "x".repeat(MAX_CLIPBOARD_BYTES);
-        assert!(!clipboard_in_mux(&at_cap, Multiplexer::None).is_empty(), "at-cap is fine");
+        assert!(
+            !clipboard_in_mux(&at_cap, Multiplexer::None).is_empty(),
+            "at-cap is fine"
+        );
     }
 
     #[test]
@@ -475,9 +489,18 @@ mod tests {
         let out = clipboard_in_mux("https://windowsforum.com/x", mux);
         assert!(out.starts_with("\x1b]52;c;"), "missing raw OSC 52: {out:?}");
         assert!(out.contains("\x1bP"), "missing screen-wrapped DCS: {out:?}");
-        assert_eq!(multiplexer_for(true, true, Some("screen")), Multiplexer::Tmux);
-        assert_eq!(multiplexer_for(false, true, Some("xterm")), Multiplexer::Screen);
-        assert_eq!(multiplexer_for(false, false, Some("xterm")), Multiplexer::None);
+        assert_eq!(
+            multiplexer_for(true, true, Some("screen")),
+            Multiplexer::Tmux
+        );
+        assert_eq!(
+            multiplexer_for(false, true, Some("xterm")),
+            Multiplexer::Screen
+        );
+        assert_eq!(
+            multiplexer_for(false, false, Some("xterm")),
+            Multiplexer::None
+        );
         assert_eq!(multiplexer_for(false, false, None), Multiplexer::None);
     }
 

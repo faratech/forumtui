@@ -19,17 +19,28 @@ impl App {
             msg => msg,
         };
         msg = match msg {
-            Msg::RecoveryVerified { generation, verified } => {
-                if generation != self.bootstrap_generation { return; }
+            Msg::RecoveryVerified {
+                generation,
+                verified,
+            } => {
+                if generation != self.bootstrap_generation {
+                    return;
+                }
                 match verified.commit() {
                     Ok((client, user)) => {
                         // No old action may ever acquire this verified grant.
                         self.cancel_recovered_work();
                         self.client = Arc::new(client);
                         self.api = self.client.clone();
-                        Msg::Bootstrap { generation, result: Ok(user) }
+                        Msg::Bootstrap {
+                            generation,
+                            result: Ok(user),
+                        }
                     }
-                    Err(e) => Msg::Bootstrap { generation, result: Err(TaskError::of(&e)) },
+                    Err(e) => Msg::Bootstrap {
+                        generation,
+                        result: Err(TaskError::of(&e)),
+                    },
                 }
             }
             msg => msg,
@@ -93,7 +104,10 @@ impl App {
                 // `mark_retryable`.
                 mark_retryable(&mut msg);
             } else if self.session_recovery_pending
-                && matches!(kind, TaskErrorKind::OAuth | TaskErrorKind::NoToken | TaskErrorKind::Api(401))
+                && matches!(
+                    kind,
+                    TaskErrorKind::OAuth | TaskErrorKind::NoToken | TaskErrorKind::Api(401)
+                )
             {
                 // Every caller that was queued behind the refresh which
                 // failed reports the same rejection, so an OAuth error, a
@@ -128,7 +142,11 @@ impl App {
             }
         }
         match msg {
-            Msg::LoginReady { generation, url, mode } => {
+            Msg::LoginReady {
+                generation,
+                url,
+                mode,
+            } => {
                 if generation != self.login_generation {
                     return; // a flow the user already restarted (issue #547)
                 }
@@ -150,7 +168,11 @@ impl App {
                     use std::os::unix::fs::OpenOptionsExt;
                     opts.mode(0o600);
                 }
-                let _ = opts.write(true).create(true).truncate(true).open(&path)
+                let _ = opts
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&path)
                     .and_then(|mut f| std::io::Write::write_all(&mut f, url.as_bytes()));
                 // `OpenOptionsExt::mode` only controls a newly-created inode;
                 // an existing login-url.txt keeps whatever permissions it had
@@ -173,12 +195,17 @@ impl App {
                     // Paste mode opens the field straight away: there is
                     // nothing else for the reader to do here.
                     ls.stage = match mode {
-                        common::site::LoginMode::Paste => crate::screens::LoginStage::Pasting { mode },
+                        common::site::LoginMode::Paste => {
+                            crate::screens::LoginStage::Pasting { mode }
+                        }
                         _ => crate::screens::LoginStage::Waiting { mode },
                     };
                 }
             }
-            Msg::LoginFailed { generation, message } => {
+            Msg::LoginFailed {
+                generation,
+                message,
+            } => {
                 if generation != self.login_generation {
                     return; // the restarted flow owns the screen now
                 }
@@ -190,7 +217,10 @@ impl App {
                 }
                 self.login_paste_tx = None;
             }
-            Msg::LoginNotice { generation, message } => {
+            Msg::LoginNotice {
+                generation,
+                message,
+            } => {
                 if generation != self.login_generation {
                     return;
                 }
@@ -275,7 +305,11 @@ impl App {
                     }
                 }
             }
-            Msg::UpdateChecked { generation, forced, result } => {
+            Msg::UpdateChecked {
+                generation,
+                forced,
+                result,
+            } => {
                 self.handle_update_checked(generation, forced, result);
             }
             Msg::AskAiEvent { turn, event } => self.on_ask_event(turn, event),
@@ -304,7 +338,9 @@ impl App {
                 // retryable one (issue #588) — and a poller's failure has no
                 // screen of its own waiting on it.
             }
-            Msg::Bootstrap { result: Ok(user), .. } => {
+            Msg::Bootstrap {
+                result: Ok(user), ..
+            } => {
                 self.bootstrap_retry_needed = false;
                 self.session_recovery_tried = false;
                 self.session_recovery_pending = false;
@@ -327,7 +363,8 @@ impl App {
                 }
                 if identity_changed {
                     self.abort_writes();
-                    self.screens.retain(|s| matches!(s, Screen::Home(_) | Screen::ForumTree(_)));
+                    self.screens
+                        .retain(|s| matches!(s, Screen::Home(_) | Screen::ForumTree(_)));
                     if self.screens.is_empty() {
                         self.screens.push(screens::home_state(false));
                     }
@@ -411,7 +448,8 @@ impl App {
                     match result {
                         Ok(nodes) => {
                             permissions.extend(nodes.iter().filter_map(|node| {
-                                node.thread_creation_permission().map(|permission| (node.node_id, permission))
+                                node.thread_creation_permission()
+                                    .map(|permission| (node.node_id, permission))
                             }));
                             // See ForumLoaded (issue #537).
                             tree.error = None;
@@ -438,13 +476,20 @@ impl App {
                         _ => None,
                     };
                     if let Some(list) = list
-                        && let Some((_, permission)) = permissions.iter().find(|(id, _)| *id == list.node_id)
+                        && let Some((_, permission)) =
+                            permissions.iter().find(|(id, _)| *id == list.node_id)
                     {
                         list.can_create_thread = Some(*permission);
                     }
                 }
             }
-            Msg::ForumLoaded { node_id, page, append, seq, result } => {
+            Msg::ForumLoaded {
+                node_id,
+                page,
+                append,
+                seq,
+                result,
+            } => {
                 let mut fill_next: Option<(u32, u32, u64)> = None;
                 let list = self
                     .list_mut_for(node_id)
@@ -527,7 +572,12 @@ impl App {
                     self.load_forum_page(node_id, page, true, seq);
                 }
             }
-            Msg::ThreadLoaded { id, page, load_id, result } => {
+            Msg::ThreadLoaded {
+                id,
+                page,
+                load_id,
+                result,
+            } => {
                 // One-shot: a reload that only exists to refresh the ♡/▲
                 // counts must not scroll the reader back to the top or move
                 // the selection out from under the next `l`/`v` (issue #538).
@@ -560,8 +610,7 @@ impl App {
                             view.scroll = 0;
                             view.sel_post = 0;
                             if let Some((_, _, sel_post, scroll)) = keep {
-                                view.sel_post =
-                                    sel_post.min(view.posts.len().saturating_sub(1));
+                                view.sel_post = sel_post.min(view.posts.len().saturating_sub(1));
                                 view.scroll = scroll;
                             }
                             // `width == 0` is the "never laid out" state (#27):
@@ -693,18 +742,17 @@ impl App {
             }
             Msg::MarkedRead(Ok(())) => self.set_status("Marked read."),
             Msg::MarkedRead(Err(e)) => self.set_status(format!("Mark-read failed: {e}")),
-            Msg::ConversationsLoaded { page, load_id, result } => {
+            Msg::ConversationsLoaded {
+                page,
+                load_id,
+                result,
+            } => {
                 let mut new_unread: Option<u32> = None;
                 let mut auto_load: Option<u32> = None;
-                if let Some(inbox) = self
-                    .screens
-                    .iter_mut()
-                    .rev()
-                    .find_map(|s| match s {
-                        Screen::Inbox(inbox) if inbox.convos.load_id == load_id => Some(inbox),
-                        _ => None,
-                    })
-                {
+                if let Some(inbox) = self.screens.iter_mut().rev().find_map(|s| match s {
+                    Screen::Inbox(inbox) if inbox.convos.load_id == load_id => Some(inbox),
+                    _ => None,
+                }) {
                     match result {
                         Ok(reply) => {
                             // See ForumLoaded (issue #537).
@@ -760,7 +808,13 @@ impl App {
                     self.load_conversation(cid, 1, false);
                 }
             }
-            Msg::ConversationLoaded { id, page, load_id, mark_read: user_opened, result } => {
+            Msg::ConversationLoaded {
+                id,
+                page,
+                load_id,
+                mark_read: user_opened,
+                result,
+            } => {
                 let mut mark_read: Option<u32> = None;
                 if let Some(view) = self.screens.iter_mut().rev().find_map(|s| match s {
                     Screen::ConversationView(view)
@@ -768,10 +822,9 @@ impl App {
                     {
                         Some(view)
                     }
-                    Screen::Inbox(inbox) => inbox
-                        .view
-                        .as_mut()
-                        .filter(|view| view.conversation.conversation_id == id && view.load_id == load_id),
+                    Screen::Inbox(inbox) => inbox.view.as_mut().filter(|view| {
+                        view.conversation.conversation_id == id && view.load_id == load_id
+                    }),
                     _ => None,
                 }) {
                     match result {
@@ -833,24 +886,24 @@ impl App {
                             .find(|c| c.conversation_id == cid)
                     {
                         let was_unread = row.is_unread || row.conversation_unread;
-                            row.is_unread = false;
-                            row.conversation_unread = false;
-                            // The badge counts ALL conversations, which only
-                            // a page-1 window measures (the poller reads
-                            // page 1 too): recounting over whatever page is
-                            // showing replaced the badge with one page's
-                            // worth, the sibling of what #52 fixed for the
-                            // load path. Elsewhere a genuine unread→read
-                            // flip is worth exactly one.
-                            if inbox.convos.page <= 1 {
-                                let unread = common::models::count_unread_conversations(
-                                    &inbox.convos.conversations,
-                                );
-                                self.convos_unread = unread;
-                            } else if was_unread {
-                                self.convos_unread = self.convos_unread.saturating_sub(1);
-                            }
+                        row.is_unread = false;
+                        row.conversation_unread = false;
+                        // The badge counts ALL conversations, which only
+                        // a page-1 window measures (the poller reads
+                        // page 1 too): recounting over whatever page is
+                        // showing replaced the badge with one page's
+                        // worth, the sibling of what #52 fixed for the
+                        // load path. Elsewhere a genuine unread→read
+                        // flip is worth exactly one.
+                        if inbox.convos.page <= 1 {
+                            let unread = common::models::count_unread_conversations(
+                                &inbox.convos.conversations,
+                            );
+                            self.convos_unread = unread;
+                        } else if was_unread {
+                            self.convos_unread = self.convos_unread.saturating_sub(1);
                         }
+                    }
                     let api = self.api.clone();
                     self.spawn_session_task(async move {
                         let _ = api.mark_conversation_read(cid).await;
@@ -958,11 +1011,7 @@ impl App {
                             // conversation and Esc used to pop the screen out
                             // from under the in-flight write.
                             nc.sending = true;
-                            (
-                                nc.resolved_ids.clone(),
-                                nc.title.clone(),
-                                nc.body.clone(),
-                            )
+                            (nc.resolved_ids.clone(), nc.title.clone(), nc.body.clone())
                         }
                     } else {
                         (Vec::new(), String::new(), String::new())
@@ -976,7 +1025,8 @@ impl App {
                                 .create_conversation(&ids, &title, &body)
                                 .await
                                 .map_err(|e| TaskError::of(&e));
-                            tx.send(session_msg(generation, Msg::ConvoCreated(result))).ok();
+                            tx.send(session_msg(generation, Msg::ConvoCreated(result)))
+                                .ok();
                         });
                     }
                 }
@@ -1021,29 +1071,26 @@ impl App {
             Msg::AlertsLoaded { load_id, result } => {
                 let mut new_unread: Option<u32> = None;
                 let mut accepted = false;
-                if let Some(inbox) = self
-                    .screens
-                    .iter_mut()
-                    .rev()
-                    .find_map(|s| match s {
-                        Screen::Inbox(inbox) if inbox.alerts.load_id == load_id => Some(inbox),
-                        _ => None,
-                    })
-                {
+                if let Some(inbox) = self.screens.iter_mut().rev().find_map(|s| match s {
+                    Screen::Inbox(inbox) if inbox.alerts.load_id == load_id => Some(inbox),
+                    _ => None,
+                }) {
                     let alerts = &mut inbox.alerts;
                     match result {
                         Ok(page) => {
                             // See ForumLoaded (issue #537).
                             alerts.error = None;
-                            let unread = page.alerts.iter().filter(|alert| !alert.viewed()).count() as u32;
+                            let unread =
+                                page.alerts.iter().filter(|alert| !alert.viewed()).count() as u32;
                             // Only an acknowledged mark can supersede a list
                             // that began before that mark. A later refresh
                             // may contain newly arrived, unviewed alerts.
-                            new_unread = Some(if inbox.alerts_viewed && load_id < inbox.alerts_view_id {
-                                0
-                            } else {
-                                unread
-                            });
+                            new_unread =
+                                Some(if inbox.alerts_viewed && load_id < inbox.alerts_view_id {
+                                    0
+                                } else {
+                                    unread
+                                });
                             if load_id > inbox.alerts_view_id && unread > 0 {
                                 inbox.alerts_viewed = false;
                                 // A mark that began before this newer snapshot
@@ -1067,32 +1114,45 @@ impl App {
                 if let Some(n) = new_unread {
                     self.alerts_unread = n;
                 }
-                if accepted { self.retry_visible_alerts_view(); }
+                if accepted {
+                    self.retry_visible_alerts_view();
+                }
             }
             Msg::AlertsViewed { view_id, result } => {
                 let mut failed = None;
                 let mut acknowledged = false;
-                if let Some(inbox) = self
-                    .screens
-                    .iter_mut()
-                    .rev()
-                    .find_map(|s| match s {
-                        Screen::Inbox(inbox) if inbox.alerts_view_id == view_id && inbox.alerts_view_pending => Some(inbox),
-                        _ => None,
-                    })
-                {
+                if let Some(inbox) = self.screens.iter_mut().rev().find_map(|s| match s {
+                    Screen::Inbox(inbox)
+                        if inbox.alerts_view_id == view_id && inbox.alerts_view_pending =>
+                    {
+                        Some(inbox)
+                    }
+                    _ => None,
+                }) {
                     inbox.alerts_view_pending = false;
                     match result {
-                        Ok(()) => { inbox.alerts_viewed = true; acknowledged = true; }
-                        Err(e) => { inbox.alerts_viewed = false; failed = Some(e.message); }
+                        Ok(()) => {
+                            inbox.alerts_viewed = true;
+                            acknowledged = true;
+                        }
+                        Err(e) => {
+                            inbox.alerts_viewed = false;
+                            failed = Some(e.message);
+                        }
                     }
                 }
-                if acknowledged { self.alerts_unread = 0; }
+                if acknowledged {
+                    self.alerts_unread = 0;
+                }
                 if let Some(message) = failed {
                     self.set_status(format!("Alerts could not be marked viewed: {message}"));
                 }
             }
-            Msg::MediaLoaded { page, load_id, result } => {
+            Msg::MediaLoaded {
+                page,
+                load_id,
+                result,
+            } => {
                 let gallery = self.screens.iter_mut().rev().find_map(|s| match s {
                     Screen::MediaGallery(m) => Some(m),
                     _ => None,
@@ -1119,7 +1179,11 @@ impl App {
                     }
                 }
             }
-            Msg::ResourceLoaded { page, load_id, result } => {
+            Msg::ResourceLoaded {
+                page,
+                load_id,
+                result,
+            } => {
                 let resources = self.screens.iter_mut().rev().find_map(|s| match s {
                     Screen::Resources(r) => Some(r),
                     _ => None,
@@ -1251,7 +1315,11 @@ impl App {
                     }
                 }
             },
-            Msg::PostDeleted { post_id, thread_id, result } => match result {
+            Msg::PostDeleted {
+                post_id,
+                thread_id,
+                result,
+            } => match result {
                 Ok(()) => {
                     self.set_status("Post deleted.");
                     let page = self
@@ -1271,7 +1339,11 @@ impl App {
                 }
                 Err(e) => self.set_status(format!("Delete failed: {}", e.message)),
             },
-            Msg::SolutionMarked { post_id, thread_id, result } => match result {
+            Msg::SolutionMarked {
+                post_id,
+                thread_id,
+                result,
+            } => match result {
                 Ok(()) => {
                     self.set_status("Solution updated.");
                     let page = self
@@ -1295,10 +1367,9 @@ impl App {
                 // Categories are decoration for the item pane: a failure
                 // leaves "All media" working rather than failing the screen.
                 if let Ok(reply) = result
-                    && let Some(Screen::MediaGallery(m)) =
-                        self.screens.iter_mut().rev().find(|s| {
-                            matches!(s, Screen::MediaGallery(m) if m.categories_load_id == load_id)
-                        })
+                    && let Some(Screen::MediaGallery(m)) = self.screens.iter_mut().rev().find(
+                        |s| matches!(s, Screen::MediaGallery(m) if m.categories_load_id == load_id),
+                    )
                 {
                     m.categories = reply.categories;
                     // The list widget clamps its visual selection, but key
@@ -1308,7 +1379,11 @@ impl App {
                     m.cat_sel = m.cat_sel.min(m.categories.len());
                 }
             }
-            Msg::ResourceViewLoaded { id, load_id, result } => {
+            Msg::ResourceViewLoaded {
+                id,
+                load_id,
+                result,
+            } => {
                 let view = self.screens.iter_mut().rev().find_map(|s| match s {
                     Screen::ResourceView(r) if r.id == id && r.load_id == load_id => Some(r),
                     _ => None,
@@ -1346,20 +1421,23 @@ impl App {
                     // selection) no matter which page they marked from
                     // (issue #608).
                     if let Some(inbox) = self.inbox_mut()
-                        && let Some(row) =
-                            inbox.convos.conversations.iter_mut().find(|c| c.conversation_id == id)
+                        && let Some(row) = inbox
+                            .convos
+                            .conversations
+                            .iter_mut()
+                            .find(|c| c.conversation_id == id)
                     {
                         let was_unread = row.is_unread || row.conversation_unread;
                         row.is_unread = false;
                         row.conversation_unread = false;
-                            // The badge counts ALL conversations, which only
-                            // a page-1 window measures (the poller reads
-                            // page 1 too) — recounting whatever page is
-                            // showing replaced the badge with one page's
-                            // worth, the sibling of what #52 fixed for the
-                            // load path. Elsewhere a genuine unread→read
-                            // flip is worth exactly one; any drift heals at
-                            // the next poll.
+                        // The badge counts ALL conversations, which only
+                        // a page-1 window measures (the poller reads
+                        // page 1 too) — recounting whatever page is
+                        // showing replaced the badge with one page's
+                        // worth, the sibling of what #52 fixed for the
+                        // load path. Elsewhere a genuine unread→read
+                        // flip is worth exactly one; any drift heals at
+                        // the next poll.
                         if inbox.convos.page <= 1 {
                             self.convos_unread = common::models::count_unread_conversations(
                                 &inbox.convos.conversations,
@@ -1372,7 +1450,11 @@ impl App {
                 }
                 Err(e) => self.set_status(format!("Mark failed: {e}")),
             },
-            Msg::SearchDone { generation, page, result } => {
+            Msg::SearchDone {
+                generation,
+                page,
+                result,
+            } => {
                 if self.status.starts_with("Searching") {
                     self.clear_status();
                 }
@@ -1459,31 +1541,33 @@ impl App {
                 }
                 self.logout_pending = false;
                 match result {
-                Ok(()) => tracing::info!("logout complete"),
-                Err(e) => {
-                    // The local token file is gone either way; say what did
-                    // not happen instead of leaving "Logged out." standing.
-                    // This is the one place the user learns their 90-day
-                    // refresh token may still be live server-side (issue
-                    // #527), so it must not be a toast that
-                    // `expire_status_toast` blanks after `STATUS_TOAST_SECS`
-                    // — a status write that vanishes on its own clock while
-                    // the user is reading the sign-in link box is the same
-                    // silence #527 wanted fixed (issue #575). `set_hint`
-                    // keeps it up until something else replaces it, and it
-                    // is also mirrored onto the Login screen's own error
-                    // line (cleared by `begin_login`) so it stays beside the
-                    // sign-in box rather than only on the status row.
-                    tracing::warn!("logout error: {e}");
-                    let message = format!("Logged out locally, but {e}.");
-                    self.set_hint(message.clone());
-                    if let Some(Screen::Login(ls)) = self.screens.last_mut() {
-                        ls.error = Some(message);
+                    Ok(()) => tracing::info!("logout complete"),
+                    Err(e) => {
+                        // The local token file is gone either way; say what did
+                        // not happen instead of leaving "Logged out." standing.
+                        // This is the one place the user learns their 90-day
+                        // refresh token may still be live server-side (issue
+                        // #527), so it must not be a toast that
+                        // `expire_status_toast` blanks after `STATUS_TOAST_SECS`
+                        // — a status write that vanishes on its own clock while
+                        // the user is reading the sign-in link box is the same
+                        // silence #527 wanted fixed (issue #575). `set_hint`
+                        // keeps it up until something else replaces it, and it
+                        // is also mirrored onto the Login screen's own error
+                        // line (cleared by `begin_login`) so it stays beside the
+                        // sign-in box rather than only on the status row.
+                        tracing::warn!("logout error: {e}");
+                        let message = format!("Logged out locally, but {e}.");
+                        self.set_hint(message.clone());
+                        if let Some(Screen::Login(ls)) = self.screens.last_mut() {
+                            ls.error = Some(message);
+                        }
                     }
                 }
-                }
             }
-            Msg::Session { .. } | Msg::RecoveryVerified { .. } => unreachable!("session messages are unwrapped at the boundary"),
+            Msg::Session { .. } | Msg::RecoveryVerified { .. } => {
+                unreachable!("session messages are unwrapped at the boundary")
+            }
         }
     }
 }

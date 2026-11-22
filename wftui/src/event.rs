@@ -44,49 +44,51 @@ pub fn spawn_reader_with_prefix(prefix: Vec<u8>) -> Receiver<Input> {
     std::thread::Builder::new()
         .name("wftui-reader".into())
         .spawn(move || {
-        #[cfg(all(feature = "images", unix))]
-        for event in startup_events(prefix) {
-            if tx.send(event).is_err() { return; }
-        }
-        #[cfg(not(all(feature = "images", unix)))]
-        let _ = prefix;
-        loop {
-            match event::read() {
-                Ok(TEvent::Key(k)) => {
-                    if !should_process_key(&k) {
-                        continue;
-                    }
-                    if tx.send(Input::Key(k)).is_err() {
-                        break;
-                    }
-                }
-                Ok(TEvent::Mouse(m)) => {
-                    if tx.send(Input::Mouse(m)).is_err() {
-                        break;
-                    }
-                }
-                Ok(TEvent::Paste(p)) => {
-                    if tx.send(Input::Paste(p)).is_err() {
-                        break;
-                    }
-                }
-                Ok(TEvent::Resize(..)) => {
-                    if tx.send(Input::Resize).is_err() {
-                        break;
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => {
-                    // Tell the UI loop the reader is gone — it respawns or
-                    // quits; a silent break used to disable all input
-                    // forever while the frame kept redrawing (#653).
-                    let _ = tx.send(Input::ReaderDied);
-                    break;
+            #[cfg(all(feature = "images", unix))]
+            for event in startup_events(prefix) {
+                if tx.send(event).is_err() {
+                    return;
                 }
             }
-        }
-    })
-    .expect("spawn reader");
+            #[cfg(not(all(feature = "images", unix)))]
+            let _ = prefix;
+            loop {
+                match event::read() {
+                    Ok(TEvent::Key(k)) => {
+                        if !should_process_key(&k) {
+                            continue;
+                        }
+                        if tx.send(Input::Key(k)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(TEvent::Mouse(m)) => {
+                        if tx.send(Input::Mouse(m)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(TEvent::Paste(p)) => {
+                        if tx.send(Input::Paste(p)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(TEvent::Resize(..)) => {
+                        if tx.send(Input::Resize).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        // Tell the UI loop the reader is gone — it respawns or
+                        // quits; a silent break used to disable all input
+                        // forever while the frame kept redrawing (#653).
+                        let _ = tx.send(Input::ReaderDied);
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("spawn reader");
     rx
 }
 
@@ -113,9 +115,14 @@ fn startup_events(bytes: Vec<u8>) -> Vec<Input> {
 /// the rest, with every key dead until some unrelated byte arrived — and
 /// that byte was then eaten into the old sequence.
 #[cfg(all(feature = "images", unix))]
-fn complete_and_decode(mut bytes: Vec<u8>, mut next_byte: impl FnMut() -> Option<u8>) -> Vec<Input> {
+fn complete_and_decode(
+    mut bytes: Vec<u8>,
+    mut next_byte: impl FnMut() -> Option<u8>,
+) -> Vec<Input> {
     while let Err(error) = std::str::from_utf8(&bytes) {
-        if error.error_len().is_some() { break; }
+        if error.error_len().is_some() {
+            break;
+        }
         let Some(byte) = next_byte() else { break };
         bytes.push(byte);
     }
@@ -139,9 +146,19 @@ fn complete_and_decode(mut bytes: Vec<u8>, mut next_byte: impl FnMut() -> Option
 fn read_byte_before(fd: std::os::fd::RawFd, deadline: std::time::Instant) -> Option<u8> {
     loop {
         let left = deadline.checked_duration_since(std::time::Instant::now())?;
-        let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         // SAFETY: one initialized entry.
-        let ready = unsafe { libc::poll(&mut poll, 1, left.as_millis().clamp(1, i32::MAX as u128) as i32) };
+        let ready = unsafe {
+            libc::poll(
+                &mut poll,
+                1,
+                left.as_millis().clamp(1, i32::MAX as u128) as i32,
+            )
+        };
         if ready < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
@@ -157,7 +174,9 @@ fn read_byte_before(fd: std::os::fd::RawFd, deadline: std::time::Instant) -> Opt
         match read {
             1 => return Some(byte),
             0 => return None,
-            _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => continue,
+            _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {
+                continue;
+            }
             _ => return None,
         }
     }
@@ -175,7 +194,9 @@ fn split_sequence_tail(bytes: &[u8]) -> bool {
     {
         return true;
     }
-    let Some(pos) = text.rfind('\x1b') else { return false };
+    let Some(pos) = text.rfind('\x1b') else {
+        return false;
+    };
     let tail = &text[pos..];
     if !tail.starts_with("\x1b[")
         && !tail.starts_with("\x1bO")
@@ -206,7 +227,9 @@ fn decode_startup_events(bytes: &[u8]) -> Vec<Input> {
             // A complete OSC, DCS or APC string is a terminal reply the probe
             // did not ask for, never a key: drop it whole (#138) instead of
             // reading it as Alt+`]` and a run of literal keys.
-            if (remaining.starts_with("\x1b]") || remaining.starts_with("\x1bP") || remaining.starts_with("\x1b_"))
+            if (remaining.starts_with("\x1b]")
+                || remaining.starts_with("\x1bP")
+                || remaining.starts_with("\x1b_"))
                 && let Some(len) = crate::images::unix::sequence_len(remaining.as_bytes())
                 && len > 2
             {
@@ -218,33 +241,57 @@ fn decode_startup_events(bytes: &[u8]) -> Vec<Input> {
             {
                 let sequence = &remaining[2..len];
                 let code = match sequence.as_bytes().last() {
-                    Some(b'A') => Some(KeyCode::Up), Some(b'B') => Some(KeyCode::Down),
-                    Some(b'C') => Some(KeyCode::Right), Some(b'D') => Some(KeyCode::Left),
-                    Some(b'H') => Some(KeyCode::Home), Some(b'F') => Some(KeyCode::End),
-                    Some(b'P') => Some(KeyCode::F(1)), Some(b'Q') => Some(KeyCode::F(2)),
-                    Some(b'R') => Some(KeyCode::F(3)), Some(b'S') => Some(KeyCode::F(4)),
-                    Some(b'Z') => { modifiers |= KeyModifiers::SHIFT; Some(KeyCode::BackTab) },
+                    Some(b'A') => Some(KeyCode::Up),
+                    Some(b'B') => Some(KeyCode::Down),
+                    Some(b'C') => Some(KeyCode::Right),
+                    Some(b'D') => Some(KeyCode::Left),
+                    Some(b'H') => Some(KeyCode::Home),
+                    Some(b'F') => Some(KeyCode::End),
+                    Some(b'P') => Some(KeyCode::F(1)),
+                    Some(b'Q') => Some(KeyCode::F(2)),
+                    Some(b'R') => Some(KeyCode::F(3)),
+                    Some(b'S') => Some(KeyCode::F(4)),
+                    Some(b'Z') => {
+                        modifiers |= KeyModifiers::SHIFT;
+                        Some(KeyCode::BackTab)
+                    }
                     Some(b'~') => match sequence.split([';', '~']).next().unwrap_or("") {
-                        "1" | "7" => Some(KeyCode::Home), "2" => Some(KeyCode::Insert),
-                        "3" => Some(KeyCode::Delete), "4" | "8" => Some(KeyCode::End),
-                        "5" => Some(KeyCode::PageUp), "6" => Some(KeyCode::PageDown),
-                        "11" => Some(KeyCode::F(1)), "12" => Some(KeyCode::F(2)),
-                        "13" => Some(KeyCode::F(3)), "14" => Some(KeyCode::F(4)),
-                        "15" => Some(KeyCode::F(5)), "17" => Some(KeyCode::F(6)),
-                        "18" => Some(KeyCode::F(7)), "19" => Some(KeyCode::F(8)),
-                        "20" => Some(KeyCode::F(9)), "21" => Some(KeyCode::F(10)),
-                        "23" => Some(KeyCode::F(11)), "24" => Some(KeyCode::F(12)), _ => None,
+                        "1" | "7" => Some(KeyCode::Home),
+                        "2" => Some(KeyCode::Insert),
+                        "3" => Some(KeyCode::Delete),
+                        "4" | "8" => Some(KeyCode::End),
+                        "5" => Some(KeyCode::PageUp),
+                        "6" => Some(KeyCode::PageDown),
+                        "11" => Some(KeyCode::F(1)),
+                        "12" => Some(KeyCode::F(2)),
+                        "13" => Some(KeyCode::F(3)),
+                        "14" => Some(KeyCode::F(4)),
+                        "15" => Some(KeyCode::F(5)),
+                        "17" => Some(KeyCode::F(6)),
+                        "18" => Some(KeyCode::F(7)),
+                        "19" => Some(KeyCode::F(8)),
+                        "20" => Some(KeyCode::F(9)),
+                        "21" => Some(KeyCode::F(10)),
+                        "23" => Some(KeyCode::F(11)),
+                        "24" => Some(KeyCode::F(12)),
+                        _ => None,
                     },
                     _ => None,
                 };
                 if let Some(code) = code {
-                    if let Some((_, value)) = sequence[..sequence.len()-1].rsplit_once(';')
+                    if let Some((_, value)) = sequence[..sequence.len() - 1].rsplit_once(';')
                         && let Ok(value) = value.parse::<u8>()
                     {
                         let bits = value.saturating_sub(1);
-                        if bits & 1 != 0 { modifiers |= KeyModifiers::SHIFT; }
-                        if bits & 2 != 0 { modifiers |= KeyModifiers::ALT; }
-                        if bits & 4 != 0 { modifiers |= KeyModifiers::CONTROL; }
+                        if bits & 1 != 0 {
+                            modifiers |= KeyModifiers::SHIFT;
+                        }
+                        if bits & 2 != 0 {
+                            modifiers |= KeyModifiers::ALT;
+                        }
+                        if bits & 4 != 0 {
+                            modifiers |= KeyModifiers::CONTROL;
+                        }
                     }
                     events.push(Input::Key(KeyEvent::new(code, modifiers)));
                     remaining = &remaining[len..];
@@ -265,10 +312,18 @@ fn decode_startup_events(bytes: &[u8]) -> Vec<Input> {
         let ch = remaining.chars().next().expect("nonempty input");
         remaining = &remaining[ch.len_utf8()..];
         let code = match ch {
-            '\x1b' => KeyCode::Esc, '\r' | '\n' => KeyCode::Enter,
-            '\t' => KeyCode::Tab, '\x7f' | '\x08' => KeyCode::Backspace,
-            '\0' => { modifiers |= KeyModifiers::CONTROL; KeyCode::Char(' ') },
-            '\x01'..='\x1a' => { modifiers |= KeyModifiers::CONTROL; KeyCode::Char((ch as u8 + b'a' - 1) as char) },
+            '\x1b' => KeyCode::Esc,
+            '\r' | '\n' => KeyCode::Enter,
+            '\t' => KeyCode::Tab,
+            '\x7f' | '\x08' => KeyCode::Backspace,
+            '\0' => {
+                modifiers |= KeyModifiers::CONTROL;
+                KeyCode::Char(' ')
+            }
+            '\x01'..='\x1a' => {
+                modifiers |= KeyModifiers::CONTROL;
+                KeyCode::Char((ch as u8 + b'a' - 1) as char)
+            }
             _ => KeyCode::Char(ch),
         };
         events.push(Input::Key(KeyEvent::new(code, modifiers)));
@@ -316,7 +371,8 @@ mod tests {
     }
 
     #[test]
-    fn filters_key_release_events() {        let press = KeyEvent {
+    fn filters_key_release_events() {
+        let press = KeyEvent {
             code: KeyCode::Char('j'),
             modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press,
@@ -342,11 +398,16 @@ mod tests {
     #[cfg(all(feature = "images", unix))]
     #[test]
     fn startup_keys_preserve_unicode_arrows_modifiers_and_paste() {
-        let keys = decode_startup_events("jZoë\x1b[A\x1b[1;5D\x1bx\x03\x1b[200~hello\x1b[201~".as_bytes());
+        let keys =
+            decode_startup_events("jZoë\x1b[A\x1b[1;5D\x1bx\x03\x1b[200~hello\x1b[201~".as_bytes());
         assert!(matches!(keys[3], Input::Key(k) if k.code == KeyCode::Char('ë')));
         assert!(matches!(keys[4], Input::Key(k) if k.code == KeyCode::Up));
-        assert!(matches!(keys[5], Input::Key(k) if k.code == KeyCode::Left && k.modifiers == KeyModifiers::CONTROL));
-        assert!(matches!(keys[6], Input::Key(k) if k.code == KeyCode::Char('x') && k.modifiers == KeyModifiers::ALT));
+        assert!(
+            matches!(keys[5], Input::Key(k) if k.code == KeyCode::Left && k.modifiers == KeyModifiers::CONTROL)
+        );
+        assert!(
+            matches!(keys[6], Input::Key(k) if k.code == KeyCode::Char('x') && k.modifiers == KeyModifiers::ALT)
+        );
         assert!(matches!(keys[7], Input::Key(k) if is_ctrl_c(k)));
         assert!(matches!(&keys[8], Input::Paste(text) if text == "hello"));
     }
@@ -363,16 +424,24 @@ mod tests {
         assert!(split_sequence_tail(b"\x1b["), "bare CSI introducer");
         assert!(split_sequence_tail(b"\x1bO"), "bare SS3 introducer");
         assert!(split_sequence_tail(b"\x1b]52;c;abc"), "unterminated OSC");
-        assert!(split_sequence_tail(b"hello\x1b[200~pa"), "unterminated paste");
+        assert!(
+            split_sequence_tail(b"hello\x1b[200~pa"),
+            "unterminated paste"
+        );
         assert!(!split_sequence_tail(b"\x1b[1;5B"), "complete CSI");
         assert!(!split_sequence_tail(b"\x1b]52;c;abc\x1b\\"), "complete OSC");
-        assert!(!split_sequence_tail(b"hi\x1b[200~pa\x1b[201~"), "complete paste");
+        assert!(
+            !split_sequence_tail(b"hi\x1b[200~pa\x1b[201~"),
+            "complete paste"
+        );
         assert!(!split_sequence_tail(b"\x1b"), "a lone ESC is an Esc press");
         assert!(!split_sequence_tail(b"\x1bx"), "ALT+x is complete");
         assert!(!split_sequence_tail(b"plain"), "no escape at all");
         // And a completed buffer decodes as the key it names, not junk.
         let keys = decode_startup_events(b"\x1b[1;5B");
-        assert!(matches!(keys[0], Input::Key(k) if k.code == KeyCode::Down && k.modifiers == KeyModifiers::CONTROL));
+        assert!(
+            matches!(keys[0], Input::Key(k) if k.code == KeyCode::Down && k.modifiers == KeyModifiers::CONTROL)
+        );
     }
 
     /// #138: a complete sequence the decoder does not name (SGR mouse,
@@ -382,12 +451,27 @@ mod tests {
     #[cfg(all(feature = "images", unix))]
     #[test]
     fn unknown_startup_sequences_are_dropped_whole() {
-        let keys = decode_startup_events(b"a\x1b[<0;12;5M\x1b[I\x1b[97;5u\x1b]11;rgb:0/0/0\x1b\\\x1bP1$r0m\x1b\\b\x1b[O\x1b[A");
-        let codes: Vec<KeyCode> = keys.iter().map(|k| match k { Input::Key(k) => k.code, other => panic!("{other:?}") }).collect();
-        assert_eq!(codes, vec![KeyCode::Char('a'), KeyCode::Char('b'), KeyCode::Up], "{keys:?}");
+        let keys = decode_startup_events(
+            b"a\x1b[<0;12;5M\x1b[I\x1b[97;5u\x1b]11;rgb:0/0/0\x1b\\\x1bP1$r0m\x1b\\b\x1b[O\x1b[A",
+        );
+        let codes: Vec<KeyCode> = keys
+            .iter()
+            .map(|k| match k {
+                Input::Key(k) => k.code,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            codes,
+            vec![KeyCode::Char('a'), KeyCode::Char('b'), KeyCode::Up],
+            "{keys:?}"
+        );
         let keys = decode_startup_events(b"x\x1b[200~rm -rf ~/j");
         assert!(matches!(&keys[0], Input::Key(k) if k.code == KeyCode::Char('x')));
-        assert!(matches!(&keys[1], Input::Paste(text) if text == "rm -rf ~/j"), "{keys:?}");
+        assert!(
+            matches!(&keys[1], Input::Paste(text) if text == "rm -rf ~/j"),
+            "{keys:?}"
+        );
         assert_eq!(keys.len(), 2);
     }
 
@@ -400,21 +484,41 @@ mod tests {
     fn completing_a_cut_sequence_never_blocks_on_a_silent_peer() {
         let started = std::time::Instant::now();
         let keys = complete_and_decode(b"j\x1b[1;5".to_vec(), || None);
-        assert!(matches!(keys.first(), Some(Input::Key(k)) if k.code == KeyCode::Char('j')), "{keys:?}");
+        assert!(
+            matches!(keys.first(), Some(Input::Key(k)) if k.code == KeyCode::Char('j')),
+            "{keys:?}"
+        );
         let mut more = b"B".to_vec().into_iter();
         let keys = complete_and_decode(b"\x1b[1;5".to_vec(), || more.next());
-        assert!(matches!(keys.as_slice(), [Input::Key(k)] if k.code == KeyCode::Down && k.modifiers == KeyModifiers::CONTROL), "{keys:?}");
+        assert!(
+            matches!(keys.as_slice(), [Input::Key(k)] if k.code == KeyCode::Down && k.modifiers == KeyModifiers::CONTROL),
+            "{keys:?}"
+        );
 
         let mut fds = [0; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let deadline = std::time::Instant::now() + Duration::from_millis(80);
-        assert_eq!(read_byte_before(fds[0], deadline), None, "an idle peer times out");
+        assert_eq!(
+            read_byte_before(fds[0], deadline),
+            None,
+            "an idle peer times out"
+        );
         assert_eq!(unsafe { libc::write(fds[1], b"zq".as_ptr().cast(), 2) }, 2);
         let deadline = std::time::Instant::now() + Duration::from_millis(500);
         assert_eq!(read_byte_before(fds[0], deadline), Some(b'z'));
-        assert_eq!(read_byte_before(fds[0], deadline), Some(b'q'), "one byte per read: nothing is buffered away");
-        unsafe { libc::close(fds[0]); libc::close(fds[1]); }
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(
+            read_byte_before(fds[0], deadline),
+            Some(b'q'),
+            "one byte per read: nothing is buffered away"
+        );
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
-
 }

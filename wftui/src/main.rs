@@ -30,7 +30,11 @@ struct Cli {
 }
 
 fn parse_cli() -> Result<Cli, String> {
-    let mut cli = Cli { site: None, print_config: false, init_config: false };
+    let mut cli = Cli {
+        site: None,
+        print_config: false,
+        init_config: false,
+    };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -88,7 +92,10 @@ fn main() -> std::process::ExitCode {
     let config_path = common::site::config_path();
     if cli.init_config {
         if config_path.exists() {
-            eprintln!("wftui: {} already exists; not overwriting it", config_path.display());
+            eprintln!(
+                "wftui: {} already exists; not overwriting it",
+                config_path.display()
+            );
             return std::process::ExitCode::from(2);
         }
         if let Some(dir) = config_path.parent() {
@@ -107,9 +114,9 @@ fn main() -> std::process::ExitCode {
     }
     // `None` is the generic edition's first run: nothing names a site yet,
     // and the client answers with its Setup screen rather than an error.
-    let (site, needs_setup) = match common::site::Config::load(&config_path)
-        .and_then(|cfg| common::site::resolve_or_setup(&cfg, cli.site.as_deref(), &common::config::config_dir()))
-    {
+    let (site, needs_setup) = match common::site::Config::load(&config_path).and_then(|cfg| {
+        common::site::resolve_or_setup(&cfg, cli.site.as_deref(), &common::config::config_dir())
+    }) {
         Ok(Some(site)) => (std::sync::Arc::new(site), false),
         Ok(None) if cli.print_config => {
             eprintln!(
@@ -118,7 +125,10 @@ fn main() -> std::process::ExitCode {
             );
             return std::process::ExitCode::from(2);
         }
-        Ok(None) => (std::sync::Arc::new(common::site::SiteConfig::placeholder()), true),
+        Ok(None) => (
+            std::sync::Arc::new(common::site::SiteConfig::placeholder()),
+            true,
+        ),
         Err(e) => {
             eprintln!("wftui: {e}");
             return std::process::ExitCode::from(2);
@@ -126,7 +136,10 @@ fn main() -> std::process::ExitCode {
     };
     if cli.print_config {
         println!("{site:#?}");
-        println!("token store: {}", common::config::token_path_for(&site.name).display());
+        println!(
+            "token store: {}",
+            common::config::token_path_for(&site.name).display()
+        );
         println!("user agent:  {}", site.user_agent());
         println!("scopes:      {}", site.effective_scopes().join(" "));
         return std::process::ExitCode::SUCCESS;
@@ -188,7 +201,13 @@ fn main() -> std::process::ExitCode {
         .build()
         .expect("tokio runtime");
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rt.block_on(app::run(images, update_cfg, just_applied, site, needs_setup))
+        rt.block_on(app::run(
+            images,
+            update_cfg,
+            just_applied,
+            site,
+            needs_setup,
+        ))
     }));
     match result {
         Ok(code) => code.into(),
@@ -214,11 +233,19 @@ fn site_logo(site: &common::site::SiteConfig) -> Option<std::sync::Arc<[u8]>> {
         Some(path) => match std::fs::read(path) {
             Ok(bytes) if bytes.len() <= images::MAX_IMAGE_BYTES => Some(bytes.into()),
             Ok(bytes) => {
-                tracing::warn!("logo {} is {} bytes, over the {} cap; using the text mark", path.display(), bytes.len(), images::MAX_IMAGE_BYTES);
+                tracing::warn!(
+                    "logo {} is {} bytes, over the {} cap; using the text mark",
+                    path.display(),
+                    bytes.len(),
+                    images::MAX_IMAGE_BYTES
+                );
                 None
             }
             Err(e) => {
-                tracing::warn!("logo {} unreadable ({e}); using the text mark", path.display());
+                tracing::warn!(
+                    "logo {} unreadable ({e}); using the text mark",
+                    path.display()
+                );
                 None
             }
         },

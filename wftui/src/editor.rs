@@ -268,7 +268,9 @@ fn grapheme_boundary(chars: &[char], cursor: usize) -> usize {
 /// aligned; measuring the complete string also keeps variation selectors and
 /// ZWJ sequences consistent with the terminal buffer's width calculation.
 fn span_cells(chars: &[char], a: usize, b: usize) -> usize {
-    let text: String = chars[a.min(chars.len())..b.min(chars.len())].iter().collect();
+    let text: String = chars[a.min(chars.len())..b.min(chars.len())]
+        .iter()
+        .collect();
     crate::chrome::cell_width(&text)
 }
 
@@ -331,7 +333,10 @@ fn wrap_logical_line(
             fit += 1;
         }
         if fit == clusters.len() {
-            rows.push(VisualRow { start: clusters[first].start, end });
+            rows.push(VisualRow {
+                start: clusters[first].start,
+                end,
+            });
             return;
         }
         let mut next = if chars[clusters[fit].start].is_whitespace() {
@@ -344,7 +349,10 @@ fn wrap_logical_line(
         }
         // Even a cluster wider than the pane must remain whole.
         next = next.max(first + 1);
-        rows.push(VisualRow { start: clusters[first].start, end: clusters[next - 1].end });
+        rows.push(VisualRow {
+            start: clusters[first].start,
+            end: clusters[next - 1].end,
+        });
         first = next;
     }
     if clusters.is_empty() {
@@ -427,10 +435,14 @@ impl LineMetrics {
 }
 
 fn segment_metrics(chars: &[char], starts: &[usize], end: usize) -> Vec<LineMetrics> {
-    starts.iter().enumerate().map(|(i, &start)| {
-        let end = starts.get(i + 1).map_or(end, |next| next.saturating_sub(1));
-        LineMetrics::new(&chars[start..end])
-    }).collect()
+    starts
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| {
+            let end = starts.get(i + 1).map_or(end, |next| next.saturating_sub(1));
+            LineMetrics::new(&chars[start..end])
+        })
+        .collect()
 }
 
 impl WrapCache {
@@ -524,7 +536,8 @@ impl WrapCache {
         let delta = new_end as isize - old_end as isize;
         let replaced = starts.len();
         self.rewrapped = rows.iter().map(Vec::len).sum();
-        self.line_metrics.splice(first..=last, segment_metrics(&self.chars, &starts, end));
+        self.line_metrics
+            .splice(first..=last, segment_metrics(&self.chars, &starts, end));
         self.line_starts.splice(first..=last, starts);
         self.line_rows.splice(first..=last, rows);
         // Everything after the replaced span keeps its wrap; only its
@@ -654,10 +667,14 @@ impl WrapCache {
         let first = metrics.boundary(r.start - base).0;
         let last = metrics.boundary(r.end - base).0;
         let target = metrics.cells[first].saturating_add(col);
-        let index = metrics.cells[first..=last].partition_point(|&cell| cell <= target)
-            .saturating_sub(1) + first;
-        base + metrics.clusters.get(index).map_or(r.end - base, |c| c.start)
-
+        let index = metrics.cells[first..=last]
+            .partition_point(|&cell| cell <= target)
+            .saturating_sub(1)
+            + first;
+        base + metrics
+            .clusters
+            .get(index)
+            .map_or(r.end - base, |c| c.start)
     }
 
     /// Move the caret `delta` visual rows, keeping the desired column — the
@@ -897,10 +914,7 @@ pub fn move_vertical(
     // row after the target: Up/Down moves sideways instead, and since
     // `desired` stays sticky, every further press repeats the same non-move
     // (issue #544). Clamp to the row's last real character instead.
-    if i == r.end
-        && i > r.start
-        && rows.get(target + 1).is_some_and(|next| next.start == r.end)
-    {
+    if i == r.end && i > r.start && rows.get(target + 1).is_some_and(|next| next.start == r.end) {
         i = cluster_start_before(&chars, i);
     }
     *cursor = i;
@@ -1008,9 +1022,9 @@ pub fn normalize_control_chars(s: &str) -> String {
                 col = next_stop;
             }
             grapheme
-                if grapheme
-                    .chars()
-                    .any(|c| (c as u32) < 0x20 || c == '\u{7f}' || ('\u{80}'..='\u{9f}').contains(&c)) =>
+                if grapheme.chars().any(|c| {
+                    (c as u32) < 0x20 || c == '\u{7f}' || ('\u{80}'..='\u{9f}').contains(&c)
+                }) =>
             {
                 // DEL and C1: ratatui's rendering of them is undefined (#652).
             }
@@ -1120,7 +1134,9 @@ mod tests {
     /// A deterministic pseudo-random stream, so the corpus below is varied
     /// but the failure is always the same failure.
     fn lcg(seed: &mut u64) -> u64 {
-        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *seed >> 33
     }
 
@@ -1163,7 +1179,11 @@ mod tests {
                     }
                     _ => {
                         let n = text.chars().count();
-                        let at = if n == 0 { 0 } else { (lcg(&mut seed) as usize) % (n + 1) };
+                        let at = if n == 0 {
+                            0
+                        } else {
+                            (lcg(&mut seed) as usize) % (n + 1)
+                        };
                         let block: String = (0..8)
                             .map(|_| alphabet[(lcg(&mut seed) as usize) % alphabet.len()])
                             .collect();
@@ -1222,13 +1242,25 @@ mod tests {
         let text = "line one\nline two\n";
         let mut cache = WrapCache::default();
         cache.sync(text, 40, 0);
-        assert_eq!(cache.fast_paths(), 0, "the first sync has no cache to match");
+        assert_eq!(
+            cache.fast_paths(),
+            0,
+            "the first sync has no cache to match"
+        );
 
         cache.sync(text, 40, 0);
-        assert_eq!(cache.fast_paths(), 1, "the unchanged frame returns immediately");
+        assert_eq!(
+            cache.fast_paths(),
+            1,
+            "the unchanged frame returns immediately"
+        );
 
         cache.sync(text, 40, 1);
-        assert_eq!(cache.fast_paths(), 1, "a bumped epoch is an edit and re-locates");
+        assert_eq!(
+            cache.fast_paths(),
+            1,
+            "a bumped epoch is an edit and re-locates"
+        );
         assert_eq!(
             cache.rewrapped_rows_for_test(text, 40, 1),
             0,
@@ -1268,7 +1300,11 @@ mod tests {
         assert!(rows_before >= 20_000, "test setup: a big draft");
 
         // Type one character into the middle line.
-        let at = text.char_indices().nth(text.chars().count() / 2).expect("a midpoint").0;
+        let at = text
+            .char_indices()
+            .nth(text.chars().count() / 2)
+            .expect("a midpoint")
+            .0;
         text.insert(at, 'x');
         let touched = cache.rewrapped_rows_for_test(&text, 40, 1);
         assert!(
@@ -1278,7 +1314,10 @@ mod tests {
 
         // …and the result is still exactly the reference wrap.
         let chars: Vec<char> = text.chars().collect();
-        assert_eq!(cache.window(0, cache.row_count()), visual_rows_of(&chars, 40));
+        assert_eq!(
+            cache.window(0, cache.row_count()),
+            visual_rows_of(&chars, 40)
+        );
     }
 
     #[test]
@@ -1333,17 +1372,40 @@ mod tests {
         let warning = "\u{26a0}\u{fe0f}";
         assert_eq!(crate::chrome::cell_width(warning), 2);
         let text = format!("{warning}{warning}");
-        assert_eq!(visual_rows(&text, 2), vec![VisualRow { start: 0, end: 2 }, VisualRow { start: 2, end: 4 }]);
-        assert_eq!(caret_position(&text, 2, 2), (1, 0), "the boundary belongs to the following visual row");
-        assert_eq!(caret_position(&text, 2, 1), (0, 0), "an interior scalar clamps before the cluster");
+        assert_eq!(
+            visual_rows(&text, 2),
+            vec![
+                VisualRow { start: 0, end: 2 },
+                VisualRow { start: 2, end: 4 }
+            ]
+        );
+        assert_eq!(
+            caret_position(&text, 2, 2),
+            (1, 0),
+            "the boundary belongs to the following visual row"
+        );
+        assert_eq!(
+            caret_position(&text, 2, 1),
+            (0, 0),
+            "an interior scalar clamps before the cluster"
+        );
 
         // A ZWJ family must also stay whole when the pane is narrow.
         let family = "👨\u{200d}👩\u{200d}👦";
         assert_eq!(crate::chrome::cell_width(family), 2);
         let family_text = format!("{family}{family}");
-        assert_eq!(visual_rows(&family_text, 2), vec![VisualRow { start: 0, end: 5 }, VisualRow { start: 5, end: 10 }]);
+        assert_eq!(
+            visual_rows(&family_text, 2),
+            vec![
+                VisualRow { start: 0, end: 5 },
+                VisualRow { start: 5, end: 10 }
+            ]
+        );
         assert_eq!(hwindow(&text, text.chars().count(), 3), (2, 2));
-        assert_eq!(normalize_control_chars(&format!("{warning}\tx")), format!("{warning}  x"));
+        assert_eq!(
+            normalize_control_chars(&format!("{warning}\tx")),
+            format!("{warning}  x")
+        );
     }
 
     #[test]
@@ -1361,7 +1423,11 @@ mod tests {
         assert_eq!(follow_caret(0, 12, 40, 10), 3);
         assert_eq!(follow_caret(20, 5, 40, 10), 5);
         assert_eq!(follow_caret(0, 39, 40, 10), 30);
-        assert_eq!(follow_caret(9, 0, 3, 10), 0, "never scrolls past the last row");
+        assert_eq!(
+            follow_caret(9, 0, 3, 10),
+            0,
+            "never scrolls past the last row"
+        );
     }
 
     /// Issue #558: the row model must be `usize` end to end. A pasted
@@ -1399,12 +1465,21 @@ mod tests {
     fn vertical_motion_does_not_stick_at_a_hard_split_continuation_boundary() {
         let text = "x".repeat(10);
         let rows = visual_rows(&text, 5);
-        assert_eq!(rows, vec![VisualRow { start: 0, end: 5 }, VisualRow { start: 5, end: 10 }]);
+        assert_eq!(
+            rows,
+            vec![
+                VisualRow { start: 0, end: 5 },
+                VisualRow { start: 5, end: 10 }
+            ]
+        );
 
         let mut cursor = 10usize; // end of text: row 1, col 5
         let mut desired: Option<usize> = None;
         move_vertical(&text, 5, &mut cursor, &mut desired, -1);
-        assert_eq!(cursor, 4, "must land on row 0's last real character, not row 1 col 0");
+        assert_eq!(
+            cursor, 4,
+            "must land on row 0's last real character, not row 1 col 0"
+        );
 
         // A second Up must actually do nothing more (already at row 0) —
         // not repeat the same sideways non-move.
@@ -1423,13 +1498,19 @@ mod tests {
         cache.sync(&text, 5, 1);
         assert_eq!(
             cache.window(0, cache.row_count()),
-            vec![VisualRow { start: 0, end: 5 }, VisualRow { start: 5, end: 10 }]
+            vec![
+                VisualRow { start: 0, end: 5 },
+                VisualRow { start: 5, end: 10 }
+            ]
         );
 
         let mut cursor = 10usize; // end of text: row 1, col 5
         let mut desired: Option<usize> = None;
         cache.move_vertical(&mut cursor, &mut desired, -1);
-        assert_eq!(cursor, 4, "must land on row 0's last real character, not row 1 col 0");
+        assert_eq!(
+            cursor, 4,
+            "must land on row 0's last real character, not row 1 col 0"
+        );
 
         cache.move_vertical(&mut cursor, &mut desired, -1);
         assert_eq!(cursor, 4, "already at the top row: Up is a no-op");
@@ -1443,12 +1524,21 @@ mod tests {
     fn vertical_motion_does_not_stick_at_a_hanging_whitespace_continuation_boundary() {
         let text = "hello world";
         let rows = visual_rows(text, 5);
-        assert_eq!(rows, vec![VisualRow { start: 0, end: 6 }, VisualRow { start: 6, end: 11 }]);
+        assert_eq!(
+            rows,
+            vec![
+                VisualRow { start: 0, end: 6 },
+                VisualRow { start: 6, end: 11 }
+            ]
+        );
 
         let mut cursor = 11usize; // end of "world": row 1, col 5
         let mut desired: Option<usize> = None;
         move_vertical(text, 5, &mut cursor, &mut desired, -1);
-        assert!(cursor < 6, "must stay inside row 0, not spill onto row 1's start: got {cursor}");
+        assert!(
+            cursor < 6,
+            "must stay inside row 0, not spill onto row 1's start: got {cursor}"
+        );
     }
 
     #[test]
@@ -1540,7 +1630,10 @@ mod tests {
         assert_eq!(normalize_control_chars("a\u{85}b"), "ab");
         // U+6F22 is two cells wide: col 2 -> the next stop is 4, two spaces.
         let cjk = "\u{6f22}";
-        assert_eq!(normalize_control_chars(&format!("{cjk}\tx")), format!("{cjk}  x"));
+        assert_eq!(
+            normalize_control_chars(&format!("{cjk}\tx")),
+            format!("{cjk}  x")
+        );
     }
 
     /// Issue #559: a tab expands to spaces up to the next 4-column stop, and
@@ -1596,7 +1689,11 @@ mod tests {
     fn caret_at_cell_counts_wide_characters_as_two_columns() {
         let text = "\u{6f22}\u{5b57}\u{30c6}"; // 3 ideographs, 6 cells
         assert_eq!(caret_at_cell(text, 20, 0, 0), 0);
-        assert_eq!(caret_at_cell(text, 20, 0, 1), 0, "the left half is still that character");
+        assert_eq!(
+            caret_at_cell(text, 20, 0, 1),
+            0,
+            "the left half is still that character"
+        );
         assert_eq!(caret_at_cell(text, 20, 0, 2), 1);
         assert_eq!(caret_at_cell(text, 20, 0, 4), 2);
         assert_eq!(caret_at_cell(text, 20, 0, 6), 3);
@@ -1613,7 +1710,10 @@ mod tests {
         // Caret at the end with room for 10 cells: `hwindow` scrolled the
         // field, so column 0 is no longer character 0.
         let (start, _) = hwindow(text, text.chars().count(), 10);
-        assert!(start > 0, "the field must have scrolled for this to mean anything");
+        assert!(
+            start > 0,
+            "the field must have scrolled for this to mean anything"
+        );
         assert_eq!(field_caret_at(text, text.chars().count(), 10, 0), start);
         assert_eq!(field_caret_at(text, text.chars().count(), 10, 2), start + 2);
         // A click past the text lands at its end.

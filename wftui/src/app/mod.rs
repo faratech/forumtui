@@ -3,11 +3,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Style;
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 use tokio::sync::mpsc;
 
 use common::api::{Toggle, WfApi, WfApiClient};
@@ -86,7 +86,10 @@ impl TaskErrorKind {
     /// `TaskError::is_account_gone()` recognizes by `code` for the one
     /// caller (`Msg::Bootstrap`) that needs them.
     pub fn ends_session(self) -> bool {
-        matches!(self, TaskErrorKind::NoToken | TaskErrorKind::OAuth | TaskErrorKind::Api(401))
+        matches!(
+            self,
+            TaskErrorKind::NoToken | TaskErrorKind::OAuth | TaskErrorKind::Api(401)
+        )
     }
 }
 
@@ -117,9 +120,7 @@ fn shellexpand_home(path: &str) -> String {
     if !rest.is_empty() && !rest.starts_with('/') && !rest.starts_with('\\') {
         return trimmed.to_string();
     }
-    let Some(home) = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-    else {
+    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
         return trimmed.to_string();
     };
     let mut out = std::path::PathBuf::from(home);
@@ -217,7 +218,9 @@ impl TaskError {
         if !matches!(self.kind, TaskErrorKind::Api(403)) {
             return false;
         }
-        let Some(code) = self.code.as_deref() else { return false };
+        let Some(code) = self.code.as_deref() else {
+            return false;
+        };
         let code = code.strip_prefix("api_error.").unwrap_or(code);
         matches!(
             code,
@@ -230,7 +233,12 @@ impl TaskError {
 
     pub fn of(e: &Error) -> Self {
         match e {
-            Error::Api { code, message, status, max_page } => TaskError {
+            Error::Api {
+                code,
+                message,
+                status,
+                max_page,
+            } => TaskError {
                 message: if code == "http_error" {
                     cap_message(message, RAW_MESSAGE_CAP)
                 } else if code.strip_prefix("api_error.").unwrap_or(code) == "missing_scope" {
@@ -291,7 +299,10 @@ pub enum Msg {
     /// unwraps this at the message boundary only when the generation is still
     /// current; queued results from a session that ended are discarded before
     /// they can mutate screens, badges, drafts, or start follow-up work.
-    Session { generation: u64, msg: Box<Msg> },
+    Session {
+        generation: u64,
+        msg: Box<Msg>,
+    },
     /// The stored-session check came back. `generation` is the
     /// `App::bootstrap_generation` the check was started under: `end_session`
     /// (and so `logout`) bumps it, so a restore that was already in flight
@@ -301,9 +312,15 @@ pub enum Msg {
     /// `Ok` and "nothing to adopt" (`Err(NoToken)`), so its own verdict is
     /// never confused with a poller's `SessionLost` landing in the same
     /// recovery window (issue #587).
-    Bootstrap { generation: u64, result: Result<User, TaskError> },
+    Bootstrap {
+        generation: u64,
+        result: Result<User, TaskError>,
+    },
     /// Candidate credentials remain private until this event-loop handoff.
-    RecoveryVerified { generation: u64, verified: Box<common::api::VerifiedSession> },
+    RecoveryVerified {
+        generation: u64,
+        verified: Box<common::api::VerifiedSession>,
+    },
     /// A background task decided the session itself is over — only the
     /// pollers send this (they otherwise drop their errors); the token-store
     /// recheck deliberately does not (issue #587), so this message shape
@@ -319,13 +336,29 @@ pub enum Msg {
     /// issue #547.
     /// A link is ready and `mode` says which flow is behind it (never
     /// `Auto`: the relay probe has already happened by now).
-    LoginReady { generation: u64, url: String, mode: common::site::LoginMode },
-    LoginFailed { generation: u64, message: String },
+    LoginReady {
+        generation: u64,
+        url: String,
+        mode: common::site::LoginMode,
+    },
+    LoginFailed {
+        generation: u64,
+        message: String,
+    },
     /// A flow that is still running has something to say — a rejected
     /// paste, say. Shown as the screen's error line; nothing else changes.
-    LoginNotice { generation: u64, message: String },
-    LoginComplete { generation: u64, result: Result<User, TaskError> },
-    NodesLoaded { load_id: u64, result: TaskResult<Vec<Node>> },
+    LoginNotice {
+        generation: u64,
+        message: String,
+    },
+    LoginComplete {
+        generation: u64,
+        result: Result<User, TaskError>,
+    },
+    NodesLoaded {
+        load_id: u64,
+        result: TaskResult<Vec<Node>>,
+    },
     /// A forum page came back. `node_id` is the forum that was asked for, so
     /// a reply that outraced a newer request is dropped instead of landing in
     /// whichever list happens to be on top (`Gate::wait` only spaces request
@@ -333,8 +366,19 @@ pub enum Msg {
     /// `append` marks a viewport-fill page (#699): it extends the list
     /// rather than replacing it, so a tall terminal is not left showing 20
     /// rows in a pane with room for 45.
-    ForumLoaded { node_id: u32, page: u32, append: bool, seq: u64, result: TaskResult<ForumReply> },
-    ThreadLoaded { id: u32, page: u32, load_id: u64, result: TaskResult<ThreadReply> },
+    ForumLoaded {
+        node_id: u32,
+        page: u32,
+        append: bool,
+        seq: u64,
+        result: TaskResult<ForumReply>,
+    },
+    ThreadLoaded {
+        id: u32,
+        page: u32,
+        load_id: u64,
+        result: TaskResult<ThreadReply>,
+    },
     ReplySent {
         composer: common::drafts::DraftKey,
         result: TaskResult<Post>,
@@ -344,7 +388,11 @@ pub enum Msg {
         result: TaskResult<Thread>,
     },
     MarkedRead(TaskResult<()>),
-    ConversationsLoaded { page: u32, load_id: u64, result: TaskResult<ConversationsReply> },
+    ConversationsLoaded {
+        page: u32,
+        load_id: u64,
+        result: TaskResult<ConversationsReply>,
+    },
     /// A conversation page came back. `mark_read` says whether this load was
     /// the USER opening the conversation — only then may the client tell the
     /// server it has been read. The dual-pane Inbox primes its right half with
@@ -361,7 +409,10 @@ pub enum Msg {
     /// Carries no error arm on purpose: a draft sync that fails is a no-op
     /// the user cannot act on, so the failure is logged where it happens and
     /// never reaches the session boundary.
-    DraftsLoaded { epoch: u64, drafts: Vec<common::models::RemoteDraft> },
+    DraftsLoaded {
+        epoch: u64,
+        drafts: Vec<common::models::RemoteDraft>,
+    },
     ConvoReplySent {
         composer: common::drafts::DraftKey,
         result: TaskResult<()>,
@@ -376,17 +427,37 @@ pub enum Msg {
     /// `TaskResult` so a transport/429/5xx/401 failure is not flattened into
     /// "not found" — and so a session-ending one still reaches the boundary
     /// (issue #597).
-    RecipientResolved { name: String, id: TaskResult<Option<u32>> },
-    AlertsLoaded { load_id: u64, result: TaskResult<AlertsReply> },
+    RecipientResolved {
+        name: String,
+        id: TaskResult<Option<u32>>,
+    },
+    AlertsLoaded {
+        load_id: u64,
+        result: TaskResult<AlertsReply>,
+    },
     AlertMarked(TaskResult<()>),
-    AlertsViewed { view_id: u64, result: TaskResult<()> },
+    AlertsViewed {
+        view_id: u64,
+        result: TaskResult<()>,
+    },
     /// Media Gallery / Resource Manager catalog pages (issue #680). Replies
     /// adopt the topmost matching screen; the screens' loading guards keep
     /// one fetch in flight, so page stamping is enough identity.
-    MediaLoaded { page: u32, load_id: u64, result: TaskResult<MediaListReply> },
-    ResourceLoaded { page: u32, load_id: u64, result: TaskResult<ResourceListReply> },
+    MediaLoaded {
+        page: u32,
+        load_id: u64,
+        result: TaskResult<MediaListReply>,
+    },
+    ResourceLoaded {
+        page: u32,
+        load_id: u64,
+        result: TaskResult<ResourceListReply>,
+    },
     /// The gallery's category tree, and one resource's page (#697).
-    MediaCategoriesLoaded { load_id: u64, result: TaskResult<common::models::MediaCategoriesReply> },
+    MediaCategoriesLoaded {
+        load_id: u64,
+        result: TaskResult<common::models::MediaCategoriesReply>,
+    },
     /// An attachment upload finished (#709): the key it went under and the
     /// file, or why not. A `TaskResult`, like every other write's (issue
     /// #88): flattening this one to a display string kept a 401/NoToken
@@ -396,23 +467,54 @@ pub enum Msg {
         result: TaskResult<(String, common::models::Attachment)>,
     },
     /// Post edits, deletions and solution toggles (#708).
-    PostEdited { post_id: u32, result: TaskResult<()> },
-    PostDeleted { post_id: u32, thread_id: u32, result: TaskResult<()> },
-    SolutionMarked { post_id: u32, thread_id: u32, result: TaskResult<()> },
-    ResourceViewLoaded { id: u32, load_id: u64, result: TaskResult<common::models::ResourceReply> },
-    SearchDone { generation: u64, page: u32, result: TaskResult<SearchResultsReply> },
+    PostEdited {
+        post_id: u32,
+        result: TaskResult<()>,
+    },
+    PostDeleted {
+        post_id: u32,
+        thread_id: u32,
+        result: TaskResult<()>,
+    },
+    SolutionMarked {
+        post_id: u32,
+        thread_id: u32,
+        result: TaskResult<()>,
+    },
+    ResourceViewLoaded {
+        id: u32,
+        load_id: u64,
+        result: TaskResult<common::models::ResourceReply>,
+    },
+    SearchDone {
+        generation: u64,
+        page: u32,
+        result: TaskResult<SearchResultsReply>,
+    },
     /// A go-to palette member lookup came back. `query` is the palette query
     /// that asked, so a stale answer to an edited query is dropped.
-    PaletteMember { query: String, user: Option<User> },
+    PaletteMember {
+        query: String,
+        user: Option<User>,
+    },
     /// A profile fetch came back. `generation` is the `open_profile` request
     /// the screen is waiting on; an older reply (profile A opened again, or
     /// B pushed over a slow A) is dropped instead of filling the topmost
     /// profile screen.
-    ProfileLoaded { generation: u64, result: TaskResult<User> },
+    ProfileLoaded {
+        generation: u64,
+        result: TaskResult<User>,
+    },
     /// Local token snapshot is complete. Login may be started after this
     /// point; remote revocation can continue in the background.
-    LogoutSnapshot { generation: u64, result: Result<(), String> },
-    LoggedOut { generation: u64, result: Result<(), String> },
+    LogoutSnapshot {
+        generation: u64,
+        result: Result<(), String>,
+    },
+    LoggedOut {
+        generation: u64,
+        result: Result<(), String>,
+    },
     /// A thumbnail / avatar / the sign-in logo finished loading off-thread.
     /// Only sent by the `images` feature's loader.
     /// `key` is `images::Pending::store_key()` — size and fetch budget identify
@@ -425,7 +527,10 @@ pub enum Msg {
     /// A like or a vote came back. XF toggles both, so the reply's
     /// insert-vs-delete is what decides the wording, and the ♡/▲ footer is
     /// baked into the post lines, so the page is re-fetched (issue #538).
-    PostToggled { verb: PostVerb, result: TaskResult<Toggle> },
+    PostToggled {
+        verb: PostVerb,
+        result: TaskResult<Toggle>,
+    },
     /// The self-update check answered (#722). Not session work: it carries
     /// its own `generation` (`App::update_generation`) and is never wrapped
     /// in `Session`, so a sign-out mid-check does not lose it.
@@ -440,11 +545,17 @@ pub enum Msg {
     /// Ask the AI: one piece of the answer in flight. `turn` is the
     /// `App::ask_generation` the question was asked under; a stopped turn's
     /// stragglers carry an older one and are dropped.
-    AskAiEvent { turn: u64, event: common::ai::AiEvent },
+    AskAiEvent {
+        turn: u64,
+        event: common::ai::AiEvent,
+    },
     /// The turn's request is over. Its `Err` is the refusal before any
     /// answer started (429, `history_required`, a 401) — the one that may
     /// end the session, like any other call's.
-    AskAiDone { turn: u64, result: TaskResult<()> },
+    AskAiDone {
+        turn: u64,
+        result: TaskResult<()>,
+    },
     /// The member's assistant allowance, for the panel's cap.
     AiUsageLoaded(TaskResult<common::ai::AiUsage>),
     Notice(String),
@@ -479,25 +590,47 @@ async fn relay_draft_operation(
     operation: common::drafts::RelayOperation,
     transient: Option<&common::drafts::Draft>,
 ) -> common::error::Result<bool> {
-    let Some(xf_key) = key.xf_key() else { return Ok(false); };
+    let Some(xf_key) = key.xf_key() else {
+        return Ok(false);
+    };
     let _relay_lock = loop {
         let store = store.clone();
-        let attempt = tokio::task::spawn_blocking(move || store.try_relay_lock(key)).await
-            .map_err(|error| common::error::Error::TokenStore(format!("draft relay lock: {error}")))??;
-        if let Some(lock) = attempt { break lock; }
+        let attempt = tokio::task::spawn_blocking(move || store.try_relay_lock(key))
+            .await
+            .map_err(|error| {
+                common::error::Error::TokenStore(format!("draft relay lock: {error}"))
+            })??;
+        if let Some(lock) = attempt {
+            break lock;
+        }
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
-    let Some(draft) = store.relay_work(owner, key, operation, transient)? else { return Ok(false); };
+    let Some(draft) = store.relay_work(owner, key, operation, transient)? else {
+        return Ok(false);
+    };
     let result = match operation.kind {
-        common::drafts::RelayKind::Save => api.save_draft(&xf_key, &draft.body, &draft.title, draft.attachment_key.as_deref()).await,
+        common::drafts::RelayKind::Save => {
+            api.save_draft(
+                &xf_key,
+                &draft.body,
+                &draft.title,
+                draft.attachment_key.as_deref(),
+            )
+            .await
+        }
         common::drafts::RelayKind::Delete => api.delete_draft(&xf_key).await,
     };
     match result {
-        Ok(()) => { store.settle(owner, key, operation)?; Ok(false) }
+        Ok(()) => {
+            store.settle(owner, key, operation)?;
+            Ok(false)
+        }
         // The relay will never mirror a draft for a target this member
         // cannot see (forumtui#126): settle the obligation instead of
         // retrying it every sync. The words stay in the local store.
-        Err(common::error::Error::Api { status: 403, code, .. }) if code == "wf_tuilink_draft_target_unavailable" => {
+        Err(common::error::Error::Api {
+            status: 403, code, ..
+        }) if code == "wf_tuilink_draft_target_unavailable" => {
             store.settle(owner, key, operation)?;
             Ok(false)
         }
@@ -740,8 +873,11 @@ pub struct App {
     /// Current desired relay operations, including memory-only oversized or
     /// temporarily unpersistable drafts. Disk remains authoritative across
     /// processes; callbacks retire only their exact operation revision.
-    draft_operations: Arc<std::sync::Mutex<std::collections::HashMap<common::drafts::DraftKey, common::drafts::RelayOperation>>>,
-
+    draft_operations: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<common::drafts::DraftKey, common::drafts::RelayOperation>,
+        >,
+    >,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -835,7 +971,7 @@ pub(crate) fn restore_terminal() {
         DisableBracketedPaste, DisableMouseCapture, PopKeyboardEnhancementFlags,
     };
     use ratatui::crossterm::execute;
-    use ratatui::crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
+    use ratatui::crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
 
     let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
@@ -917,15 +1053,14 @@ pub async fn run(
             return 1;
         }
     };
-    let mut terminal = match ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(
-        std::io::stdout(),
-    )) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("terminal init failed: {e}");
-            return 1;
-        }
-    };
+    let mut terminal =
+        match ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("terminal init failed: {e}");
+                return 1;
+            }
+        };
 
     let _guard = match TerminalGuard::new() {
         Ok(g) => g,
@@ -1045,7 +1180,7 @@ pub async fn run(
 /// mode is entered; ends only if a stream fails to register.
 #[cfg(unix)]
 async fn forward_signals(tx: mpsc::UnboundedSender<Msg>) {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut term = match signal(SignalKind::terminate()) {
         Ok(s) => s,
         Err(_) => return,
@@ -1193,7 +1328,10 @@ impl App {
                 if !first_frame_logged {
                     first_frame_logged = true;
                     if let Some(start) = crate::PROCESS_START.get() {
-                        tracing::info!("first frame drawn {} ms after process start", start.elapsed().as_millis());
+                        tracing::info!(
+                            "first frame drawn {} ms after process start",
+                            start.elapsed().as_millis()
+                        );
                     }
                 }
                 last_step = step;
@@ -1374,7 +1512,8 @@ impl App {
             // Status belongs to this viewer's current size and byte budget.
             // A thumbnail failure cannot block it, and a previous thumbnail
             // success cannot conceal a failed full-size request.
-            (v.loading, v.error) = v.image_request(body, &self.theme, &self.glyphs)
+            (v.loading, v.error) = v
+                .image_request(body, &self.theme, &self.glyphs)
                 .map(|request| self.images.request_state(&request))
                 .unwrap_or((false, None));
         }
@@ -1398,10 +1537,8 @@ impl App {
         // cell colours) and the overlay's own `Clear` erases the rect for that
         // frame. Closing the overlay makes the cells differ again, so the next
         // frame re-emits the image without any extra bookkeeping.
-        let overlay_open = self.palette.is_some()
-            || self.show_help
-            || self.prefix.armed()
-            || capture_active(self);
+        let overlay_open =
+            self.palette.is_some() || self.show_help || self.prefix.armed() || capture_active(self);
         if !overlay_open {
             let reqs: Vec<crate::images::Request> = self
                 .screens
@@ -1628,7 +1765,8 @@ impl App {
                 return Some(permission);
             }
         }
-        self.tree().and_then(|tree| tree.nodes.iter().find(|node| node.node_id == node_id))
+        self.tree()
+            .and_then(|tree| tree.nodes.iter().find(|node| node.node_id == node_id))
             .and_then(Node::thread_creation_permission)
     }
 
@@ -1641,7 +1779,9 @@ impl App {
         if let Some((node_id, title)) = self.current_forum() {
             if self.forum_thread_creation_permission(node_id) != Some(false) {
                 items.push(Item::action(
-                    format!("New thread in {title}"), "N", Target::NewThread(node_id),
+                    format!("New thread in {title}"),
+                    "N",
+                    Target::NewThread(node_id),
                 ));
             }
             items.push(Item::action(
@@ -1722,7 +1862,11 @@ impl App {
         let session_generation = self.session_generation;
         self.spawn_session_task(async move {
             let user = api.find_user(&query).await.unwrap_or(None);
-            tx.send(session_msg(session_generation, Msg::PaletteMember { query, user })).ok();
+            tx.send(session_msg(
+                session_generation,
+                Msg::PaletteMember { query, user },
+            ))
+            .ok();
         });
     }
 
@@ -1732,7 +1876,9 @@ impl App {
     /// a row still marks that one read.
     ///
     fn mark_alerts_viewed(&mut self) {
-        if self.client.requests_paused() { return; }
+        if self.client.requests_paused() {
+            return;
+        }
         let view_id = self.next_load_id();
         let Some(inbox) = self.inbox_mut() else {
             return;
@@ -1746,8 +1892,15 @@ impl App {
         let tx = self.tx.clone();
         let session_generation = self.session_generation;
         self.spawn_session_task(async move {
-            let result = api.mark_alerts_viewed().await.map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::AlertsViewed { view_id, result })).ok();
+            let result = api
+                .mark_alerts_viewed()
+                .await
+                .map_err(|e| TaskError::of(&e));
+            tx.send(session_msg(
+                session_generation,
+                Msg::AlertsViewed { view_id, result },
+            ))
+            .ok();
         });
     }
 
@@ -1782,7 +1935,10 @@ impl App {
         if let Some(Screen::ThreadView(view)) = &gone {
             let id = view.thread.thread_id;
             if self.keep_thread_position.is_some_and(|(kid, ..)| kid == id)
-                && !self.screens.iter().any(|s| matches!(s, Screen::ThreadView(v) if v.thread.thread_id == id))
+                && !self
+                    .screens
+                    .iter()
+                    .any(|s| matches!(s, Screen::ThreadView(v) if v.thread.thread_id == id))
             {
                 self.keep_thread_position = None;
             }
@@ -1826,7 +1982,11 @@ impl App {
             return;
         };
         let (edit_thread_id, edit_thread_title, edit_seed_body) = match c.target.as_ref() {
-            Some(ComposeTarget::EditPost { thread_id, thread_title, .. }) => (
+            Some(ComposeTarget::EditPost {
+                thread_id,
+                thread_title,
+                ..
+            }) => (
                 Some(*thread_id),
                 Some(thread_title.clone()),
                 Some(c.seed_body.clone()),
@@ -1857,7 +2017,9 @@ impl App {
         let saved = self.persist_draft(key);
         self.draft_mutations.insert(key, self.draft_epoch);
         self.draft_deletions.remove(&key);
-        if relay { self.relay_draft(key); }
+        if relay {
+            self.relay_draft(key);
+        }
         if !feedback {
             return;
         }
@@ -1928,7 +2090,9 @@ impl App {
         self.persist_draft(key);
         self.draft_mutations.insert(key, self.draft_epoch);
         self.draft_deletions.insert(key, self.draft_epoch);
-        if relay { self.relay_draft(key); }
+        if relay {
+            self.relay_draft(key);
+        }
     }
 
     /// Forget every draft, in memory and on disk. For the two moments where
@@ -1947,7 +2111,8 @@ impl App {
             self.drafts.clear();
         }
         if let Some(owner) = self.draft_owner.take()
-            && let Err(e) = self.draft_store.erase(&owner) {
+            && let Err(e) = self.draft_store.erase(&owner)
+        {
             tracing::warn!("could not clear drafts: {e}");
         }
         self.draft_epoch = self.draft_epoch.wrapping_add(1);
@@ -1983,7 +2148,11 @@ impl App {
 
     fn open_drafts(&mut self) {
         let rows = self.draft_rows();
-        self.push_screen(Screen::Drafts(screens::DraftsState { rows, sel: 0, ..Default::default() }));
+        self.push_screen(Screen::Drafts(screens::DraftsState {
+            rows,
+            sel: 0,
+            ..Default::default()
+        }));
     }
 
     /// Reopen the composer a listed draft belongs to.
@@ -2081,9 +2250,9 @@ impl App {
                     None => "New thread".to_string(),
                 }
             }
-            Some(ComposeTarget::ConversationReply { conversation_title, .. }) => {
-                conversation_title.clone()
-            }
+            Some(ComposeTarget::ConversationReply {
+                conversation_title, ..
+            }) => conversation_title.clone(),
             None => String::new(),
         }
     }
@@ -2095,26 +2264,57 @@ impl App {
     }
 
     fn relay_draft(&mut self, key: common::drafts::DraftKey) {
-        if !self.draft_relay_enabled() { return; }
-        let Some(owner) = self.draft_owner.clone() else { return; };
-        let Some(operation) = self.draft_operations.lock().expect("lock").get(&key).copied() else { return; };
+        if !self.draft_relay_enabled() {
+            return;
+        }
+        let Some(owner) = self.draft_owner.clone() else {
+            return;
+        };
+        let Some(operation) = self
+            .draft_operations
+            .lock()
+            .expect("lock")
+            .get(&key)
+            .copied()
+        else {
+            return;
+        };
         // Revision zero is an in-memory save after a disk error. It shields
         // the words but cannot dispatch without the durable revision fence.
-        if operation.revision == 0 { return; }
+        if operation.revision == 0 {
+            return;
+        }
         let api = self.api.clone();
         let store = self.draft_store.clone();
         let operations = self.draft_operations.clone();
-        let transient = self.drafts.get(&key).filter(|draft| draft.too_big_to_persist()).cloned();
+        let transient = self
+            .drafts
+            .get(&key)
+            .filter(|draft| draft.too_big_to_persist())
+            .cloned();
         let tx = self.tx.clone();
         let generation = self.session_generation;
         self.spawn_session_task(async move {
-            match relay_draft_operation(api.as_ref(), &store, &owner, key, operation, transient.as_ref()).await {
+            match relay_draft_operation(
+                api.as_ref(),
+                &store,
+                &owner,
+                key,
+                operation,
+                transient.as_ref(),
+            )
+            .await
+            {
                 Ok(missing) => {
                     if !missing {
                         let mut pending = operations.lock().expect("lock");
-                        if pending.get(&key) == Some(&operation) { pending.remove(&key); }
+                        if pending.get(&key) == Some(&operation) {
+                            pending.remove(&key);
+                        }
                     }
-                    if missing { tx.send(session_msg(generation, Msg::DraftRelayAbsent)).ok(); }
+                    if missing {
+                        tx.send(session_msg(generation, Msg::DraftRelayAbsent)).ok();
+                    }
                 }
                 Err(error) => tracing::warn!("could not relay draft {key:?}: {error}"),
             }
@@ -2124,35 +2324,68 @@ impl App {
     /// Import only clean slots. A pending Save protects local words even
     /// after restart; a pending Delete prevents discarded text reappearing.
     fn merge_remote_drafts(&mut self, epoch: u64, remote: Vec<common::models::RemoteDraft>) {
-        let Some(owner) = self.draft_owner.clone() else { return; };
+        let Some(owner) = self.draft_owner.clone() else {
+            return;
+        };
         for r in remote {
-            let Some(key) = common::drafts::DraftKey::from_xf_key(&r.key) else { continue; };
-            if self.draft_mutations.get(&key).is_some_and(|mutation| *mutation > epoch) {
+            let Some(key) = common::drafts::DraftKey::from_xf_key(&r.key) else {
+                continue;
+            };
+            if self
+                .draft_mutations
+                .get(&key)
+                .is_some_and(|mutation| *mutation > epoch)
+            {
                 continue;
             }
-            let transient = self.draft_operations.lock().expect("lock").get(&key).copied()
-                .is_some_and(|operation| operation.revision == 0
-                    || self.drafts.get(&key).is_some_and(|draft| draft.too_big_to_persist()));
-            if transient { continue; }
+            let transient = self
+                .draft_operations
+                .lock()
+                .expect("lock")
+                .get(&key)
+                .copied()
+                .is_some_and(|operation| {
+                    operation.revision == 0
+                        || self
+                            .drafts
+                            .get(&key)
+                            .is_some_and(|draft| draft.too_big_to_persist())
+                });
+            if transient {
+                continue;
+            }
             let draft = common::drafts::Draft {
                 title: r.title,
                 body: r.message,
-                attachment_key: self.drafts.get(&key).and_then(|draft| draft.attachment_key.clone()),
+                attachment_key: self
+                    .drafts
+                    .get(&key)
+                    .and_then(|draft| draft.attachment_key.clone()),
                 saved_at: r.last_update,
                 remote_attachments: r.has_attachments,
-                label: self.drafts.get(&key).map(|draft| draft.label.clone()).unwrap_or_default(),
+                label: self
+                    .drafts
+                    .get(&key)
+                    .map(|draft| draft.label.clone())
+                    .unwrap_or_default(),
                 ..Default::default()
             };
             match self.draft_store.merge_remote(&owner, key, &draft, epoch) {
-                Ok(true) => { self.drafts.insert(key, draft); }
+                Ok(true) => {
+                    self.drafts.insert(key, draft);
+                }
                 Ok(false) => {
                     // A sibling may have changed this slot since our list
                     // started. Adopt its current local copy, never our stale
                     // remote response or whole-file snapshot.
                     if let Ok(snapshot) = self.draft_store.snapshot(&owner) {
                         match snapshot.drafts.get(&key) {
-                            Some(draft) => { self.drafts.insert(key, draft.clone()); }
-                            None => { self.drafts.remove(&key); }
+                            Some(draft) => {
+                                self.drafts.insert(key, draft.clone());
+                            }
+                            None => {
+                                self.drafts.remove(&key);
+                            }
                         }
                     }
                 }
@@ -2166,13 +2399,24 @@ impl App {
     /// Retry durable desired operations before listing. Each key has a
     /// cross-process relay lock, and work is re-read after acquiring it.
     fn sync_drafts(&mut self) {
-        if !self.draft_relay_enabled() { return; }
-        let Some(owner) = self.draft_owner.clone() else { return; };
+        if !self.draft_relay_enabled() {
+            return;
+        }
+        let Some(owner) = self.draft_owner.clone() else {
+            return;
+        };
         // A repaired filesystem can make earlier memory-only failures
         // durable now; until then the in-memory guards keep their words.
-        let unpersisted: Vec<_> = self.draft_operations.lock().expect("lock").iter()
-            .filter_map(|(key, operation)| (operation.revision == 0).then_some(*key)).collect();
-        for key in unpersisted { self.persist_draft(key); }
+        let unpersisted: Vec<_> = self
+            .draft_operations
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter_map(|(key, operation)| (operation.revision == 0).then_some(*key))
+            .collect();
+        for key in unpersisted {
+            self.persist_draft(key);
+        }
         let api = self.api.clone();
         let store = self.draft_store.clone();
         let operations = self.draft_operations.clone();
@@ -2181,34 +2425,51 @@ impl App {
         self.spawn_session_task(async move {
             let snapshot = match store.snapshot(&owner) {
                 Ok(snapshot) => snapshot,
-                Err(error) => { tracing::warn!("could not read draft relay work: {error}"); return; }
+                Err(error) => {
+                    tracing::warn!("could not read draft relay work: {error}");
+                    return;
+                }
             };
             let mut retries: Vec<_> = snapshot.operations.into_iter().collect();
             retries.sort_by_key(|(key, _)| key.as_key());
             for (key, operation) in retries {
-                match relay_draft_operation(api.as_ref(), &store, &owner, key, operation, None).await {
+                match relay_draft_operation(api.as_ref(), &store, &owner, key, operation, None)
+                    .await
+                {
                     Ok(missing) => {
                         if missing {
                             tx.send(session_msg(generation, Msg::DraftRelayAbsent)).ok();
                             return;
                         }
                         let mut pending = operations.lock().expect("lock");
-                        if pending.get(&key) == Some(&operation) { pending.remove(&key); }
+                        if pending.get(&key) == Some(&operation) {
+                            pending.remove(&key);
+                        }
                     }
-                    Err(error) => tracing::warn!("draft relay work remains owed for {key:?}: {error}"),
+                    Err(error) => {
+                        tracing::warn!("draft relay work remains owed for {key:?}: {error}")
+                    }
                 }
             }
             // The revision belongs to the ACTUAL list snapshot, after the
             // retry work. Subsequent mutations in any instance fence it out.
             let epoch = match store.snapshot(&owner) {
                 Ok(snapshot) => snapshot.revision,
-                Err(error) => { tracing::warn!("could not snapshot drafts: {error}"); return; }
+                Err(error) => {
+                    tracing::warn!("could not snapshot drafts: {error}");
+                    return;
+                }
             };
             match api.list_drafts().await {
-                Ok(drafts) => { tx.send(session_msg(generation, Msg::DraftsLoaded { epoch, drafts })).ok(); }
+                Ok(drafts) => {
+                    tx.send(session_msg(generation, Msg::DraftsLoaded { epoch, drafts }))
+                        .ok();
+                }
                 Err(error) => {
                     tracing::warn!("could not read drafts from the site: {error}");
-                    if relay_route_missing(&error) { tx.send(session_msg(generation, Msg::DraftRelayAbsent)).ok(); }
+                    if relay_route_missing(&error) {
+                        tx.send(session_msg(generation, Msg::DraftRelayAbsent)).ok();
+                    }
                 }
             }
         });
@@ -2232,20 +2493,28 @@ impl App {
         }
         if let Ok(snapshot) = self.draft_store.snapshot(&owner) {
             self.draft_epoch = self.draft_epoch.max(snapshot.revision);
-            self.draft_operations.lock().expect("lock").extend(snapshot.operations);
+            self.draft_operations
+                .lock()
+                .expect("lock")
+                .extend(snapshot.operations);
         }
     }
 
     /// Persist only explicit mutations. Text, desired operation, and revision
     /// are committed together; a failed save remains shielded in memory.
     fn persist_draft(&mut self, key: common::drafts::DraftKey) -> bool {
-        let Some(owner) = &self.draft_owner else { return false; };
+        let Some(owner) = &self.draft_owner else {
+            return false;
+        };
         let draft = self.drafts.get(&key).cloned();
         match self.draft_store.apply(owner, &[(key, draft.clone())]) {
             Ok(changed) => {
                 if let Some(operation) = changed.get(&key) {
                     self.draft_epoch = self.draft_epoch.max(operation.revision);
-                    self.draft_operations.lock().expect("lock").insert(key, *operation);
+                    self.draft_operations
+                        .lock()
+                        .expect("lock")
+                        .insert(key, *operation);
                 } else if let Ok(snapshot) = self.draft_store.snapshot(owner) {
                     self.draft_epoch = self.draft_epoch.max(snapshot.revision);
                 }
@@ -2255,10 +2524,17 @@ impl App {
                 tracing::warn!("could not save draft: {error}");
                 self.draft_epoch = self.draft_epoch.saturating_add(1);
                 if key.xf_key().is_some() {
-                    self.draft_operations.lock().expect("lock").insert(key, common::drafts::RelayOperation {
-                        revision: 0,
-                        kind: if draft.is_some() { common::drafts::RelayKind::Save } else { common::drafts::RelayKind::Delete },
-                    });
+                    self.draft_operations.lock().expect("lock").insert(
+                        key,
+                        common::drafts::RelayOperation {
+                            revision: 0,
+                            kind: if draft.is_some() {
+                                common::drafts::RelayKind::Save
+                            } else {
+                                common::drafts::RelayKind::Delete
+                            },
+                        },
+                    );
                 }
                 false
             }
@@ -2332,10 +2608,7 @@ impl App {
     /// One of the `1`/`2`/`3` destinations, resolved through the loaded tree so
     /// a category opens its first forum and a link-forum opens its URL.
     fn open_quick_node(&mut self, node_id: u32, title: &str) {
-        let nodes = self
-            .tree()
-            .map(|t| t.nodes.clone())
-            .unwrap_or_default();
+        let nodes = self.tree().map(|t| t.nodes.clone()).unwrap_or_default();
         let action = screens::open_node_action(&nodes, node_id, title);
         self.execute_action(action);
     }
@@ -2402,9 +2675,11 @@ impl App {
         screen.set_site(&self.site);
         if let Screen::Compose(incoming) = &mut screen
             && let Some(key) = incoming.target.as_ref().map(|target| target.draft_key())
-            && let Some(index) = self.screens.iter().rposition(|screen| matches!(screen,
+            && let Some(index) = self.screens.iter().rposition(|screen| {
+                matches!(screen,
                 Screen::Compose(existing)
-                    if existing.target.as_ref().is_some_and(|target| target.draft_key() == key)))
+                    if existing.target.as_ref().is_some_and(|target| target.draft_key() == key))
+            })
         {
             if let Screen::Compose(existing) = &self.screens[index]
                 && (existing.busy || existing.uploading)
@@ -2419,7 +2694,9 @@ impl App {
             // Header navigation can bury an idle editor. Its live words are
             // newer than the saved draft, so replace that one editor before
             // the ordinary restoration below applies a fresh quote or seed.
-            let Screen::Compose(existing) = self.screens.remove(index) else { unreachable!() };
+            let Screen::Compose(existing) = self.screens.remove(index) else {
+                unreachable!()
+            };
             self.stash_draft_quiet(&existing);
             incoming.attachments = existing.attachments;
             if matches!(incoming.target, Some(ComposeTarget::EditPost { .. }))
@@ -2524,10 +2801,14 @@ impl App {
     /// the composer while its write still runs, leaving the result without an
     /// owner and risking a post the user thought they had abandoned.
     fn navigation_is_blocked(&mut self) -> bool {
-        let hint = self.screens.iter().rev().find_map(|screen| match screen.esc_intent() {
-            screens::EscIntent::Blocked(hint) => Some(hint),
-            _ => None,
-        });
+        let hint = self
+            .screens
+            .iter()
+            .rev()
+            .find_map(|screen| match screen.esc_intent() {
+                screens::EscIntent::Blocked(hint) => Some(hint),
+                _ => None,
+            });
         if let Some(hint) = hint {
             self.set_hint(hint);
             true
@@ -2726,13 +3007,21 @@ impl App {
             // pass user_id 0; resolve it to a real id via find-name first,
             // since `GET /users/0` always 404s (issue #521).
             let found = if user_id == 0 {
-                api.find_user(&fallback_name).await.ok().flatten().map(|u| u.user_id)
+                api.find_user(&fallback_name)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|u| u.user_id)
             } else {
                 None
             };
             let id = resolve_profile_id(user_id, found);
             let result = api.user(id).await.map_err(|e| TaskError::of(&e));
-            tx.send(session_msg(session_generation, Msg::ProfileLoaded { generation, result })).ok();
+            tx.send(session_msg(
+                session_generation,
+                Msg::ProfileLoaded { generation, result },
+            ))
+            .ok();
         });
     }
 
@@ -2798,7 +3087,6 @@ impl App {
             ..Default::default()
         }));
     }
-
 }
 
 /// The scheme prefix of `url` (the part before its first `:`), lower-cased,
@@ -2874,7 +3162,10 @@ fn is_image_cell(cell: &ratatui::buffer::Cell) -> bool {
 
 /// The screens' input-capture probe, free of `self` borrow entanglement.
 fn capture_active(app: &App) -> bool {
-    app.screens.last().map(|s| s.input_capture()).unwrap_or(false)
+    app.screens
+        .last()
+        .map(|s| s.input_capture())
+        .unwrap_or(false)
 }
 
 /// The whole login flow, in the mode the site (or `m`) asked for:
@@ -2905,7 +3196,10 @@ async fn run_login_flow(
         tx,
         client,
         generation,
-        LoginFlowIo { browser_opener, bind_loopback: common::oauth::bind_loopback },
+        LoginFlowIo {
+            browser_opener,
+            bind_loopback: common::oauth::bind_loopback,
+        },
         site,
         mode,
         paste_rx,
@@ -2935,7 +3229,10 @@ where
 {
     use common::site::LoginMode;
     const LOGIN_TIMEOUT: Duration = Duration::from_secs(600);
-    let LoginFlowIo { browser_opener, bind_loopback } = io;
+    let LoginFlowIo {
+        browser_opener,
+        bind_loopback,
+    } = io;
     let automatic = mode == LoginMode::Auto;
 
     let client_id = client.client_id().to_string();
@@ -2952,10 +3249,16 @@ where
 
     // ---- 1. the relay
     let mut mode = mode;
-    if matches!(mode, LoginMode::Auto | LoginMode::TuiLink) && site.features.tuilink != Some(false) {
+    if matches!(mode, LoginMode::Auto | LoginMode::TuiLink) && site.features.tuilink != Some(false)
+    {
         match common::oauth::register_link(&http, &base, &state, &pkce.challenge).await {
             Ok(link) => {
-                tx.send(Msg::LoginReady { generation, url: link.url.clone(), mode: LoginMode::TuiLink }).ok();
+                tx.send(Msg::LoginReady {
+                    generation,
+                    url: link.url.clone(),
+                    mode: LoginMode::TuiLink,
+                })
+                .ok();
                 let _ = browser_opener(&link.url);
                 // The link lives 600 s on the server; poll until then, at
                 // the spacing `next_poll_delay` picks from the last answer
@@ -2989,7 +3292,9 @@ where
                             return Err("login link expired — press Enter to start again".into());
                         }
                         Ok(common::oauth::PollStatus::Denied) => {
-                            return Err("authorization was denied — press Enter to start again".into());
+                            return Err(
+                                "authorization was denied — press Enter to start again".into()
+                            );
                         }
                         Ok(common::oauth::PollStatus::Waiting) => {}
                         Err(e) => tracing::warn!("login poll error (retrying): {e}"),
@@ -3006,7 +3311,9 @@ where
                 mode = LoginMode::Loopback;
             }
             Err(e) if mode == LoginMode::TuiLink && common::oauth::is_route_missing(&e) => {
-                return Err("this site has no TuiLink relay — press m for loopback or paste mode".into());
+                return Err(
+                    "this site has no TuiLink relay — press m for loopback or paste mode".into(),
+                );
             }
             Err(e) => return Err(e.to_string()),
         }
@@ -3020,14 +3327,28 @@ where
             Ok((l, uri)) => (Some(l), uri, LoginMode::Loopback),
             Err(e) if automatic => {
                 tracing::info!("cannot bind a loopback listener ({e}); falling back to paste");
-                (None, common::oauth::PASTE_REDIRECT_URI.to_string(), LoginMode::Paste)
+                (
+                    None,
+                    common::oauth::PASTE_REDIRECT_URI.to_string(),
+                    LoginMode::Paste,
+                )
             }
             Err(e) => return Err(format!("{e} — press m for paste mode")),
         },
-        _ => (None, common::oauth::PASTE_REDIRECT_URI.to_string(), LoginMode::Paste),
+        _ => (
+            None,
+            common::oauth::PASTE_REDIRECT_URI.to_string(),
+            LoginMode::Paste,
+        ),
     };
-    let url = common::oauth::authorize_url(&base, &pkce, &state, &redirect_uri, &client_id, &scopes);
-    tx.send(Msg::LoginReady { generation, url: url.clone(), mode }).ok();
+    let url =
+        common::oauth::authorize_url(&base, &pkce, &state, &redirect_uri, &client_id, &scopes);
+    tx.send(Msg::LoginReady {
+        generation,
+        url: url.clone(),
+        mode,
+    })
+    .ok();
     let _ = browser_opener(&url);
 
     // A paste is accepted in both modes; a bad one is reported and the flow
@@ -3037,11 +3358,17 @@ where
             match common::oauth::code_from_pasted(&text, &state) {
                 Ok(code) => return Ok(code),
                 Err(e) => {
-                    tx.send(Msg::LoginNotice { generation, message: format!("{e} — try again") }).ok();
+                    tx.send(Msg::LoginNotice {
+                        generation,
+                        message: format!("{e} — try again"),
+                    })
+                    .ok();
                 }
             }
         }
-        Err(common::error::Error::Handshake("the sign-in screen went away".into()))
+        Err(common::error::Error::Handshake(
+            "the sign-in screen went away".into(),
+        ))
     };
     let code = match listener {
         Some(listener) => tokio::select! {
@@ -3050,12 +3377,23 @@ where
         },
         None => tokio::time::timeout(LOGIN_TIMEOUT, pasted)
             .await
-            .unwrap_or_else(|_| Err(common::error::Error::Handshake("timed out waiting for the pasted address".into()))),
+            .unwrap_or_else(|_| {
+                Err(common::error::Error::Handshake(
+                    "timed out waiting for the pasted address".into(),
+                ))
+            }),
     }
     .map_err(|e| format!("{e} — press Enter to start again"))?;
-    let tokens = common::oauth::exchange_code(&http, &base, &code, &redirect_uri, &pkce.verifier, &client_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    let tokens = common::oauth::exchange_code(
+        &http,
+        &base,
+        &code,
+        &redirect_uri,
+        &pkce.verifier,
+        &client_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     finish_login(tx, client, tokens, generation).await;
     Ok(())
 }
@@ -3069,17 +3407,27 @@ async fn finish_login(
     generation: u64,
 ) {
     if let Err(e) = client.set_tokens(tokens).await {
-        tx.send(Msg::LoginFailed { generation, message: format!("token store: {e}") })
-            .ok();
+        tx.send(Msg::LoginFailed {
+            generation,
+            message: format!("token store: {e}"),
+        })
+        .ok();
         return;
     }
     match client.me().await {
         Ok(user) => {
-            tx.send(Msg::LoginComplete { generation, result: Ok(user) }).ok();
+            tx.send(Msg::LoginComplete {
+                generation,
+                result: Ok(user),
+            })
+            .ok();
         }
         Err(e) => {
-            tx.send(Msg::LoginComplete { generation, result: Err(TaskError::of(&e)) })
-                .ok();
+            tx.send(Msg::LoginComplete {
+                generation,
+                result: Err(TaskError::of(&e)),
+            })
+            .ok();
         }
     }
 }
@@ -3299,26 +3647,38 @@ mod tests {
             max_page: None,
             kind: TaskErrorKind::NoToken,
         };
-        assert!(session_error_of(&Msg::PostEdited { post_id: 1, result: Err(error()) }).is_some());
-        assert!(session_error_of(&Msg::PostDeleted {
-            post_id: 1,
-            thread_id: 2,
-            result: Err(error()),
-        })
-        .is_some());
-        assert!(session_error_of(&Msg::SolutionMarked {
-            post_id: 1,
-            thread_id: 2,
-            result: Err(error()),
-        })
-        .is_some());
+        assert!(
+            session_error_of(&Msg::PostEdited {
+                post_id: 1,
+                result: Err(error())
+            })
+            .is_some()
+        );
+        assert!(
+            session_error_of(&Msg::PostDeleted {
+                post_id: 1,
+                thread_id: 2,
+                result: Err(error()),
+            })
+            .is_some()
+        );
+        assert!(
+            session_error_of(&Msg::SolutionMarked {
+                post_id: 1,
+                thread_id: 2,
+                result: Err(error()),
+            })
+            .is_some()
+        );
         // Issue #88: an upload's session-ending failure reaches the same
         // boundary instead of dying as a flattened display string.
-        assert!(session_error_of(&Msg::AttachmentUploaded {
-            composer: common::drafts::DraftKey::ThreadReply(1),
-            result: Err(error()),
-        })
-        .is_some());
+        assert!(
+            session_error_of(&Msg::AttachmentUploaded {
+                composer: common::drafts::DraftKey::ThreadReply(1),
+                result: Err(error()),
+            })
+            .is_some()
+        );
     }
 
     #[tokio::test]
@@ -3353,12 +3713,20 @@ mod tests {
                 kind: TaskErrorKind::Other,
             }),
         });
-        assert!(matches!(app.screens.get(1), Some(Screen::Compose(c)) if !c.busy && c.error.as_deref() == Some("first failed")));
-        assert!(matches!(app.screens.last(), Some(Screen::Compose(c)) if c.busy && c.body == "second draft"));
+        assert!(
+            matches!(app.screens.get(1), Some(Screen::Compose(c)) if !c.busy && c.error.as_deref() == Some("first failed"))
+        );
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Compose(c)) if c.busy && c.body == "second draft")
+        );
 
         app.handle_msg(Msg::ReplySent {
             composer: common::drafts::DraftKey::ThreadReply(1),
-            result: Ok(Post { post_id: 3, thread_id: 1, ..Default::default() }),
+            result: Ok(Post {
+                post_id: 3,
+                thread_id: 1,
+                ..Default::default()
+            }),
         });
         assert!(!app.screens.iter().any(|screen| {
             matches!(screen, Screen::Compose(c) if matches!(c.target, Some(ComposeTarget::ThreadReply { thread_id: 1, .. })))
@@ -3381,7 +3749,8 @@ mod tests {
             busy: true,
             ..Default::default()
         }));
-        app.screens.push(Screen::Search(screens::SearchState::default()));
+        app.screens
+            .push(Screen::Search(screens::SearchState::default()));
         let before = app.screens.len();
 
         app.go_to_crumb(usize::MAX);
@@ -3389,7 +3758,11 @@ mod tests {
         assert!(app.status.contains("Sending"), "status: {:?}", app.status);
 
         app.open_inbox(screens::InboxTab::Conversations);
-        assert_eq!(app.screens.len(), before, "navigation must stay blocked while the buried write runs");
+        assert_eq!(
+            app.screens.len(),
+            before,
+            "navigation must stay blocked while the buried write runs"
+        );
     }
 
     /// Image cells are not text. `ratatui-image` puts a whole escape payload
@@ -3447,8 +3820,7 @@ mod tests {
             result: Err("the server kept refresh token valid".into()),
         });
         assert!(
-            app.status.contains("Logged out locally")
-                && app.status.contains("refresh token"),
+            app.status.contains("Logged out locally") && app.status.contains("refresh token"),
             "the revoke failure was swallowed: {:?}",
             app.status
         );
@@ -3459,7 +3831,9 @@ mod tests {
         match app.screens.last() {
             Some(Screen::Login(ls)) => {
                 assert!(
-                    ls.error.as_deref().is_some_and(|e| e.contains("refresh token")),
+                    ls.error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("refresh token")),
                     "the warning must also surface beside the sign-in box: {:?}",
                     ls.error
                 );
@@ -3488,16 +3862,32 @@ mod tests {
         app.session_generation = old_generation.wrapping_add(2); // end_session, then begin_session
         app.logout_pending = false;
         app.status = "Signed in as alice.".into();
-        app.handle_msg(Msg::LoggedOut { generation: old_generation, result: Ok(()) });
-        assert_eq!(app.status, "Signed in as alice.", "a clean stale result says nothing");
+        app.handle_msg(Msg::LoggedOut {
+            generation: old_generation,
+            result: Ok(()),
+        });
+        assert_eq!(
+            app.status, "Signed in as alice.",
+            "a clean stale result says nothing"
+        );
         app.handle_msg(Msg::LoggedOut {
             generation: old_generation,
             result: Err("the server kept refresh token valid".into()),
         });
-        assert!(app.status.contains("refresh token") && app.status.contains("local only"), "{:?}", app.status);
-        assert!(app.status_set_at.is_none(), "a persistent hint, not a toast");
+        assert!(
+            app.status.contains("refresh token") && app.status.contains("local only"),
+            "{:?}",
+            app.status
+        );
+        assert!(
+            app.status_set_at.is_none(),
+            "a persistent hint, not a toast"
+        );
         assert!(!app.logout_pending, "the new session's state is untouched");
-        assert!(matches!(app.screens.last(), Some(Screen::Home(_))), "no screen is changed");
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Home(_))),
+            "no screen is changed"
+        );
     }
 
     /// Issue #537: a transient load failure must not be permanent. Once a
@@ -3525,7 +3915,10 @@ mod tests {
             let Some(Screen::ThreadList(list)) = app.screens.last() else {
                 panic!("expected the ThreadList screen");
             };
-            assert!(list.error.is_none(), "a successful ForumLoaded must clear the old error");
+            assert!(
+                list.error.is_none(),
+                "a successful ForumLoaded must clear the old error"
+            );
         }
 
         let mut term =
@@ -3533,12 +3926,22 @@ mod tests {
         term.draw(|f| {
             let area = f.area();
             let screen = app.screens.last_mut().expect("screen");
-            screen.render(f, area, &app.theme, &app.glyphs, &mut crate::hit::HitMap::default());
+            screen.render(
+                f,
+                area,
+                &app.theme,
+                &app.glyphs,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let buf = term.backend().buffer().clone();
         let screen_text: String = (0..24)
-            .map(|y| (0..80).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .map(|y| {
+                (0..80)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
             .collect();
         assert!(
             !screen_text.contains("Error:"),
@@ -3550,7 +3953,10 @@ mod tests {
         app.push_screen(Screen::ThreadView(screens::ThreadViewState {
             error: Some("timed out".into()),
             loading: true,
-            thread: Thread { thread_id: 9, ..Default::default() },
+            thread: Thread {
+                thread_id: 9,
+                ..Default::default()
+            },
             ..Default::default()
         }));
         app.handle_msg(Msg::ThreadLoaded {
@@ -3558,7 +3964,10 @@ mod tests {
             page: 1,
             load_id: 0,
             result: Ok(ThreadReply {
-                thread: Thread { thread_id: 9, ..Default::default() },
+                thread: Thread {
+                    thread_id: 9,
+                    ..Default::default()
+                },
                 ..Default::default()
             }),
         });
@@ -3566,7 +3975,10 @@ mod tests {
             let Some(Screen::ThreadView(view)) = app.screens.last() else {
                 panic!("expected the ThreadView screen");
             };
-            assert!(view.error.is_none(), "a successful ThreadLoaded must clear the old error");
+            assert!(
+                view.error.is_none(),
+                "a successful ThreadLoaded must clear the old error"
+            );
         }
         let mut term2 =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
@@ -3574,14 +3986,27 @@ mod tests {
             .draw(|f| {
                 let area = f.area();
                 let screen = app.screens.last_mut().expect("screen");
-                screen.render(f, area, &app.theme, &app.glyphs, &mut crate::hit::HitMap::default());
+                screen.render(
+                    f,
+                    area,
+                    &app.theme,
+                    &app.glyphs,
+                    &mut crate::hit::HitMap::default(),
+                );
             })
             .expect("draw");
         let buf2 = term2.backend().buffer().clone();
         let screen2: String = (0..24)
-            .map(|y| (0..80).map(|x| buf2[(x, y)].symbol().to_string()).collect::<String>())
+            .map(|y| {
+                (0..80)
+                    .map(|x| buf2[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
             .collect();
-        assert!(!screen2.contains("Error:"), "thread view still shows the stale error:\n{screen2}");
+        assert!(
+            !screen2.contains("Error:"),
+            "thread view still shows the stale error:\n{screen2}"
+        );
     }
 
     /// The stale-reply identity rule for profiles: a `ProfileLoaded` reply
@@ -3600,20 +4025,34 @@ mod tests {
 
         app.handle_msg(Msg::ProfileLoaded {
             generation: alice_generation,
-            result: Ok(User { user_id: 11, username: "alice".into(), ..Default::default() }),
+            result: Ok(User {
+                user_id: 11,
+                username: "alice".into(),
+                ..Default::default()
+            }),
         });
         {
             let Some(Screen::Profile(top)) = app.screens.last() else {
                 panic!("expected bob's profile screen on top");
             };
             assert_eq!(top.title, "bob");
-            assert!(top.user.is_none(), "alice's reply must not fill bob's screen");
-            assert!(top.loading, "bob's screen is still waiting on its own reply");
+            assert!(
+                top.user.is_none(),
+                "alice's reply must not fill bob's screen"
+            );
+            assert!(
+                top.loading,
+                "bob's screen is still waiting on its own reply"
+            );
         }
 
         app.handle_msg(Msg::ProfileLoaded {
             generation: bob_generation,
-            result: Ok(User { user_id: 22, username: "bob".into(), ..Default::default() }),
+            result: Ok(User {
+                user_id: 22,
+                username: "bob".into(),
+                ..Default::default()
+            }),
         });
         {
             let Some(Screen::Profile(top)) = app.screens.last() else {
@@ -3628,7 +4067,11 @@ mod tests {
         app.screens.pop();
         app.handle_msg(Msg::ProfileLoaded {
             generation: alice_generation,
-            result: Ok(User { user_id: 11, username: "alice".into(), ..Default::default() }),
+            result: Ok(User {
+                user_id: 11,
+                username: "alice".into(),
+                ..Default::default()
+            }),
         });
         let Some(Screen::Profile(alice)) = app.screens.last() else {
             panic!("expected alice's profile screen");
@@ -3667,8 +4110,14 @@ mod tests {
                 panic!("expected bob's search screen on top");
             };
             assert_eq!(top.member.as_ref().map(|m| m.0), Some(22));
-            assert!(top.loading, "bob's screen is still waiting on its own reply");
-            assert!(top.results.is_empty(), "alice's reply must not fill bob's screen");
+            assert!(
+                top.loading,
+                "bob's screen is still waiting on its own reply"
+            );
+            assert!(
+                top.results.is_empty(),
+                "alice's reply must not fill bob's screen"
+            );
         }
 
         app.handle_msg(Msg::SearchDone {
@@ -3693,7 +4142,11 @@ mod tests {
             panic!("expected a NewConversation screen to be pushed");
         };
         assert_eq!(state.recipients, "Zoë, ");
-        assert_eq!(state.recipients.len(), 6, "sanity: the byte length differs from the char count");
+        assert_eq!(
+            state.recipients.len(),
+            6,
+            "sanity: the byte length differs from the char count"
+        );
         assert_eq!(
             state.recipients_cursor,
             state.recipients.chars().count(),
@@ -3748,7 +4201,10 @@ mod tests {
             "the copied text must not carry the continuation cells"
         );
         assert_eq!(app.find_word_bounds(5, 0), Some((5, 6)));
-        assert_eq!(app.extract_selection_text(0, 0, 6, 0), "\u{6f22}\u{5b57} ok");
+        assert_eq!(
+            app.extract_selection_text(0, 0, 6, 0),
+            "\u{6f22}\u{5b57} ok"
+        );
         assert_eq!(app.find_word_bounds(4, 0), None, "a space is not a word");
     }
 
@@ -3775,8 +4231,16 @@ mod tests {
         let buf = term.backend().buffer().clone();
         for x in 0..=3u16 {
             let cell = &buf[(x, 0)];
-            assert_eq!(cell.fg, Color::Reset, "mono selection painted a foreground at col {x}");
-            assert_eq!(cell.bg, Color::Reset, "mono selection painted a background at col {x}");
+            assert_eq!(
+                cell.fg,
+                Color::Reset,
+                "mono selection painted a foreground at col {x}"
+            );
+            assert_eq!(
+                cell.bg,
+                Color::Reset,
+                "mono selection painted a background at col {x}"
+            );
         }
     }
 
@@ -3789,7 +4253,10 @@ mod tests {
     fn known_thread_last_page_finds_the_open_view_or_defaults_to_one() {
         let view = |thread_id: u32, last_page: u32| {
             Screen::ThreadView(screens::ThreadViewState {
-                thread: Thread { thread_id, ..Default::default() },
+                thread: Thread {
+                    thread_id,
+                    ..Default::default()
+                },
                 last_page,
                 ..Default::default()
             })
@@ -3812,7 +4279,10 @@ mod tests {
     /// than 0 for both "no matching view" and "not yet loaded".
     #[test]
     fn known_conversation_last_page_finds_the_open_view_or_defaults_to_one() {
-        let convo = |id: u32| Conversation { conversation_id: id, ..Default::default() };
+        let convo = |id: u32| Conversation {
+            conversation_id: id,
+            ..Default::default()
+        };
         let standalone = |id: u32, last_page: u32| {
             Screen::ConversationView(screens::ConversationViewState {
                 conversation: convo(id),
@@ -3835,10 +4305,18 @@ mod tests {
         let screens = vec![standalone(1, 1), standalone(42, 3)];
         assert_eq!(known_conversation_last_page(&screens, 42), 3);
         assert_eq!(known_conversation_last_page(&screens, 1), 1);
-        assert_eq!(known_conversation_last_page(&screens, 999), 1, "no matching view");
+        assert_eq!(
+            known_conversation_last_page(&screens, 999),
+            1,
+            "no matching view"
+        );
 
         let screens = vec![inbox_view(9, 4)];
-        assert_eq!(known_conversation_last_page(&screens, 9), 4, "Inbox's dual-pane view slot");
+        assert_eq!(
+            known_conversation_last_page(&screens, 9),
+            4,
+            "Inbox's dual-pane view slot"
+        );
 
         // A conversation that briefly reports last_page 0 (unloaded) never
         // yields a "request page 1" that a downstream +1 would leave at 1
@@ -3877,15 +4355,28 @@ mod tests {
             panic!("expected the Inbox screen to survive");
         };
         assert_eq!(ib.convos.page, 2, "the list must not jump back to page 1");
-        let row = ib.convos.conversations.iter().find(|c| c.conversation_id == 22).unwrap();
+        let row = ib
+            .convos
+            .conversations
+            .iter()
+            .find(|c| c.conversation_id == 22)
+            .unwrap();
         assert!(!row.is_unread, "the marked row must flip locally");
-        let other = ib.convos.conversations.iter().find(|c| c.conversation_id == 21).unwrap();
+        let other = ib
+            .convos
+            .conversations
+            .iter()
+            .find(|c| c.conversation_id == 21)
+            .unwrap();
         assert!(other.is_unread, "an unrelated row must be untouched");
         // The badge counts ALL conversations; this list is page 2 of 2, so
         // a page-local recount would report 1 and silently discard the
         // unread living on page 1 (#67 — the test used to pin exactly that).
         // A genuine unread→read flip anywhere is worth exactly one.
-        assert_eq!(app.convos_unread, 4, "the page-2 mark is worth one unread globally");
+        assert_eq!(
+            app.convos_unread, 4,
+            "the page-2 mark is worth one unread globally"
+        );
 
         // No reload was spawned: the list above is still the page-2 window
         // this test built (a reload would have replaced it).
@@ -3924,10 +4415,22 @@ mod tests {
         );
 
         // Everything else with a scheme is refused, never rewritten.
-        assert_eq!(resolve_open_url("javascript:alert(1)", base), Err("javascript".into()));
-        assert_eq!(resolve_open_url("data:text/html,x", base), Err("data".into()));
-        assert_eq!(resolve_open_url("file:///etc/passwd", base), Err("file".into()));
-        assert_eq!(resolve_open_url("VBScript:msgbox(1)", base), Err("vbscript".into()));
+        assert_eq!(
+            resolve_open_url("javascript:alert(1)", base),
+            Err("javascript".into())
+        );
+        assert_eq!(
+            resolve_open_url("data:text/html,x", base),
+            Err("data".into())
+        );
+        assert_eq!(
+            resolve_open_url("file:///etc/passwd", base),
+            Err("file".into())
+        );
+        assert_eq!(
+            resolve_open_url("VBScript:msgbox(1)", base),
+            Err("vbscript".into())
+        );
 
         // No scheme at all: a site-relative path, prefixed with base exactly
         // as before.
@@ -4046,7 +4549,11 @@ mod tests {
     #[async_trait::async_trait]
     impl WfApi for RecordingApi {
         async fn ai_usage(&self) -> common::error::Result<common::ai::AiUsage> {
-            Ok(common::ai::AiUsage { remaining: Some(3), limit: Some(25), ..Default::default() })
+            Ok(common::ai::AiUsage {
+                remaining: Some(3),
+                limit: Some(25),
+                ..Default::default()
+            })
         }
         async fn ask_ai(
             &self,
@@ -4088,10 +4595,14 @@ mod tests {
             if self.drafts_fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(common::error::Error::NoToken);
             }
-            if self.drafts_refuse_target.load(std::sync::atomic::Ordering::SeqCst) {
+            if self
+                .drafts_refuse_target
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
                 return Err(common::error::Error::Api {
                     code: "wf_tuilink_draft_target_unavailable".into(),
-                    message: "You do not have permission to view this page or perform this action.".into(),
+                    message: "You do not have permission to view this page or perform this action."
+                        .into(),
                     status: 403,
                     max_page: None,
                 });
@@ -4104,17 +4615,26 @@ mod tests {
             Ok(())
         }
         async fn delete_draft(&self, xf_key: &str) -> common::error::Result<()> {
-            let ordinal = self.draft_delete_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let ordinal = self
+                .draft_delete_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if ordinal == 0 && !self.draft_delete_delay.is_zero() {
                 tokio::time::sleep(self.draft_delete_delay).await;
             }
-            if ordinal > 0 && self.draft_delete_fail_after_first.load(std::sync::atomic::Ordering::SeqCst) {
+            if ordinal > 0
+                && self
+                    .draft_delete_fail_after_first
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
                 return Err(common::error::Error::FetchRejected("delete failed".into()));
             }
             if self.drafts_fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(common::error::Error::NoToken);
             }
-            self.drafts_deleted.lock().expect("lock").push(xf_key.to_string());
+            self.drafts_deleted
+                .lock()
+                .expect("lock")
+                .push(xf_key.to_string());
             Ok(())
         }
         async fn mark_conversation_read(&self, id: u32) -> common::error::Result<()> {
@@ -4133,7 +4653,11 @@ mod tests {
         async fn thread(&self, _: u32, _: u32) -> common::error::Result<ThreadReply> {
             Err(common::error::Error::NoToken)
         }
-        async fn thread_posts(&self, _: u32, _: u32) -> common::error::Result<common::models::PostsReply> {
+        async fn thread_posts(
+            &self,
+            _: u32,
+            _: u32,
+        ) -> common::error::Result<common::models::PostsReply> {
             Err(common::error::Error::NoToken)
         }
         async fn reply(
@@ -4168,7 +4692,10 @@ mod tests {
             message: &str,
             _: Option<&str>,
         ) -> common::error::Result<()> {
-            self.edits.lock().expect("lock").push((id, message.to_string()));
+            self.edits
+                .lock()
+                .expect("lock")
+                .push((id, message.to_string()));
             Ok(())
         }
         async fn delete_post(&self, id: u32, hard: bool) -> common::error::Result<()> {
@@ -4180,7 +4707,8 @@ mod tests {
             Ok(())
         }
         async fn mark_alerts_viewed(&self) -> common::error::Result<()> {
-            self.alerts_viewed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.alerts_viewed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         async fn mark_thread_read(&self, id: u32, date: Option<i64>) -> common::error::Result<()> {
@@ -4205,10 +4733,11 @@ mod tests {
             title: &str,
             body: &str,
         ) -> common::error::Result<Conversation> {
-            self.conversations_created
-                .lock()
-                .expect("lock")
-                .push((ids.to_vec(), title.to_string(), body.to_string()));
+            self.conversations_created.lock().expect("lock").push((
+                ids.to_vec(),
+                title.to_string(),
+                body.to_string(),
+            ));
             Err(common::error::Error::NoToken)
         }
         async fn delete_conversation(&self, _: u32) -> common::error::Result<()> {
@@ -4240,15 +4769,18 @@ mod tests {
             id: u32,
         ) -> common::error::Result<common::models::MediaItemReply> {
             Ok(common::models::MediaItemReply {
-                media: common::models::MediaItem { media_id: id, ..Default::default() },
+                media: common::models::MediaItem {
+                    media_id: id,
+                    ..Default::default()
+                },
             })
         }
-        async fn resource(
-            &self,
-            id: u32,
-        ) -> common::error::Result<common::models::ResourceReply> {
+        async fn resource(&self, id: u32) -> common::error::Result<common::models::ResourceReply> {
             Ok(common::models::ResourceReply {
-                resource: common::models::Resource { resource_id: id, ..Default::default() },
+                resource: common::models::Resource {
+                    resource_id: id,
+                    ..Default::default()
+                },
             })
         }
         async fn resources_list(
@@ -4358,7 +4890,11 @@ mod tests {
             };
             assert_eq!(h.list.sel, 3, "the list under the pointer must scroll");
             assert_eq!(h.tree.sel, 0, "the focused tree must not move");
-            assert_eq!(h.focus, screens::Pane::List, "the pointer takes the keyboard");
+            assert_eq!(
+                h.focus,
+                screens::Pane::List,
+                "the pointer takes the keyboard"
+            );
         }
 
         // ...and back over the left pane.
@@ -4389,7 +4925,10 @@ mod tests {
         app.show_help = false;
         app.prefix.arm();
         app.handle_mouse(wheel(100, 5));
-        assert!(app.prefix.armed(), "the wheel must not cancel an armed g chord");
+        assert!(
+            app.prefix.armed(),
+            "the wheel must not cancel an armed g chord"
+        );
     }
 
     /// Issue #548: the Search screen a profile's `t`/`p` opens is a member's
@@ -4472,20 +5011,33 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         tokio::task::yield_now().await;
         // The one recipient resolves.
-        app.handle_msg(Msg::RecipientResolved { name: "kemical".into(), id: Ok(Some(9)) });
+        app.handle_msg(Msg::RecipientResolved {
+            name: "kemical".into(),
+            id: Ok(Some(9)),
+        });
         tokio::task::yield_now().await;
-        assert_eq!(api.conversations_created().len(), 1, "one create was spawned");
+        assert_eq!(
+            api.conversations_created().len(),
+            1,
+            "one create was spawned"
+        );
 
         let Some(Screen::NewConversation(nc)) = app.screens.last() else {
             panic!("the screen must still be up while the write is in flight");
         };
         assert!(nc.busy, "busy must span the write, not just the resolution");
-        assert!(nc.sending, "the screen says Sending… once the write is spawned");
+        assert!(
+            nc.sending,
+            "the screen says Sending… once the write is spawned"
+        );
 
         // Enter again, then let a resolution answer land: no second create.
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         tokio::task::yield_now().await;
-        app.handle_msg(Msg::RecipientResolved { name: "kemical".into(), id: Ok(Some(9)) });
+        app.handle_msg(Msg::RecipientResolved {
+            name: "kemical".into(),
+            id: Ok(Some(9)),
+        });
         tokio::task::yield_now().await;
         assert_eq!(
             api.conversations_created().len(),
@@ -4545,7 +5097,11 @@ mod tests {
             max_page: None,
             kind: TaskErrorKind::Other,
         })));
-        assert!(app.status.contains("flooding"), "status was {:?}", app.status);
+        assert!(
+            app.status.contains("flooding"),
+            "status was {:?}",
+            app.status
+        );
     }
 
     /// A successful new conversation can be started from a profile opened
@@ -4557,16 +5113,27 @@ mod tests {
         let mut app = test_app();
         app.api = api.clone();
         app.screens.push(screens::home_state(false));
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 9, ..Default::default() },
-            posts: vec![Post { post_id: 1, post_date: 100, ..Default::default() }],
-            page: 1,
-            last_page: 1,
-            seen_date: 100,
-            ..Default::default()
-        }));
-        app.screens.push(Screen::Profile(screens::ProfileState::default()));
-        app.screens.push(Screen::NewConversation(screens::NewConversationState::default()));
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 9,
+                    ..Default::default()
+                },
+                posts: vec![Post {
+                    post_id: 1,
+                    post_date: 100,
+                    ..Default::default()
+                }],
+                page: 1,
+                last_page: 1,
+                seen_date: 100,
+                ..Default::default()
+            }));
+        app.screens
+            .push(Screen::Profile(screens::ProfileState::default()));
+        app.screens.push(Screen::NewConversation(
+            screens::NewConversationState::default(),
+        ));
 
         app.handle_msg(Msg::ConvoCreated(Ok(Conversation {
             conversation_id: 77,
@@ -4604,7 +5171,10 @@ mod tests {
             ..Default::default()
         };
         let reply = || ConversationReply {
-            conversation: Conversation { conversation_id: 7, ..Default::default() },
+            conversation: Conversation {
+                conversation_id: 7,
+                ..Default::default()
+            },
             ..Default::default()
         };
         app.screens.push(Screen::Inbox(screens::InboxState {
@@ -4634,7 +5204,10 @@ mod tests {
             result: Ok(reply()),
         });
         tokio::task::yield_now().await;
-        assert!(api.marks().is_empty(), "priming the pane marked a DM read on the server");
+        assert!(
+            api.marks().is_empty(),
+            "priming the pane marked a DM read on the server"
+        );
         {
             let Some(Screen::Inbox(inbox)) = app.screens.last() else {
                 panic!("expected the Inbox screen");
@@ -4675,12 +5248,16 @@ mod tests {
         let mut app = test_app();
         app.api = api.clone();
 
-        app.screens.push(Screen::ConversationView(screens::ConversationViewState {
-            conversation: Conversation { conversation_id: 7, ..Default::default() },
-            page: 2,
-            last_page: 2,
-            ..Default::default()
-        }));
+        app.screens
+            .push(Screen::ConversationView(screens::ConversationViewState {
+                conversation: Conversation {
+                    conversation_id: 7,
+                    ..Default::default()
+                },
+                page: 2,
+                last_page: 2,
+                ..Default::default()
+            }));
         app.screens.push(Screen::Compose(screens::ComposeState {
             target: Some(ComposeTarget::ConversationReply {
                 conversation_id: 7,
@@ -4707,10 +5284,21 @@ mod tests {
             other => other,
         };
         match sent {
-            Msg::ConversationLoaded { id, page, mark_read, .. } => {
+            Msg::ConversationLoaded {
+                id,
+                page,
+                mark_read,
+                ..
+            } => {
                 assert_eq!(id, 7);
-                assert_eq!(page, 3, "must ask for known last_page (2) + 1, not hard-coded 1");
-                assert!(mark_read, "the reader's own reload must still mark the DM read");
+                assert_eq!(
+                    page, 3,
+                    "must ask for known last_page (2) + 1, not hard-coded 1"
+                );
+                assert!(
+                    mark_read,
+                    "the reader's own reload must still mark the DM read"
+                );
             }
             _ => panic!("expected ConversationLoaded"),
         }
@@ -4730,13 +5318,17 @@ mod tests {
         let mut app = test_app();
         app.api = api.clone();
 
-        app.screens.push(Screen::ConversationView(screens::ConversationViewState {
-            conversation: Conversation { conversation_id: 7, ..Default::default() },
-            page: 3,
-            last_page: 3,
-            loading: true,
-            ..Default::default()
-        }));
+        app.screens
+            .push(Screen::ConversationView(screens::ConversationViewState {
+                conversation: Conversation {
+                    conversation_id: 7,
+                    ..Default::default()
+                },
+                page: 3,
+                last_page: 3,
+                loading: true,
+                ..Default::default()
+            }));
 
         app.handle_msg(Msg::ConversationLoaded {
             id: 7,
@@ -4755,9 +5347,15 @@ mod tests {
             let Some(Screen::ConversationView(view)) = app.screens.last() else {
                 panic!("expected the ConversationView screen");
             };
-            assert_eq!(view.last_page, 2, "the view must clamp to the server's max_page");
+            assert_eq!(
+                view.last_page, 2,
+                "the view must clamp to the server's max_page"
+            );
             assert!(view.loading, "the clamped reload must be in flight");
-            assert!(view.error.is_none(), "a clamp-and-retry must not also show an error");
+            assert!(
+                view.error.is_none(),
+                "a clamp-and-retry must not also show an error"
+            );
         }
 
         let sent = tokio::time::timeout(std::time::Duration::from_secs(1), app.rx.recv())
@@ -4772,10 +5370,21 @@ mod tests {
             other => other,
         };
         match sent {
-            Msg::ConversationLoaded { id, page, mark_read, .. } => {
+            Msg::ConversationLoaded {
+                id,
+                page,
+                mark_read,
+                ..
+            } => {
                 assert_eq!(id, 7);
-                assert_eq!(page, 2, "must re-request the clamped max_page, not the stale page");
-                assert!(mark_read, "the original mark_read intent must survive the retry");
+                assert_eq!(
+                    page, 2,
+                    "must re-request the clamped max_page, not the stale page"
+                );
+                assert!(
+                    mark_read,
+                    "the original mark_read intent must survive the retry"
+                );
             }
             _ => panic!("expected ConversationLoaded"),
         }
@@ -4795,9 +5404,14 @@ mod tests {
         let before = app.screens.len();
         app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
         assert_eq!(app.screens.len(), before, "nothing pushed over Setup");
-        assert!(matches!(app.screens.last(), Some(Screen::Setup(_))), "Setup stays on top");
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Setup(_))),
+            "Setup stays on top"
+        );
         assert!(!app.screens.iter().any(|s| matches!(s, Screen::Login(_))));
-        let Some(Screen::Setup(s)) = app.screens.last() else { unreachable!() };
+        let Some(Screen::Setup(s)) = app.screens.last() else {
+            unreachable!()
+        };
         assert_eq!(s.origin, "forum.example", "typed fields survive");
         assert!(app.status.contains("setup"), "{}", app.status);
     }
@@ -4808,28 +5422,56 @@ mod tests {
     #[tokio::test]
     async fn a_popped_thread_views_position_hint_does_not_reach_the_next_open() {
         let mut app = test_app();
-        let posts = |n: u32| (1..=n).map(|i| common::models::Post { post_id: i, ..Default::default() }).collect::<Vec<_>>();
-        let view = || Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 42, ..Default::default() },
-            page: 2,
-            posts: posts(5),
-            ..Default::default()
-        });
+        let posts = |n: u32| {
+            (1..=n)
+                .map(|i| common::models::Post {
+                    post_id: i,
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>()
+        };
+        let view = || {
+            Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 42,
+                    ..Default::default()
+                },
+                page: 2,
+                posts: posts(5),
+                ..Default::default()
+            })
+        };
         app.screens.push(screens::home_state(false));
         app.push_screen(view());
         app.keep_thread_position = Some((42, 2, 3, 12));
         assert!(app.pop_screen());
-        assert!(app.keep_thread_position.is_none(), "the hint left with its view");
+        assert!(
+            app.keep_thread_position.is_none(),
+            "the hint left with its view"
+        );
 
         app.push_screen(view());
         app.handle_msg(Msg::ThreadLoaded {
             id: 42,
             page: 2,
             load_id: 0,
-            result: Ok(ThreadReply { thread: Thread { thread_id: 42, ..Default::default() }, posts: posts(5), ..Default::default() }),
+            result: Ok(ThreadReply {
+                thread: Thread {
+                    thread_id: 42,
+                    ..Default::default()
+                },
+                posts: posts(5),
+                ..Default::default()
+            }),
         });
-        let Some(Screen::ThreadView(v)) = app.screens.last() else { panic!("thread view") };
-        assert_eq!((v.sel_post, v.scroll), (0, 0), "a fresh open lands at the top");
+        let Some(Screen::ThreadView(v)) = app.screens.last() else {
+            panic!("thread view")
+        };
+        assert_eq!(
+            (v.sel_post, v.scroll),
+            (0, 0),
+            "a fresh open lands at the top"
+        );
 
         // Popping some OTHER screen keeps a live view's hint.
         app.keep_thread_position = Some((42, 2, 3, 12));
@@ -4846,38 +5488,64 @@ mod tests {
         for max in [Some(2), Some(0)] {
             let mut app = test_app();
             app.api = std::sync::Arc::new(RecordingApi::default());
-            app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-                thread: Thread { thread_id: 42, ..Default::default() },
-                page: 2,
-                loading: true,
-                ..Default::default()
-            }));
-            app.screens.push(Screen::ConversationView(screens::ConversationViewState {
-                conversation: Conversation { conversation_id: 7, ..Default::default() },
-                page: 2,
-                loading: true,
-                ..Default::default()
-            }));
+            app.screens
+                .push(Screen::ThreadView(screens::ThreadViewState {
+                    thread: Thread {
+                        thread_id: 42,
+                        ..Default::default()
+                    },
+                    page: 2,
+                    loading: true,
+                    ..Default::default()
+                }));
+            app.screens
+                .push(Screen::ConversationView(screens::ConversationViewState {
+                    conversation: Conversation {
+                        conversation_id: 7,
+                        ..Default::default()
+                    },
+                    page: 2,
+                    loading: true,
+                    ..Default::default()
+                }));
             let refusal = || TaskError {
                 message: "The requested page could not be found.".into(),
                 code: Some("invalid_page".into()),
                 max_page: max,
                 kind: TaskErrorKind::Api(400),
             };
-            app.handle_msg(Msg::ThreadLoaded { id: 42, page: 2, load_id: 0, result: Err(refusal()) });
-            app.handle_msg(Msg::ConversationLoaded { id: 7, page: 2, load_id: 0, mark_read: false, result: Err(refusal()) });
+            app.handle_msg(Msg::ThreadLoaded {
+                id: 42,
+                page: 2,
+                load_id: 0,
+                result: Err(refusal()),
+            });
+            app.handle_msg(Msg::ConversationLoaded {
+                id: 7,
+                page: 2,
+                load_id: 0,
+                mark_read: false,
+                result: Err(refusal()),
+            });
             for s in &app.screens {
                 match s {
                     Screen::ThreadView(v) => {
-                        assert!(!v.loading && v.error.is_some(), "max {max:?}: thread view must stop and say why");
+                        assert!(
+                            !v.loading && v.error.is_some(),
+                            "max {max:?}: thread view must stop and say why"
+                        );
                     }
                     Screen::ConversationView(v) => {
-                        assert!(!v.loading && v.error.is_some(), "max {max:?}: conversation must stop and say why");
+                        assert!(
+                            !v.loading && v.error.is_some(),
+                            "max {max:?}: conversation must stop and say why"
+                        );
                     }
                     _ => {}
                 }
             }
-            let next = tokio::time::timeout(std::time::Duration::from_millis(300), app.rx.recv()).await;
+            let next =
+                tokio::time::timeout(std::time::Duration::from_millis(300), app.rx.recv()).await;
             assert!(next.is_err(), "max {max:?}: nothing may be re-requested");
         }
     }
@@ -4911,7 +5579,10 @@ mod tests {
         assert_eq!(TaskError::of(&Error::NoToken).kind, TaskErrorKind::NoToken);
 
         // Transport and every other non-session variant fall into `Other`.
-        assert_eq!(TaskError::of(&Error::Config("bad".into())).kind, TaskErrorKind::Other);
+        assert_eq!(
+            TaskError::of(&Error::Config("bad".into())).kind,
+            TaskErrorKind::Other
+        );
         assert_eq!(TaskError::of(&Error::Throttled).kind, TaskErrorKind::Other);
 
         assert!(TaskErrorKind::Api(401).ends_session());
@@ -4925,9 +5596,15 @@ mod tests {
         assert!(!TaskErrorKind::Api(403).ends_session());
         assert!(TaskErrorKind::OAuth.ends_session());
         assert!(TaskErrorKind::NoToken.ends_session());
-        assert!(!TaskErrorKind::Api(500).ends_session(), "a server 5xx must not end the session");
+        assert!(
+            !TaskErrorKind::Api(500).ends_session(),
+            "a server 5xx must not end the session"
+        );
         assert!(!TaskErrorKind::Api(200).ends_session());
-        assert!(!TaskErrorKind::Other.ends_session(), "a transport failure must not end the session");
+        assert!(
+            !TaskErrorKind::Other.ends_session(),
+            "a transport failure must not end the session"
+        );
 
         // Issue #555: a synthetic `"http_error"` code means the body wasn't
         // JSON at all — a Cloudflare 5xx/429/HTML page, not a real OAuth/API
@@ -5002,31 +5679,51 @@ mod tests {
             .await
             .expect("r must re-run the session check")
             .expect("channel open");
-        assert!(matches!(sent, Msg::Bootstrap { .. }), "expected a fresh Bootstrap check");
+        assert!(
+            matches!(sent, Msg::Bootstrap { .. }),
+            "expected a fresh Bootstrap check"
+        );
     }
 
     /// A failed identity check preserves the draft and pauses requests.
     /// Retry remains available outside an editor; inside, r is ordinary text.
     #[tokio::test]
-    async fn bootstrap_transient_error_in_a_live_session_preserves_draft_and_retries_outside_input() {
-        let (server, client) = recovery_client(wiremock::ResponseTemplate::new(503)
-            .set_body_string("fixture temporarily unavailable")).await;
+    async fn bootstrap_transient_error_in_a_live_session_preserves_draft_and_retries_outside_input()
+    {
+        let (server, client) = recovery_client(
+            wiremock::ResponseTemplate::new(503).set_body_string("fixture temporarily unavailable"),
+        )
+        .await;
         let mut app = test_app();
         app.client = client.clone();
         app.api = client.clone();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.draft_owner = None;
         app.select_draft_owner(7);
         app.screens.push(screens::home_state(false));
         app.screens.push(Screen::Compose(screens::ComposeState {
-            target: Some(ComposeTarget::ThreadReply { thread_id: 42, thread_title: "thread".into() }),
-            body: "a draft nobody may lose".into(), ..Default::default()
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 42,
+                thread_title: "thread".into(),
+            }),
+            body: "a draft nobody may lose".into(),
+            ..Default::default()
         }));
         app.recheck_stored_session("old grant rejected".into());
-        let verdict = tokio::time::timeout(Duration::from_secs(2), app.rx.recv()).await.unwrap().unwrap();
+        let verdict = tokio::time::timeout(Duration::from_secs(2), app.rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(verdict, Msg::Bootstrap { result: Err(_), .. }));
         app.handle_msg(verdict);
-        assert!(client.requests_paused(), "failed verification must keep active requests paused");
+        assert!(
+            client.requests_paused(),
+            "failed verification must keep active requests paused"
+        );
         assert!(app.bootstrap_retry_needed);
         assert!(app.poller_handles.is_empty());
         assert!(!app.session_recovery_pending);
@@ -5034,27 +5731,54 @@ mod tests {
         assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(7));
         assert!(app.status.contains("requests paused"), "{}", app.status);
         app.execute_action(Action::ReactPost(88));
-        let refused = tokio::time::timeout(Duration::from_secs(2), app.rx.recv()).await.unwrap().unwrap();
-        assert!(match &refused {
-            Msg::Session { msg, .. } => matches!(msg.as_ref(), Msg::PostToggled { result: Err(_), .. }),
-            Msg::PostToggled { result: Err(_), .. } => true,
-            _ => false,
-        }, "the new action must finish with a retryable refusal");
+        let refused = tokio::time::timeout(Duration::from_secs(2), app.rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            match &refused {
+                Msg::Session { msg, .. } =>
+                    matches!(msg.as_ref(), Msg::PostToggled { result: Err(_), .. }),
+                Msg::PostToggled { result: Err(_), .. } => true,
+                _ => false,
+            },
+            "the new action must finish with a retryable refusal"
+        );
         app.handle_msg(refused);
-        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"),
-            "a new mutation after failed verification must never reach the server");
-        let Some(Screen::Compose(compose)) = app.screens.last() else { panic!("composer retained") };
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method.as_str() == "GET"),
+            "a new mutation after failed verification must never reach the server"
+        );
+        let Some(Screen::Compose(compose)) = app.screens.last() else {
+            panic!("composer retained")
+        };
         assert_eq!(compose.body, "a draft nobody may lose");
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        assert!(app.bootstrap_retry_needed, "typing must not consume the retry");
+        assert!(
+            app.bootstrap_retry_needed,
+            "typing must not consume the retry"
+        );
         assert!(!app.session_recovery_pending);
-        let Some(Screen::Compose(compose)) = app.screens.last() else { panic!("typing stays in the editor") };
+        let Some(Screen::Compose(compose)) = app.screens.last() else {
+            panic!("typing stays in the editor")
+        };
         let edited = compose.body.clone();
         assert_eq!(edited.len(), "a draft nobody may lose".len() + 1);
         app.pop_screen();
-        assert_eq!(app.drafts[&common::drafts::DraftKey::ThreadReply(42)].body, edited);
+        assert_eq!(
+            app.drafts[&common::drafts::DraftKey::ThreadReply(42)].body,
+            edited
+        );
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        assert!(!app.bootstrap_retry_needed, "r outside input starts verification");
+        assert!(
+            !app.bootstrap_retry_needed,
+            "r outside input starts verification"
+        );
         assert!(app.session_recovery_pending);
         assert!(client.requests_paused());
         app.abort_session_tasks();
@@ -5096,7 +5820,11 @@ mod tests {
     fn bootstrap_invalid_grant_ends_the_session_and_shows_login() {
         let mut app = test_app();
         app.screens.push(screens::home_state(true));
-        app.me = Some(User { user_id: 3, username: "stale".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 3,
+            username: "stale".into(),
+            ..Default::default()
+        });
 
         app.handle_msg(Msg::Bootstrap {
             generation: app.bootstrap_generation,
@@ -5112,7 +5840,10 @@ mod tests {
             "a genuine invalid_grant must end the session"
         );
         assert!(app.me.is_none(), "me must be cleared once the session ends");
-        assert!(!app.bootstrap_retry_needed, "there is no session left to retry restoring");
+        assert!(
+            !app.bootstrap_retry_needed,
+            "there is no session left to retry restoring"
+        );
     }
 
     /// Issue #594: `finish_login` persists the exchanged tokens BEFORE
@@ -5153,7 +5884,10 @@ mod tests {
             .await
             .expect("r must re-run the session check")
             .expect("channel open");
-        assert!(matches!(sent, Msg::Bootstrap { .. }), "expected a fresh Bootstrap check");
+        assert!(
+            matches!(sent, Msg::Bootstrap { .. }),
+            "expected a fresh Bootstrap check"
+        );
     }
 
     /// Issue #594 (converse): a session-ending or account-gone failure right
@@ -5214,7 +5948,11 @@ mod tests {
             "a transient failure must not push the login screen"
         );
         assert!(app.bootstrap_retry_needed);
-        assert!(!app.status.contains('\n'), "status must be one line: {:?}", app.status);
+        assert!(
+            !app.status.contains('\n'),
+            "status must be one line: {:?}",
+            app.status
+        );
         assert!(app.status.contains("press r to retry"), "{:?}", app.status);
         assert!(
             app.status.chars().count() < 100,
@@ -5229,12 +5967,22 @@ mod tests {
         term.draw(|f| {
             let area = f.area();
             let screen = app.screens.last_mut().expect("screen");
-            screen.render(f, area, &app.theme, &app.glyphs, &mut crate::hit::HitMap::default());
+            screen.render(
+                f,
+                area,
+                &app.theme,
+                &app.glyphs,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let buf = term.backend().buffer().clone();
         let screen_text: String = (0..24)
-            .map(|y| (0..80).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .map(|y| {
+                (0..80)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
             .collect();
         assert!(
             !screen_text.contains("Loading forums"),
@@ -5256,12 +6004,20 @@ mod tests {
     async fn in_session_invalid_grant_ends_the_session_from_any_message() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
-        app.keep_thread_position = Some((42, 1, 0, 0));
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 42, ..Default::default() },
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
             ..Default::default()
-        }));
+        });
+        app.keep_thread_position = Some((42, 1, 0, 0));
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 42,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
         app.start_pollers();
         assert_eq!(app.poller_handles.len(), 2);
         let generation_before = app.bootstrap_generation;
@@ -5279,15 +6035,24 @@ mod tests {
             }),
         });
 
-        assert!(app.me.is_none(), "the header must stop showing a signed-out user");
+        assert!(
+            app.me.is_none(),
+            "the header must stop showing a signed-out user"
+        );
         assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
         assert!(
-            !app.screens.iter().any(|s| matches!(s, Screen::ThreadView(_))),
+            !app.screens
+                .iter()
+                .any(|s| matches!(s, Screen::ThreadView(_))),
             "the stack must be truncated back to Home"
         );
         assert!(app.keep_thread_position.is_none());
         assert!(app.poller_handles.is_empty(), "the pollers must be stopped");
-        assert!(app.status.contains("Session expired"), "status: {:?}", app.status);
+        assert!(
+            app.status.contains("Session expired"),
+            "status: {:?}",
+            app.status
+        );
         assert_ne!(
             app.bootstrap_generation, generation_before,
             "ending a session must invalidate any restore already in flight"
@@ -5305,7 +6070,11 @@ mod tests {
         // 401 still ends the session rather than looping forever.
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.session_recovery_tried = true;
         app.handle_msg(Msg::SessionLost(TaskError {
             message: "unauthorized".into(),
@@ -5335,21 +6104,38 @@ mod tests {
         // The restore that was already running finally answers.
         app.handle_msg(Msg::Bootstrap {
             generation: in_flight,
-            result: Ok(User { user_id: 7, username: "kemical".into(), ..Default::default() }),
+            result: Ok(User {
+                user_id: 7,
+                username: "kemical".into(),
+                ..Default::default()
+            }),
         });
 
-        assert!(app.me.is_none(), "a superseded restore must not sign anyone back in");
+        assert!(
+            app.me.is_none(),
+            "a superseded restore must not sign anyone back in"
+        );
         assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
-        assert!(app.poller_handles.is_empty(), "no pollers may be started for a dead session");
+        assert!(
+            app.poller_handles.is_empty(),
+            "no pollers may be started for a dead session"
+        );
         assert_eq!(app.status, "Logged out.");
 
         // The restore started *after* the logout is still the live one.
         app.restore_session();
         app.handle_msg(Msg::Bootstrap {
             generation: app.bootstrap_generation,
-            result: Ok(User { user_id: 7, username: "kemical".into(), ..Default::default() }),
+            result: Ok(User {
+                user_id: 7,
+                username: "kemical".into(),
+                ..Default::default()
+            }),
         });
-        assert!(app.me.is_some(), "the current generation's answer must still land");
+        assert!(
+            app.me.is_some(),
+            "the current generation's answer must still land"
+        );
     }
 
     /// Issue #574: each `/api/oauth2/revoke` round-trip inside `logout()` can
@@ -5376,9 +6162,13 @@ mod tests {
         let store_path = scratch_config_dir().join("token-race-574.json");
         let _ = std::fs::remove_file(&store_path);
         let store = common::token::Store::with_path(store_path.clone());
-        let client = Arc::new(WfApiClient::with_store(store, server.uri(), "test-client").expect("client init"));
+        let client = Arc::new(
+            WfApiClient::with_store(store, server.uri(), "test-client").expect("client init"),
+        );
         client
-            .set_tokens(common::token::TokenSet { origin: String::new(), client_id: String::new(),
+            .set_tokens(common::token::TokenSet {
+                origin: String::new(),
+                client_id: String::new(),
                 access_token: "old-access".into(),
                 refresh_token: "old-refresh".into(),
                 expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -5400,7 +6190,9 @@ mod tests {
 
         // A sign-in lands here — exactly what `finish_login` does.
         client
-            .set_tokens(common::token::TokenSet { origin: String::new(), client_id: String::new(),
+            .set_tokens(common::token::TokenSet {
+                origin: String::new(),
+                client_id: String::new(),
                 access_token: "new-access".into(),
                 refresh_token: "new-refresh".into(),
                 expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -5422,7 +6214,10 @@ mod tests {
             .expect("channel open");
         assert!(matches!(sent, Msg::LoggedOut { .. }), "expected LoggedOut");
 
-        let live = client.token_set().await.expect("the new session must survive in memory");
+        let live = client
+            .token_set()
+            .await
+            .expect("the new session must survive in memory");
         assert_eq!(live.access_token, "new-access");
 
         let on_disk = common::token::Store::with_path(store_path)
@@ -5440,7 +6235,10 @@ mod tests {
 
         assert!(app.logout_pending);
         app.begin_login();
-        assert!(app.logout_pending, "a login must not race the logout snapshot");
+        assert!(
+            app.logout_pending,
+            "a login must not race the logout snapshot"
+        );
         assert!(app.status.contains("Signing out"));
 
         let snapshot = tokio::time::timeout(Duration::from_secs(1), app.rx.recv())
@@ -5451,7 +6249,10 @@ mod tests {
         assert!(!app.logout_pending);
 
         app.begin_login();
-        assert!(app.login_task.is_some(), "a new login is allowed after the snapshot");
+        assert!(
+            app.login_task.is_some(),
+            "a new login is allowed after the snapshot"
+        );
         if let Some(task) = app.login_task.take() {
             task.abort();
         }
@@ -5468,7 +6269,11 @@ mod tests {
     async fn an_oauth_error_arriving_mid_recheck_is_stale_and_the_recheck_still_decides() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
 
         // A NoToken opens the recovery window.
         app.handle_msg(Msg::NodesLoaded {
@@ -5480,7 +6285,10 @@ mod tests {
                 kind: TaskErrorKind::NoToken,
             }),
         });
-        assert!(app.session_recovery_pending, "test setup: the recheck must be in flight");
+        assert!(
+            app.session_recovery_pending,
+            "test setup: the recheck must be in flight"
+        );
 
         // A queued caller now reports the refresh rejection that started all
         // of this. It must not end the session.
@@ -5514,12 +6322,19 @@ mod tests {
             "expected Bootstrap {{ Err }}"
         );
         app.handle_msg(sent);
-        assert!(app.me.is_none(), "the recheck's own verdict still ends the session");
+        assert!(
+            app.me.is_none(),
+            "the recheck's own verdict still ends the session"
+        );
         assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
         assert!(!app.session_recovery_pending);
 
         // Outside that window an OAuth rejection ends the session as before.
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.handle_msg(Msg::ThreadLoaded {
             id: 42,
             page: 1,
@@ -5532,7 +6347,11 @@ mod tests {
             }),
         });
         assert!(app.me.is_none());
-        assert!(app.status.contains("Session expired"), "status: {:?}", app.status);
+        assert!(
+            app.status.contains("Session expired"),
+            "status: {:?}",
+            app.status
+        );
     }
 
     /// Issue #593: XenForo revokes the OLD access token in the SAME request
@@ -5547,7 +6366,11 @@ mod tests {
     async fn a_live_session_401_starts_a_recheck_instead_of_ending_the_session() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
 
         app.handle_msg(Msg::SessionLost(TaskError {
             message: "Unauthorized".into(),
@@ -5560,8 +6383,14 @@ mod tests {
             app.session_recovery_tried,
             "an Api(401) in a live session must start the store recheck"
         );
-        assert!(app.session_recovery_pending, "the recheck must be in flight");
-        assert!(app.me.is_some(), "the session must not be ended before the recheck reports back");
+        assert!(
+            app.session_recovery_pending,
+            "the recheck must be in flight"
+        );
+        assert!(
+            app.me.is_some(),
+            "the session must not be ended before the recheck reports back"
+        );
         assert!(!matches!(app.screens.last(), Some(Screen::Login(_))));
     }
 
@@ -5571,22 +6400,40 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/me"))
-            .and(wiremock::matchers::header("authorization", "Bearer sibling-access"))
-            .respond_with(me_response).mount(&server).await;
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer sibling-access",
+            ))
+            .respond_with(me_response)
+            .mount(&server)
+            .await;
         let store_path = scratch_config_dir().join(format!(
-            "recovery-{}.json", TEST_DRAFT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            "recovery-{}.json",
+            TEST_DRAFT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
-        let client = Arc::new(WfApiClient::with_store(
-            common::token::Store::with_path(store_path.clone()), server.uri(), "test-client"
-        ).unwrap());
+        let client = Arc::new(
+            WfApiClient::with_store(
+                common::token::Store::with_path(store_path.clone()),
+                server.uri(),
+                "test-client",
+            )
+            .unwrap(),
+        );
         let grant = |access: &str, refresh: &str| common::token::TokenSet {
-            access_token: access.into(), refresh_token: refresh.into(),
+            access_token: access.into(),
+            refresh_token: refresh.into(),
             expires_at: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
-            scope: "test".into(), origin: server.uri(), client_id: "test-client".into(),
+            scope: "test".into(),
+            origin: server.uri(),
+            client_id: "test-client".into(),
         };
-        client.set_tokens(grant("old-access", "old-refresh")).await.unwrap();
+        client
+            .set_tokens(grant("old-access", "old-refresh"))
+            .await
+            .unwrap();
         common::token::Store::with_path(store_path)
-            .save(&grant("sibling-access", "sibling-refresh")).unwrap();
+            .save(&grant("sibling-access", "sibling-refresh"))
+            .unwrap();
         (server, client)
     }
 
@@ -5605,23 +6452,35 @@ mod tests {
                 }
                 app.handle_msg(msg);
             }
-        }).await.expect("identity verification must report its verdict")
+        })
+        .await
+        .expect("identity verification must report its verdict")
     }
 
     #[tokio::test]
     async fn recovery_verifies_identity_before_any_queued_or_new_mutation_can_use_it() {
-        let (server, client) = recovery_client(wiremock::ResponseTemplate::new(200)
-            .set_body_json(serde_json::json!({"me": {"user_id": 99, "username": "NewAccount"}}))
-            .set_delay(Duration::from_millis(300))).await;
+        let (server, client) = recovery_client(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"me": {"user_id": 99, "username": "NewAccount"}}))
+                .set_delay(Duration::from_millis(300)),
+        )
+        .await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/api/posts/99/react"))
-            .respond_with(wiremock::ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"success": true, "action": "insert"})))
-            .mount(&server).await;
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"success": true, "action": "insert"})),
+            )
+            .mount(&server)
+            .await;
         let mut app = test_app();
         app.client = client.clone();
         app.api = client.clone();
-        app.me = Some(User { user_id: 7, username: "OldAccount".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "OldAccount".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
         client.api_gate.penalize(Duration::from_millis(100));
         app.execute_action(Action::ReactPost(77));
@@ -5634,60 +6493,122 @@ mod tests {
         assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(7));
         assert!(app.session_recovery_pending);
         assert_eq!(client.token_set().await.unwrap().access_token, "old-access");
-        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"),
-            "neither a queued nor a new old-account mutation may use the candidate grant");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method.as_str() == "GET"),
+            "neither a queued nor a new old-account mutation may use the candidate grant"
+        );
         app.handle_msg(verified);
         assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(99));
         assert_ne!(app.session_generation, old_epoch);
         assert!(!app.client.requests_paused());
-        assert!(client.requests_paused(), "old tasks retain a permanently paused client");
-        app.handle_msg(session_msg(old_epoch, Msg::SessionLost(TaskError {
-            message: "late rejection of old grant".into(), code: None, max_page: None,
-            kind: TaskErrorKind::Api(401),
-        })));
+        assert!(
+            client.requests_paused(),
+            "old tasks retain a permanently paused client"
+        );
+        app.handle_msg(session_msg(
+            old_epoch,
+            Msg::SessionLost(TaskError {
+                message: "late rejection of old grant".into(),
+                code: None,
+                max_page: None,
+                kind: TaskErrorKind::Api(401),
+            }),
+        ));
         assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(99));
-        assert!(!app.session_recovery_pending, "an old epoch cannot restart recovery");
+        assert!(
+            !app.session_recovery_pending,
+            "an old epoch cannot restart recovery"
+        );
         assert!(!app.client.requests_paused());
         app.execute_action(Action::ReactPost(99));
         let requests = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let requests = server.received_requests().await.unwrap();
-                if requests.iter().any(|r| r.url.path() == "/api/posts/99/react") { break requests; }
+                if requests
+                    .iter()
+                    .any(|r| r.url.path() == "/api/posts/99/react")
+                {
+                    break requests;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.expect("the verified account must be able to write");
-        let writes: Vec<_> = requests.iter().filter(|r| r.method.as_str() == "POST").collect();
+        })
+        .await
+        .expect("the verified account must be able to write");
+        let writes: Vec<_> = requests
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .collect();
         assert_eq!(writes.len(), 1, "old-account actions are never replayed");
-        assert_eq!(writes[0].headers.get("authorization").unwrap(), "Bearer sibling-access");
-        app.abort_writes(); app.abort_session_tasks(); app.stop_pollers();
+        assert_eq!(
+            writes[0].headers.get("authorization").unwrap(),
+            "Bearer sibling-access"
+        );
+        app.abort_writes();
+        app.abort_session_tasks();
+        app.stop_pollers();
     }
 
     #[tokio::test]
     async fn recovery_account_change_clears_private_forums_before_and_after_a_failed_fetch() {
-        let (_server, client) = recovery_client(wiremock::ResponseTemplate::new(200)
-            .set_body_json(serde_json::json!({"me": {"user_id": 99, "username": "NewAccount"}}))).await;
+        let (_server, client) =
+            recovery_client(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"me": {"user_id": 99, "username": "NewAccount"}}),
+            ))
+            .await;
         let mut app = test_app();
         app.client = client.clone();
         app.api = client;
-        app.me = Some(User { user_id: 7, username: "OldAccount".into(), ..Default::default() });
-        let private = Node { node_id: 900, title: "ConfidentialForum".into(), node_type: "Forum".into(), ..Default::default() };
+        app.me = Some(User {
+            user_id: 7,
+            username: "OldAccount".into(),
+            ..Default::default()
+        });
+        let private = Node {
+            node_id: 900,
+            title: "ConfidentialForum".into(),
+            node_type: "Forum".into(),
+            ..Default::default()
+        };
         let mut home = screens::home_state(false);
-        if let Screen::Home(h) = &mut home { h.tree.nodes = vec![private.clone()]; }
+        if let Screen::Home(h) = &mut home {
+            h.tree.nodes = vec![private.clone()];
+        }
         app.screens.push(home);
-        app.screens.push(Screen::ForumTree(screens::ForumTreeState { nodes: vec![private], ..Default::default() }));
-        assert!(frame_text(&mut app, 120, 24).contains("ConfidentialForum"), "fixture must draw the old private forum");
+        app.screens.push(Screen::ForumTree(screens::ForumTreeState {
+            nodes: vec![private],
+            ..Default::default()
+        }));
+        assert!(
+            frame_text(&mut app, 120, 24).contains("ConfidentialForum"),
+            "fixture must draw the old private forum"
+        );
         app.recheck_stored_session("old grant rejected".into());
         let verified = recovery_verdict(&mut app).await;
         assert!(matches!(verified, Msg::RecoveryVerified { .. }));
         app.handle_msg(verified);
         assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(99));
-        assert!(!frame_text(&mut app, 120, 24).contains("ConfidentialForum"),
-            "the new identity must never draw the previous account's nodes while loading");
-        pump_until(&mut app, |app| app.screens.iter().any(|s| matches!(s,
-            Screen::ForumTree(tree) if tree.error.is_some()
-        ))).await;
-        assert!(!frame_text(&mut app, 120, 24).contains("ConfidentialForum"),
-            "a failed node refresh must not resurrect the old private forums");
+        assert!(
+            !frame_text(&mut app, 120, 24).contains("ConfidentialForum"),
+            "the new identity must never draw the previous account's nodes while loading"
+        );
+        pump_until(&mut app, |app| {
+            app.screens.iter().any(|s| {
+                matches!(s,
+                    Screen::ForumTree(tree) if tree.error.is_some()
+                )
+            })
+        })
+        .await;
+        assert!(
+            !frame_text(&mut app, 120, 24).contains("ConfidentialForum"),
+            "a failed node refresh must not resurrect the old private forums"
+        );
         for screen in &app.screens {
             match screen {
                 Screen::Home(home) => assert!(home.tree.nodes.is_empty()),
@@ -5695,28 +6616,44 @@ mod tests {
                 _ => {}
             }
         }
-        app.abort_writes(); app.abort_session_tasks(); app.stop_pollers();
+        app.abort_writes();
+        app.abort_session_tasks();
+        app.stop_pollers();
     }
 
     #[tokio::test]
     async fn recovery_timeout_preserves_draft_and_rejects_a_late_verified_candidate() {
-        let (_server, client) = recovery_client(wiremock::ResponseTemplate::new(200)
-            .set_body_json(serde_json::json!({"me": {"user_id": 99, "username": "NewAccount"}}))).await;
+        let (_server, client) =
+            recovery_client(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"me": {"user_id": 99, "username": "NewAccount"}}),
+            ))
+            .await;
         let mut app = test_app();
-        app.client = client.clone(); app.api = client.clone();
-        app.me = Some(User { user_id: 7, username: "OldAccount".into(), ..Default::default() });
+        app.client = client.clone();
+        app.api = client.clone();
+        app.me = Some(User {
+            user_id: 7,
+            username: "OldAccount".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
         app.screens.push(Screen::Compose(screens::ComposeState {
-            target: Some(ComposeTarget::ThreadReply { thread_id: 42, thread_title: "thread".into() }),
-            body: "unsent local words".into(), busy: true, ..Default::default()
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 42,
+                thread_title: "thread".into(),
+            }),
+            body: "unsent local words".into(),
+            busy: true,
+            ..Default::default()
         }));
         app.recheck_stored_session("old grant rejected".into());
         let verified = recovery_verdict(&mut app).await;
         assert!(matches!(verified, Msg::RecoveryVerified { .. }));
         // The network result is ready but the UI has not processed it yet.
         let old_generation = app.bootstrap_generation;
-        app.session_recovery_started_at = Some(std::time::Instant::now()
-            - Duration::from_secs(SESSION_RECOVERY_TIMEOUT_SECS + 1));
+        app.session_recovery_started_at = Some(
+            std::time::Instant::now() - Duration::from_secs(SESSION_RECOVERY_TIMEOUT_SECS + 1),
+        );
         assert!(app.expire_session_recovery_timeout());
         assert_ne!(app.bootstrap_generation, old_generation);
         app.handle_msg(verified);
@@ -5726,10 +6663,14 @@ mod tests {
         assert!(app.bootstrap_retry_needed);
         assert!(!app.session_recovery_pending);
         assert!(app.poller_handles.is_empty());
-        let Some(Screen::Compose(compose)) = app.screens.last() else { panic!("local composer retained") };
+        let Some(Screen::Compose(compose)) = app.screens.last() else {
+            panic!("local composer retained")
+        };
         assert_eq!(compose.body, "unsent local words");
         assert!(!compose.busy, "cancelled work must release the editor");
-        app.abort_writes(); app.abort_session_tasks(); app.stop_pollers();
+        app.abort_writes();
+        app.abort_session_tasks();
+        app.stop_pollers();
     }
 
     /// Round 7 regression, issue #580: `valid_token()` clearing the
@@ -5747,7 +6688,11 @@ mod tests {
     async fn a_second_no_token_mid_recheck_does_not_end_the_session_and_the_recheck_still_wins() {
         let (_server, client) = recovery_client(same_account_recovery_response()).await;
 
-        let expected_user = User { user_id: 7, username: "kemical".into(), ..Default::default() };
+        let expected_user = User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        };
         let mut app = test_app();
         app.client = client;
         app.api = app.client.clone();
@@ -5766,7 +6711,10 @@ mod tests {
                 kind: TaskErrorKind::NoToken,
             }),
         });
-        assert!(app.session_recovery_pending, "test setup: the recheck must be in flight");
+        assert!(
+            app.session_recovery_pending,
+            "test setup: the recheck must be in flight"
+        );
         app.handle_msg(Msg::AlertsLoaded {
             load_id: 0,
             result: Err(TaskError {
@@ -5777,7 +6725,10 @@ mod tests {
             }),
         });
 
-        assert!(app.me.is_some(), "a second NoToken mid-recheck must not end the session");
+        assert!(
+            app.me.is_some(),
+            "a second NoToken mid-recheck must not end the session"
+        );
         assert!(!matches!(app.screens.last(), Some(Screen::Login(_))));
         assert_eq!(
             app.bootstrap_generation, generation_before,
@@ -5790,13 +6741,21 @@ mod tests {
             .await
             .expect("the recheck must report back")
             .expect("channel open");
-        assert!(matches!(sent, Msg::RecoveryVerified { .. }), "expected a verified recovery candidate");
+        assert!(
+            matches!(sent, Msg::RecoveryVerified { .. }),
+            "expected a verified recovery candidate"
+        );
         app.handle_msg(sent);
 
-        assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(7), "the recheck's Ok must be honoured");
+        assert_eq!(
+            app.me.as_ref().map(|u| u.user_id),
+            Some(7),
+            "the recheck's Ok must be honoured"
+        );
         assert!(!matches!(app.screens.last(), Some(Screen::Login(_))));
         assert!(
-            !(app.client.has_tokens().await && matches!(app.screens.last(), Some(Screen::Login(_)))),
+            !(app.client.has_tokens().await
+                && matches!(app.screens.last(), Some(Screen::Login(_)))),
             "must never hold a live adopted token under a Login screen"
         );
     }
@@ -5818,7 +6777,11 @@ mod tests {
      {
         let (_server, client) = recovery_client(same_account_recovery_response()).await;
 
-        let expected_user = User { user_id: 7, username: "kemical".into(), ..Default::default() };
+        let expected_user = User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        };
         let mut app = test_app();
         app.client = client;
         app.api = app.client.clone();
@@ -5834,7 +6797,10 @@ mod tests {
             max_page: None,
             kind: TaskErrorKind::NoToken,
         }));
-        assert!(app.session_recovery_pending, "test setup: the recheck must be in flight");
+        assert!(
+            app.session_recovery_pending,
+            "test setup: the recheck must be in flight"
+        );
 
         // The conversations poller (90 s) coincides and reports the same
         // rejection the same way.
@@ -5859,13 +6825,21 @@ mod tests {
             .await
             .expect("the recheck must report back")
             .expect("channel open");
-        assert!(matches!(sent, Msg::RecoveryVerified { .. }), "expected a verified recovery candidate");
+        assert!(
+            matches!(sent, Msg::RecoveryVerified { .. }),
+            "expected a verified recovery candidate"
+        );
         app.handle_msg(sent);
 
-        assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(7), "the recheck's Ok must be honoured");
+        assert_eq!(
+            app.me.as_ref().map(|u| u.user_id),
+            Some(7),
+            "the recheck's Ok must be honoured"
+        );
         assert!(!matches!(app.screens.last(), Some(Screen::Login(_))));
         assert!(
-            !(app.client.has_tokens().await && matches!(app.screens.last(), Some(Screen::Login(_)))),
+            !(app.client.has_tokens().await
+                && matches!(app.screens.last(), Some(Screen::Login(_)))),
             "must never hold a live adopted token under a Login screen"
         );
     }
@@ -5880,7 +6854,11 @@ mod tests {
      {
         let (_server, client) = recovery_client(same_account_recovery_response()).await;
 
-        let expected_user = User { user_id: 7, username: "kemical".into(), ..Default::default() };
+        let expected_user = User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        };
         let mut app = test_app();
         app.client = client;
         app.api = app.client.clone();
@@ -5894,7 +6872,10 @@ mod tests {
             max_page: None,
             kind: TaskErrorKind::NoToken,
         }));
-        assert!(app.session_recovery_pending, "test setup: the recheck must be in flight");
+        assert!(
+            app.session_recovery_pending,
+            "test setup: the recheck must be in flight"
+        );
 
         app.handle_msg(Msg::SessionLost(TaskError {
             message: "oauth error [invalid_grant]".into(),
@@ -5914,12 +6895,20 @@ mod tests {
             .await
             .expect("the recheck must report back")
             .expect("channel open");
-        assert!(matches!(sent, Msg::RecoveryVerified { .. }), "expected a verified recovery candidate");
+        assert!(
+            matches!(sent, Msg::RecoveryVerified { .. }),
+            "expected a verified recovery candidate"
+        );
         app.handle_msg(sent);
 
-        assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(7), "the recheck's Ok must be honoured");
+        assert_eq!(
+            app.me.as_ref().map(|u| u.user_id),
+            Some(7),
+            "the recheck's Ok must be honoured"
+        );
         assert!(
-            !(app.client.has_tokens().await && matches!(app.screens.last(), Some(Screen::Login(_)))),
+            !(app.client.has_tokens().await
+                && matches!(app.screens.last(), Some(Screen::Login(_)))),
             "must never hold a live adopted token under a Login screen"
         );
     }
@@ -5935,7 +6924,11 @@ mod tests {
     /// working, ^S available again.
     #[tokio::test]
     async fn a_write_consumed_by_the_session_boundary_still_frees_the_composer() {
-        let user = User { user_id: 7, username: "kemical".into(), ..Default::default() };
+        let user = User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        };
         let mut app = test_app();
         app.me = Some(user.clone());
         app.screens.push(screens::home_state(false));
@@ -5960,16 +6953,28 @@ mod tests {
                 kind: TaskErrorKind::NoToken,
             }),
         });
-        assert!(app.session_recovery_pending, "test setup: the recheck must be in flight");
+        assert!(
+            app.session_recovery_pending,
+            "test setup: the recheck must be in flight"
+        );
 
         let Some(Screen::Compose(compose)) = app.screens.last() else {
             panic!("the composer must still be open");
         };
-        assert!(!compose.busy, "the composer must not be left on \"Sending…\"");
-        assert_eq!(compose.body, "a draft nobody may lose", "the draft must survive");
+        assert!(
+            !compose.busy,
+            "the composer must not be left on \"Sending…\""
+        );
+        assert_eq!(
+            compose.body, "a draft nobody may lose",
+            "the draft must survive"
+        );
         assert_eq!(compose.error.as_deref(), Some(SESSION_RECHECK_RETRY_MSG));
         assert!(
-            matches!(app.screens.last().expect("a screen").esc_intent(), screens::EscIntent::Screen),
+            matches!(
+                app.screens.last().expect("a screen").esc_intent(),
+                screens::EscIntent::Screen
+            ),
             "Esc must be able to leave the composer again"
         );
 
@@ -5999,7 +7004,11 @@ mod tests {
     /// coming until the user navigated away and back.
     #[tokio::test]
     async fn a_list_load_consumed_by_the_session_boundary_reloads_after_the_recheck() {
-        let user = User { user_id: 7, username: "kemical".into(), ..Default::default() };
+        let user = User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        };
         let mut app = test_app();
         app.me = Some(user.clone());
         app.screens.push(screens::home_state(false));
@@ -6020,16 +7029,26 @@ mod tests {
                 kind: TaskErrorKind::NoToken,
             }),
         });
-        assert!(app.session_recovery_pending, "test setup: the recheck must be in flight");
-        let Some(Screen::Home(h)) = app.screens.first() else { panic!("expected Home") };
-        assert!(!h.list.loading, "a consumed load must still clear the list's spinner");
+        assert!(
+            app.session_recovery_pending,
+            "test setup: the recheck must be in flight"
+        );
+        let Some(Screen::Home(h)) = app.screens.first() else {
+            panic!("expected Home")
+        };
+        assert!(
+            !h.list.loading,
+            "a consumed load must still clear the list's spinner"
+        );
         assert_eq!(h.list.error.as_deref(), Some(SESSION_RECHECK_RETRY_MSG));
 
         app.handle_msg(Msg::Bootstrap {
             generation: app.bootstrap_generation,
             result: Ok(user),
         });
-        let Some(Screen::Home(h)) = app.screens.first() else { panic!("expected Home") };
+        let Some(Screen::Home(h)) = app.screens.first() else {
+            panic!("expected Home")
+        };
         assert!(
             h.list.loading,
             "the restored session must re-prime the Home list, not leave it empty"
@@ -6049,7 +7068,11 @@ mod tests {
     #[test]
     fn a_session_recovery_window_left_open_past_the_timeout_backstop_keeps_the_live_session() {
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
 
         app.session_recovery_tried = true;
@@ -6058,22 +7081,33 @@ mod tests {
 
         // Not old enough yet: a fresh window must survive a tick.
         app.expire_session_recovery_timeout();
-        assert!(app.me.is_some(), "must not touch the session before the timeout elapses");
+        assert!(
+            app.me.is_some(),
+            "must not touch the session before the timeout elapses"
+        );
         assert!(app.session_recovery_pending);
 
         // Backdate past the timeout — nothing ever reported back.
-        app.session_recovery_started_at =
-            Some(std::time::Instant::now() - Duration::from_secs(SESSION_RECOVERY_TIMEOUT_SECS + 1));
+        app.session_recovery_started_at = Some(
+            std::time::Instant::now() - Duration::from_secs(SESSION_RECOVERY_TIMEOUT_SECS + 1),
+        );
         app.expire_session_recovery_timeout();
 
-        assert!(app.me.is_some(), "a live session must survive the timeout backstop");
+        assert!(
+            app.me.is_some(),
+            "a live session must survive the timeout backstop"
+        );
         assert!(!matches!(app.screens.last(), Some(Screen::Login(_))));
         assert!(!app.session_recovery_pending);
         assert!(app.session_recovery_started_at.is_none());
         assert!(app.client.requests_paused());
         assert!(app.bootstrap_retry_needed);
         assert!(app.poller_handles.is_empty());
-        assert!(app.status.contains("requests paused"), "status: {:?}", app.status);
+        assert!(
+            app.status.contains("requests paused"),
+            "status: {:?}",
+            app.status
+        );
     }
 
     /// Issue #591: `SESSION_RECOVERY_TIMEOUT_SECS` used to be 15 s — shorter
@@ -6090,7 +7124,11 @@ mod tests {
     /// restore the session with the Compose screen intact.
     #[tokio::test]
     async fn a_recheck_slower_than_the_old_15s_timeout_still_restores_the_session() {
-        let user = User { user_id: 7, username: "kemical".into(), ..Default::default() };
+        let user = User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        };
         let mut app = test_app();
         app.me = Some(user.clone());
         app.screens.push(screens::home_state(false));
@@ -6115,7 +7153,10 @@ mod tests {
                 kind: TaskErrorKind::NoToken,
             }),
         });
-        assert!(app.session_recovery_pending, "test setup: the recheck must be in flight");
+        assert!(
+            app.session_recovery_pending,
+            "test setup: the recheck must be in flight"
+        );
 
         // Backdate the window by 16 s — longer than the OLD 15 s timeout,
         // well inside the new backstop — and let a tick run.
@@ -6125,13 +7166,22 @@ mod tests {
             app.session_recovery_pending,
             "16 s must not trip the new timeout backstop"
         );
-        assert!(app.me.is_some(), "a merely slow recheck must not end the session early");
+        assert!(
+            app.me.is_some(),
+            "a merely slow recheck must not end the session early"
+        );
 
         // The recheck's own (slow but successful) verdict still arrives
         // under the same generation.
-        app.handle_msg(Msg::Bootstrap { generation: app.bootstrap_generation, result: Ok(user) });
+        app.handle_msg(Msg::Bootstrap {
+            generation: app.bootstrap_generation,
+            result: Ok(user),
+        });
 
-        assert!(app.me.is_some(), "the session must survive a slow-but-successful recheck");
+        assert!(
+            app.me.is_some(),
+            "the session must survive a slow-but-successful recheck"
+        );
         let Some(Screen::Compose(compose)) = app.screens.last() else {
             panic!("the Compose screen must survive a slow-but-successful recheck");
         };
@@ -6154,12 +7204,19 @@ mod tests {
         });
         let mut app = test_app();
         app.api = api.clone();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
         app.screens.push(screens::search_state());
         app.keep_thread_position = Some((42, 1, 0, 0));
         app.open_palette();
-        assert!(app.palette.is_some(), "test setup: the palette must actually be open");
+        assert!(
+            app.palette.is_some(),
+            "test setup: the palette must actually be open"
+        );
         // Issue #590: the old identity's unread badges and its
         // already-loaded Home thread list must not survive under the new
         // username either.
@@ -6168,7 +7225,11 @@ mod tests {
         if let Some(Screen::Home(h)) = app.screens.first_mut() {
             h.list.node_id = 4; // a forum the old identity had open
             h.list.title = "News".into();
-            h.list.threads = vec![Thread { thread_id: 1, title: "old identity's thread".into(), ..Default::default() }];
+            h.list.threads = vec![Thread {
+                thread_id: 1,
+                title: "old identity's thread".into(),
+                ..Default::default()
+            }];
         }
 
         app.execute_action(Action::SubmitReply {
@@ -6178,12 +7239,19 @@ mod tests {
         // Let the write start and park in the gate wait, exactly like
         // `a_reply_abandoned_by_ctrl_l_is_never_sent`.
         tokio::task::yield_now().await;
-        assert!(api.replies().is_empty(), "test setup: the write must still be gated");
+        assert!(
+            api.replies().is_empty(),
+            "test setup: the write must still be gated"
+        );
 
         let generation = app.bootstrap_generation;
         app.handle_msg(Msg::Bootstrap {
             generation,
-            result: Ok(User { user_id: 99, username: "someone-else".into(), ..Default::default() }),
+            result: Ok(User {
+                user_id: 99,
+                username: "someone-else".into(),
+                ..Default::default()
+            }),
         });
 
         assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(99));
@@ -6193,16 +7261,28 @@ mod tests {
             "the old screen stack must be truncated to Home/ForumTree, not carried over"
         );
         assert!(matches!(app.screens.last(), Some(Screen::Home(_))));
-        assert!(app.keep_thread_position.is_none(), "a stale thread position must not survive");
-        assert!(app.palette.is_none(), "an open palette must not survive an identity change");
+        assert!(
+            app.keep_thread_position.is_none(),
+            "a stale thread position must not survive"
+        );
+        assert!(
+            app.palette.is_none(),
+            "an open palette must not survive an identity change"
+        );
         assert!(
             app.status.contains("someone-else"),
             "the hint must name the new identity: {:?}",
             app.status
         );
         assert_ne!(app.status, "Session restored.");
-        assert_eq!(app.alerts_unread, 0, "the old identity's alert badge must not survive");
-        assert_eq!(app.convos_unread, 0, "the old identity's inbox badge must not survive");
+        assert_eq!(
+            app.alerts_unread, 0,
+            "the old identity's alert badge must not survive"
+        );
+        assert_eq!(
+            app.convos_unread, 0,
+            "the old identity's inbox badge must not survive"
+        );
         let Some(Screen::Home(h)) = app.screens.first() else {
             panic!("expected a Home screen at the base of the stack");
         };
@@ -6234,13 +7314,20 @@ mod tests {
     #[tokio::test]
     async fn end_session_resets_homes_list_like_the_identity_change_teardown() {
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
         if let Some(Screen::Home(h)) = app.screens.first_mut() {
             h.list.node_id = 4; // a forum the old session had open
             h.list.title = "News".into();
-            h.list.threads =
-                vec![Thread { thread_id: 1, title: "old session's thread".into(), ..Default::default() }];
+            h.list.threads = vec![Thread {
+                thread_id: 1,
+                title: "old session's thread".into(),
+                ..Default::default()
+            }];
             h.focus = screens::Pane::List;
         }
 
@@ -6269,12 +7356,19 @@ mod tests {
         // not sit on the (now-empty) old state forever.
         app.handle_msg(Msg::LoginComplete {
             generation: app.login_generation,
-            result: Ok(User { user_id: 99, username: "someone-else".into(), ..Default::default() }),
+            result: Ok(User {
+                user_id: 99,
+                username: "someone-else".into(),
+                ..Default::default()
+            }),
         });
         let Some(Screen::Home(h)) = app.screens.first() else {
             panic!("expected the retained Home screen");
         };
-        assert!(h.list.loading, "the next sign-in must have re-primed Home's list");
+        assert!(
+            h.list.loading,
+            "the next sign-in must have re-primed Home's list"
+        );
     }
 
     /// Issue #600 (boundary half): a load already in flight when the session
@@ -6318,7 +7412,11 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_ok_with_the_same_user_is_unchanged() {
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
         app.screens.push(screens::search_state());
         app.keep_thread_position = Some((42, 1, 0, 0));
@@ -6326,12 +7424,23 @@ mod tests {
         let generation = app.bootstrap_generation;
         app.handle_msg(Msg::Bootstrap {
             generation,
-            result: Ok(User { user_id: 7, username: "kemical".into(), ..Default::default() }),
+            result: Ok(User {
+                user_id: 7,
+                username: "kemical".into(),
+                ..Default::default()
+            }),
         });
 
         assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(7));
-        assert_eq!(app.screens.len(), 2, "the same-user path must not touch the screen stack");
-        assert!(app.keep_thread_position.is_some(), "same-user path must not clear this either");
+        assert_eq!(
+            app.screens.len(),
+            2,
+            "the same-user path must not touch the screen stack"
+        );
+        assert!(
+            app.keep_thread_position.is_some(),
+            "same-user path must not clear this either"
+        );
         assert_eq!(app.status, "Session restored.");
     }
 
@@ -6343,7 +7452,11 @@ mod tests {
     async fn no_token_mid_session_rechecks_the_store_once_before_ending() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
 
         app.handle_msg(Msg::NodesLoaded {
             load_id: 0,
@@ -6355,9 +7468,16 @@ mod tests {
             }),
         });
 
-        assert!(app.me.is_some(), "the session survives until the store has been re-read");
+        assert!(
+            app.me.is_some(),
+            "the session survives until the store has been re-read"
+        );
         assert!(app.session_recovery_tried);
-        assert!(app.status.contains("re-checking"), "status: {:?}", app.status);
+        assert!(
+            app.status.contains("re-checking"),
+            "status: {:?}",
+            app.status
+        );
 
         let sent = tokio::time::timeout(std::time::Duration::from_secs(1), app.rx.recv())
             .await
@@ -6376,7 +7496,11 @@ mod tests {
 
         // And the recheck is one-shot: the next NoToken ends the session
         // straight away instead of looping on the store.
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.session_recovery_tried = true;
         app.handle_msg(Msg::NodesLoaded {
             load_id: 0,
@@ -6409,33 +7533,60 @@ mod tests {
 
         // PostToggled: reacting to your own content.
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.start_pollers();
         app.screens.push(screens::home_state(false));
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 42, ..Default::default() },
-            ..Default::default()
-        }));
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 42,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
         app.handle_msg(Msg::PostToggled {
             verb: PostVerb::Like,
-            result: Err(phrase_error("reacting_to_your_own_content_is_considered_cheating")),
+            result: Err(phrase_error(
+                "reacting_to_your_own_content_is_considered_cheating",
+            )),
         });
-        assert!(app.me.is_some(), "a 403 permission refusal must not sign the user out");
-        assert!(!app.poller_handles.is_empty(), "the pollers must keep running");
+        assert!(
+            app.me.is_some(),
+            "a 403 permission refusal must not sign the user out"
+        );
+        assert!(
+            !app.poller_handles.is_empty(),
+            "the pollers must keep running"
+        );
         assert!(
             matches!(app.screens.last(), Some(Screen::ThreadView(_))),
             "the thread view must not be replaced by Login"
         );
-        assert!(app.status.contains("Like failed"), "status: {:?}", app.status);
+        assert!(
+            app.status.contains("Like failed"),
+            "status: {:?}",
+            app.status
+        );
 
         // ReplySent: replying to a closed thread, with a busy Compose whose
         // draft must survive.
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.start_pollers();
         app.screens.push(screens::home_state(false));
         app.screens.push(Screen::Compose(screens::ComposeState {
-            target: Some(ComposeTarget::ThreadReply { thread_id: 1, thread_title: "A thread".into() }),
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 1,
+                thread_title: "A thread".into(),
+            }),
             body: "my draft".into(),
             busy: true,
             ..Default::default()
@@ -6446,8 +7597,14 @@ mod tests {
                 "you_may_not_perform_this_action_because_discussion_is_closed",
             )),
         });
-        assert!(app.me.is_some(), "a 403 permission refusal must not sign the user out");
-        assert!(!app.poller_handles.is_empty(), "the pollers must keep running");
+        assert!(
+            app.me.is_some(),
+            "a 403 permission refusal must not sign the user out"
+        );
+        assert!(
+            !app.poller_handles.is_empty(),
+            "the pollers must keep running"
+        );
         match app.screens.last() {
             Some(Screen::Compose(cs)) => {
                 assert_eq!(cs.body, "my draft", "the draft must survive");
@@ -6459,24 +7616,41 @@ mod tests {
 
         // ThreadLoaded: viewing a thread/forum the user lacks permission for.
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.start_pollers();
         app.screens.push(screens::home_state(false));
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 42, ..Default::default() },
-            ..Default::default()
-        }));
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 42,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
         app.handle_msg(Msg::ThreadLoaded {
             id: 42,
             page: 1,
             load_id: 0,
             result: Err(phrase_error("no_permission")),
         });
-        assert!(app.me.is_some(), "a 403 permission refusal must not sign the user out");
-        assert!(!app.poller_handles.is_empty(), "the pollers must keep running");
+        assert!(
+            app.me.is_some(),
+            "a 403 permission refusal must not sign the user out"
+        );
+        assert!(
+            !app.poller_handles.is_empty(),
+            "the pollers must keep running"
+        );
         match app.screens.last() {
             Some(Screen::ThreadView(v)) => {
-                assert!(v.error.is_some(), "the refusal must show in the thread view, not sign out");
+                assert!(
+                    v.error.is_some(),
+                    "the refusal must show in the thread view, not sign out"
+                );
             }
             _ => panic!("expected the ThreadView screen to survive"),
         }
@@ -6495,7 +7669,11 @@ mod tests {
             "api_error.api_key_inactive",
         ] {
             let mut app = test_app();
-            app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+            app.me = Some(User {
+                user_id: 7,
+                username: "kemical".into(),
+                ..Default::default()
+            });
             app.start_pollers();
             app.screens.push(screens::home_state(false));
             app.handle_msg(Msg::Bootstrap {
@@ -6508,8 +7686,14 @@ mod tests {
                 }),
             });
             assert!(app.me.is_none(), "code {code:?} must end the session");
-            assert!(matches!(app.screens.last(), Some(Screen::Login(_))), "code {code:?}");
-            assert!(app.poller_handles.is_empty(), "code {code:?} must stop the pollers");
+            assert!(
+                matches!(app.screens.last(), Some(Screen::Login(_))),
+                "code {code:?}"
+            );
+            assert!(
+                app.poller_handles.is_empty(),
+                "code {code:?} must stop the pollers"
+            );
         }
 
         // missing_scope on bootstrap must not end the session, and its
@@ -6528,12 +7712,22 @@ mod tests {
             err.message
         );
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.start_pollers();
         app.screens.push(screens::home_state(false));
-        app.handle_msg(Msg::Bootstrap { generation: app.bootstrap_generation, result: Err(err) });
+        app.handle_msg(Msg::Bootstrap {
+            generation: app.bootstrap_generation,
+            result: Err(err),
+        });
         assert!(app.me.is_some(), "missing_scope must not sign the user out");
-        assert!(app.poller_handles.is_empty(), "a failed identity check must not resume polling");
+        assert!(
+            app.poller_handles.is_empty(),
+            "a failed identity check must not resume polling"
+        );
         assert!(app.client.requests_paused());
         assert!(app.bootstrap_retry_needed);
     }
@@ -6559,11 +7753,17 @@ mod tests {
         let mut app = test_app();
         let posts = |n: u32| {
             (1..=n)
-                .map(|i| common::models::Post { post_id: i, ..Default::default() })
+                .map(|i| common::models::Post {
+                    post_id: i,
+                    ..Default::default()
+                })
                 .collect::<Vec<_>>()
         };
         app.push_screen(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 42, ..Default::default() },
+            thread: Thread {
+                thread_id: 42,
+                ..Default::default()
+            },
             page: 2,
             sel_post: 3,
             scroll: 12,
@@ -6580,7 +7780,10 @@ mod tests {
             page: 2,
             load_id: 0,
             result: Ok(ThreadReply {
-                thread: Thread { thread_id: 42, ..Default::default() },
+                thread: Thread {
+                    thread_id: 42,
+                    ..Default::default()
+                },
                 posts: posts(5),
                 ..Default::default()
             }),
@@ -6589,7 +7792,10 @@ mod tests {
             let Some(Screen::ThreadView(view)) = app.screens.last() else {
                 panic!("expected the ThreadView screen");
             };
-            assert_eq!(view.sel_post, 3, "a counts refresh must not move the selection");
+            assert_eq!(
+                view.sel_post, 3,
+                "a counts refresh must not move the selection"
+            );
             assert_eq!(view.scroll, 12, "…nor scroll the reader back to the top");
         }
         assert!(app.keep_thread_position.is_none(), "the hint is one-shot");
@@ -6600,7 +7806,10 @@ mod tests {
             page: 2,
             load_id: 0,
             result: Ok(ThreadReply {
-                thread: Thread { thread_id: 42, ..Default::default() },
+                thread: Thread {
+                    thread_id: 42,
+                    ..Default::default()
+                },
                 posts: posts(5),
                 ..Default::default()
             }),
@@ -6617,10 +7826,13 @@ mod tests {
     fn scratch_config_dir() -> std::path::PathBuf {
         static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
         ROOT.get_or_init(|| {
-            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default().as_nanos();
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
             std::env::temp_dir().join(format!("wftui-test-app-{}-{nonce}", std::process::id()))
-        }).clone()
+        })
+        .clone()
     }
 
     /// An origin no test can actually reach: port 1 on loopback refuses
@@ -6640,7 +7852,8 @@ mod tests {
     fn black_hole_feed() -> &'static str {
         static FEED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         FEED.get_or_init(|| {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind black-hole feed");
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind black-hole feed");
             let addr = listener.local_addr().expect("black-hole feed addr");
             std::thread::spawn(move || {
                 // Accept and drop: the peer sees EOF before it can send a
@@ -6659,13 +7872,16 @@ mod tests {
     /// or erase the machine owner's `token.json`) and an unreachable origin.
     fn offline_client() -> Arc<WfApiClient> {
         let store = common::token::Store::with_path(scratch_config_dir().join("token.json"));
-        let client = WfApiClient::with_store(store, OFFLINE_BASE, "test-client").expect("client init");
+        let client =
+            WfApiClient::with_store(store, OFFLINE_BASE, "test-client").expect("client init");
         // Checked on every single `test_app()`, not just in the guard test:
         // if someone ever swaps this back to `WfApiClient::new()`, every
         // test in the crate fails loudly instead of quietly reading (and
         // revoking) the operator's session.
         assert!(
-            !client.store_path().starts_with(common::config::default_config_root()),
+            !client
+                .store_path()
+                .starts_with(common::config::default_config_root()),
             "a test client resolved the real config dir: {:?}",
             client.store_path()
         );
@@ -6679,7 +7895,11 @@ mod tests {
     async fn esc_keeps_the_draft_and_reopening_the_same_composer_restores_it() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "hours of typing".into();
         }
@@ -6689,12 +7909,26 @@ mod tests {
             "the composer is gone from the stack"
         );
 
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         match app.screens.last() {
             Some(Screen::Compose(c)) => {
-                assert_eq!(c.body, "hours of typing", "the words must come back verbatim");
-                assert_eq!(c.body_cursor, "hours of typing".chars().count(), "caret at the end");
-                assert!(c.resumed, "and the composer knows it resumed, so ^X is offered");
+                assert_eq!(
+                    c.body, "hours of typing",
+                    "the words must come back verbatim"
+                );
+                assert_eq!(
+                    c.body_cursor,
+                    "hours of typing".chars().count(),
+                    "caret at the end"
+                );
+                assert!(
+                    c.resumed,
+                    "and the composer knows it resumed, so ^X is offered"
+                );
             }
             other => panic!("expected a composer, got {:?}", other.map(|s| s.title())),
         }
@@ -6703,8 +7937,14 @@ mod tests {
     #[tokio::test]
     async fn thread_creation_permission_tracks_current_forum_and_preserves_local_draft_access() {
         let mut app = test_app();
-        let node = |node_id, permission| Node { node_id, node_type: "Forum".into(),
-            type_data: Some(common::models::NodeTypeData { can_create_thread: permission }), ..Default::default() };
+        let node = |node_id, permission| Node {
+            node_id,
+            node_type: "Forum".into(),
+            type_data: Some(common::models::NodeTypeData {
+                can_create_thread: permission,
+            }),
+            ..Default::default()
+        };
         let mut home = screens::home_state(false);
         if let Screen::Home(h) = &mut home {
             h.dual = true;
@@ -6712,48 +7952,118 @@ mod tests {
         }
         app.screens.push(home);
         app.open_list(7, "read only".into());
-        assert_eq!(app.list_mut().unwrap().can_create_thread, Some(false), "node permission applies before forum load");
+        assert_eq!(
+            app.list_mut().unwrap().can_create_thread,
+            Some(false),
+            "node permission applies before forum load"
+        );
         let stale = app.list_mut().unwrap().load_seq;
         app.new_thread(7);
         assert!(!app.screens.iter().any(|s| matches!(s, Screen::Compose(_))));
         app.open_palette();
-        assert!(!app.palette.as_ref().unwrap().titles().iter().any(|title| title.starts_with("New thread")));
+        assert!(
+            !app.palette
+                .as_ref()
+                .unwrap()
+                .titles()
+                .iter()
+                .any(|title| title.starts_with("New thread"))
+        );
         app.palette = None;
         app.open_list(8, "legacy".into());
-        assert_eq!(app.list_mut().unwrap().can_create_thread, None, "another forum cannot inherit the previous refusal");
+        assert_eq!(
+            app.list_mut().unwrap().can_create_thread,
+            None,
+            "another forum cannot inherit the previous refusal"
+        );
         let current = app.list_mut().unwrap().load_seq;
-        let reply = |id, permission| ForumReply { forum: common::models::Forum { node_id: id,
-            type_data: Some(common::models::NodeTypeData { can_create_thread: permission }), ..Default::default() },
-            ..Default::default() };
-        app.handle_msg(Msg::ForumLoaded { node_id: 7, page: 1, append: false, seq: stale,
-            result: Ok(reply(7, Some(false))) });
+        let reply = |id, permission| ForumReply {
+            forum: common::models::Forum {
+                node_id: id,
+                type_data: Some(common::models::NodeTypeData {
+                    can_create_thread: permission,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        app.handle_msg(Msg::ForumLoaded {
+            node_id: 7,
+            page: 1,
+            append: false,
+            seq: stale,
+            result: Ok(reply(7, Some(false))),
+        });
         assert_eq!(app.list_mut().unwrap().can_create_thread, None);
-        app.handle_msg(Msg::ForumLoaded { node_id: 8, page: 1, append: false, seq: current,
-            result: Ok(reply(8, Some(false))) });
+        app.handle_msg(Msg::ForumLoaded {
+            node_id: 8,
+            page: 1,
+            append: false,
+            seq: current,
+            result: Ok(reply(8, Some(false))),
+        });
         assert_eq!(app.list_mut().unwrap().can_create_thread, Some(false));
         app.load_forum(8, 1);
         let refreshed = app.list_mut().unwrap().load_seq;
-        app.handle_msg(Msg::ForumLoaded { node_id: 8, page: 1, append: false, seq: current,
-            result: Ok(reply(8, Some(true))) });
-        assert_eq!(app.list_mut().unwrap().can_create_thread, Some(false), "stale response cannot re-enable N");
-        app.handle_msg(Msg::ForumLoaded { node_id: 8, page: 1, append: false, seq: refreshed,
-            result: Ok(reply(8, Some(true))) });
+        app.handle_msg(Msg::ForumLoaded {
+            node_id: 8,
+            page: 1,
+            append: false,
+            seq: current,
+            result: Ok(reply(8, Some(true))),
+        });
+        assert_eq!(
+            app.list_mut().unwrap().can_create_thread,
+            Some(false),
+            "stale response cannot re-enable N"
+        );
+        app.handle_msg(Msg::ForumLoaded {
+            node_id: 8,
+            page: 1,
+            append: false,
+            seq: refreshed,
+            result: Ok(reply(8, Some(true))),
+        });
         assert_eq!(app.list_mut().unwrap().can_create_thread, Some(true));
         let tree_load = app.tree().unwrap().load_id;
-        app.handle_msg(Msg::NodesLoaded { load_id: tree_load + 1, result: Ok(vec![node(8, Some(false))]) });
-        assert_eq!(app.list_mut().unwrap().can_create_thread, Some(true), "stale node metadata is ignored");
-        app.handle_msg(Msg::NodesLoaded { load_id: tree_load, result: Ok(vec![node(8, Some(false))]) });
-        assert_eq!(app.list_mut().unwrap().can_create_thread, Some(false), "fresh node metadata updates the visible list");
+        app.handle_msg(Msg::NodesLoaded {
+            load_id: tree_load + 1,
+            result: Ok(vec![node(8, Some(false))]),
+        });
+        assert_eq!(
+            app.list_mut().unwrap().can_create_thread,
+            Some(true),
+            "stale node metadata is ignored"
+        );
+        app.handle_msg(Msg::NodesLoaded {
+            load_id: tree_load,
+            result: Ok(vec![node(8, Some(false))]),
+        });
+        assert_eq!(
+            app.list_mut().unwrap().can_create_thread,
+            Some(false),
+            "fresh node metadata updates the visible list"
+        );
         app.open_list(0, "Latest".into());
         assert_eq!(app.list_mut().unwrap().can_create_thread, None);
         app.new_thread(0);
         assert!(!app.screens.iter().any(|s| matches!(s, Screen::Compose(_))));
         let key = common::drafts::DraftKey::NewThread(7);
-        app.drafts.insert(key, common::drafts::Draft { title: "local subject".into(), body: "unsent words".into(), ..Default::default() });
+        app.drafts.insert(
+            key,
+            common::drafts::Draft {
+                title: "local subject".into(),
+                body: "unsent words".into(),
+                ..Default::default()
+            },
+        );
         app.resume_draft(key);
-        assert!(matches!(app.screens.last(), Some(Screen::Compose(c)) if c.body == "unsent words"),
-            "posting restrictions do not hide saved local writing");
-        app.abort_session_tasks(); app.abort_writes();
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Compose(c)) if c.body == "unsent words"),
+            "posting restrictions do not hide saved local writing"
+        );
+        app.abort_session_tasks();
+        app.abort_writes();
     }
 
     #[tokio::test]
@@ -6763,44 +8073,85 @@ mod tests {
         if let Screen::Home(h) = &mut home {
             h.dual = true;
             h.tree.nodes = vec![
-                Node { node_id: 1, node_type: "Category".into(), ..Default::default() },
-                Node { node_id: 2, node_type: "Category".into(), ..Default::default() },
-                Node { node_id: 3, parent_node_id: 2, depth: 1, node_type: "Forum".into(), ..Default::default() },
+                Node {
+                    node_id: 1,
+                    node_type: "Category".into(),
+                    ..Default::default()
+                },
+                Node {
+                    node_id: 2,
+                    node_type: "Category".into(),
+                    ..Default::default()
+                },
+                Node {
+                    node_id: 3,
+                    parent_node_id: 2,
+                    depth: 1,
+                    node_type: "Forum".into(),
+                    ..Default::default()
+                },
             ];
         }
         app.screens.push(home);
         app.execute_action(Action::OpenThreadList(1, "empty".into()));
         assert_eq!(app.screens.len(), 1);
         assert_eq!(app.list_mut().unwrap().node_id, 0);
-        assert!(app.session_handles.is_empty(), "no category 404 or foreign-forum request is spawned");
+        assert!(
+            app.session_handles.is_empty(),
+            "no category 404 or foreign-forum request is spawned"
+        );
         assert!(app.status.contains("no forum"));
         app.execute_action(Action::OpenThreadList(2, "second".into()));
-        assert_eq!(app.list_mut().unwrap().node_id, 3, "a populated category still opens its own child");
+        assert_eq!(
+            app.list_mut().unwrap().node_id,
+            3,
+            "a populated category still opens its own child"
+        );
         app.abort_session_tasks();
     }
 
     #[tokio::test]
     async fn reopening_a_buried_composer_preserves_one_latest_draft_for_every_target() {
         let targets = [
-            ComposeTarget::ThreadReply { thread_id: 7, thread_title: "thread".into() },
+            ComposeTarget::ThreadReply {
+                thread_id: 7,
+                thread_title: "thread".into(),
+            },
             ComposeTarget::NewThread { node_id: 7 },
-            ComposeTarget::EditPost { post_id: 7, thread_id: 9, thread_title: "edit".into() },
-            ComposeTarget::ConversationReply { conversation_id: 7, conversation_title: "DM".into(), participants: "member".into() },
+            ComposeTarget::EditPost {
+                post_id: 7,
+                thread_id: 9,
+                thread_title: "edit".into(),
+            },
+            ComposeTarget::ConversationReply {
+                conversation_id: 7,
+                conversation_title: "DM".into(),
+                participants: "member".into(),
+            },
         ];
         for target in targets {
             for exit in ["shutdown", "home", "expiry"] {
                 let mut app = test_app();
                 app.draft_owner = None;
                 app.select_draft_owner(7);
-                app.me = Some(User { user_id: 7, ..Default::default() });
+                app.me = Some(User {
+                    user_id: 7,
+                    ..Default::default()
+                });
                 let owner = app.draft_owner.clone().unwrap();
                 let key = target.draft_key();
                 app.screens.push(screens::home_state(false));
                 app.push_screen(Screen::Compose(screens::ComposeState {
-                    target: Some(target.clone()), body: "live words not saved yet".into(),
-                    title: "live subject".into(), seed_body: "original post".into(),
+                    target: Some(target.clone()),
+                    body: "live words not saved yet".into(),
+                    title: "live subject".into(),
+                    seed_body: "original post".into(),
                     attachment_key: Some("uploads-key".into()),
-                    attachments: vec![Attachment { attachment_id: 5, filename: "photo.png".into(), ..Default::default() }],
+                    attachments: vec![Attachment {
+                        attachment_id: 5,
+                        filename: "photo.png".into(),
+                        ..Default::default()
+                    }],
                     ..Default::default()
                 }));
                 // This is the header navigation that can bury a live editor.
@@ -6809,17 +8160,31 @@ mod tests {
                 let is_edit = matches!(target, ComposeTarget::EditPost { .. });
                 app.push_screen(Screen::Compose(screens::ComposeState {
                     target: Some(target.clone()),
-                    body: if is_edit { "current server post".into() } else { String::new() },
+                    body: if is_edit {
+                        "current server post".into()
+                    } else {
+                        String::new()
+                    },
                     ..Default::default()
                 }));
-                assert_eq!(app.screens.iter().filter(|screen| matches!(screen,
-                    Screen::Compose(c) if c.target.as_ref().is_some_and(|t| t.draft_key() == key))).count(), 1);
-                let Some(Screen::Compose(c)) = app.screens.last_mut() else { panic!("composer"); };
+                assert_eq!(
+                    app.screens
+                        .iter()
+                        .filter(|screen| matches!(screen,
+                    Screen::Compose(c) if c.target.as_ref().is_some_and(|t| t.draft_key() == key)))
+                        .count(),
+                    1
+                );
+                let Some(Screen::Compose(c)) = app.screens.last_mut() else {
+                    panic!("composer");
+                };
                 assert_eq!(c.body, "live words not saved yet");
                 assert_eq!(c.title, "live subject");
                 assert_eq!(c.attachment_key.as_deref(), Some("uploads-key"));
                 assert_eq!(c.attachments[0].attachment_id, 5);
-                if is_edit { assert_eq!(c.seed_body, "current server post"); }
+                if is_edit {
+                    assert_eq!(c.seed_body, "current server post");
+                }
                 c.body = "latest words from reopened editor".into();
                 match exit {
                     "shutdown" => app.shutdown().await,
@@ -6827,10 +8192,16 @@ mod tests {
                     _ => app.end_session("expired"),
                 }
                 let draft = &app.draft_store.load(&owner)[&key];
-                assert_eq!(draft.body, "latest words from reopened editor", "{target:?} via {exit}");
+                assert_eq!(
+                    draft.body, "latest words from reopened editor",
+                    "{target:?} via {exit}"
+                );
                 assert_eq!(draft.attachment_key.as_deref(), Some("uploads-key"));
-                if is_edit { assert_eq!(draft.edit_seed_body.as_deref(), Some("current server post")); }
-                app.stop_pollers(); app.abort_session_tasks();
+                if is_edit {
+                    assert_eq!(draft.edit_seed_body.as_deref(), Some("current server post"));
+                }
+                app.stop_pollers();
+                app.abort_session_tasks();
             }
         }
     }
@@ -6839,15 +8210,36 @@ mod tests {
     async fn quoting_into_a_buried_composer_keeps_the_live_words_under_the_fresh_quote() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
-        let thread = Thread { thread_id: 7, title: "thread".into(), ..Default::default() };
+        let thread = Thread {
+            thread_id: 7,
+            title: "thread".into(),
+            ..Default::default()
+        };
         app.reply_to_thread(&thread);
-        if let Some(Screen::Compose(c)) = app.screens.last_mut() { c.body = "live reply".into(); }
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "live reply".into();
+        }
         app.open_inbox(screens::InboxTab::Conversations);
-        let post = Post { post_id: 5, user_id: 8, username: "member".into(), message: "quoted text".into(), ..Default::default() };
-        let quote = common::bbcode::quote_block(&post.username, post.post_id, post.user_id, &post.message);
+        let post = Post {
+            post_id: 5,
+            user_id: 8,
+            username: "member".into(),
+            message: "quoted text".into(),
+            ..Default::default()
+        };
+        let quote =
+            common::bbcode::quote_block(&post.username, post.post_id, post.user_id, &post.message);
         app.execute_action(Action::StartReplyQuoting(thread, Box::new(post)));
-        assert_eq!(app.screens.iter().filter(|screen| matches!(screen, Screen::Compose(_))).count(), 1);
-        let Some(Screen::Compose(c)) = app.screens.last() else { panic!("composer"); };
+        assert_eq!(
+            app.screens
+                .iter()
+                .filter(|screen| matches!(screen, Screen::Compose(_)))
+                .count(),
+            1
+        );
+        let Some(Screen::Compose(c)) = app.screens.last() else {
+            panic!("composer");
+        };
         assert_eq!(c.body, format!("{}\n\nlive reply", quote.trim_end()));
         assert_eq!(c.seed_body, quote);
         app.abort_session_tasks();
@@ -6857,23 +8249,34 @@ mod tests {
     async fn reopening_a_busy_or_uploading_composer_cannot_replace_its_live_state() {
         for uploading in [false, true] {
             let mut app = test_app();
-            let target = ComposeTarget::ThreadReply { thread_id: 7, thread_title: "thread".into() };
+            let target = ComposeTarget::ThreadReply {
+                thread_id: 7,
+                thread_title: "thread".into(),
+            };
             app.screens.push(screens::home_state(false));
             app.push_screen(Screen::Compose(screens::ComposeState {
-                target: Some(target.clone()), body: "submitted words".into(),
-                busy: !uploading, uploading, ..Default::default()
+                target: Some(target.clone()),
+                body: "submitted words".into(),
+                busy: !uploading,
+                uploading,
+                ..Default::default()
             }));
             // A previously opened screen may cover the composer when an
             // asynchronous send/upload begins; duplicate protection is local.
             app.screens.push(screens::search_state());
             let depth = app.screens.len();
             app.push_screen(Screen::Compose(screens::ComposeState {
-                target: Some(target), body: "replacement".into(), ..Default::default()
+                target: Some(target),
+                body: "replacement".into(),
+                ..Default::default()
             }));
             assert_eq!(app.screens.len(), depth);
             assert!(matches!(app.screens.get(1), Some(Screen::Compose(c))
                 if c.body == "submitted words" && (c.busy || c.uploading)));
-            assert!(app.status.contains(if uploading { "Uploading" } else { "Sending" }));
+            assert!(
+                app.status
+                    .contains(if uploading { "Uploading" } else { "Sending" })
+            );
         }
     }
 
@@ -6892,7 +8295,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         let hint = app.status.clone();
         assert!(
             hint.contains("attachments stay there") && hint.contains("^X discards"),
@@ -6910,14 +8317,22 @@ mod tests {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
 
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "reply draft".into();
         }
         app.pop_screen();
 
         // A different thread: same kind of composer, different slot.
-        app.reply_to_thread(&Thread { thread_id: 8, title: "Another thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 8,
+            title: "Another thread".into(),
+            ..Default::default()
+        });
         match app.screens.last() {
             Some(Screen::Compose(c)) => {
                 assert!(c.body.is_empty(), "thread 8 must not see thread 7's draft");
@@ -6928,7 +8343,11 @@ mod tests {
         app.pop_screen();
 
         // And thread 7 still has its own.
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         match app.screens.last() {
             Some(Screen::Compose(c)) => assert_eq!(c.body, "reply draft"),
             _ => panic!("expected a composer"),
@@ -6942,13 +8361,21 @@ mod tests {
     async fn an_empty_composer_stores_nothing() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "   \n ".into();
         }
         app.pop_screen();
         assert!(app.drafts.is_empty(), "whitespace is not a draft");
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         match app.screens.last() {
             Some(Screen::Compose(c)) => assert!(!c.resumed, "nothing to resume"),
             _ => panic!("expected a composer"),
@@ -6963,7 +8390,11 @@ mod tests {
     async fn a_successful_reply_clears_the_draft() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "posted words".into();
         }
@@ -6971,10 +8402,18 @@ mod tests {
         app.pop_screen();
         assert_eq!(app.drafts.len(), 1);
 
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         app.handle_msg(Msg::ReplySent {
             composer: common::drafts::DraftKey::ThreadReply(7),
-            result: Ok(Post { post_id: 1, thread_id: 7, ..Default::default() }),
+            result: Ok(Post {
+                post_id: 1,
+                thread_id: 7,
+                ..Default::default()
+            }),
         });
         assert!(app.drafts.is_empty(), "a sent reply leaves no draft behind");
         assert!(
@@ -6991,11 +8430,22 @@ mod tests {
     async fn discarding_a_resumed_draft_restores_the_seed_not_an_empty_editor() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
-        let thread = Thread { thread_id: 7, title: "A thread".into(), ..Default::default() };
-        let mut post = Post { post_id: 500, thread_id: 7, ..Default::default() };
+        let thread = Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        };
+        let mut post = Post {
+            post_id: 500,
+            thread_id: 7,
+            ..Default::default()
+        };
         post.message = "the post as it stands".into();
 
-        app.execute_action(Action::StartEditPost(thread.clone(), Box::new(post.clone())));
+        app.execute_action(Action::StartEditPost(
+            thread.clone(),
+            Box::new(post.clone()),
+        ));
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "an edit I abandoned".into();
         }
@@ -7005,7 +8455,10 @@ mod tests {
         match app.screens.last() {
             Some(Screen::Compose(c)) => {
                 assert_eq!(c.body, "an edit I abandoned", "the draft wins on reopen");
-                assert_eq!(c.seed_body, "the post as it stands", "the seed is remembered");
+                assert_eq!(
+                    c.seed_body, "the post as it stands",
+                    "the seed is remembered"
+                );
             }
             _ => panic!("expected a composer"),
         }
@@ -7028,7 +8481,11 @@ mod tests {
     async fn an_edit_draft_restart_restores_its_thread_context_and_baseline() {
         let mut first = test_app();
         first.screens.push(screens::home_state(false));
-        let thread = Thread { thread_id: 7, title: "A thread".into(), ..Default::default() };
+        let thread = Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        };
         let post = Post {
             post_id: 500,
             thread_id: 7,
@@ -7044,7 +8501,9 @@ mod tests {
 
         let mut restarted = test_app();
         restarted.draft_store = common::drafts::Store::with_path(path);
-        restarted.drafts = restarted.draft_store.load(restarted.draft_owner.as_ref().unwrap());
+        restarted.drafts = restarted
+            .draft_store
+            .load(restarted.draft_owner.as_ref().unwrap());
         restarted.screens.push(screens::home_state(false));
         restarted.resume_draft(common::drafts::DraftKey::EditPost(500));
 
@@ -7055,7 +8514,11 @@ mod tests {
         assert_eq!(c.seed_body, "original post");
         assert!(matches!(
             c.target,
-            Some(ComposeTarget::EditPost { post_id: 500, thread_id: 7, .. })
+            Some(ComposeTarget::EditPost {
+                post_id: 500,
+                thread_id: 7,
+                ..
+            })
         ));
     }
 
@@ -7069,7 +8532,11 @@ mod tests {
         let path = app.draft_store.path().to_path_buf();
         let _ = std::fs::remove_file(&path);
         app.screens.push(screens::home_state(false));
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "private words".into();
         }
@@ -7078,7 +8545,12 @@ mod tests {
 
         app.clear_all_drafts();
         assert!(app.drafts.is_empty(), "nothing left in memory");
-        assert!(common::drafts::Store::with_path(path).load(&common::drafts::Owner::new("http://127.0.0.1:9", 7)).is_empty(), "nothing available to the old owner");
+        assert!(
+            common::drafts::Store::with_path(path)
+                .load(&common::drafts::Owner::new("http://127.0.0.1:9", 7))
+                .is_empty(),
+            "nothing available to the old owner"
+        );
     }
 
     /// A session that merely *expires* is the same person coming back, so
@@ -7090,7 +8562,11 @@ mod tests {
         let mut app = test_app();
         let _ = std::fs::remove_file(app.draft_store.path());
         app.screens.push(screens::home_state(false));
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "still mine".into();
         }
@@ -7114,7 +8590,11 @@ mod tests {
         let path = app.draft_store.path().to_path_buf();
         let _ = std::fs::remove_file(&path);
         app.screens.push(screens::home_state(false));
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "typed before expiry".into();
         }
@@ -7127,7 +8607,10 @@ mod tests {
                 .map(|d| d.body.as_str()),
             Some("typed before expiry")
         );
-        assert!(path.exists(), "the expired session must persist the open draft");
+        assert!(
+            path.exists(),
+            "the expired session must persist the open draft"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -7140,7 +8623,11 @@ mod tests {
         let path = app.draft_store.path().to_path_buf();
         let _ = std::fs::remove_file(&path);
         app.screens.push(screens::home_state(false));
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "survives a crash".into();
         }
@@ -7151,7 +8638,11 @@ mod tests {
         next.draft_store = common::drafts::Store::with_path(path.clone());
         next.drafts = next.draft_store.load(next.draft_owner.as_ref().unwrap());
         next.screens.push(screens::home_state(false));
-        next.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        next.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         match next.screens.last() {
             Some(Screen::Compose(c)) => assert_eq!(c.body, "survives a crash"),
             _ => panic!("expected a composer"),
@@ -7166,14 +8657,21 @@ mod tests {
     async fn a_draft_from_the_website_is_offered_in_the_composer() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
-        app.merge_remote_drafts(0, vec![common::models::RemoteDraft {
-            key: "thread-7".into(),
-            message: "typed in the browser".into(),
-            title: String::new(),
-            last_update: 2_000,
-            has_attachments: false,
-        }]);
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.merge_remote_drafts(
+            0,
+            vec![common::models::RemoteDraft {
+                key: "thread-7".into(),
+                message: "typed in the browser".into(),
+                title: String::new(),
+                last_update: 2_000,
+                has_attachments: false,
+            }],
+        );
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         match app.screens.last() {
             Some(Screen::Compose(c)) => {
                 assert_eq!(c.body, "typed in the browser");
@@ -7218,7 +8716,11 @@ mod tests {
         // keeps the words. A server stamp that only looks newer (its clock
         // runs ahead) must not overwrite them.
         app.screens.push(screens::home_state(false));
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         let list_epoch = app.draft_epoch;
         let snapshot = match app.screens.last_mut() {
             Some(Screen::Compose(c)) => {
@@ -7243,12 +8745,26 @@ mod tests {
     #[tokio::test]
     async fn unknown_remote_draft_kinds_are_ignored() {
         let mut app = test_app();
-        app.merge_remote_drafts(0, vec![
-            common::models::RemoteDraft { key: "report-1".into(), message: "x".into(), ..Default::default() },
-            common::models::RemoteDraft { key: "thread-7".into(), message: "ok".into(), ..Default::default() },
-        ]);
+        app.merge_remote_drafts(
+            0,
+            vec![
+                common::models::RemoteDraft {
+                    key: "report-1".into(),
+                    message: "x".into(),
+                    ..Default::default()
+                },
+                common::models::RemoteDraft {
+                    key: "thread-7".into(),
+                    message: "ok".into(),
+                    ..Default::default()
+                },
+            ],
+        );
         assert_eq!(app.drafts.len(), 1);
-        assert!(app.drafts.contains_key(&common::drafts::DraftKey::ThreadReply(7)));
+        assert!(
+            app.drafts
+                .contains_key(&common::drafts::DraftKey::ThreadReply(7))
+        );
     }
 
     /// Esc mirrors the draft to the website under XenForo's own key, and a
@@ -7262,7 +8778,11 @@ mod tests {
         app.api = api.clone();
         app.screens.push(screens::home_state(false));
 
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "shared words".into();
         }
@@ -7270,14 +8790,26 @@ mod tests {
         finish_draft_relays(&app).await;
         assert_eq!(
             api.drafts_saved(),
-            vec![("thread-7".to_string(), "shared words".to_string(), String::new())],
+            vec![(
+                "thread-7".to_string(),
+                "shared words".to_string(),
+                String::new()
+            )],
             "Esc must mirror the draft under XF's own key"
         );
 
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         app.handle_msg(Msg::ReplySent {
             composer: common::drafts::DraftKey::ThreadReply(7),
-            result: Ok(Post { post_id: 1, thread_id: 7, ..Default::default() }),
+            result: Ok(Post {
+                post_id: 1,
+                thread_id: 7,
+                ..Default::default()
+            }),
         });
         finish_draft_relays(&app).await;
         assert_eq!(api.drafts_deleted(), vec!["thread-7".to_string()]);
@@ -7292,19 +8824,28 @@ mod tests {
     async fn a_submission_mirrors_its_words_until_the_send_settles() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "words in flight".into();
         }
 
-        app.execute_action(Action::SubmitReply { thread_id: 7, message: "words in flight".into() });
+        app.execute_action(Action::SubmitReply {
+            thread_id: 7,
+            message: "words in flight".into(),
+        });
         let key = common::drafts::DraftKey::ThreadReply(7);
         assert_eq!(
             app.drafts.get(&key).map(|d| d.body.as_str()),
             Some("words in flight"),
             "an in-flight submission keeps a local mirror"
         );
-        let stored = app.draft_store.load(app.draft_owner.as_ref().expect("test owner"));
+        let stored = app
+            .draft_store
+            .load(app.draft_owner.as_ref().expect("test owner"));
         assert_eq!(
             stored.get(&key).map(|d| d.body.as_str()),
             Some("words in flight"),
@@ -7313,19 +8854,34 @@ mod tests {
 
         app.handle_msg(Msg::ReplySent {
             composer: key,
-            result: Ok(Post { post_id: 1, thread_id: 7, ..Default::default() }),
+            result: Ok(Post {
+                post_id: 1,
+                thread_id: 7,
+                ..Default::default()
+            }),
         });
-        assert!(!app.drafts.contains_key(&key), "a sent reply's mirror must not survive");
-        let stored = app.draft_store.load(app.draft_owner.as_ref().expect("test owner"));
+        assert!(
+            !app.drafts.contains_key(&key),
+            "a sent reply's mirror must not survive"
+        );
+        let stored = app
+            .draft_store
+            .load(app.draft_owner.as_ref().expect("test owner"));
         assert!(!stored.contains_key(&key), "...and not on disk either");
     }
 
     async fn finish_draft_relays(app: &App) {
         tokio::time::timeout(Duration::from_secs(3), async {
-            while app.session_handles.iter().any(|handle| !handle.is_finished()) {
+            while app
+                .session_handles
+                .iter()
+                .any(|handle| !handle.is_finished())
+            {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
-        }).await.expect("draft relay tasks finished");
+        })
+        .await
+        .expect("draft relay tasks finished");
     }
 
     /// A remote delete that failed (#815) stays owed: the merge refuses to
@@ -7335,11 +8891,16 @@ mod tests {
     #[tokio::test]
     async fn an_owed_remote_delete_blocks_resurrection_until_it_settles() {
         let api = Arc::new(RecordingApi::default());
-        api.drafts_fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        api.drafts_fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let mut app = test_app();
         app.api = api.clone();
         app.screens.push(screens::home_state(false));
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "posted words".into();
         }
@@ -7350,13 +8911,23 @@ mod tests {
         // NoToken while `drafts_fail` is set.
         app.handle_msg(Msg::ReplySent {
             composer: common::drafts::DraftKey::ThreadReply(7),
-            result: Ok(Post { post_id: 1, thread_id: 7, ..Default::default() }),
+            result: Ok(Post {
+                post_id: 1,
+                thread_id: 7,
+                ..Default::default()
+            }),
         });
         finish_draft_relays(&app).await;
         let key = common::drafts::DraftKey::ThreadReply(7);
-        assert!(api.drafts_deleted().is_empty(), "the relay is failing; nothing was deleted");
         assert!(
-            app.draft_operations.lock().expect("lock").contains_key(&key),
+            api.drafts_deleted().is_empty(),
+            "the relay is failing; nothing was deleted"
+        );
+        assert!(
+            app.draft_operations
+                .lock()
+                .expect("lock")
+                .contains_key(&key),
             "a failed delete stays owed"
         );
 
@@ -7377,7 +8948,8 @@ mod tests {
 
         // The next sync retries the owed delete, and a settled retry takes
         // the key off the books.
-        api.drafts_fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        api.drafts_fail
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         app.sync_drafts();
         finish_draft_relays(&app).await;
         finish_draft_relays(&app).await;
@@ -7401,8 +8973,16 @@ mod tests {
         app.api = api.clone();
         app.screens.push(screens::home_state(false));
 
-        let thread = Thread { thread_id: 7, title: "A thread".into(), ..Default::default() };
-        let post = Post { post_id: 500, thread_id: 7, ..Default::default() };
+        let thread = Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        };
+        let post = Post {
+            post_id: 500,
+            thread_id: 7,
+            ..Default::default()
+        };
         app.execute_action(Action::StartEditPost(thread, Box::new(post)));
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "an edit in progress".into();
@@ -7423,19 +9003,28 @@ mod tests {
     #[tokio::test]
     async fn a_relay_failure_never_costs_the_local_draft() {
         let api = Arc::new(RecordingApi::default());
-        api.drafts_fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        api.drafts_fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let mut app = test_app();
         app.api = api.clone();
         app.screens.push(screens::home_state(false));
 
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "survives a broken relay".into();
         }
         app.pop_screen();
         finish_draft_relays(&app).await;
 
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         match app.screens.last() {
             Some(Screen::Compose(c)) => assert_eq!(c.body, "survives a broken relay"),
             _ => panic!("expected a composer"),
@@ -7448,20 +9037,38 @@ mod tests {
     #[tokio::test]
     async fn a_relay_refusal_for_an_unviewable_target_settles_and_keeps_the_words() {
         let api = Arc::new(RecordingApi::default());
-        api.drafts_refuse_target.store(true, std::sync::atomic::Ordering::SeqCst);
+        api.drafts_refuse_target
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let mut app = test_app();
         app.api = api.clone();
         app.screens.push(screens::home_state(false));
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "kept here".into();
         }
         app.pop_screen();
         finish_draft_relays(&app).await;
         let key = common::drafts::DraftKey::ThreadReply(7);
-        assert!(app.draft_operations.lock().expect("lock").get(&key).is_none(), "the refusal settled the obligation");
-        let stored = app.draft_store.load(app.draft_owner.as_ref().expect("test owner"));
-        assert_eq!(stored.get(&key).map(|d| d.body.as_str()), Some("kept here"), "the words are still local");
+        assert!(
+            app.draft_operations
+                .lock()
+                .expect("lock")
+                .get(&key)
+                .is_none(),
+            "the refusal settled the obligation"
+        );
+        let stored = app
+            .draft_store
+            .load(app.draft_owner.as_ref().expect("test owner"));
+        assert_eq!(
+            stored.get(&key).map(|d| d.body.as_str()),
+            Some("kept here"),
+            "the words are still local"
+        );
         assert!(api.drafts_saved.lock().expect("lock").is_empty());
     }
 
@@ -7476,7 +9083,11 @@ mod tests {
         app.api = api.clone();
         let _ = std::fs::remove_file(app.draft_store.path());
         app.screens.push(screens::home_state(false));
-        app.reply_to_thread(&Thread { thread_id: 7, title: "A thread".into(), ..Default::default() });
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        });
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "still mine on the website".into();
         }
@@ -7515,14 +9126,22 @@ mod tests {
         match app.screens.last() {
             Some(Screen::Drafts(d)) => {
                 assert_eq!(d.rows.len(), 1);
-                assert_eq!(d.rows[0].preview, "Test 1 2 3", "the row says what was written");
+                assert_eq!(
+                    d.rows[0].preview, "Test 1 2 3",
+                    "the row says what was written"
+                );
                 assert!(d.rows[0].shared, "a new-thread draft syncs to the site");
             }
-            other => panic!("expected the drafts list, got {:?}", other.map(|s| s.title())),
+            other => panic!(
+                "expected the drafts list, got {:?}",
+                other.map(|s| s.title())
+            ),
         }
 
         // Enter resumes it, and the composer comes back with the words.
-        app.execute_action(Action::ResumeDraft(common::drafts::DraftKey::NewThread(304)));
+        app.execute_action(Action::ResumeDraft(common::drafts::DraftKey::NewThread(
+            304,
+        )));
         match app.screens.last() {
             Some(Screen::Compose(c)) => {
                 assert_eq!(c.body, "Test 1 2 3");
@@ -7542,8 +9161,16 @@ mod tests {
     async fn the_drafts_list_marks_what_does_not_sync() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
-        let thread = Thread { thread_id: 7, title: "A thread".into(), ..Default::default() };
-        let post = Post { post_id: 500, thread_id: 7, ..Default::default() };
+        let thread = Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        };
+        let post = Post {
+            post_id: 500,
+            thread_id: 7,
+            ..Default::default()
+        };
         app.execute_action(Action::StartEditPost(thread, Box::new(post)));
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
             c.body = "an edit".into();
@@ -7594,10 +9221,15 @@ mod tests {
     async fn the_thread_view_says_when_a_reply_is_waiting() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 7, title: "A thread".into(), ..Default::default() },
-            ..Default::default()
-        }));
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 7,
+                    title: "A thread".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
 
         let bar = |app: &mut App| {
             let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
@@ -7614,7 +9246,10 @@ mod tests {
                 .join("\n")
         };
 
-        assert!(bar(&mut app).contains("reply"), "test setup: the reply cap is shown");
+        assert!(
+            bar(&mut app).contains("reply"),
+            "test setup: the reply cap is shown"
+        );
         assert!(
             !bar(&mut app).contains("resume draft"),
             "with no draft it must just say reply"
@@ -7622,7 +9257,10 @@ mod tests {
 
         app.drafts.insert(
             common::drafts::DraftKey::ThreadReply(7),
-            common::drafts::Draft { body: "waiting".into(), ..Default::default() },
+            common::drafts::Draft {
+                body: "waiting".into(),
+                ..Default::default()
+            },
         );
         assert!(
             bar(&mut app).contains("resume draft"),
@@ -7638,10 +9276,15 @@ mod tests {
     async fn pressing_r_in_a_thread_reopens_the_draft() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 7, title: "A thread".into(), ..Default::default() },
-            ..Default::default()
-        }));
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 7,
+                    title: "A thread".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
 
         app.handle_key(KeyEvent::from(KeyCode::Char('r')));
         if let Some(Screen::Compose(c)) = app.screens.last_mut() {
@@ -7676,10 +9319,17 @@ mod tests {
         app.screens.push(screens::home_state(false));
         app.drafts.insert(
             common::drafts::DraftKey::ThreadReply(7),
-            common::drafts::Draft { body: "half a reply".into(), ..Default::default() },
+            common::drafts::Draft {
+                body: "half a reply".into(),
+                ..Default::default()
+            },
         );
 
-        let thread = Thread { thread_id: 7, title: "A thread".into(), ..Default::default() };
+        let thread = Thread {
+            thread_id: 7,
+            title: "A thread".into(),
+            ..Default::default()
+        };
         let post = Post {
             post_id: 99,
             thread_id: 7,
@@ -7692,8 +9342,16 @@ mod tests {
 
         match app.screens.last() {
             Some(Screen::Compose(c)) => {
-                assert!(c.body.contains("the quoted words"), "the quote must survive: {:?}", c.body);
-                assert!(c.body.contains("half a reply"), "and so must the draft: {:?}", c.body);
+                assert!(
+                    c.body.contains("the quoted words"),
+                    "the quote must survive: {:?}",
+                    c.body
+                );
+                assert!(
+                    c.body.contains("half a reply"),
+                    "and so must the draft: {:?}",
+                    c.body
+                );
                 assert!(
                     c.body.find("the quoted words") < c.body.find("half a reply"),
                     "the draft belongs under the quote, where a reply goes"
@@ -7720,8 +9378,14 @@ mod tests {
         // 1. The session store is scratch, and it holds nothing — so no
         //    handler that spawns a call can ever authenticate one.
         let store = app.client.store_path();
-        assert!(store.starts_with(&scratch), "store escaped the scratch dir: {store:?}");
-        assert!(!store.starts_with(&real), "store resolved the real config dir: {store:?}");
+        assert!(
+            store.starts_with(&scratch),
+            "store escaped the scratch dir: {store:?}"
+        );
+        assert!(
+            !store.starts_with(&real),
+            "store resolved the real config dir: {store:?}"
+        );
         assert!(
             !app.client.has_tokens().await,
             "a test client must never see a stored session"
@@ -7730,23 +9394,53 @@ mod tests {
         // 2. Every other file the app writes hangs off that same store path.
         let login_url = app.client.store_path().with_file_name("login-url.txt");
         assert!(login_url.starts_with(&scratch), "{login_url:?}");
-        assert!(app.images.disk_dir().starts_with(&scratch), "{:?}", app.images.disk_dir());
-        assert!(!app.images.disk_dir().starts_with(&real), "{:?}", app.images.disk_dir());
+        assert!(
+            app.images.disk_dir().starts_with(&scratch),
+            "{:?}",
+            app.images.disk_dir()
+        );
+        assert!(
+            !app.images.disk_dir().starts_with(&real),
+            "{:?}",
+            app.images.disk_dir()
+        );
         // #715: drafts are the third file the app writes, and a test that
         // pops a composer writes one — it must never land on the operator's.
         let drafts = app.draft_store.path();
-        assert!(drafts.starts_with(&scratch), "draft store escaped the scratch dir: {drafts:?}");
-        assert!(!drafts.starts_with(&real), "draft store resolved the real config dir: {drafts:?}");
+        assert!(
+            drafts.starts_with(&scratch),
+            "draft store escaped the scratch dir: {drafts:?}"
+        );
+        assert!(
+            !drafts.starts_with(&real),
+            "draft store resolved the real config dir: {drafts:?}"
+        );
         // #722: a staged update is the fourth, and the "binary" a test would
         // swap must be a scratch file — never this test runner.
         let update_root = &app.update_cfg.root;
-        assert!(update_root.starts_with(&scratch), "update root escaped the scratch dir: {update_root:?}");
-        assert!(!update_root.starts_with(&real), "update root resolved the real config dir: {update_root:?}");
+        assert!(
+            update_root.starts_with(&scratch),
+            "update root escaped the scratch dir: {update_root:?}"
+        );
+        assert!(
+            !update_root.starts_with(&real),
+            "update root resolved the real config dir: {update_root:?}"
+        );
         let exe = app.update_cfg.exe.as_ref().expect("test exe");
-        assert!(exe.starts_with(&scratch), "the update target is not a scratch file: {exe:?}");
-        assert!(!app.update_cfg.feed_url.contains("github.com"), "a test must never ask the real feed");
+        assert!(
+            exe.starts_with(&scratch),
+            "the update target is not a scratch file: {exe:?}"
+        );
+        assert!(
+            !app.update_cfg.feed_url.contains("github.com"),
+            "a test must never ask the real feed"
+        );
         // The Setup screen's file is this app's own scratch file.
-        assert!(app.config_path.starts_with(&scratch), "{:?}", app.config_path);
+        assert!(
+            app.config_path.starts_with(&scratch),
+            "{:?}",
+            app.config_path
+        );
         // Per-site files (the generalised client): every site's store, and
         // the config file itself, resolve under the scratch dir too.
         // These resolve from `WFTUI_CONFIG_DIR` (the suite's scratch, set by
@@ -7757,16 +9451,29 @@ mod tests {
             common::config::drafts_path_for("other-site"),
             common::site::config_path(),
         ] {
-            assert!(!path.starts_with(&real), "resolved the real config dir: {path:?}");
+            assert!(
+                !path.starts_with(&real),
+                "resolved the real config dir: {path:?}"
+            );
         }
-        assert_eq!(app.site.origin, "https://windowsforum.com", "the built-in site's origin is only a label here");
-        assert_eq!(app.client.base_url(), OFFLINE_BASE, "…the client itself is pinned offline");
+        assert_eq!(
+            app.site.origin, "https://windowsforum.com",
+            "the built-in site's origin is only a label here"
+        );
+        assert_eq!(
+            app.client.base_url(),
+            OFFLINE_BASE,
+            "…the client itself is pinned offline"
+        );
 
         // 3. The origin is unreachable, and the API seam is a stub, not the
         //    network client (`me()` answers without a request).
         assert_eq!(app.client.base_url(), OFFLINE_BASE);
         assert!(!app.client.base_url().contains("windowsforum.com"));
-        assert!(matches!(app.api.me().await, Err(common::error::Error::NoToken)));
+        assert!(matches!(
+            app.api.me().await,
+            Err(common::error::Error::NoToken)
+        ));
 
         // 4. Poisoned: a config dir that is a plain FILE cannot hold a
         //    store, and nothing may quietly fall back to one that can.
@@ -7781,7 +9488,9 @@ mod tests {
         );
         assert!(
             poisoned
-                .save(&common::token::TokenSet { origin: String::new(), client_id: String::new(),
+                .save(&common::token::TokenSet {
+                    origin: String::new(),
+                    client_id: String::new(),
                     access_token: "guard".into(),
                     refresh_token: "guard".into(),
                     expires_at: 0,
@@ -7841,12 +9550,10 @@ mod tests {
             // draft file deleted another test's draft mid-run. A test that
             // deliberately wants two apps to share one (the restart case)
             // points the second at the first's `draft_store.path()`.
-            draft_store: common::drafts::Store::with_path(
-                scratch_config_dir().join(format!(
-                    "drafts-{}.json",
-                    TEST_DRAFT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                )),
-            ),
+            draft_store: common::drafts::Store::with_path(scratch_config_dir().join(format!(
+                "drafts-{}.json",
+                TEST_DRAFT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ))),
             image_slots: Arc::new(tokio::sync::Semaphore::new(IMAGE_LOAD_CONCURRENCY)),
             screens: Vec::new(),
             me: None,
@@ -8032,8 +9739,17 @@ mod tests {
     /// disagree.
     #[test]
     fn every_app_module_is_covered_by_the_source_scans() {
-        const SCANNED: [&str; 6] = ["mod.rs", "actions.rs", "input.rs", "msg.rs", "session.rs", "update.rs"];
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("app");
+        const SCANNED: [&str; 6] = [
+            "mod.rs",
+            "actions.rs",
+            "input.rs",
+            "msg.rs",
+            "session.rs",
+            "update.rs",
+        ];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("app");
         let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
             .expect("app module dir")
             .filter_map(|e| {
@@ -8061,13 +9777,19 @@ mod tests {
         let mut app = test_app();
         app.screens.push(screens::login_state());
         if let Some(Screen::Login(ls)) = app.screens.last_mut() {
-            ls.stage = screens::LoginStage::Waiting { mode: common::site::LoginMode::TuiLink };
+            ls.stage = screens::LoginStage::Waiting {
+                mode: common::site::LoginMode::TuiLink,
+            };
             ls.url = "https://windowsforum.com/tui-start/abc123".into();
         }
         assert!(app.me.is_none());
 
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
-        assert_eq!(app.screens.len(), 1, "c must not push the Inbox over a session-less Login screen");
+        assert_eq!(
+            app.screens.len(),
+            1,
+            "c must not push the Inbox over a session-less Login screen"
+        );
         assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
         assert_eq!(
             app.clipboard, "https://windowsforum.com/tui-start/abc123",
@@ -8077,7 +9799,11 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        assert_eq!(app.screens.len(), 1, "a/s// must not push screens while logged out");
+        assert_eq!(
+            app.screens.len(),
+            1,
+            "a/s// must not push screens while logged out"
+        );
         assert!(matches!(app.screens.last(), Some(Screen::Login(_))));
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -8100,7 +9826,10 @@ mod tests {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
         app.open_palette();
-        assert!(app.palette.is_some(), "test setup: the palette must actually be open");
+        assert!(
+            app.palette.is_some(),
+            "test setup: the palette must actually be open"
+        );
 
         app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
 
@@ -8129,7 +9858,11 @@ mod tests {
         });
         let mut app = test_app();
         app.api = api.clone();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
 
         app.execute_action(Action::SubmitReply {
@@ -8144,7 +9877,10 @@ mod tests {
         );
 
         app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
-        assert!(app.me.is_none(), "test setup: Ctrl+L must have ended the session");
+        assert!(
+            app.me.is_none(),
+            "test setup: Ctrl+L must have ended the session"
+        );
 
         // Well past the gate the abandoned write was waiting on.
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -8177,7 +9913,11 @@ mod tests {
         });
         let mut app = test_app();
         app.api = api.clone();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
 
         app.execute_action(Action::ReactPost(99));
@@ -8188,7 +9928,10 @@ mod tests {
         );
 
         app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
-        assert!(app.me.is_none(), "test setup: Ctrl+L must have ended the session");
+        assert!(
+            app.me.is_none(),
+            "test setup: Ctrl+L must have ended the session"
+        );
 
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(
@@ -8212,10 +9955,17 @@ mod tests {
     #[tokio::test]
     async fn a_double_enter_on_one_thread_stacks_no_duplicate_view() {
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
 
-        let thread = Thread { thread_id: 42, ..Default::default() };
+        let thread = Thread {
+            thread_id: 42,
+            ..Default::default()
+        };
         app.execute_action(Action::OpenThread(thread.clone()));
         let depth = app.screens.len();
         assert!(matches!(app.screens.last(), Some(Screen::ThreadView(_))));
@@ -8230,7 +9980,11 @@ mod tests {
     #[tokio::test]
     async fn reopening_a_loading_conversation_does_not_replace_the_view() {
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         // The dual-pane Inbox is where the view pane lives.
         app.screens.push(Screen::Inbox(screens::InboxState {
             dual: true,
@@ -8259,7 +10013,6 @@ mod tests {
         assert!(view.loading);
     }
 
-
     // ---------------------------------------------------------------- setup
 
     /// The generic edition's first run: a bad answer stays on the Setup
@@ -8274,28 +10027,58 @@ mod tests {
         app.site = Arc::new(common::site::SiteConfig::placeholder());
         app.push_screen(Screen::Setup(screens::setup::SetupState::default()));
         let text = frame_text(&mut app, 120, 30);
-        assert!(text.contains("Set up") && text.contains("Terminal") && text.contains("Forum address"), "{text}");
+        assert!(
+            text.contains("Set up") && text.contains("Terminal") && text.contains("Forum address"),
+            "{text}"
+        );
 
         // Refused: no client id. The screen keeps the fields and says why.
-        app.execute_action(Action::SetupSite { origin: "https://forum.example.com".into(), client_id: "".into(), name: "Example".into() });
-        let Some(Screen::Setup(s)) = app.screens.last() else { panic!("stays on Setup") };
-        assert!(s.errors.iter().any(|e| e.contains("oauth_client_id")), "{:?}", s.errors);
+        app.execute_action(Action::SetupSite {
+            origin: "https://forum.example.com".into(),
+            client_id: "".into(),
+            name: "Example".into(),
+        });
+        let Some(Screen::Setup(s)) = app.screens.last() else {
+            panic!("stays on Setup")
+        };
+        assert!(
+            s.errors.iter().any(|e| e.contains("oauth_client_id")),
+            "{:?}",
+            s.errors
+        );
         assert!(!path.exists(), "nothing is written for a refused site");
 
         // Accepted: config.json gains the site as default, the app is now
         // that site, and the login flow is running for it.
-        app.execute_action(Action::SetupSite { origin: "http://127.0.0.1:1/".into(), client_id: "test-client".into(), name: "Example Forum".into() });
-        assert!(!app.screens.iter().any(|s| matches!(s, Screen::Setup(_))), "Setup is gone");
-        assert!(matches!(app.screens.last(), Some(Screen::Login(_))), "sign-in is up");
+        app.execute_action(Action::SetupSite {
+            origin: "http://127.0.0.1:1/".into(),
+            client_id: "test-client".into(),
+            name: "Example Forum".into(),
+        });
+        assert!(
+            !app.screens.iter().any(|s| matches!(s, Screen::Setup(_))),
+            "Setup is gone"
+        );
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Login(_))),
+            "sign-in is up"
+        );
         assert_eq!(app.site.name, "127-0-0-1");
         assert_eq!(app.site.origin, "http://127.0.0.1:1");
         assert_eq!(app.site.brand.name, "Example Forum");
         assert_eq!(app.site.brand.mark, "EX");
         assert_eq!(app.client.base_url(), "http://127.0.0.1:1");
         assert_eq!(app.client.client_id(), "test-client");
-        assert!(app.client.store_path().ends_with("sites/127-0-0-1/token.json"), "{:?}", app.client.store_path());
+        assert!(
+            app.client
+                .store_path()
+                .ends_with("sites/127-0-0-1/token.json"),
+            "{:?}",
+            app.client.store_path()
+        );
         assert!(app.login_task.is_some(), "begin_login ran for the new site");
-        let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written["default_site"], "127-0-0-1");
         assert_eq!(written["sites"][0]["origin"], "http://127.0.0.1:1");
         assert_eq!(written["sites"][0]["oauth_client_id"], "test-client");
@@ -8303,14 +10086,20 @@ mod tests {
         let cfg = common::site::Config::load(&path).unwrap();
         let again = common::site::resolve(&cfg, None, &dir).unwrap();
         assert_eq!(again.brand.name, "Example Forum");
-        let Some(Screen::Login(ls)) = app.screens.last() else { panic!() };
-        assert!(Arc::ptr_eq(&ls.site, &app.site), "the pushed login screen carries the new site");
+        let Some(Screen::Login(ls)) = app.screens.last() else {
+            panic!()
+        };
+        assert!(
+            Arc::ptr_eq(&ls.site, &app.site),
+            "the pushed login screen carries the new site"
+        );
 
         // Re-saving the same site replaces its entry rather than duplicating it.
         let mut site = (*app.site).clone();
         site.brand.name = "Renamed".into();
         common::site::save_site(&path, &site).unwrap();
-        let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written["sites"].as_array().unwrap().len(), 1);
         assert_eq!(written["sites"][0]["brand"]["name"], "Renamed");
 
@@ -8323,7 +10112,11 @@ mod tests {
     #[tokio::test]
     async fn setup_fields_capture_typing_and_paste() {
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "x".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "x".into(),
+            ..Default::default()
+        });
         app.push_screen(Screen::Setup(screens::setup::SetupState::default()));
         for c in "https://f.example".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
@@ -8336,7 +10129,9 @@ mod tests {
         assert!(!app.prefix.armed(), "g is a letter in a field");
         app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(!app.should_quit, "q is a letter in a field");
-        let Some(Screen::Setup(s)) = app.screens.last() else { panic!() };
+        let Some(Screen::Setup(s)) = app.screens.last() else {
+            panic!()
+        };
         assert_eq!(s.origin, "https://f.example");
         assert_eq!(s.client_id, "cid-123gq");
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -8358,15 +10153,30 @@ mod tests {
     async fn go_media_on_a_site_without_xfmg_notices() {
         let mut app = test_app();
         app.site = site_without_addons();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
         app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
-        assert!(matches!(app.screens.last(), Some(Screen::Home(_))), "no gallery screen was pushed");
-        assert!(app.status.contains("Media Gallery is not enabled"), "{}", app.status);
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Home(_))),
+            "no gallery screen was pushed"
+        );
+        assert!(
+            app.status.contains("Media Gallery is not enabled"),
+            "{}",
+            app.status
+        );
         app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        assert!(app.status.contains("Resources are not enabled"), "{}", app.status);
+        assert!(
+            app.status.contains("Resources are not enabled"),
+            "{}",
+            app.status
+        );
         // A site chord the plain site does not declare cancels silently.
         app.status.clear();
         app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
@@ -8377,21 +10187,40 @@ mod tests {
     #[tokio::test]
     async fn palette_hides_media_and_resources_when_features_off() {
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
         let titles = app.palette.as_ref().unwrap().titles();
-        for t in ["Windows News", "Security Alerts", "Windows Tutorials", "Media Gallery", "Resources"] {
-            assert!(titles.iter().any(|x| x == t), "built-in palette lacks {t}: {titles:?}");
+        for t in [
+            "Windows News",
+            "Security Alerts",
+            "Windows Tutorials",
+            "Media Gallery",
+            "Resources",
+        ] {
+            assert!(
+                titles.iter().any(|x| x == t),
+                "built-in palette lacks {t}: {titles:?}"
+            );
         }
         app.palette = None;
         app.site = site_without_addons();
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
         let titles = app.palette.as_ref().unwrap().titles();
         for t in ["Windows News", "Media Gallery", "Resources"] {
-            assert!(!titles.iter().any(|x| x == t), "a plain site must not offer {t}: {titles:?}");
+            assert!(
+                !titles.iter().any(|x| x == t),
+                "a plain site must not offer {t}: {titles:?}"
+            );
         }
-        assert!(titles.iter().any(|x| x == "Latest posts") && titles.iter().any(|x| x == "Check for updates"));
+        assert!(
+            titles.iter().any(|x| x == "Latest posts")
+                && titles.iter().any(|x| x == "Check for updates")
+        );
     }
 
     /// The which-key panel reflows to the site: no quick row at all, or
@@ -8405,25 +10234,51 @@ mod tests {
         nine.quick = "bcefjnoqs"
             .chars()
             .enumerate()
-            .map(|(i, key)| common::site::QuickNode { key, label: format!("Forum {i}"), node_id: i as u32 + 1 })
+            .map(|(i, key)| common::site::QuickNode {
+                key,
+                label: format!("Forum {i}"),
+                node_id: i as u32 + 1,
+            })
             .collect();
         for (site, rows) in [(common::site::SiteConfig::blank("zero"), 3), (nine, 6)] {
             let cells = overlay::which_key_cells(&site);
-            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
             let theme = Theme::truecolor();
             term.draw(|f| {
                 let body = ratatui::layout::Rect::new(0, 1, 80, 21);
-                overlay::render_which_key(f, body, &theme, &glyph::UNICODE, &cells, &mut HitMap::default());
+                overlay::render_which_key(
+                    f,
+                    body,
+                    &theme,
+                    &glyph::UNICODE,
+                    &cells,
+                    &mut HitMap::default(),
+                );
             })
             .unwrap();
             let buf = term.backend().buffer().clone();
             let text: Vec<String> = (0..24)
                 .map(|y| (0..80).map(|x| buf[(x, y)].symbol().to_string()).collect())
                 .collect();
-            let drawn = text.iter().filter(|l| l.contains('\u{2502}') || l.contains('\u{256D}') || l.contains('\u{2570}')).count();
-            assert_eq!(drawn, rows + 2, "{} cells → {rows} rows plus the border:\n{}", cells.len(), text.join("\n"));
+            let drawn = text
+                .iter()
+                .filter(|l| {
+                    l.contains('\u{2502}') || l.contains('\u{256D}') || l.contains('\u{2570}')
+                })
+                .count();
+            assert_eq!(
+                drawn,
+                rows + 2,
+                "{} cells → {rows} rows plus the border:\n{}",
+                cells.len(),
+                text.join("\n")
+            );
             for (key, _) in &cells {
-                assert!(text.iter().any(|l| l.contains(&format!(" {key} "))), "cap {key} missing");
+                assert!(
+                    text.iter().any(|l| l.contains(&format!(" {key} "))),
+                    "cap {key} missing"
+                );
             }
         }
     }
@@ -8433,29 +10288,55 @@ mod tests {
     #[tokio::test]
     async fn quick_digit_beyond_the_list_is_not_advertised() {
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         let mut one = common::site::SiteConfig::blank("one");
         one.origin = "http://127.0.0.1:1".into();
         one.oauth_client_id = "test-client".into();
-        one.quick = vec![common::site::QuickNode { key: 'n', label: "News".into(), node_id: 12 }];
+        one.quick = vec![common::site::QuickNode {
+            key: 'n',
+            label: "News".into(),
+            node_id: 12,
+        }];
         app.site = Arc::new(one);
         // Through `push_screen`, which stamps the site — a bare `Vec::push`
         // would leave the tree on the built-in list until the first frame.
         app.push_screen(screens::home_state(false));
         let hints = app.screens.last().unwrap().hints();
-        assert!(!hints.keys.iter().any(|(k, _)| k.starts_with('1')), "Home never advertised digits: {:?}", hints.keys);
-        let tree = Screen::ForumTree(screens::ForumTreeState { site: app.site.clone(), ..Default::default() });
+        assert!(
+            !hints.keys.iter().any(|(k, _)| k.starts_with('1')),
+            "Home never advertised digits: {:?}",
+            hints.keys
+        );
+        let tree = Screen::ForumTree(screens::ForumTreeState {
+            site: app.site.clone(),
+            ..Default::default()
+        });
         let caps: Vec<&str> = tree.hints().keys.iter().map(|(k, _)| *k).collect();
         assert!(caps.contains(&"1") && !caps.contains(&"1/2/3"), "{caps:?}");
         let builtin = Screen::ForumTree(screens::ForumTreeState::default());
         let caps: Vec<&str> = builtin.hints().keys.iter().map(|(k, _)| *k).collect();
         assert!(caps.contains(&"1/2/3"), "{caps:?}");
-        let zero = screens::ForumTreeState { site: site_without_addons(), ..Default::default() };
-        let caps: Vec<&str> = Screen::ForumTree(zero).hints().keys.iter().map(|(k, _)| *k).collect();
+        let zero = screens::ForumTreeState {
+            site: site_without_addons(),
+            ..Default::default()
+        };
+        let caps: Vec<&str> = Screen::ForumTree(zero)
+            .hints()
+            .keys
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
         assert!(!caps.iter().any(|k| k.starts_with('1')), "{caps:?}");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
-        assert!(matches!(app.screens.last(), Some(Screen::Home(_))), "digit 2 has no forum on this site");
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Home(_))),
+            "digit 2 has no forum on this site"
+        );
         app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         assert!(
             matches!(app.screens.last(), Some(Screen::ThreadList(l)) if l.node_id == 12 && l.title == "News"),
@@ -8464,7 +10345,10 @@ mod tests {
         // And the Home tree draws the QUICK block from the same list.
         app.screens.truncate(1);
         let text = frame_text(&mut app, 120, 30);
-        assert!(text.contains(" 1  News") && !text.contains("Windows News"), "{text}");
+        assert!(
+            text.contains(" 1  News") && !text.contains("Windows News"),
+            "{text}"
+        );
     }
 
     /// The first 404 from the draft relay turns the mirror off for the
@@ -8473,18 +10357,32 @@ mod tests {
     #[tokio::test]
     async fn draft_relay_404_stops_further_relay_calls() {
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         assert!(app.draft_relay_enabled());
         app.handle_msg(Msg::DraftRelayAbsent);
         assert!(!app.draft_relay_enabled());
         let before = app.session_handles.len();
         let key = common::drafts::DraftKey::ThreadReply(5);
-        app.drafts.insert(key, common::drafts::Draft { body: "words".into(), ..Default::default() });
+        app.drafts.insert(
+            key,
+            common::drafts::Draft {
+                body: "words".into(),
+                ..Default::default()
+            },
+        );
         app.persist_draft(key);
         app.relay_draft(key);
         app.discard_draft(key);
         app.sync_drafts();
-        assert_eq!(app.session_handles.len(), before, "no relay task after a 404");
+        assert_eq!(
+            app.session_handles.len(),
+            before,
+            "no relay task after a 404"
+        );
 
         let mut pinned = test_app();
         let mut site = common::site::SiteConfig::windowsforum();
@@ -8571,14 +10469,20 @@ mod tests {
             .replace("%3A", ":")
             .replace("%2F", "/");
         let state = state_of(url);
-        let Some(host_port) = redirect.strip_prefix("http://").and_then(|r| r.split('/').next()) else {
+        let Some(host_port) = redirect
+            .strip_prefix("http://")
+            .and_then(|r| r.split('/').next())
+        else {
             return Ok(());
         };
         let host_port = host_port.to_string();
         std::thread::spawn(move || {
             use std::io::Write;
             if let Ok(mut s) = std::net::TcpStream::connect(&host_port) {
-                let _ = write!(s, "GET /callback?code=thecode&state={state} HTTP/1.1\r\nHost: x\r\n\r\n");
+                let _ = write!(
+                    s,
+                    "GET /callback?code=thecode&state={state} HTTP/1.1\r\nHost: x\r\n\r\n"
+                );
                 let _ = s.flush();
                 std::thread::sleep(Duration::from_millis(200));
             }
@@ -8596,17 +10500,21 @@ mod tests {
             .and(body_string_contains("grant_type=authorization_code"))
             .and(body_string_contains("code=thecode"))
             .and(body_string_contains("client_id=test-client"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "tok-1", "refresh_token": "refresh-1",
-                "expires_in": 7200, "token_type": "bearer", "scope": "test"
-            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "tok-1", "refresh_token": "refresh-1",
+                    "expires_in": 7200, "token_type": "bearer", "scope": "test"
+                })),
+            )
             .mount(&server)
             .await;
         wiremock::Mock::given(method("GET"))
             .and(path("/api/me"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"me": {"user_id": 7, "username": "kemical"}}),
-            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"me": {"user_id": 7, "username": "kemical"}}),
+                ),
+            )
             .mount(&server)
             .await;
         server
@@ -8617,19 +10525,23 @@ mod tests {
         use wiremock::matchers::{method, path};
         wiremock::Mock::given(method("POST"))
             .and(path("/api/wf-tuilink/register"))
-            .respond_with(wiremock::ResponseTemplate::new(status).set_body_json(serde_json::json!({
-                "errors": [{"code": "route_not_found", "message": "Route not found"}]
-            })))
+            .respond_with(wiremock::ResponseTemplate::new(status).set_body_json(
+                serde_json::json!({
+                    "errors": [{"code": "route_not_found", "message": "Route not found"}]
+                }),
+            ))
             .mount(server)
             .await;
     }
 
     fn app_for(server: &wiremock::MockServer, mode: Option<common::site::LoginMode>) -> App {
         let mut app = test_app();
-        let store = common::token::Store::with_path(
-            scratch_config_dir().join(format!("login-{}.json", TEST_DRAFT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst))),
-        );
-        app.client = Arc::new(WfApiClient::with_store(store, server.uri(), "test-client").expect("client"));
+        let store = common::token::Store::with_path(scratch_config_dir().join(format!(
+            "login-{}.json",
+            TEST_DRAFT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        )));
+        app.client =
+            Arc::new(WfApiClient::with_store(store, server.uri(), "test-client").expect("client"));
         app.browser_opener = redirecting_browser;
         app.screens.push(screens::home_state(false));
         app.screens.push(screens::login_state());
@@ -8653,22 +10565,43 @@ mod tests {
             panic!("{events:?}");
         };
         assert_eq!(*mode, common::site::LoginMode::Loopback);
-        assert!(url.starts_with(&format!("{}/oauth2/authorize?", server.uri())), "{url}");
-        assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A"), "{url}");
+        assert!(
+            url.starts_with(&format!("{}/oauth2/authorize?", server.uri())),
+            "{url}"
+        );
+        assert!(
+            url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A"),
+            "{url}"
+        );
         assert!(url.contains("client_id=test-client"), "{url}");
         assert!(url.contains("code_challenge_method=S256"), "{url}");
-        assert!(url.contains("media%3Aread"), "the built-in site's scopes: {url}");
-        assert_eq!(events.last(), Some(&LoginEvent::Complete(true)), "{events:?}");
-        assert_eq!(app.me.as_ref().map(|u| u.username.as_str()), Some("kemical"));
+        assert!(
+            url.contains("media%3Aread"),
+            "the built-in site's scopes: {url}"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&LoginEvent::Complete(true)),
+            "{events:?}"
+        );
+        assert_eq!(
+            app.me.as_ref().map(|u| u.username.as_str()),
+            Some("kemical")
+        );
         let stored = app.client.store_path();
-        let tokens = common::token::Store::with_path(stored.to_path_buf()).load().unwrap().unwrap();
+        let tokens = common::token::Store::with_path(stored.to_path_buf())
+            .load()
+            .unwrap()
+            .unwrap();
         assert_eq!(tokens.origin, server.uri());
         assert_eq!(tokens.client_id, "test-client");
         app.shutdown().await;
     }
 
     async fn refused_login_loopback() -> common::error::Result<(tokio::net::TcpListener, String)> {
-        Err(common::error::Error::Handshake("fixture cannot bind loopback".into()))
+        Err(common::error::Error::Handshake(
+            "fixture cannot bind loopback".into(),
+        ))
     }
 
     async fn assert_auto_login_falls_back_to_paste(tuilink: Option<bool>) {
@@ -8683,24 +10616,58 @@ mod tests {
         let (paste_tx, paste_rx) = mpsc::unbounded_channel();
         let flow = tokio::spawn(async move {
             run_login_flow_with_io(
-                &tx, client, generation,
-                LoginFlowIo { browser_opener: test_browser_opener, bind_loopback: refused_login_loopback },
-                Arc::new(site), common::site::LoginMode::Auto, paste_rx,
-            ).await
+                &tx,
+                client,
+                generation,
+                LoginFlowIo {
+                    browser_opener: test_browser_opener,
+                    bind_loopback: refused_login_loopback,
+                },
+                Arc::new(site),
+                common::site::LoginMode::Auto,
+                paste_rx,
+            )
+            .await
         });
-        let ready = tokio::time::timeout(Duration::from_secs(5), app.rx.recv()).await.unwrap().unwrap();
+        let ready = tokio::time::timeout(Duration::from_secs(5), app.rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let url = match &ready {
-            Msg::LoginReady { mode: common::site::LoginMode::Paste, url, .. } => url.clone(),
+            Msg::LoginReady {
+                mode: common::site::LoginMode::Paste,
+                url,
+                ..
+            } => url.clone(),
             _ => panic!("automatic login must offer paste after binding fails"),
         };
-        assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"), "{url}");
+        assert!(
+            url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"),
+            "{url}"
+        );
         app.handle_msg(ready);
-        paste_tx.send(format!("http://127.0.0.1/callback?code=thecode&state={}", state_of(&url))).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), flow).await.unwrap().unwrap().unwrap();
+        paste_tx
+            .send(format!(
+                "http://127.0.0.1/callback?code=thecode&state={}",
+                state_of(&url)
+            ))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), flow)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         let events = drain_login(&mut app, Duration::from_secs(5)).await;
-        assert_eq!(events.last(), Some(&LoginEvent::Complete(true)), "{events:?}");
+        assert_eq!(
+            events.last(),
+            Some(&LoginEvent::Complete(true)),
+            "{events:?}"
+        );
         let requests = server.received_requests().await.unwrap();
-        let probes = requests.iter().filter(|r| r.url.path() == "/api/wf-tuilink/register").count();
+        let probes = requests
+            .iter()
+            .filter(|r| r.url.path() == "/api/wf-tuilink/register")
+            .count();
         assert_eq!(probes, usize::from(tuilink != Some(false)));
         app.shutdown().await;
     }
@@ -8721,13 +10688,25 @@ mod tests {
         let mut app = app_for(&server, Some(common::site::LoginMode::Loopback));
         let (_paste_tx, paste_rx) = mpsc::unbounded_channel();
         let error = run_login_flow_with_io(
-            &app.tx, app.client.clone(), app.login_generation,
-            LoginFlowIo { browser_opener: test_browser_opener, bind_loopback: refused_login_loopback },
-            app.site.clone(), common::site::LoginMode::Loopback, paste_rx,
-        ).await.unwrap_err();
+            &app.tx,
+            app.client.clone(),
+            app.login_generation,
+            LoginFlowIo {
+                browser_opener: test_browser_opener,
+                bind_loopback: refused_login_loopback,
+            },
+            app.site.clone(),
+            common::site::LoginMode::Loopback,
+            paste_rx,
+        )
+        .await
+        .unwrap_err();
         assert!(error.contains("fixture cannot bind loopback"), "{error}");
         assert!(error.contains("press m for paste mode"), "{error}");
-        assert!(app.rx.try_recv().is_err(), "an explicit failure must not announce another mode");
+        assert!(
+            app.rx.try_recv().is_err(),
+            "an explicit failure must not announce another mode"
+        );
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
@@ -8743,29 +10722,58 @@ mod tests {
         app.browser_opener = test_browser_opener;
         app.begin_login();
         // Only the link comes back on its own; nothing else happens until a paste.
-        let msg = tokio::time::timeout(Duration::from_secs(10), app.rx.recv()).await.unwrap().unwrap();
+        let msg = tokio::time::timeout(Duration::from_secs(10), app.rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let (url, mode) = match &msg {
             Msg::LoginReady { url, mode, .. } => (url.clone(), *mode),
             _ => panic!("expected the link first"),
         };
         app.handle_msg(msg);
         assert_eq!(mode, common::site::LoginMode::Paste);
-        assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"), "{url}");
-        let Some(Screen::Login(ls)) = app.screens.last() else { panic!() };
-        assert_eq!(ls.stage, screens::LoginStage::Pasting { mode: common::site::LoginMode::Paste });
+        assert!(
+            url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"),
+            "{url}"
+        );
+        let Some(Screen::Login(ls)) = app.screens.last() else {
+            panic!()
+        };
+        assert_eq!(
+            ls.stage,
+            screens::LoginStage::Pasting {
+                mode: common::site::LoginMode::Paste
+            }
+        );
         assert!(app.login_paste_tx.is_some());
 
-        app.execute_action(Action::LoginPaste("http://127.0.0.1/callback?code=x&state=wrong".into()));
+        app.execute_action(Action::LoginPaste(
+            "http://127.0.0.1/callback?code=x&state=wrong".into(),
+        ));
         let events = drain_login(&mut app, Duration::from_secs(2)).await;
-        assert!(matches!(events.as_slice(), [LoginEvent::Notice(m)] if m.contains("state mismatch")), "{events:?}");
-        let Some(Screen::Login(ls)) = app.screens.last() else { panic!() };
+        assert!(
+            matches!(events.as_slice(), [LoginEvent::Notice(m)] if m.contains("state mismatch")),
+            "{events:?}"
+        );
+        let Some(Screen::Login(ls)) = app.screens.last() else {
+            panic!()
+        };
         assert!(ls.error.as_deref().is_some_and(|e| e.contains("try again")));
-        assert!(matches!(ls.stage, screens::LoginStage::Pasting { .. }), "a bad paste keeps the field open");
+        assert!(
+            matches!(ls.stage, screens::LoginStage::Pasting { .. }),
+            "a bad paste keeps the field open"
+        );
 
         let state = state_of(&url);
-        app.execute_action(Action::LoginPaste(format!("http://127.0.0.1/callback?code=thecode&state={state}")));
+        app.execute_action(Action::LoginPaste(format!(
+            "http://127.0.0.1/callback?code=thecode&state={state}"
+        )));
         let events = drain_login(&mut app, Duration::from_secs(10)).await;
-        assert_eq!(events.last(), Some(&LoginEvent::Complete(true)), "{events:?}");
+        assert_eq!(
+            events.last(),
+            Some(&LoginEvent::Complete(true)),
+            "{events:?}"
+        );
         assert_eq!(app.me.as_ref().map(|u| u.user_id), Some(7));
         app.shutdown().await;
     }
@@ -8780,8 +10788,13 @@ mod tests {
         let mut app = app_for(&server, Some(common::site::LoginMode::TuiLink));
         app.begin_login();
         let events = drain_login(&mut app, Duration::from_secs(10)).await;
-        assert!(matches!(events.as_slice(), [LoginEvent::Failed(m)] if m.contains("no TuiLink relay")), "{events:?}");
-        let Some(Screen::Login(ls)) = app.screens.last() else { panic!() };
+        assert!(
+            matches!(events.as_slice(), [LoginEvent::Failed(m)] if m.contains("no TuiLink relay")),
+            "{events:?}"
+        );
+        let Some(Screen::Login(ls)) = app.screens.last() else {
+            panic!()
+        };
         assert!(!ls.busy && ls.stage == screens::LoginStage::Idle);
 
         let broken = oauth_server().await;
@@ -8789,7 +10802,10 @@ mod tests {
         let mut app = app_for(&broken, None);
         app.begin_login();
         let events = drain_login(&mut app, Duration::from_secs(10)).await;
-        assert!(matches!(events.as_slice(), [LoginEvent::Failed(_)]), "a 500 is not a missing relay: {events:?}");
+        assert!(
+            matches!(events.as_slice(), [LoginEvent::Failed(_)]),
+            "a 500 is not a missing relay: {events:?}"
+        );
     }
 
     /// The generalised relay reports a refused approval as `denied`; the
@@ -8807,9 +10823,11 @@ mod tests {
             .await;
         wiremock::Mock::given(method("POST"))
             .and(path("/api/wf-tuilink/poll"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": true, "status": "denied"
-            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true, "status": "denied"
+                })),
+            )
             .mount(&server)
             .await;
         let mut app = app_for(&server, None);
@@ -8831,13 +10849,22 @@ mod tests {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
         app.screens.push(Screen::Login(screens::LoginState {
-            stage: screens::LoginStage::Waiting { mode: common::site::LoginMode::Loopback },
+            stage: screens::LoginStage::Waiting {
+                mode: common::site::LoginMode::Loopback,
+            },
             url: "http://127.0.0.1:1/oauth2/authorize?state=s".into(),
             ..Default::default()
         }));
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
-        let Some(Screen::Login(ls)) = app.screens.last() else { panic!() };
-        assert_eq!(ls.stage, screens::LoginStage::Pasting { mode: common::site::LoginMode::Loopback });
+        let Some(Screen::Login(ls)) = app.screens.last() else {
+            panic!()
+        };
+        assert_eq!(
+            ls.stage,
+            screens::LoginStage::Pasting {
+                mode: common::site::LoginMode::Loopback
+            }
+        );
         for c in "qm".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
@@ -8845,13 +10872,28 @@ mod tests {
         app.clipboard = "?code=c".into();
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
         app.handle_paste("&state=s\n".into());
-        let Some(Screen::Login(ls)) = app.screens.last() else { panic!() };
+        let Some(Screen::Login(ls)) = app.screens.last() else {
+            panic!()
+        };
         assert_eq!(ls.paste, "qm?code=c&state=s");
-        assert!(ls.mode_override.is_none(), "m typed into the field is not the mode key");
+        assert!(
+            ls.mode_override.is_none(),
+            "m typed into the field is not the mode key"
+        );
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        let Some(Screen::Login(ls)) = app.screens.last() else { panic!() };
-        assert_eq!(ls.stage, screens::LoginStage::Waiting { mode: common::site::LoginMode::Loopback });
-        assert!(matches!(app.screens.last(), Some(Screen::Login(_))), "Esc never leaves the gate");
+        let Some(Screen::Login(ls)) = app.screens.last() else {
+            panic!()
+        };
+        assert_eq!(
+            ls.stage,
+            screens::LoginStage::Waiting {
+                mode: common::site::LoginMode::Loopback
+            }
+        );
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Login(_))),
+            "Esc never leaves the gate"
+        );
 
         // Enter in the field with nothing pasted says so; with text it is
         // handed to the flow — or, with no flow, reported.
@@ -8864,7 +10906,11 @@ mod tests {
         assert!(app.status.contains("Paste the address"), "{}", app.status);
         app.handle_paste("abc".into());
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.status.contains("No sign-in in progress"), "{}", app.status);
+        assert!(
+            app.status.contains("No sign-in in progress"),
+            "{}",
+            app.status
+        );
 
         // `m` while waiting cycles the mode and restarts — from the mode
         // the screen DISPLAYS: this flow is Waiting{Loopback} (an Auto
@@ -8873,8 +10919,16 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         let before = app.login_generation;
         app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
-        assert!(app.status.starts_with("Login mode: paste"), "{}", app.status);
-        assert_eq!(app.login_generation, before + 1, "a running flow restarts in the new mode");
+        assert!(
+            app.status.starts_with("Login mode: paste"),
+            "{}",
+            app.status
+        );
+        assert_eq!(
+            app.login_generation,
+            before + 1,
+            "a running flow restarts in the new mode"
+        );
         app.shutdown().await;
     }
 
@@ -8895,11 +10949,17 @@ mod tests {
     }
 
     fn frame_text(app: &mut App, w: u16, h: u16) -> String {
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
         term.draw(|f| app.draw(f)).expect("draw");
         let buf = term.backend().buffer().clone();
         (0..h)
-            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>() + "\n")
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
             .collect()
     }
 
@@ -8909,7 +10969,11 @@ mod tests {
     #[tokio::test]
     async fn update_checked_staged_sets_the_chip_and_the_palette_row() {
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
         assert!(app.update_chip().is_none());
 
@@ -8922,23 +10986,48 @@ mod tests {
                 path: app.update_cfg.root.join("pending-x").join("wftui"),
             }),
         });
-        assert_eq!(app.update, update::UpdateState::Staged { version: "9.9.9".into() });
+        assert_eq!(
+            app.update,
+            update::UpdateState::Staged {
+                version: "9.9.9".into()
+            }
+        );
         assert_eq!(app.update_chip().as_deref(), Some("update v9.9.9 ready"));
         assert!(app.status.contains("restart"), "{}", app.status);
-        assert!(app.status_set_at.is_none(), "a staged update is a persistent hint, not a toast");
+        assert!(
+            app.status_set_at.is_none(),
+            "a staged update is a persistent hint, not a toast"
+        );
         let text = frame_text(&mut app, 120, 30);
-        assert!(text.lines().next().unwrap().contains("update v9.9.9 ready"), "{text}");
+        assert!(
+            text.lines().next().unwrap().contains("update v9.9.9 ready"),
+            "{text}"
+        );
 
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
         for c in "update".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
-        let row = app.palette.as_ref().and_then(|p| p.selected()).map(|i| i.title.clone());
-        assert_eq!(row.as_deref(), Some("Update v9.9.9 ready, restart to apply"));
+        let row = app
+            .palette
+            .as_ref()
+            .and_then(|p| p.selected())
+            .map(|i| i.title.clone());
+        assert_eq!(
+            row.as_deref(),
+            Some("Update v9.9.9 ready, restart to apply")
+        );
         app.status.clear();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.status.contains("restart wftui to apply"), "{}", app.status);
-        assert_eq!(app.update_generation, 1, "a staged update is not re-checked");
+        assert!(
+            app.status.contains("restart wftui to apply"),
+            "{}",
+            app.status
+        );
+        assert_eq!(
+            app.update_generation, 1,
+            "a staged update is not re-checked"
+        );
         assert!(app.update_task.is_none());
     }
 
@@ -8949,9 +11038,16 @@ mod tests {
         app.handle_msg(Msg::UpdateChecked {
             generation: 4,
             forced: true,
-            result: Ok(common::update::Outcome::Staged { version: "9.9.9".into(), path: std::path::PathBuf::new() }),
+            result: Ok(common::update::Outcome::Staged {
+                version: "9.9.9".into(),
+                path: std::path::PathBuf::new(),
+            }),
         });
-        assert_eq!(app.update, update::UpdateState::Idle, "a superseded check must not speak");
+        assert_eq!(
+            app.update,
+            update::UpdateState::Idle,
+            "a superseded check must not speak"
+        );
         assert!(app.status.is_empty());
         assert!(app.update_chip().is_none());
     }
@@ -8961,7 +11057,11 @@ mod tests {
     #[tokio::test]
     async fn update_check_task_survives_end_session() {
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
         app.check_for_updates_now();
         assert_eq!(app.update, update::UpdateState::Checking);
@@ -8969,17 +11069,29 @@ mod tests {
         let generation = app.update_generation;
 
         app.end_session("Session expired; log in again.");
-        assert!(app.update_task.is_some(), "end_session must not abort the update check");
+        assert!(
+            app.update_task.is_some(),
+            "end_session must not abort the update check"
+        );
         assert_eq!(app.update_generation, generation);
         assert_eq!(app.update, update::UpdateState::Checking);
 
         // The feed is unreachable, so the answer is a failure — delivered
         // and shown even though the session that started it is gone.
-        let msg = tokio::time::timeout(Duration::from_secs(10), app.rx.recv()).await.expect("answer").expect("msg");
-        assert!(matches!(msg, Msg::UpdateChecked { generation: g, forced: true, result: Err(_) } if g == generation));
+        let msg = tokio::time::timeout(Duration::from_secs(10), app.rx.recv())
+            .await
+            .expect("answer")
+            .expect("msg");
+        assert!(
+            matches!(msg, Msg::UpdateChecked { generation: g, forced: true, result: Err(_) } if g == generation)
+        );
         app.handle_msg(msg);
         assert!(matches!(app.update, update::UpdateState::Failed(_)));
-        assert!(app.status.starts_with("Update check failed:"), "{}", app.status);
+        assert!(
+            app.status.starts_with("Update check failed:"),
+            "{}",
+            app.status
+        );
 
         app.check_for_updates_now();
         app.shutdown().await;
@@ -8991,7 +11103,11 @@ mod tests {
     #[tokio::test]
     async fn g_u_chord_and_palette_row_trigger_a_forced_check() {
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
@@ -9002,7 +11118,10 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
-        assert_eq!(app.update_generation, 1, "a second press does not start a second check");
+        assert_eq!(
+            app.update_generation, 1,
+            "a second press does not start a second check"
+        );
         assert_eq!(app.status, "Already checking for updates…");
 
         app.update = update::UpdateState::UpToDate;
@@ -9010,17 +11129,26 @@ mod tests {
         for c in "check for updates".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
-        let row = app.palette.as_ref().and_then(|p| p.selected()).map(|i| i.title.clone());
+        let row = app
+            .palette
+            .as_ref()
+            .and_then(|p| p.selected())
+            .map(|i| i.title.clone());
         assert_eq!(row.as_deref(), Some("Check for updates"));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.update_generation, 2, "the palette row runs the same check");
+        assert_eq!(
+            app.update_generation, 2,
+            "the palette row runs the same check"
+        );
         assert_eq!(app.update, update::UpdateState::Checking);
 
         // A manual answer of "nothing new" is a toast; the automatic one is silent.
         app.handle_msg(Msg::UpdateChecked {
             generation: 2,
             forced: true,
-            result: Ok(common::update::Outcome::UpToDate { latest: "0.0.1".into() }),
+            result: Ok(common::update::Outcome::UpToDate {
+                latest: "0.0.1".into(),
+            }),
         });
         assert!(app.status.contains("is up to date"), "{}", app.status);
         assert!(app.status_set_at.is_some(), "a toast");
@@ -9029,9 +11157,14 @@ mod tests {
         app.handle_msg(Msg::UpdateChecked {
             generation: 3,
             forced: false,
-            result: Ok(common::update::Outcome::UpToDate { latest: "0.0.1".into() }),
+            result: Ok(common::update::Outcome::UpToDate {
+                latest: "0.0.1".into(),
+            }),
         });
-        assert!(app.status.is_empty(), "the automatic check is quiet when there is nothing to do");
+        assert!(
+            app.status.is_empty(),
+            "the automatic check is quiet when there is nothing to do"
+        );
         app.shutdown().await;
     }
 
@@ -9043,17 +11176,32 @@ mod tests {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
         app.screens.push(screens::login_state());
-        app.update = update::UpdateState::JustApplied { version: "9.9.9".into() };
+        app.update = update::UpdateState::JustApplied {
+            version: "9.9.9".into(),
+        };
         app.schedule_startup_update_check();
         assert!(app.update_task.is_none());
         assert_eq!(app.update_generation, 0);
-        assert_eq!(app.update_chip().as_deref(), Some("v9.9.9 applied, restart"));
+        assert_eq!(
+            app.update_chip().as_deref(),
+            Some("v9.9.9 applied, restart")
+        );
         let text = frame_text(&mut app, 120, 30);
-        assert!(text.lines().next().unwrap().contains("v9.9.9 applied, restart"), "signed out or not: {text}");
+        assert!(
+            text.lines()
+                .next()
+                .unwrap()
+                .contains("v9.9.9 applied, restart"),
+            "signed out or not: {text}"
+        );
 
         app.check_for_updates_now();
         assert!(app.update_task.is_none());
-        assert!(app.status.contains("restart wftui to run it"), "{}", app.status);
+        assert!(
+            app.status.contains("restart wftui to run it"),
+            "{}",
+            app.status
+        );
 
         // The ordinary start does schedule one (delayed) check.
         let mut fresh = test_app();
@@ -9089,11 +11237,17 @@ mod tests {
                 command: command.into(),
             }),
         });
-        assert_eq!(app.status, format!("Update v9.9.9 downloaded; install it with: {command}"));
+        assert_eq!(
+            app.status,
+            format!("Update v9.9.9 downloaded; install it with: {command}")
+        );
         assert_eq!(app.update_chip().as_deref(), Some("update v9.9.9 (manual)"));
         app.status.clear();
         app.check_for_updates_now();
-        assert!(app.status.contains(command), "g u repeats the command rather than re-checking");
+        assert!(
+            app.status.contains(command),
+            "g u repeats the command rather than re-checking"
+        );
         assert_eq!(app.update_generation, 1);
 
         let mut msix = test_app();
@@ -9110,8 +11264,16 @@ mod tests {
         assert!(msix.status.contains("release page"), "{}", msix.status);
         assert_eq!(msix.update_chip().as_deref(), Some("update v9.9.9"));
         msix.check_for_updates_now();
-        assert!(msix.status.starts_with("Opening http://127.0.0.1:9/releases/tag/v9.9.9"), "{}", msix.status);
-        assert_eq!(msix.clipboard, "http://127.0.0.1:9/releases/tag/v9.9.9", "the URL is on the clipboard for remote sessions");
+        assert!(
+            msix.status
+                .starts_with("Opening http://127.0.0.1:9/releases/tag/v9.9.9"),
+            "{}",
+            msix.status
+        );
+        assert_eq!(
+            msix.clipboard, "http://127.0.0.1:9/releases/tag/v9.9.9",
+            "the URL is on the clipboard for remote sessions"
+        );
     }
 
     /// #680: both navigation surfaces reach the new catalogs — `g m` / `g r`
@@ -9120,20 +11282,30 @@ mod tests {
     #[tokio::test]
     async fn the_gallery_and_resources_are_reachable_by_chord_and_palette() {
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
         let Some(Screen::MediaGallery(m)) = app.screens.last() else {
-            panic!("g m must open the Media Gallery, got {:?}", app.screens.last().map(|s| s.title()));
+            panic!(
+                "g m must open the Media Gallery, got {:?}",
+                app.screens.last().map(|s| s.title())
+            );
         };
         assert!(m.loading, "the page-1 fetch is in flight");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         let Some(Screen::Resources(r)) = app.screens.last() else {
-            panic!("g r must open Resources, got {:?}", app.screens.last().map(|s| s.title()));
+            panic!(
+                "g r must open Resources, got {:?}",
+                app.screens.last().map(|s| s.title())
+            );
         };
         assert!(r.loading, "the page-1 fetch is in flight");
 
@@ -9165,19 +11337,24 @@ mod tests {
     #[test]
     fn clicking_a_play_row_plays_that_video() {
         let mut app = home_app();
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 9, title: "A thread".into(), ..Default::default() },
-            posts: vec![Post {
-                post_id: 1,
-                username: "kemical".into(),
-                message: "one [MEDIA=youtube]aaa[/MEDIA]\ntwo [MEDIA=youtube]bbb[/MEDIA]"
-                    .into(),
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 9,
+                    title: "A thread".into(),
+                    ..Default::default()
+                },
+                posts: vec![Post {
+                    post_id: 1,
+                    username: "kemical".into(),
+                    message: "one [MEDIA=youtube]aaa[/MEDIA]\ntwo [MEDIA=youtube]bbb[/MEDIA]"
+                        .into(),
+                    ..Default::default()
+                }],
+                page: 1,
+                last_page: 1,
                 ..Default::default()
-            }],
-            page: 1,
-            last_page: 1,
-            ..Default::default()
-        }));
+            }));
         frame(&mut app, 120, 24);
 
         // Both rows registered, and each answers as its own index.
@@ -9205,7 +11382,6 @@ mod tests {
             app.status
         );
     }
-
 
     /// #709: an uploaded file lands at the caret as `[ATTACH]id[/ATTACH]`,
     /// its key is remembered, and the write that follows carries that key —
@@ -9241,7 +11417,10 @@ mod tests {
         });
         match app.screens.last() {
             Some(Screen::Compose(c)) => {
-                assert_eq!(c.body, "See: [ATTACH]55[/ATTACH]after", "inserted at the caret");
+                assert_eq!(
+                    c.body, "See: [ATTACH]55[/ATTACH]after",
+                    "inserted at the caret"
+                );
                 assert_eq!(c.body_cursor, 5 + "[ATTACH]55[/ATTACH]".chars().count());
                 assert_eq!(c.attachment_key.as_deref(), Some("key-1"));
                 assert!(!c.uploading);
@@ -9258,7 +11437,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let sent = api.replies();
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].2.as_deref(), Some("key-1"), "the write carries the key");
+        assert_eq!(
+            sent[0].2.as_deref(),
+            Some("key-1"),
+            "the write carries the key"
+        );
     }
 
     /// A failed upload says why and leaves the draft alone — the file is the
@@ -9291,7 +11474,11 @@ mod tests {
                 assert_eq!(c.body, "my draft");
                 assert!(!c.uploading);
                 assert!(c.attachment_key.is_none());
-                assert!(c.error.as_deref().is_some_and(|e| e.contains("No such file")));
+                assert!(
+                    c.error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("No such file"))
+                );
             }
             _ => panic!("the composer should still be open"),
         }
@@ -9356,29 +11543,47 @@ mod tests {
         let mut app = test_app();
         app.api = api.clone();
         app.screens.push(screens::home_state(false));
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 9, title: "A thread".into(), ..Default::default() },
-            posts: vec![Post {
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 9,
+                    title: "A thread".into(),
+                    ..Default::default()
+                },
+                posts: vec![Post {
+                    post_id: 500,
+                    message: "before".into(),
+                    can_edit: true,
+                    ..Default::default()
+                }],
+                page: 2,
+                last_page: 2,
+                ..Default::default()
+            }));
+
+        app.execute_action(Action::StartEditPost(
+            Thread {
+                thread_id: 9,
+                title: "A thread".into(),
+                ..Default::default()
+            },
+            Box::new(Post {
                 post_id: 500,
                 message: "before".into(),
                 can_edit: true,
                 ..Default::default()
-            }],
-            page: 2,
-            last_page: 2,
-            ..Default::default()
-        }));
-
-        app.execute_action(Action::StartEditPost(
-            Thread { thread_id: 9, title: "A thread".into(), ..Default::default() },
-            Box::new(Post { post_id: 500, message: "before".into(), can_edit: true, ..Default::default() }),
+            }),
         ));
         match app.screens.last() {
             Some(Screen::Compose(c)) => {
                 assert_eq!(c.body, "before", "the editor opens on what is there now");
                 assert!(matches!(
                     c.target,
-                    Some(ComposeTarget::EditPost { post_id: 500, thread_id: 9, .. })
+                    Some(ComposeTarget::EditPost {
+                        post_id: 500,
+                        thread_id: 9,
+                        ..
+                    })
                 ));
             }
             _ => panic!("an editor should be open"),
@@ -9394,7 +11599,10 @@ mod tests {
             vec![(500, "after".to_string())]
         );
 
-        app.handle_msg(Msg::PostEdited { post_id: 500, result: Ok(()) });
+        app.handle_msg(Msg::PostEdited {
+            post_id: 500,
+            result: Ok(()),
+        });
         assert!(
             matches!(app.screens.last(), Some(Screen::ThreadView(_))),
             "the editor closes on success"
@@ -9449,9 +11657,15 @@ mod tests {
         let mut app = test_app();
         app.api = api.clone();
         app.screens.push(screens::home_state(false));
-        app.execute_action(Action::DeletePost { post_id: 500, thread_id: 9 });
+        app.execute_action(Action::DeletePost {
+            post_id: 500,
+            thread_id: 9,
+        });
         tokio::task::yield_now().await;
-        assert_eq!(api.deletes.lock().expect("lock").clone(), vec![(500, false)]);
+        assert_eq!(
+            api.deletes.lock().expect("lock").clone(),
+            vec![(500, false)]
+        );
     }
 
     /// #694: reading a thread marks it read — up to the newest post that
@@ -9463,19 +11677,35 @@ mod tests {
         app.api = api.clone();
         app.screens.push(screens::home_state(false));
         if let Some(Screen::Home(h)) = app.screens.last_mut() {
-            h.list.threads = vec![Thread { thread_id: 9, is_unread: true, ..Default::default() }];
+            h.list.threads = vec![Thread {
+                thread_id: 9,
+                is_unread: true,
+                ..Default::default()
+            }];
         }
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 9, ..Default::default() },
-            posts: vec![
-                Post { post_id: 1, post_date: 100, ..Default::default() },
-                Post { post_id: 2, post_date: 200, ..Default::default() },
-            ],
-            page: 1,
-            last_page: 1,
-            seen_date: 100,
-            ..Default::default()
-        }));
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 9,
+                    ..Default::default()
+                },
+                posts: vec![
+                    Post {
+                        post_id: 1,
+                        post_date: 100,
+                        ..Default::default()
+                    },
+                    Post {
+                        post_id: 2,
+                        post_date: 200,
+                        ..Default::default()
+                    },
+                ],
+                page: 1,
+                last_page: 1,
+                seen_date: 100,
+                ..Default::default()
+            }));
 
         app.pop_screen();
         // The write is spawned, like every other one in this app.
@@ -9493,17 +11723,29 @@ mod tests {
         }
 
         // Read to the end this time: the row flips without a refetch.
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 9, ..Default::default() },
-            posts: vec![
-                Post { post_id: 1, post_date: 100, ..Default::default() },
-                Post { post_id: 2, post_date: 200, ..Default::default() },
-            ],
-            page: 1,
-            last_page: 1,
-            seen_date: 200,
-            ..Default::default()
-        }));
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 9,
+                    ..Default::default()
+                },
+                posts: vec![
+                    Post {
+                        post_id: 1,
+                        post_date: 100,
+                        ..Default::default()
+                    },
+                    Post {
+                        post_id: 2,
+                        post_date: 200,
+                        ..Default::default()
+                    },
+                ],
+                page: 1,
+                last_page: 1,
+                seen_date: 200,
+                ..Default::default()
+            }));
         app.pop_screen();
         tokio::task::yield_now().await;
         assert_eq!(reported().len(), 2);
@@ -9522,13 +11764,21 @@ mod tests {
         let mut app = test_app();
         app.api = api.clone();
         app.screens.push(screens::home_state(false));
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 9, ..Default::default() },
-            posts: vec![Post { post_id: 1, post_date: 100, ..Default::default() }],
-            seen_date: 100,
-            reported_date: 100,
-            ..Default::default()
-        }));
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 9,
+                    ..Default::default()
+                },
+                posts: vec![Post {
+                    post_id: 1,
+                    post_date: 100,
+                    ..Default::default()
+                }],
+                seen_date: 100,
+                reported_date: 100,
+                ..Default::default()
+            }));
         app.pop_screen();
         tokio::task::yield_now().await;
         assert!(
@@ -9546,14 +11796,22 @@ mod tests {
         let mut app = test_app();
         app.api = api.clone();
         app.screens.push(screens::home_state(false));
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 9, ..Default::default() },
-            posts: vec![Post { post_id: 1, post_date: 100, ..Default::default() }],
-            page: 1,
-            last_page: 1,
-            seen_date: 100,
-            ..Default::default()
-        }));
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 9,
+                    ..Default::default()
+                },
+                posts: vec![Post {
+                    post_id: 1,
+                    post_date: 100,
+                    ..Default::default()
+                }],
+                page: 1,
+                last_page: 1,
+                seen_date: 100,
+                ..Default::default()
+            }));
         app.screens.push(Screen::Compose(screens::ComposeState {
             target: Some(ComposeTarget::ThreadReply {
                 thread_id: 9,
@@ -9601,10 +11859,15 @@ mod tests {
 
         app.go(GoTarget::Home);
 
-        assert_eq!(app.screens.len(), 2, "the blocked boundary stops the unwind");
+        assert_eq!(
+            app.screens.len(),
+            2,
+            "the blocked boundary stops the unwind"
+        );
         assert!(app.screens.iter().any(|s| matches!(s, Screen::Compose(_))));
         assert!(
-            !app.drafts.contains_key(&common::drafts::DraftKey::ThreadReply(9)),
+            !app.drafts
+                .contains_key(&common::drafts::DraftKey::ThreadReply(9)),
             "nothing was stashed behind the write"
         );
         assert!(!app.status.is_empty(), "the boundary says why");
@@ -9636,10 +11899,18 @@ mod tests {
                     is_unread: true,
                     ..Default::default()
                 }],
-                pagination: Pagination { current_page: 2, last_page: 3, total: 30, ..Default::default() },
+                pagination: Pagination {
+                    current_page: 2,
+                    last_page: 3,
+                    total: 30,
+                    ..Default::default()
+                },
             }),
         });
-        assert_eq!(app.convos_unread, 5, "a later page's count is not the badge");
+        assert_eq!(
+            app.convos_unread, 5,
+            "a later page's count is not the badge"
+        );
         match app.screens.last() {
             Some(Screen::Inbox(inbox)) => {
                 assert_eq!(inbox.convos.page, 2, "the page itself still lands");
@@ -9654,10 +11925,23 @@ mod tests {
             load_id,
             result: Ok(ConversationsReply {
                 conversations: vec![
-                    Conversation { conversation_id: 1, is_unread: true, ..Default::default() },
-                    Conversation { conversation_id: 3, is_unread: false, ..Default::default() },
+                    Conversation {
+                        conversation_id: 1,
+                        is_unread: true,
+                        ..Default::default()
+                    },
+                    Conversation {
+                        conversation_id: 3,
+                        is_unread: false,
+                        ..Default::default()
+                    },
                 ],
-                pagination: Pagination { current_page: 1, last_page: 3, total: 30, ..Default::default() },
+                pagination: Pagination {
+                    current_page: 1,
+                    last_page: 3,
+                    total: 30,
+                    ..Default::default()
+                },
             }),
         });
         assert_eq!(app.convos_unread, 1, "a page-1 recount is the real badge");
@@ -9674,12 +11958,20 @@ mod tests {
         app.screens.push(screens::home_state(false));
         app.alerts_unread = 3;
         app.open_inbox(screens::InboxTab::Alerts);
-        assert_eq!(app.alerts_unread, 3, "an unacknowledged mark cannot clear the badge");
+        assert_eq!(
+            app.alerts_unread, 3,
+            "an unacknowledged mark cannot clear the badge"
+        );
         tokio::task::yield_now().await;
         let viewed = || api.alerts_viewed.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(viewed(), 1);
-        while let Ok(msg) = app.rx.try_recv() { app.handle_msg(msg); }
-        assert_eq!(app.alerts_unread, 0, "the successful acknowledgment clears the badge");
+        while let Ok(msg) = app.rx.try_recv() {
+            app.handle_msg(msg);
+        }
+        assert_eq!(
+            app.alerts_unread, 0,
+            "the successful acknowledgment clears the badge"
+        );
 
         // Revisiting with nothing to clear sends nothing.
         app.open_inbox(screens::InboxTab::Alerts);
@@ -9695,8 +11987,13 @@ mod tests {
         let api = std::sync::Arc::new(RecordingApi::default());
         let mut app = test_app();
         app.api = api.clone();
-        app.me = Some(User { user_id: 1, username: "Mike".into(), ..Default::default() });
-        app.screens.push(Screen::Inbox(screens::InboxState::default()));
+        app.me = Some(User {
+            user_id: 1,
+            username: "Mike".into(),
+            ..Default::default()
+        });
+        app.screens
+            .push(Screen::Inbox(screens::InboxState::default()));
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(matches!(
@@ -9704,7 +12001,10 @@ mod tests {
             Some(Screen::Inbox(ib)) if ib.tab == screens::InboxTab::Alerts
         ));
         tokio::task::yield_now().await;
-        assert_eq!(api.alerts_viewed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            api.alerts_viewed.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(matches!(
@@ -9718,7 +12018,10 @@ mod tests {
             .expect("the Alerts chip");
         click(&mut app, x, y);
         tokio::task::yield_now().await;
-        assert_eq!(api.alerts_viewed.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            api.alerts_viewed.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
     }
 
     #[tokio::test]
@@ -9749,27 +12052,69 @@ mod tests {
         app.alerts_unread = 3;
         app.screens.push(Screen::Inbox(screens::InboxState {
             tab: screens::InboxTab::Alerts,
-            alerts: screens::AlertsState { load_id: 10, ..Default::default() },
-            alerts_view_pending: true, alerts_view_id: 11,
+            alerts: screens::AlertsState {
+                load_id: 10,
+                ..Default::default()
+            },
+            alerts_view_pending: true,
+            alerts_view_id: 11,
             ..Default::default()
         }));
-        let page = || AlertsReply { alerts: (1..=3).map(|alert_id| Alert { alert_id, ..Default::default() }).collect(), ..Default::default() };
-        app.handle_msg(Msg::AlertsLoaded { load_id: 10, result: Ok(page()) });
-        assert_eq!(app.alerts_unread, 3, "a list arriving before mark success keeps its real unread count");
-        app.handle_msg(Msg::AlertsViewed { view_id: 9, result: Ok(()) });
+        let page = || AlertsReply {
+            alerts: (1..=3)
+                .map(|alert_id| Alert {
+                    alert_id,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        app.handle_msg(Msg::AlertsLoaded {
+            load_id: 10,
+            result: Ok(page()),
+        });
+        assert_eq!(
+            app.alerts_unread, 3,
+            "a list arriving before mark success keeps its real unread count"
+        );
+        app.handle_msg(Msg::AlertsViewed {
+            view_id: 9,
+            result: Ok(()),
+        });
         assert_eq!(app.alerts_unread, 3, "a stale mark cannot clear the badge");
-        app.handle_msg(Msg::AlertsViewed { view_id: 11,
-            result: Err(TaskError::of(&common::error::Error::FetchRejected("offline".into()))) });
+        app.handle_msg(Msg::AlertsViewed {
+            view_id: 11,
+            result: Err(TaskError::of(&common::error::Error::FetchRejected(
+                "offline".into(),
+            ))),
+        });
         assert_eq!(app.alerts_unread, 3);
-        assert!(matches!(app.screens.last(), Some(Screen::Inbox(s)) if !s.alerts_viewed && !s.alerts_view_pending));
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Inbox(s)) if !s.alerts_viewed && !s.alerts_view_pending)
+        );
         app.open_inbox(screens::InboxTab::Alerts);
         let view_id = app.inbox_mut().unwrap().alerts_view_id;
-        assert!(view_id > 11, "the failed mark can be retried without leaving Alerts");
-        app.handle_msg(Msg::AlertsViewed { view_id, result: Ok(()) });
+        assert!(
+            view_id > 11,
+            "the failed mark can be retried without leaving Alerts"
+        );
+        app.handle_msg(Msg::AlertsViewed {
+            view_id,
+            result: Ok(()),
+        });
         assert_eq!(app.alerts_unread, 0);
-        app.handle_msg(Msg::AlertsLoaded { load_id: 10, result: Ok(page()) });
-        assert_eq!(app.alerts_unread, 0, "the acknowledged mark supersedes its older list snapshot");
-        app.handle_msg(Msg::AlertsLoaded { load_id: 8, result: Ok(page()) });
+        app.handle_msg(Msg::AlertsLoaded {
+            load_id: 10,
+            result: Ok(page()),
+        });
+        assert_eq!(
+            app.alerts_unread, 0,
+            "the acknowledged mark supersedes its older list snapshot"
+        );
+        app.handle_msg(Msg::AlertsLoaded {
+            load_id: 8,
+            result: Ok(page()),
+        });
         assert_eq!(app.alerts_unread, 0, "a stale list ID is ignored");
         app.abort_session_tasks();
     }
@@ -9781,45 +12126,93 @@ mod tests {
         app.screens.push(screens::home_state(false));
         app.screens.push(Screen::Inbox(screens::InboxState {
             tab: screens::InboxTab::Alerts,
-            alerts: screens::AlertsState { load_id: 12, ..Default::default() },
-            alerts_view_id: 11, alerts_view_pending: true, ..Default::default()
+            alerts: screens::AlertsState {
+                load_id: 12,
+                ..Default::default()
+            },
+            alerts_view_id: 11,
+            alerts_view_pending: true,
+            ..Default::default()
         }));
         app.alerts_unread = 1;
         // Mark 11 executed before this alert arrived, but its response is
         // delayed behind a newer GET snapshot. XF's mark-all transaction
         // cannot mark an alert that did not exist when it executed.
-        app.handle_msg(session_msg(app.session_generation, Msg::AlertsLoaded {
-            load_id: 12, result: Ok(AlertsReply {
-                alerts: vec![Alert { alert_id: 500, event_date: 200, view_date: 0, ..Default::default() }],
-                ..Default::default()
-            }),
-        }));
+        app.handle_msg(session_msg(
+            app.session_generation,
+            Msg::AlertsLoaded {
+                load_id: 12,
+                result: Ok(AlertsReply {
+                    alerts: vec![Alert {
+                        alert_id: 500,
+                        event_date: 200,
+                        view_date: 0,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            },
+        ));
         let fresh_id = app.inbox_mut().unwrap().alerts_view_id;
-        assert!(fresh_id > 12, "the newer visible snapshot needs a fresh mark");
+        assert!(
+            fresh_id > 12,
+            "the newer visible snapshot needs a fresh mark"
+        );
         assert!(app.inbox_mut().unwrap().alerts_view_pending);
-        app.handle_msg(session_msg(app.session_generation, Msg::AlertsViewed { view_id: 11, result: Ok(()) }));
-        assert_eq!(app.alerts_unread, 1, "the older acknowledgment cannot clear the newer alert");
+        app.handle_msg(session_msg(
+            app.session_generation,
+            Msg::AlertsViewed {
+                view_id: 11,
+                result: Ok(()),
+            },
+        ));
+        assert_eq!(
+            app.alerts_unread, 1,
+            "the older acknowledgment cannot clear the newer alert"
+        );
         assert!(!app.inbox_mut().unwrap().alerts_viewed);
         assert!(app.inbox_mut().unwrap().alerts_view_pending);
-        app.handle_msg(session_msg(app.session_generation, Msg::AlertsViewed { view_id: fresh_id, result: Ok(()) }));
-        assert_eq!(app.alerts_unread, 0, "the fresh mark's acknowledgment covers the snapshot");
+        app.handle_msg(session_msg(
+            app.session_generation,
+            Msg::AlertsViewed {
+                view_id: fresh_id,
+                result: Ok(()),
+            },
+        ));
+        assert_eq!(
+            app.alerts_unread, 0,
+            "the fresh mark's acknowledgment covers the snapshot"
+        );
         app.abort_session_tasks();
     }
 
     #[tokio::test]
     async fn recovery_retries_visible_alerts_only_after_the_candidate_is_verified() {
-        use wiremock::matchers::{method, path, header};
+        use wiremock::matchers::{header, method, path};
         let (server, client) = recovery_client(same_account_recovery_response()).await;
-        wiremock::Mock::given(method("POST")).and(path("/api/alerts/mark-all"))
+        wiremock::Mock::given(method("POST"))
+            .and(path("/api/alerts/mark-all"))
             .and(header("authorization", "Bearer sibling-access"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"success":true})))
-            .expect(1).mount(&server).await;
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"success":true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
         let mut app = test_app();
-        app.client = client.clone(); app.api = client;
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.client = client.clone();
+        app.api = client;
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
         app.screens.push(Screen::Inbox(screens::InboxState {
-            tab: screens::InboxTab::Alerts, alerts_view_pending: true, alerts_view_id: 42,
+            tab: screens::InboxTab::Alerts,
+            alerts_view_pending: true,
+            alerts_view_id: 42,
             ..Default::default()
         }));
         app.alerts_unread = 3;
@@ -9827,28 +12220,49 @@ mod tests {
         app.recheck_stored_session("rotated".into());
         let verdict = recovery_verdict(&mut app).await;
         assert!(matches!(verdict, Msg::RecoveryVerified { .. }));
-        assert!(server.received_requests().await.unwrap().iter()
-            .all(|request| request.url.path() != "/api/alerts/mark-all"), "no mark may use an unverified candidate");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.url.path() != "/api/alerts/mark-all"),
+            "no mark may use an unverified candidate"
+        );
         app.handle_msg(verdict);
         let fresh_id = app.inbox_mut().unwrap().alerts_view_id;
         assert_ne!(fresh_id, 42);
         assert!(app.inbox_mut().unwrap().alerts_view_pending);
-        app.handle_msg(session_msg(old_epoch, Msg::AlertsViewed { view_id: 42, result: Ok(()) }));
-        assert_eq!(app.alerts_unread, 3, "the cancelled epoch's success cannot clear the new badge");
+        app.handle_msg(session_msg(
+            old_epoch,
+            Msg::AlertsViewed {
+                view_id: 42,
+                result: Ok(()),
+            },
+        ));
+        assert_eq!(
+            app.alerts_unread, 3,
+            "the cancelled epoch's success cannot clear the new badge"
+        );
         tokio::time::timeout(Duration::from_secs(4), async {
             while !app.inbox_mut().unwrap().alerts_viewed {
                 let message = app.rx.recv().await.expect("message");
                 app.handle_msg(message);
             }
-        }).await.expect("verified session retries its cancelled mark");
+        })
+        .await
+        .expect("verified session retries its cancelled mark");
         assert_eq!(app.alerts_unread, 0);
         let acknowledged_id = app.inbox_mut().unwrap().alerts_view_id;
         app.cancel_recovered_work();
         app.retry_visible_alerts_view();
-        assert!(matches!(app.screens.last(), Some(Screen::Inbox(s))
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Inbox(s))
             if s.alerts_viewed && !s.alerts_view_pending && s.alerts_view_id == acknowledged_id),
-            "an already acknowledged mark survives cancellation without another request");
-        app.stop_pollers(); app.abort_session_tasks();
+            "an already acknowledged mark survives cancellation without another request"
+        );
+        app.stop_pollers();
+        app.abort_session_tasks();
     }
 
     /// #700: clicking a breadcrumb goes back to the place it names — a pop,
@@ -9859,15 +12273,21 @@ mod tests {
     async fn clicking_a_breadcrumb_returns_to_that_screen() {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
-        app.screens.push(Screen::ThreadList(screens::ThreadListState {
-            node_id: 4,
-            title: "Windows News".into(),
-            ..Default::default()
-        }));
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 1, title: "A thread".into(), ..Default::default() },
-            ..Default::default()
-        }));
+        app.screens
+            .push(Screen::ThreadList(screens::ThreadListState {
+                node_id: 4,
+                title: "Windows News".into(),
+                ..Default::default()
+            }));
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 1,
+                    title: "A thread".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
         // Home(0), ThreadList(1), ThreadView(2) — the crumb row the frame
         // built for exactly that stack.
         app.crumb_targets = vec![0, 0, 1, 2];
@@ -9908,7 +12328,10 @@ mod tests {
         if let Some(Screen::Home(h)) = app.screens.last_mut() {
             h.list.node_id = 4;
             h.list.threads = (0..40)
-                .map(|i| Thread { thread_id: i, ..Default::default() })
+                .map(|i| Thread {
+                    thread_id: i,
+                    ..Default::default()
+                })
                 .collect();
             h.list.page = 1;
             h.list.pages_loaded = 2;
@@ -9932,7 +12355,10 @@ mod tests {
             h.list.sel = 32;
         }
         app.autoload_more();
-        assert!(loading(&app), "approaching the end must fetch the next page");
+        assert!(
+            loading(&app),
+            "approaching the end must fetch the next page"
+        );
 
         // And it never fires twice at once.
         app.autoload_more();
@@ -9960,14 +12386,24 @@ mod tests {
         app.screens.push(screens::home_state(false));
         if let Some(Screen::Home(h)) = app.screens.last_mut() {
             h.list.node_id = 4;
-            h.list.threads = vec![Thread { thread_id: 1, ..Default::default() }];
+            h.list.threads = vec![Thread {
+                thread_id: 1,
+                ..Default::default()
+            }];
             h.list.page = 1;
             h.list.pages_loaded = 3;
             h.list.load_seq = 7;
         }
         let reply = |page: u32| ForumReply {
-            forum: common::models::Forum { node_id: 4, title: "News".into(), ..Default::default() },
-            threads: vec![Thread { thread_id: 900 + page, ..Default::default() }],
+            forum: common::models::Forum {
+                node_id: 4,
+                title: "News".into(),
+                ..Default::default()
+            },
+            threads: vec![Thread {
+                thread_id: 900 + page,
+                ..Default::default()
+            }],
             sticky: Vec::new(),
             pagination: common::models::Pagination {
                 current_page: page,
@@ -10079,7 +12515,10 @@ mod tests {
                     ..Default::default()
                 },
                 threads: (0..20)
-                    .map(|i| Thread { thread_id: i, ..Default::default() })
+                    .map(|i| Thread {
+                        thread_id: i,
+                        ..Default::default()
+                    })
                     .collect(),
                 sticky: Vec::new(),
                 pagination: common::models::Pagination {
@@ -10116,8 +12555,15 @@ mod tests {
             h.list.visible = 500;
         }
         let short_page = |page: u32| ForumReply {
-            forum: common::models::Forum { node_id: 307, title: "BSOD".into(), ..Default::default() },
-            threads: vec![Thread { thread_id: page, ..Default::default() }],
+            forum: common::models::Forum {
+                node_id: 307,
+                title: "BSOD".into(),
+                ..Default::default()
+            },
+            threads: vec![Thread {
+                thread_id: page,
+                ..Default::default()
+            }],
             sticky: Vec::new(),
             pagination: common::models::Pagination {
                 current_page: page,
@@ -10162,7 +12608,11 @@ mod tests {
     #[tokio::test]
     async fn a_short_page_pulls_in_the_next_one_until_the_pane_is_full() {
         let page_of = |n: u32, count: usize| ForumReply {
-            forum: common::models::Forum { node_id: 4, title: "Windows News".into(), ..Default::default() },
+            forum: common::models::Forum {
+                node_id: 4,
+                title: "Windows News".into(),
+                ..Default::default()
+            },
             threads: (0..count)
                 .map(|i| Thread {
                     thread_id: n * 100 + i as u32,
@@ -10204,7 +12654,11 @@ mod tests {
             ),
             _ => panic!("home"),
         };
-        assert_eq!(list(&app), (20, 1, 1, true), "20 rows in a 45-row pane must ask for more");
+        assert_eq!(
+            list(&app),
+            (20, 1, 1, true),
+            "20 rows in a 45-row pane must ask for more"
+        );
 
         app.handle_msg(Msg::ForumLoaded {
             node_id: 4,
@@ -10213,7 +12667,11 @@ mod tests {
             seq: 0,
             result: Ok(page_of(2, 20)),
         });
-        assert_eq!(list(&app), (40, 1, 2, true), "still short of 45: keep going");
+        assert_eq!(
+            list(&app),
+            (40, 1, 2, true),
+            "still short of 45: keep going"
+        );
 
         app.handle_msg(Msg::ForumLoaded {
             node_id: 4,
@@ -10224,7 +12682,10 @@ mod tests {
         });
         let (rows, page, loaded, loading) = list(&app);
         assert_eq!((rows, page, loaded), (50, 1, 3));
-        assert!(!loading, "the last page ends the fill even though the pane has room");
+        assert!(
+            !loading,
+            "the last page ends the fill even though the pane has room"
+        );
 
         // A fresh (non-append) load replaces rather than piling up.
         app.handle_msg(Msg::ForumLoaded {
@@ -10235,7 +12696,11 @@ mod tests {
             result: Ok(page_of(2, 20)),
         });
         let (rows, page, loaded, _) = list(&app);
-        assert_eq!((rows, page, loaded), (20, 2, 1), "a real page turn starts over");
+        assert_eq!(
+            (rows, page, loaded),
+            (20, 2, 1),
+            "a real page turn starts over"
+        );
     }
 
     /// A fill page that fails leaves the rows already on screen alone: the
@@ -10247,7 +12712,10 @@ mod tests {
         app.screens.push(screens::home_state(false));
         if let Some(Screen::Home(h)) = app.screens.last_mut() {
             h.list.node_id = 4;
-            h.list.threads = vec![Thread { thread_id: 1, ..Default::default() }];
+            h.list.threads = vec![Thread {
+                thread_id: 1,
+                ..Default::default()
+            }];
             h.list.page = 1;
             h.list.pages_loaded = 1;
             h.list.loading = true;
@@ -10321,7 +12789,11 @@ mod tests {
         let Some(Screen::MediaGallery(m)) = app.screens.last() else {
             panic!("the gallery must still be on top");
         };
-        assert_eq!(m.items.len(), 1, "a reply nobody is waiting on must be dropped");
+        assert_eq!(
+            m.items.len(),
+            1,
+            "a reply nobody is waiting on must be dropped"
+        );
         assert_eq!(m.page, 1, "and it must not renumber the page either");
     }
 
@@ -10361,23 +12833,36 @@ mod tests {
         let Some(Screen::MediaGallery(m)) = app.screens.last() else {
             panic!("expected the gallery");
         };
-        assert_eq!(m.cat_sel, 1, "the last visible category row should be selected");
+        assert_eq!(
+            m.cat_sel, 1,
+            "the last visible category row should be selected"
+        );
         let action = app
             .screens
             .last_mut()
             .expect("gallery")
             .on_key(KeyEvent::from(KeyCode::Enter));
-        assert!(matches!(action, Action::LoadMedia { category: Some(9), page: 1 }));
+        assert!(matches!(
+            action,
+            Action::LoadMedia {
+                category: Some(9),
+                page: 1
+            }
+        ));
     }
 
     #[tokio::test]
     async fn a_reopened_thread_drops_the_previous_load_even_when_the_id_matches() {
         let mut app = test_app();
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 7, ..Default::default() },
-            loading: true,
-            ..Default::default()
-        }));
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 7,
+                    ..Default::default()
+                },
+                loading: true,
+                ..Default::default()
+            }));
         app.load_thread(7, 1);
         let first = match app.screens.last() {
             Some(Screen::ThreadView(view)) => view.load_id,
@@ -10395,7 +12880,10 @@ mod tests {
             page: 1,
             load_id: first,
             result: Ok(ThreadReply {
-                posts: vec![Post { post_id: 1, ..Default::default() }],
+                posts: vec![Post {
+                    post_id: 1,
+                    ..Default::default()
+                }],
                 ..Default::default()
             }),
         });
@@ -10410,7 +12898,10 @@ mod tests {
             page: 2,
             load_id: second,
             result: Ok(ThreadReply {
-                posts: vec![Post { post_id: 2, ..Default::default() }],
+                posts: vec![Post {
+                    post_id: 2,
+                    ..Default::default()
+                }],
                 ..Default::default()
             }),
         });
@@ -10458,11 +12949,15 @@ mod tests {
 
         // A loading screen animates its spinner even with no gate pending.
         let mut app = test_app();
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 42, ..Default::default() },
-            loading: true,
-            ..Default::default()
-        }));
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 42,
+                    ..Default::default()
+                },
+                loading: true,
+                ..Default::default()
+            }));
         let step = app.animation_step();
         assert_eq!(
             step.map(|(spinner, _)| spinner),
@@ -10478,9 +12973,8 @@ mod tests {
         let mut app = test_app();
         app.set_status("Reply posted.");
         assert!(!app.expire_status_toast(), "a fresh toast is not expired");
-        app.status_set_at = Some(
-            std::time::Instant::now() - Duration::from_secs(STATUS_TOAST_SECS + 1),
-        );
+        app.status_set_at =
+            Some(std::time::Instant::now() - Duration::from_secs(STATUS_TOAST_SECS + 1));
         assert!(app.expire_status_toast(), "the boundary tick clears it");
         assert!(!app.expire_status_toast(), "and only once");
     }
@@ -10536,12 +13030,20 @@ mod tests {
     #[tokio::test]
     async fn a_post_toggled_landing_after_teardown_reloads_nothing() {
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 42, ..Default::default() },
-            page: 2,
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
             ..Default::default()
-        }));
+        });
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 42,
+                    ..Default::default()
+                },
+                page: 2,
+                ..Default::default()
+            }));
         let toggle = |result: Result<Toggle, TaskError>| Msg::PostToggled {
             verb: PostVerb::Like,
             result,
@@ -10575,7 +13077,9 @@ mod tests {
         let mut app = test_app();
         app.screens.push(screens::login_state());
         if let Some(Screen::Login(ls)) = app.screens.last_mut() {
-            ls.stage = screens::LoginStage::Waiting { mode: common::site::LoginMode::TuiLink };
+            ls.stage = screens::LoginStage::Waiting {
+                mode: common::site::LoginMode::TuiLink,
+            };
             ls.url = "https://windowsforum.com/tui-start/abc123".into();
         }
         app.status = "Login link \u{2192} clipboard + login-url.txt".into();
@@ -10597,7 +13101,10 @@ mod tests {
             }
             _ => panic!("expected the Login screen to survive untouched"),
         }
-        assert_ne!(app.status, "Logged out.", "no sign-out happened, so no such status");
+        assert_ne!(
+            app.status, "Logged out.",
+            "no sign-out happened, so no such status"
+        );
     }
 
     /// #612: the keys card is modal — "any key closes" means the key is
@@ -10607,7 +13114,11 @@ mod tests {
     #[tokio::test]
     async fn the_keys_card_consumes_its_dismissing_key() {
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
@@ -10615,7 +13126,10 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(!app.show_help, "the card closed");
-        assert!(!app.should_quit, "q closed the card — it must not quit the client");
+        assert!(
+            !app.should_quit,
+            "q closed the card — it must not quit the client"
+        );
         assert!(
             matches!(app.screens.last(), Some(Screen::Home(_))),
             "the screen underneath is untouched"
@@ -10630,10 +13144,18 @@ mod tests {
     #[tokio::test]
     async fn the_profile_dm_key_opens_the_dm_composer() {
         let mut app = test_app();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.open_profile(42, "SysAdmin");
         if let Some(Screen::Profile(p)) = app.screens.last_mut() {
-            p.user = Some(User { user_id: 42, username: "SysAdmin".into(), ..Default::default() });
+            p.user = Some(User {
+                user_id: 42,
+                username: "SysAdmin".into(),
+                ..Default::default()
+            });
         }
 
         // The global `c` still opens the Inbox from the profile...
@@ -10647,7 +13169,10 @@ mod tests {
         // ...and `d` reaches the profile's own DM action.
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
         let Some(Screen::NewConversation(state)) = app.screens.last() else {
-            panic!("expected the DM composer, got {:?}", app.screens.last().map(|s| s.title()));
+            panic!(
+                "expected the DM composer, got {:?}",
+                app.screens.last().map(|s| s.title())
+            );
         };
         assert_eq!(state.recipients, "SysAdmin, ", "the member is pre-filled");
     }
@@ -10659,14 +13184,18 @@ mod tests {
     #[test]
     fn pasting_a_tab_into_the_composer_keeps_the_caret_at_the_drawn_text_end() {
         let mut app = test_app();
-        app.screens.push(Screen::Compose(screens::ComposeState::default()));
+        app.screens
+            .push(Screen::Compose(screens::ComposeState::default()));
 
         app.handle_paste("a\tb".into());
 
         let Some(Screen::Compose(cs)) = app.screens.last() else {
             panic!("expected the Compose screen");
         };
-        assert_eq!(cs.body, "a   b", "the tab must expand to spaces, not stay raw");
+        assert_eq!(
+            cs.body, "a   b",
+            "the tab must expand to spaces, not stay raw"
+        );
         let (_, col) = crate::editor::caret_position(&cs.body, 80, cs.body_cursor);
         assert_eq!(
             col,
@@ -10685,7 +13214,9 @@ mod tests {
         let mut app = test_app();
         app.screens.push(screens::login_state());
         if let Some(Screen::Login(ls)) = app.screens.last_mut() {
-            ls.stage = screens::LoginStage::Waiting { mode: common::site::LoginMode::TuiLink };
+            ls.stage = screens::LoginStage::Waiting {
+                mode: common::site::LoginMode::TuiLink,
+            };
             ls.url = "https://windowsforum.com/tui-start/old".into();
         }
 
@@ -10781,8 +13312,15 @@ mod tests {
             url: "https://windowsforum.com/tui-start/abc123".into(),
             mode: common::site::LoginMode::TuiLink,
         });
-        let mode = std::fs::metadata(&path).expect("the login link is persisted").permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "login-url.txt must be owner-only: {path:?}");
+        let mode = std::fs::metadata(&path)
+            .expect("the login link is persisted")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "login-url.txt must be owner-only: {path:?}"
+        );
     }
 
     /// Session-scoped work can finish after logout even when its task was
@@ -10821,9 +13359,18 @@ mod tests {
         let Some(Screen::Home(home)) = app.screens.first() else {
             panic!("expected Home");
         };
-        assert!(home.tree.nodes.is_empty(), "stale nodes must not cross the boundary");
-        assert!(home.tree.loading, "the stale result must not clear the new load");
-        assert!(app.drafts.is_empty(), "stale drafts must not cross identities");
+        assert!(
+            home.tree.nodes.is_empty(),
+            "stale nodes must not cross the boundary"
+        );
+        assert!(
+            home.tree.loading,
+            "the stale result must not clear the new load"
+        );
+        assert!(
+            app.drafts.is_empty(),
+            "stale drafts must not cross identities"
+        );
     }
 
     /// Issue #524: a second `start_pollers` (the re-login path) must not
@@ -10835,12 +13382,20 @@ mod tests {
         let mut app = test_app();
 
         app.start_pollers();
-        assert_eq!(app.poller_handles.len(), 2, "one alerts + one conversations loop");
+        assert_eq!(
+            app.poller_handles.len(),
+            2,
+            "one alerts + one conversations loop"
+        );
         let first_pair: Vec<_> = app.poller_handles.iter().map(|h| h.id()).collect();
 
         // Simulate logout -> login again without this fix: doubles the rate.
         app.start_pollers();
-        assert_eq!(app.poller_handles.len(), 2, "re-login must not stack a second pair");
+        assert_eq!(
+            app.poller_handles.len(),
+            2,
+            "re-login must not stack a second pair"
+        );
         let second_pair: Vec<_> = app.poller_handles.iter().map(|h| h.id()).collect();
         assert_ne!(
             first_pair, second_pair,
@@ -10848,9 +13403,18 @@ mod tests {
         );
 
         app.logout();
-        assert!(app.poller_handles.is_empty(), "logout must abort every poller");
-        assert_eq!(app.alerts_unread, 0, "logout must clear the stale alerts count");
-        assert_eq!(app.convos_unread, 0, "logout must clear the stale conversations count");
+        assert!(
+            app.poller_handles.is_empty(),
+            "logout must abort every poller"
+        );
+        assert_eq!(
+            app.alerts_unread, 0,
+            "logout must clear the stale alerts count"
+        );
+        assert_eq!(
+            app.convos_unread, 0,
+            "logout must clear the stale conversations count"
+        );
     }
 
     /// Issue #520: the app used to swallow Esc for every screen. A composer
@@ -10878,7 +13442,11 @@ mod tests {
         app.screens.push(screens::home_state(false));
         app.screens.push(composer(true));
         app.handle_key(esc());
-        assert_eq!(app.screens.len(), 2, "a busy composer must not be popped mid-send");
+        assert_eq!(
+            app.screens.len(),
+            2,
+            "a busy composer must not be popped mid-send"
+        );
         assert!(
             app.status.contains("Esc"),
             "the refusal must not be silent: {:?}",
@@ -10898,8 +13466,15 @@ mod tests {
             ..Default::default()
         }));
         app.handle_key(esc());
-        assert_eq!(app.screens.len(), 2, "an uploading composer must not be popped");
-        assert!(app.status.contains("Uploading"), "upload refusal must be visible");
+        assert_eq!(
+            app.screens.len(),
+            2,
+            "an uploading composer must not be popped"
+        );
+        assert!(
+            app.status.contains("Uploading"),
+            "upload refusal must be visible"
+        );
 
         // Idle: the composer's own Esc arm discards it.
         app.screens.pop();
@@ -10914,7 +13489,11 @@ mod tests {
             ..Default::default()
         }));
         app.handle_key(esc());
-        assert_eq!(app.screens.len(), 2, "Esc in the query field must not close Search");
+        assert_eq!(
+            app.screens.len(),
+            2,
+            "Esc in the query field must not close Search"
+        );
         assert!(matches!(app.screens.last(), Some(Screen::Search(s)) if !s.input_mode));
         app.handle_key(esc());
         assert_eq!(app.screens.len(), 1, "a second Esc leaves Search");
@@ -10977,7 +13556,10 @@ mod tests {
         // Home on Latest (0), Security (46) pushed on top; News (4) is in
         // flight from the screen the user already popped.
         let mut stack = vec![home(0), pushed(46)];
-        assert!(list_showing(&mut stack, 4).is_none(), "stale News reply must be dropped");
+        assert!(
+            list_showing(&mut stack, 4).is_none(),
+            "stale News reply must be dropped"
+        );
         assert_eq!(
             list_showing(&mut stack, 46).map(|l| l.node_id),
             Some(46),
@@ -11006,8 +13588,8 @@ mod tests {
     /// Draw one frame into a `w x h` test terminal. The frame is thrown away;
     /// what is kept is `App::hits` (and `App::screen_rows`).
     fn frame(app: &mut App, w: u16, h: u16) {
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
-            .expect("terminal");
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
         term.draw(|f| app.draw(f)).expect("draw");
     }
 
@@ -11042,13 +13624,14 @@ mod tests {
                 ..Default::default()
             });
         }
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: thread(9),
-            posts: vec![p],
-            page: 1,
-            last_page: 1,
-            ..Default::default()
-        }));
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: thread(9),
+                posts: vec![p],
+                page: 1,
+                last_page: 1,
+                ..Default::default()
+            }));
         frame(&mut app, 120, 60);
 
         // The 11th caption is a registered hit, and clicking it opens the
@@ -11076,10 +13659,18 @@ mod tests {
         let key = DraftKey::ThreadReply(7);
         app.discard_draft_local(key, false);
         let delete = app.draft_store.snapshot(&owner).unwrap().operations[&key];
-        app.stash_draft_impl(&screens::ComposeState {
-            target: Some(ComposeTarget::ThreadReply { thread_id: 7, thread_title: "thread".into() }),
-            body: "new words on shutdown".into(), ..Default::default()
-        }, false, false);
+        app.stash_draft_impl(
+            &screens::ComposeState {
+                target: Some(ComposeTarget::ThreadReply {
+                    thread_id: 7,
+                    thread_title: "thread".into(),
+                }),
+                body: "new words on shutdown".into(),
+                ..Default::default()
+            },
+            false,
+            false,
+        );
         let save = app.draft_store.snapshot(&owner).unwrap().operations[&key];
         assert_eq!(save.kind, RelayKind::Save);
         assert!(save.revision > delete.revision);
@@ -11096,14 +13687,22 @@ mod tests {
         finish_draft_relays(&restarted).await;
         assert_eq!(api.drafts_saved()[0].1, "new words on shutdown");
         assert!(api.drafts_deleted().is_empty());
-        assert!(restarted.draft_store.snapshot(&owner).unwrap().operations.is_empty());
+        assert!(
+            restarted
+                .draft_store
+                .snapshot(&owner)
+                .unwrap()
+                .operations
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn a_failed_superseding_save_stays_dirty_across_restart() {
         use common::drafts::{DraftKey, RelayKind};
         let api = Arc::new(RecordingApi::default());
-        api.drafts_fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        api.drafts_fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let mut app = test_app();
         app.api = api;
         app.draft_owner = None;
@@ -11111,10 +13710,18 @@ mod tests {
         let owner = app.draft_owner.clone().unwrap();
         let key = DraftKey::ThreadReply(7);
         app.discard_draft_local(key, false);
-        app.stash_draft_impl(&screens::ComposeState {
-            target: Some(ComposeTarget::ThreadReply { thread_id: 7, thread_title: "thread".into() }),
-            body: "latest local words".into(), ..Default::default()
-        }, true, false);
+        app.stash_draft_impl(
+            &screens::ComposeState {
+                target: Some(ComposeTarget::ThreadReply {
+                    thread_id: 7,
+                    thread_title: "thread".into(),
+                }),
+                body: "latest local words".into(),
+                ..Default::default()
+            },
+            true,
+            false,
+        );
         finish_draft_relays(&app).await;
         let snapshot = app.draft_store.snapshot(&owner).unwrap();
         assert_eq!(snapshot.operations[&key].kind, RelayKind::Save);
@@ -11122,9 +13729,14 @@ mod tests {
         restarted.draft_owner = None;
         restarted.draft_store = app.draft_store.clone();
         restarted.select_draft_owner(7);
-        restarted.merge_remote_drafts(restarted.draft_epoch, vec![common::models::RemoteDraft {
-            key: "thread-7".into(), message: "stale posted text".into(), ..Default::default()
-        }]);
+        restarted.merge_remote_drafts(
+            restarted.draft_epoch,
+            vec![common::models::RemoteDraft {
+                key: "thread-7".into(),
+                message: "stale posted text".into(),
+                ..Default::default()
+            }],
+        );
         assert_eq!(restarted.drafts[&key].body, "latest local words");
     }
 
@@ -11137,22 +13749,44 @@ mod tests {
         let owner = app.draft_owner.clone().unwrap();
         let key = DraftKey::ThreadReply(7);
         app.screens.push(screens::home_state(false));
-        app.merge_remote_drafts(0, vec![common::models::RemoteDraft {
-            key: "thread-7".into(), message: "v1 already on the website".into(), ..Default::default()
-        }]);
-        app.reply_to_thread(&Thread { thread_id: 7, title: "thread".into(), ..Default::default() });
-        if let Some(Screen::Compose(c)) = app.screens.last_mut() { c.body = "v2 latest local words".into(); }
+        app.merge_remote_drafts(
+            0,
+            vec![common::models::RemoteDraft {
+                key: "thread-7".into(),
+                message: "v1 already on the website".into(),
+                ..Default::default()
+            }],
+        );
+        app.reply_to_thread(&Thread {
+            thread_id: 7,
+            title: "thread".into(),
+            ..Default::default()
+        });
+        if let Some(Screen::Compose(c)) = app.screens.last_mut() {
+            c.body = "v2 latest local words".into();
+        }
         app.shutdown().await;
-        assert_eq!(app.draft_store.load(&owner)[&key].body, "v2 latest local words");
+        assert_eq!(
+            app.draft_store.load(&owner)[&key].body,
+            "v2 latest local words"
+        );
         let mut restarted = test_app();
         restarted.draft_store = app.draft_store.clone();
         restarted.draft_owner = None;
         restarted.select_draft_owner(7);
-        restarted.merge_remote_drafts(restarted.draft_epoch, vec![common::models::RemoteDraft {
-            key: "thread-7".into(), message: "v1 already on the website".into(), ..Default::default()
-        }]);
+        restarted.merge_remote_drafts(
+            restarted.draft_epoch,
+            vec![common::models::RemoteDraft {
+                key: "thread-7".into(),
+                message: "v1 already on the website".into(),
+                ..Default::default()
+            }],
+        );
         assert_eq!(restarted.drafts[&key].body, "v2 latest local words");
-        assert_eq!(restarted.draft_store.load(&owner)[&key].body, "v2 latest local words");
+        assert_eq!(
+            restarted.draft_store.load(&owner)[&key].body,
+            "v2 latest local words"
+        );
     }
 
     #[tokio::test]
@@ -11162,7 +13796,8 @@ mod tests {
             draft_delete_delay: Duration::from_millis(80),
             ..Default::default()
         });
-        api.draft_delete_fail_after_first.store(true, std::sync::atomic::Ordering::SeqCst);
+        api.draft_delete_fail_after_first
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let mut app = test_app();
         app.api = api.clone();
         app.draft_owner = None;
@@ -11171,25 +13806,54 @@ mod tests {
         let key = DraftKey::ThreadReply(7);
         app.discard_draft(key);
         tokio::time::timeout(Duration::from_secs(2), async {
-            while api.draft_delete_calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            while api
+                .draft_delete_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
-        }).await.unwrap();
-        app.stash_draft_impl(&screens::ComposeState {
-            target: Some(ComposeTarget::ThreadReply { thread_id: 7, thread_title: "thread".into() }),
-            body: "new version, then discarded".into(), ..Default::default()
-        }, true, false);
+        })
+        .await
+        .unwrap();
+        app.stash_draft_impl(
+            &screens::ComposeState {
+                target: Some(ComposeTarget::ThreadReply {
+                    thread_id: 7,
+                    thread_title: "thread".into(),
+                }),
+                body: "new version, then discarded".into(),
+                ..Default::default()
+            },
+            true,
+            false,
+        );
         app.discard_draft(key);
         let desired = app.draft_store.snapshot(&owner).unwrap().operations[&key];
         finish_draft_relays(&app).await;
-        assert_eq!(api.draft_delete_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert!(api.drafts_saved().is_empty(), "the superseded Save skips dispatch after acquiring the lock");
+        assert_eq!(
+            api.draft_delete_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert!(
+            api.drafts_saved().is_empty(),
+            "the superseded Save skips dispatch after acquiring the lock"
+        );
         assert_eq!(desired.kind, RelayKind::Delete);
-        assert_eq!(app.draft_store.snapshot(&owner).unwrap().operations[&key], desired);
+        assert_eq!(
+            app.draft_store.snapshot(&owner).unwrap().operations[&key],
+            desired
+        );
         assert_eq!(app.draft_operations.lock().expect("lock")[&key], desired);
-        app.merge_remote_drafts(app.draft_epoch, vec![common::models::RemoteDraft {
-            key: "thread-7".into(), message: "new version, then discarded".into(), ..Default::default()
-        }]);
+        app.merge_remote_drafts(
+            app.draft_epoch,
+            vec![common::models::RemoteDraft {
+                key: "thread-7".into(),
+                message: "new version, then discarded".into(),
+                ..Default::default()
+            }],
+        );
         assert!(!app.drafts.contains_key(&key));
     }
 
@@ -11201,8 +13865,10 @@ mod tests {
         let mut app = test_app();
         // A tier that actually demands the bytes: the text tier never
         // spawns a fetch, so nothing would ever be in flight.
-        app.images
-            .set_policy(crate::images::Policy { tier: crate::images::Tier::Halfblocks, font: (10, 20) });
+        app.images.set_policy(crate::images::Policy {
+            tier: crate::images::Tier::Halfblocks,
+            font: (10, 20),
+        });
         app.screens.push(Screen::ImageView(screens::ImageViewState {
             title: "shot".into(),
             key: Some("https://wf/media/7.png".to_string()),
@@ -11224,7 +13890,10 @@ mod tests {
     #[cfg(feature = "images")]
     async fn the_viewer_ignores_a_small_variant_failure_once_a_variant_loads() {
         let mut app = test_app();
-        app.images.set_policy(crate::images::Policy { tier: crate::images::Tier::Halfblocks, font: (10, 20) });
+        app.images.set_policy(crate::images::Policy {
+            tier: crate::images::Tier::Halfblocks,
+            font: (10, 20),
+        });
         let src = "https://wf/media/9.png";
         app.screens.push(Screen::ImageView(screens::ImageViewState {
             title: "shot".into(),
@@ -11232,10 +13901,15 @@ mod tests {
             ..Default::default()
         }));
         // The small variant tripped its cap...
-        app.images
-            .on_loaded(crate::images::store_key(src, 12, 12), Err("http 404".into()));
+        app.images.on_loaded(
+            crate::images::store_key(src, 12, 12),
+            Err("http 404".into()),
+        );
         let text = frame_text(&mut app, 80, 24);
-        assert!(!text.contains("Error:"), "a thumbnail cannot block the viewer: {text}");
+        assert!(
+            !text.contains("Error:"),
+            "a thumbnail cannot block the viewer: {text}"
+        );
         let request = match app.screens.last() {
             Some(Screen::ImageView(view)) => view.image_requests[0].clone(),
             _ => panic!("viewer"),
@@ -11250,10 +13924,12 @@ mod tests {
             request.rect.height,
         )
         .expect("decode the sample");
-        app.images
-            .on_loaded(request.store_key(), Ok(loaded));
+        app.images.on_loaded(request.store_key(), Ok(loaded));
         let text = frame_text(&mut app, 80, 24);
-        assert!(!text.contains("Error:"), "the stale failure must yield: {text}");
+        assert!(
+            !text.contains("Error:"),
+            "the stale failure must yield: {text}"
+        );
     }
 
     /// #60: the viewer's panes read the image store's live state - a
@@ -11263,7 +13939,10 @@ mod tests {
     #[tokio::test]
     async fn the_image_viewer_shows_store_failures_and_r_retries() {
         let mut app = test_app();
-        app.images.set_policy(crate::images::Policy { tier: crate::images::Tier::Halfblocks, font: (10, 20) });
+        app.images.set_policy(crate::images::Policy {
+            tier: crate::images::Tier::Halfblocks,
+            font: (10, 20),
+        });
         let src = "https://wf/media/9.png";
         app.screens.push(Screen::ImageView(screens::ImageViewState {
             title: "shot".into(),
@@ -11275,7 +13954,8 @@ mod tests {
             Some(Screen::ImageView(view)) => view.image_requests[0].clone(),
             _ => panic!("viewer"),
         };
-        app.images.on_loaded(request.store_key(), Err("http 404".into()));
+        app.images
+            .on_loaded(request.store_key(), Err("http 404".into()));
         let text = frame_text(&mut app, 80, 24);
         assert!(text.contains("Error:"), "{text}");
         assert!(text.contains("R to retry"), "{text}");
@@ -11291,45 +13971,87 @@ mod tests {
     #[cfg(feature = "images")]
     async fn a_known_thumbnail_does_not_hide_a_full_viewer_failure() {
         let mut app = test_app();
-        app.images.set_policy(crate::images::Policy { tier: crate::images::Tier::Halfblocks, font: (10, 20) });
+        app.images.set_policy(crate::images::Policy {
+            tier: crate::images::Tier::Halfblocks,
+            font: (10, 20),
+        });
         let src = "https://wf/media/known.png";
-        let thumbnail = crate::images::decode(&ratatui_image::picker::Picker::halfblocks(),
-            include_bytes!("../../assets/wf-logo.png"), 12, 4).unwrap();
-        app.images.on_loaded(crate::images::store_key(src, 12, 4), Ok(thumbnail));
-        app.screens.push(Screen::ImageView(screens::ImageViewState { key: Some(src.into()), ..Default::default() }));
+        let thumbnail = crate::images::decode(
+            &ratatui_image::picker::Picker::halfblocks(),
+            include_bytes!("../../assets/wf-logo.png"),
+            12,
+            4,
+        )
+        .unwrap();
+        app.images
+            .on_loaded(crate::images::store_key(src, 12, 4), Ok(thumbnail));
+        app.screens.push(Screen::ImageView(screens::ImageViewState {
+            key: Some(src.into()),
+            ..Default::default()
+        }));
         frame(&mut app, 80, 24);
         let request = match app.screens.last() {
             Some(Screen::ImageView(view)) => view.image_requests[0].clone(),
             _ => panic!("viewer"),
         };
-        app.images.on_loaded(request.store_key(), Err("full image refused".into()));
+        app.images
+            .on_loaded(request.store_key(), Err("full image refused".into()));
         let text = frame_text(&mut app, 80, 24);
-        assert!(text.contains("full image refused") && text.contains("R to retry"), "{text}");
-        assert!(!app.images.request_state(&request).0, "a failed request is not queued again every frame");
+        assert!(
+            text.contains("full image refused") && text.contains("R to retry"),
+            "{text}"
+        );
+        assert!(
+            !app.images.request_state(&request).0,
+            "a failed request is not queued again every frame"
+        );
     }
 
     #[tokio::test]
     async fn a_viewer_waiting_for_a_thumbnail_keeps_its_queued_demand() {
         let mut app = test_app();
-        app.images.set_policy(crate::images::Policy { tier: crate::images::Tier::Halfblocks, font: (10, 20) });
+        app.images.set_policy(crate::images::Policy {
+            tier: crate::images::Tier::Halfblocks,
+            font: (10, 20),
+        });
         let src = "https://wf/media/queued.png";
-        let thumbnail = crate::images::Request { key: src.into(), rect: ratatui::layout::Rect::new(0, 0, 12, 4), full: false };
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let thumbnail = crate::images::Request {
+            key: src.into(),
+            rect: ratatui::layout::Rect::new(0, 0, 12, 4),
+            full: false,
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         let mut pending = Vec::new();
-        terminal.draw(|f| pending = app.images.paint(f, &[thumbnail])).unwrap();
-        app.screens.push(Screen::ImageView(screens::ImageViewState { key: Some(src.into()), ..Default::default() }));
+        terminal
+            .draw(|f| pending = app.images.paint(f, &[thumbnail]))
+            .unwrap();
+        app.screens.push(Screen::ImageView(screens::ImageViewState {
+            key: Some(src.into()),
+            ..Default::default()
+        }));
         frame(&mut app, 80, 24);
         for _ in 0..2 {
-            assert!(frame_text(&mut app, 80, 24).contains("Loading"), "the queued request stays visible to the loader");
+            assert!(
+                frame_text(&mut app, 80, 24).contains("Loading"),
+                "the queued request stays visible to the loader"
+            );
         }
-        app.images.on_loaded(pending[0].store_key(), Err("thumbnail rejected".into()));
+        app.images
+            .on_loaded(pending[0].store_key(), Err("thumbnail rejected".into()));
         let text = frame_text(&mut app, 80, 24);
-        assert!(!text.contains("Error:"), "a thumbnail failure cannot replace the viewer: {text}");
+        assert!(
+            !text.contains("Error:"),
+            "a thumbnail failure cannot replace the viewer: {text}"
+        );
         let request = match app.screens.last() {
             Some(Screen::ImageView(view)) => view.image_requests[0].clone(),
             _ => panic!("viewer"),
         };
-        assert!(app.images.request_state(&request).0, "the viewer takes the freed worker slot");
+        assert!(
+            app.images.request_state(&request).0,
+            "the viewer takes the freed worker slot"
+        );
     }
 
     /// #139: the disk cache keeps only bytes that decoded. A transient bad
@@ -11337,72 +14059,173 @@ mod tests {
     /// disk that no longer decodes is evicted — so a retry reaches the
     /// network instead of failing on the same cached bytes forever.
     #[tokio::test]
-    #[cfg(feature="images")]
+    #[cfg(feature = "images")]
     async fn a_body_that_does_not_decode_never_poisons_the_disk_cache() {
-        use wiremock::{Mock,MockServer,ResponseTemplate};
-        use wiremock::matchers::{method,path};
-        let server=MockServer::start().await;
-        let png=include_bytes!("../../assets/wf-logo.png").to_vec();
-        Mock::given(method("GET")).and(path("/flaky.png"))
-            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type","image/png").set_body_bytes(b"<html>busy</html>".to_vec()))
-            .up_to_n_times(1).mount(&server).await;
-        Mock::given(method("GET")).and(path("/flaky.png"))
-            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type","image/png").set_body_bytes(png.clone()))
-            .mount(&server).await;
-        let dir=std::env::temp_dir().join(format!("wftui-image-cache-poison-{}",std::process::id()));
-        let _=std::fs::remove_dir_all(&dir);
-        let client=common::api::WfApiClient::with_store(common::token::Store::with_path(dir.join("token.json")),server.uri(),"fixture-client").unwrap();
-        let disk=crate::images::DiskCache::with_dir(dir.join("cache"),32*1024*1024);
-        let slots=Arc::new(tokio::sync::Semaphore::new(1));
-        let src=format!("{}/flaky.png",server.uri());
-        let pending=crate::images::Pending{key:src.clone(),cols:12,rows:4,full:false};
-        let load=|| crate::images::load(&client,&disk,ratatui_image::picker::Picker::halfblocks(),&pending,slots.clone().try_acquire_owned().unwrap(),None);
-        assert!(load().await.is_err(),"the HTML body does not decode");
-        assert!(disk.get(&src).is_none(),"…and was not stored");
-        assert!(load().await.is_ok(),"the retry reached the network");
-        assert_eq!(disk.get(&src).as_deref(),Some(png.as_slice()),"a decoded body is stored");
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let png = include_bytes!("../../assets/wf-logo.png").to_vec();
+        Mock::given(method("GET"))
+            .and(path("/flaky.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "image/png")
+                    .set_body_bytes(b"<html>busy</html>".to_vec()),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/flaky.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "image/png")
+                    .set_body_bytes(png.clone()),
+            )
+            .mount(&server)
+            .await;
+        let dir =
+            std::env::temp_dir().join(format!("wftui-image-cache-poison-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let client = common::api::WfApiClient::with_store(
+            common::token::Store::with_path(dir.join("token.json")),
+            server.uri(),
+            "fixture-client",
+        )
+        .unwrap();
+        let disk = crate::images::DiskCache::with_dir(dir.join("cache"), 32 * 1024 * 1024);
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let src = format!("{}/flaky.png", server.uri());
+        let pending = crate::images::Pending {
+            key: src.clone(),
+            cols: 12,
+            rows: 4,
+            full: false,
+        };
+        let load = || {
+            crate::images::load(
+                &client,
+                &disk,
+                ratatui_image::picker::Picker::halfblocks(),
+                &pending,
+                slots.clone().try_acquire_owned().unwrap(),
+                None,
+            )
+        };
+        assert!(load().await.is_err(), "the HTML body does not decode");
+        assert!(disk.get(&src).is_none(), "…and was not stored");
+        assert!(load().await.is_ok(), "the retry reached the network");
+        assert_eq!(
+            disk.get(&src).as_deref(),
+            Some(png.as_slice()),
+            "a decoded body is stored"
+        );
 
         // An entry already on disk that no longer decodes is evicted, and the
         // next attempt fetches again.
-        disk.put(&src,b"truncated");
-        let before=server.received_requests().await.unwrap_or_default().len();
-        assert!(load().await.is_err(),"the cached bytes are bad");
-        assert!(disk.get(&src).is_none(),"…so they are evicted");
+        disk.put(&src, b"truncated");
+        let before = server.received_requests().await.unwrap_or_default().len();
+        assert!(load().await.is_err(), "the cached bytes are bad");
+        assert!(disk.get(&src).is_none(), "…so they are evicted");
         assert!(load().await.is_ok());
-        assert_eq!(server.received_requests().await.unwrap_or_default().len(),before+1,"exactly one refetch");
-        let _=std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            before + 1,
+            "exactly one refetch"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    #[cfg(feature="images")]
+    #[cfg(feature = "images")]
     async fn viewer_gets_its_own_eight_mib_budget_after_thumbnail_rejection() {
-        use wiremock::{Mock,MockServer,ResponseTemplate};
-        use wiremock::matchers::{method,path};
-        let server=MockServer::start().await;
-        let mut body=include_bytes!("../../assets/wf-logo.png").to_vec();
-        body.resize(crate::images::MAX_IMAGE_BYTES+1024,0);
-        Mock::given(method("GET")).and(path("/large.png"))
-            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type","image/png").set_body_bytes(body))
-            .mount(&server).await;
-        let dir=std::env::temp_dir().join(format!("wftui-ui-audit-image-budget-{}",std::process::id()));
-        let client=common::api::WfApiClient::with_store(common::token::Store::with_path(dir.join("token.json")),server.uri(),"fixture-client").unwrap();
-        let disk=crate::images::DiskCache::with_dir(dir.join("cache"),32*1024*1024);
-        let slots=Arc::new(tokio::sync::Semaphore::new(1));
-        let src=format!("{}/large.png",server.uri());
-        let small=crate::images::Pending{key:src.clone(),cols:12,rows:4,full:false};
-        let thumb_result=crate::images::load(&client,&disk,ratatui_image::picker::Picker::halfblocks(),&small,slots.clone().acquire_owned().await.unwrap(),None).await;
-        let reason=thumb_result.err().expect("thumbnail must exceed its 2MiB cap");
-        let full=crate::images::Pending{key:src.clone(),cols:70,rows:18,full:true};
-        let full_result=crate::images::load(&client,&disk,ratatui_image::picker::Picker::halfblocks(),&full,slots.acquire_owned().await.unwrap(),None).await;
-        assert!(full_result.is_ok(),"the same image is valid under the full viewer's 8MiB budget");
-        let mut app=test_app();
-        app.images.set_policy(crate::images::Policy{tier:crate::images::Tier::Halfblocks,font:(10,20)});
-        app.images.on_loaded(small.store_key(),Err(reason.clone()));
-        app.screens.push(Screen::ImageView(screens::ImageViewState{title:"large inline image".into(),key:Some(src),..Default::default()}));
-        frame(&mut app,80,24);
-        let Some(Screen::ImageView(view))=app.screens.last() else {panic!("viewer")};
-        assert!(view.error.is_none(), "thumbnail failure must not become the viewer error");
-        assert!(view.image_requests.iter().any(|r|r.full),"a thumbnail budget failure must not prevent the full-size request");
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let mut body = include_bytes!("../../assets/wf-logo.png").to_vec();
+        body.resize(crate::images::MAX_IMAGE_BYTES + 1024, 0);
+        Mock::given(method("GET"))
+            .and(path("/large.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "image/png")
+                    .set_body_bytes(body),
+            )
+            .mount(&server)
+            .await;
+        let dir = std::env::temp_dir().join(format!(
+            "wftui-ui-audit-image-budget-{}",
+            std::process::id()
+        ));
+        let client = common::api::WfApiClient::with_store(
+            common::token::Store::with_path(dir.join("token.json")),
+            server.uri(),
+            "fixture-client",
+        )
+        .unwrap();
+        let disk = crate::images::DiskCache::with_dir(dir.join("cache"), 32 * 1024 * 1024);
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let src = format!("{}/large.png", server.uri());
+        let small = crate::images::Pending {
+            key: src.clone(),
+            cols: 12,
+            rows: 4,
+            full: false,
+        };
+        let thumb_result = crate::images::load(
+            &client,
+            &disk,
+            ratatui_image::picker::Picker::halfblocks(),
+            &small,
+            slots.clone().acquire_owned().await.unwrap(),
+            None,
+        )
+        .await;
+        let reason = thumb_result
+            .err()
+            .expect("thumbnail must exceed its 2MiB cap");
+        let full = crate::images::Pending {
+            key: src.clone(),
+            cols: 70,
+            rows: 18,
+            full: true,
+        };
+        let full_result = crate::images::load(
+            &client,
+            &disk,
+            ratatui_image::picker::Picker::halfblocks(),
+            &full,
+            slots.acquire_owned().await.unwrap(),
+            None,
+        )
+        .await;
+        assert!(
+            full_result.is_ok(),
+            "the same image is valid under the full viewer's 8MiB budget"
+        );
+        let mut app = test_app();
+        app.images.set_policy(crate::images::Policy {
+            tier: crate::images::Tier::Halfblocks,
+            font: (10, 20),
+        });
+        app.images.on_loaded(small.store_key(), Err(reason.clone()));
+        app.screens.push(Screen::ImageView(screens::ImageViewState {
+            title: "large inline image".into(),
+            key: Some(src),
+            ..Default::default()
+        }));
+        frame(&mut app, 80, 24);
+        let Some(Screen::ImageView(view)) = app.screens.last() else {
+            panic!("viewer")
+        };
+        assert!(
+            view.error.is_none(),
+            "thumbnail failure must not become the viewer error"
+        );
+        assert!(
+            view.image_requests.iter().any(|r| r.full),
+            "a thumbnail budget failure must not prevent the full-size request"
+        );
     }
 
     /// #136: after a resize, nothing measured off the old frame may act —
@@ -11414,14 +14237,27 @@ mod tests {
         let mut app = test_app();
         app.screens.push(screens::home_state(false));
         frame(&mut app, 100, 30);
-        let (x, y) = find_hit(&app, 100, 30, |h| matches!(h, Hit::Key("?"))).expect("the keys cap is drawn");
-        app.selection = Some(Selection { anchor: (0, 0), end: (20, 2) });
-        assert!(!app.extract_selection_text(0, 0, 20, 2).is_empty(), "the old frame had text");
+        let (x, y) =
+            find_hit(&app, 100, 30, |h| matches!(h, Hit::Key("?"))).expect("the keys cap is drawn");
+        app.selection = Some(Selection {
+            anchor: (0, 0),
+            end: (20, 2),
+        });
+        assert!(
+            !app.extract_selection_text(0, 0, 20, 2).is_empty(),
+            "the old frame had text"
+        );
 
         app.handle_resize();
         assert!(app.selection.is_none(), "the band went with its layout");
-        assert!(app.extract_selection_text(0, 0, 20, 2).is_empty(), "nothing stale to copy");
-        assert!(find_hit(&app, 100, 30, |_| true).is_none(), "no hit survives the resize");
+        assert!(
+            app.extract_selection_text(0, 0, 20, 2).is_empty(),
+            "nothing stale to copy"
+        );
+        assert!(
+            find_hit(&app, 100, 30, |_| true).is_none(),
+            "no hit survives the resize"
+        );
         assert!(app.status.contains("resized"), "{}", app.status);
         let before = app.screens.len();
         click(&mut app, x, y);
@@ -11468,24 +14304,25 @@ mod tests {
             message: message.to_string(),
             ..Default::default()
         };
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: thread(9),
-            posts: vec![post(
-                1,
-                "cite [1] pasted from the log, see https://example.com/a for details",
-            )],
-            page: 1,
-            last_page: 1,
-            ..Default::default()
-        }));
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: thread(9),
+                posts: vec![post(
+                    1,
+                    "cite [1] pasted from the log, see https://example.com/a for details",
+                )],
+                page: 1,
+                last_page: 1,
+                ..Default::default()
+            }));
         frame(&mut app, 80, 24);
 
         // The real link is still clickable somewhere.
         assert!(find_hit(&app, 80, 24, |h| matches!(h, Hit::Link(_))).is_some());
 
         // The literal "[1]" right after "cite" is not.
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
-            .expect("terminal");
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| app.draw(f)).expect("draw");
         let buf = term.backend().buffer().clone();
         let mut lit = None;
@@ -11498,7 +14335,10 @@ mod tests {
             }
             if let Some(c) = row.find("cite [1]") {
                 let at = c + "cite ".len();
-                let x = starts.iter().position(|&b| b == at).expect("cell of the literal") as u16;
+                let x = starts
+                    .iter()
+                    .position(|&b| b == at)
+                    .expect("cell of the literal") as u16;
                 lit = Some((x, y));
             }
         }
@@ -11561,11 +14401,12 @@ mod tests {
     #[test]
     fn the_breadcrumb_row_maps_each_crumb_to_its_screen() {
         let mut app = home_app();
-        app.screens.push(Screen::ThreadList(screens::ThreadListState {
-            node_id: 4,
-            title: "Windows News".into(),
-            ..Default::default()
-        }));
+        app.screens
+            .push(Screen::ThreadList(screens::ThreadListState {
+                node_id: 4,
+                title: "Windows News".into(),
+                ..Default::default()
+            }));
         frame(&mut app, 120, 24);
 
         // Row 0 is the header. Walk it and collect what each cell answers.
@@ -11591,13 +14432,25 @@ mod tests {
         }
         // The last crumb is the screen on top, and clicking it changes
         // nothing; the one before it pops back one place.
-        let deepest = seen.iter().map(|(i, _)| *i).filter(|i| *i != usize::MAX).max().unwrap();
+        let deepest = seen
+            .iter()
+            .map(|(i, _)| *i)
+            .filter(|i| *i != usize::MAX)
+            .max()
+            .unwrap();
         let depth_before = app.screens.len();
         app.go_to_crumb(deepest);
-        assert_eq!(app.screens.len(), depth_before, "the current crumb is inert");
+        assert_eq!(
+            app.screens.len(),
+            depth_before,
+            "the current crumb is inert"
+        );
         if deepest > 0 {
             app.go_to_crumb(deepest - 1);
-            assert!(app.screens.len() < depth_before, "an ancestor crumb pops back");
+            assert!(
+                app.screens.len() < depth_before,
+                "an ancestor crumb pops back"
+            );
         }
     }
 
@@ -11631,12 +14484,18 @@ mod tests {
 
         // A click in the right-hand pane takes the keyboard with it (#549's
         // rects, now for clicks as well as the wheel).
-        assert!(matches!(app.screens.last(), Some(Screen::Home(h)) if h.focus == screens::Pane::Tree));
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Home(h)) if h.focus == screens::Pane::Tree)
+        );
         click(&mut app, 60, 5);
         let Some(Screen::Home(h)) = app.screens.last() else {
             panic!("expected Home");
         };
-        assert_eq!(h.focus, screens::Pane::List, "the pointer takes the keyboard");
+        assert_eq!(
+            h.focus,
+            screens::Pane::List,
+            "the pointer takes the keyboard"
+        );
         assert_eq!(h.list.sel, 2, "and the row it landed on is selected");
     }
 
@@ -11649,16 +14508,27 @@ mod tests {
         frame(&mut app, 120, 24);
 
         click(&mut app, 60, 5);
-        assert_eq!(app.screens.len(), 1, "the first click only moves the selection");
+        assert_eq!(
+            app.screens.len(),
+            1,
+            "the first click only moves the selection"
+        );
         assert!(matches!(app.screens.last(), Some(Screen::Home(h)) if h.list.sel == 2));
 
         frame(&mut app, 120, 24);
         click_later(&mut app, 60, 5);
-        assert_eq!(app.screens.len(), 2, "the second click on the same row opens it");
+        assert_eq!(
+            app.screens.len(),
+            2,
+            "the second click on the same row opens it"
+        );
         let Some(Screen::ThreadView(v)) = app.screens.last() else {
             panic!("expected the thread view");
         };
-        assert_eq!(v.thread.thread_id, 3, "and it opens the row that was clicked");
+        assert_eq!(
+            v.thread.thread_id, 3,
+            "and it opens the row that was clicked"
+        );
     }
 
     /// The other way to open: a double click, which never waits for a second
@@ -11670,7 +14540,11 @@ mod tests {
         // Row 3 of the list, which nothing has selected yet.
         click(&mut app, 60, 6);
         click(&mut app, 60, 6);
-        assert_eq!(app.screens.len(), 2, "a double click opens without a second frame");
+        assert_eq!(
+            app.screens.len(),
+            2,
+            "a double click opens without a second frame"
+        );
         let Some(Screen::ThreadView(v)) = app.screens.last() else {
             panic!("expected the thread view");
         };
@@ -11721,12 +14595,17 @@ mod tests {
         let Some(Screen::Home(h)) = app.screens.last() else {
             panic!("expected Home");
         };
-        assert_eq!(h.tree.sel, 1, "a compound cap presses its first key: j moves down");
+        assert_eq!(
+            h.tree.sel, 1,
+            "a compound cap presses its first key: j moves down"
+        );
 
         // `test_app` starts with 5 unread DMs and 3 unread alerts, so both
         // badges are drawn.
-        let (x, y) = find_hit(&app, 120, 24, |h| h == &Hit::Badge(screens::InboxTab::Alerts))
-            .expect("an Alerts badge");
+        let (x, y) = find_hit(&app, 120, 24, |h| {
+            h == &Hit::Badge(screens::InboxTab::Alerts)
+        })
+        .expect("an Alerts badge");
         assert_eq!(y, 0, "the badges are on the header band");
         click(&mut app, x, y);
         let Some(Screen::Inbox(ib)) = app.screens.last() else {
@@ -11760,13 +14639,14 @@ mod tests {
             content_type: "image/png".into(),
             ..Default::default()
         }];
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: thread(9),
-            posts: vec![post(1, "see https://example.com/a for details"), second],
-            page: 1,
-            last_page: 1,
-            ..Default::default()
-        }));
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: thread(9),
+                posts: vec![post(1, "see https://example.com/a for details"), second],
+                page: 1,
+                last_page: 1,
+                ..Default::default()
+            }));
         frame(&mut app, 80, 24);
 
         let link = find_hit(&app, 80, 24, |h| {
@@ -11857,14 +14737,20 @@ mod tests {
 
         // Inner x 1, tabs on row 2, rows from row 4 — two lines each.
         assert_eq!(app.hits.at(10, 4), Some(&Hit::Row(0)));
-        assert_eq!(app.hits.at(10, 5), Some(&Hit::Row(0)), "the meta line is the row");
+        assert_eq!(
+            app.hits.at(10, 5),
+            Some(&Hit::Row(0)),
+            "the meta line is the row"
+        );
         assert_eq!(app.hits.at(10, 6), Some(&Hit::Row(1)));
 
         let (x, y) = find_hit(&app, 120, 24, |h| h == &Hit::Tab(screens::InboxTab::Alerts))
             .expect("an Alerts chip");
         assert_eq!(y, 2, "the tab row is the panel's first inner row");
         click(&mut app, x, y);
-        assert!(matches!(app.screens.last(), Some(Screen::Inbox(ib)) if ib.tab == screens::InboxTab::Alerts));
+        assert!(
+            matches!(app.screens.last(), Some(Screen::Inbox(ib)) if ib.tab == screens::InboxTab::Alerts)
+        );
 
         // Alerts are one line each; clicking the second selects it.
         frame(&mut app, 120, 24);
@@ -11908,7 +14794,11 @@ mod tests {
 
         // Panel inner y 2: query, chips, rule, count, blank, then results.
         assert_eq!(app.hits.at(10, 7), Some(&Hit::Row(0)));
-        assert_eq!(app.hits.at(10, 8), Some(&Hit::Row(0)), "the snippet is the row");
+        assert_eq!(
+            app.hits.at(10, 8),
+            Some(&Hit::Row(0)),
+            "the snippet is the row"
+        );
         assert_eq!(app.hits.at(10, 9), Some(&Hit::Row(1)));
         // The `/ query` row is a field, not a result.
         assert_eq!(app.hits.at(10, 2), Some(&Hit::Field(0)));
@@ -11970,19 +14860,20 @@ mod tests {
 
         // 5. The thread view's link popup, which is the screen's own overlay.
         let mut app = test_app();
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: thread(9),
-            posts: vec![Post {
-                post_id: 1,
-                username: "kemical".into(),
-                message: "see https://example.com/a".into(),
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: thread(9),
+                posts: vec![Post {
+                    post_id: 1,
+                    username: "kemical".into(),
+                    message: "see https://example.com/a".into(),
+                    ..Default::default()
+                }],
+                page: 1,
+                last_page: 1,
+                link_popup: true,
                 ..Default::default()
-            }],
-            page: 1,
-            last_page: 1,
-            link_popup: true,
-            ..Default::default()
-        }));
+            }));
         frame(&mut app, 80, 24);
         let (x, y) = find_hit(&app, 80, 24, |h| h == &Hit::CloseOverlay).expect("an outside cell");
         click(&mut app, x, y);
@@ -12015,8 +14906,15 @@ mod tests {
         let Some(Screen::Home(h)) = app.screens.last() else {
             panic!("expected Home");
         };
-        assert_eq!(h.list.sel, 0, "a drag is not a click: the row must not move");
-        assert_eq!(h.focus, screens::Pane::Tree, "and it must not steal the keyboard");
+        assert_eq!(
+            h.list.sel, 0,
+            "a drag is not a click: the row must not move"
+        );
+        assert_eq!(
+            h.focus,
+            screens::Pane::Tree,
+            "and it must not steal the keyboard"
+        );
 
         // The same cell, without the movement between press and release, is
         // a click. (A moment later: two presses in one cell inside the
@@ -12034,8 +14932,8 @@ mod tests {
     #[test]
     fn a_click_in_the_composer_places_the_caret_on_a_wrapped_row_and_after_a_cjk_character() {
         let mut app = test_app();
-        let body = "one two three four five six seven eight nine ten eleven twelve thirteen"
-            .to_string();
+        let body =
+            "one two three four five six seven eight nine ten eleven twelve thirteen".to_string();
         app.screens.push(Screen::Compose(screens::ComposeState {
             target: Some(ComposeTarget::ThreadReply {
                 thread_id: 9,
@@ -12050,7 +14948,10 @@ mod tests {
             Some(Screen::Compose(c)) => (c.body_rect, c.body_width as usize),
             _ => panic!("expected the composer"),
         };
-        assert!(rect.height > 1 && width > 0, "the body pane must be on screen");
+        assert!(
+            rect.height > 1 && width > 0,
+            "the body pane must be on screen"
+        );
         assert_eq!(app.hits.at(rect.x + 4, rect.y + 1), Some(&Hit::Field(1)));
 
         // Second visual row, five cells in: the caret must land on exactly
@@ -12175,22 +15076,23 @@ mod tests {
     #[test]
     fn media_gallery_narrow_mouse_focus_and_esc_routing() {
         let mut app = home_app();
-        app.screens.push(Screen::MediaGallery(screens::MediaListState {
-            focus: screens::MediaPane::Items,
-            items: vec![common::models::MediaItem {
-                media_id: 10,
-                title: "Test Image".into(),
-                view_url: Some("https://windowsforum.com/media/10/".into()),
+        app.screens
+            .push(Screen::MediaGallery(screens::MediaListState {
+                focus: screens::MediaPane::Items,
+                items: vec![common::models::MediaItem {
+                    media_id: 10,
+                    title: "Test Image".into(),
+                    view_url: Some("https://windowsforum.com/media/10/".into()),
+                    ..Default::default()
+                }],
+                categories: vec![common::models::MediaCategory {
+                    category_id: 1,
+                    title: "Wallpapers".into(),
+                    view_url: Some("https://windowsforum.com/media/categories/1/".into()),
+                    ..Default::default()
+                }],
                 ..Default::default()
-            }],
-            categories: vec![common::models::MediaCategory {
-                category_id: 1,
-                title: "Wallpapers".into(),
-                view_url: Some("https://windowsforum.com/media/categories/1/".into()),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }));
+            }));
         // Esc from Items switches focus to Categories, not popping the screen
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         let Some(Screen::MediaGallery(m)) = app.screens.last() else {
@@ -12273,10 +15175,21 @@ mod tests {
     #[tokio::test]
     async fn shutdown_saves_active_new_and_resumed_drafts_without_esc() {
         for target in [
-            ComposeTarget::ThreadReply { thread_id: 7, thread_title: "thread".into() },
+            ComposeTarget::ThreadReply {
+                thread_id: 7,
+                thread_title: "thread".into(),
+            },
             ComposeTarget::NewThread { node_id: 7 },
-            ComposeTarget::EditPost { post_id: 7, thread_id: 9, thread_title: "edit".into() },
-            ComposeTarget::ConversationReply { conversation_id: 7, conversation_title: "DM".into(), participants: "user".into() },
+            ComposeTarget::EditPost {
+                post_id: 7,
+                thread_id: 9,
+                thread_title: "edit".into(),
+            },
+            ComposeTarget::ConversationReply {
+                conversation_id: 7,
+                conversation_title: "DM".into(),
+                participants: "user".into(),
+            },
         ] {
             for resumed in [false, true] {
                 let mut app = test_app();
@@ -12284,16 +15197,30 @@ mod tests {
                 let key = target.draft_key();
                 app.screens.push(screens::home_state(false));
                 if resumed {
-                    app.drafts.insert(key, common::drafts::Draft { body: "previous version".into(), ..Default::default() });
+                    app.drafts.insert(
+                        key,
+                        common::drafts::Draft {
+                            body: "previous version".into(),
+                            ..Default::default()
+                        },
+                    );
                     assert!(app.persist_draft(key));
                 }
                 app.screens.push(Screen::Compose(screens::ComposeState {
-                    target: Some(target.clone()), body: "latest unsent words".into(), resumed,
+                    target: Some(target.clone()),
+                    body: "latest unsent words".into(),
+                    resumed,
                     ..Default::default()
                 }));
                 app.shutdown().await;
-                assert_eq!(app.draft_store.load(&owner)[&key].body, "latest unsent words");
-                assert!(app.session_handles.is_empty(), "shutdown must not create relay tasks");
+                assert_eq!(
+                    app.draft_store.load(&owner)[&key].body,
+                    "latest unsent words"
+                );
+                assert!(
+                    app.session_handles.is_empty(),
+                    "shutdown must not create relay tasks"
+                );
             }
         }
     }
@@ -12303,26 +15230,46 @@ mod tests {
         for same_account in [true, false] {
             let mut app = test_app();
             app.select_draft_owner(7);
-            app.me = Some(User { user_id: 7, ..Default::default() });
+            app.me = Some(User {
+                user_id: 7,
+                ..Default::default()
+            });
             let owner = app.draft_owner.clone().unwrap();
             let path = app.draft_store.path().to_owned();
             app.screens.push(screens::home_state(false));
             app.screens.push(Screen::Compose(screens::ComposeState {
-                target: Some(ComposeTarget::ThreadReply { thread_id: 1, thread_title: "thread".into() }),
-                body: "account seven's words".into(), ..Default::default()
+                target: Some(ComposeTarget::ThreadReply {
+                    thread_id: 1,
+                    thread_title: "thread".into(),
+                }),
+                body: "account seven's words".into(),
+                ..Default::default()
             }));
             app.end_session("expired");
-            assert!(app.session_handles.is_empty(), "no tasks may be spawned after cancellation");
+            assert!(
+                app.session_handles.is_empty(),
+                "no tasks may be spawned after cancellation"
+            );
             assert_eq!(app.draft_store.load(&owner).len(), 1);
             let id = if same_account { 7 } else { 8 };
-            app.handle_msg(Msg::LoginComplete { generation: app.login_generation, result: Ok(User { user_id: id, ..Default::default() }) });
+            app.handle_msg(Msg::LoginComplete {
+                generation: app.login_generation,
+                result: Ok(User {
+                    user_id: id,
+                    ..Default::default()
+                }),
+            });
             assert_eq!(app.drafts.len(), usize::from(same_account));
-            app.stop_pollers(); app.abort_session_tasks();
+            app.stop_pollers();
+            app.abort_session_tasks();
             let mut restarted = test_app();
             restarted.draft_owner = None;
             restarted.draft_store = common::drafts::Store::with_path(path);
             restarted.select_draft_owner(9);
-            assert!(restarted.drafts.is_empty(), "a replaced token cannot expose another account's drafts");
+            assert!(
+                restarted.drafts.is_empty(),
+                "a replaced token cannot expose another account's drafts"
+            );
         }
     }
 
@@ -12331,23 +15278,54 @@ mod tests {
         for success in [false, true] {
             let mut app = test_app();
             app.screens.push(screens::home_state(false));
-            let target = ComposeTarget::ThreadReply { thread_id: 7, thread_title: "thread".into() };
+            let target = ComposeTarget::ThreadReply {
+                thread_id: 7,
+                thread_title: "thread".into(),
+            };
             app.screens.push(Screen::Compose(screens::ComposeState {
-                target: Some(target), body: "submitted".into(), busy: true, ..Default::default()
+                target: Some(target),
+                body: "submitted".into(),
+                busy: true,
+                ..Default::default()
             }));
             app.handle_paste("not submitted".into());
             assert_eq!(app.clipboard, "not submitted");
-            assert!(matches!(app.screens.last(), Some(Screen::Compose(c)) if c.body == "submitted"));
-            let result = if success { Ok(Post { post_id: 9, thread_id: 7, ..Default::default() }) }
-                else { Err(TaskError::of(&common::error::Error::FetchRejected("failed".into()))) };
-            app.handle_msg(Msg::ReplySent { composer: common::drafts::DraftKey::ThreadReply(7), result });
-            if !success { assert!(matches!(app.screens.last(), Some(Screen::Compose(c)) if c.body == "submitted")); }
+            assert!(
+                matches!(app.screens.last(), Some(Screen::Compose(c)) if c.body == "submitted")
+            );
+            let result = if success {
+                Ok(Post {
+                    post_id: 9,
+                    thread_id: 7,
+                    ..Default::default()
+                })
+            } else {
+                Err(TaskError::of(&common::error::Error::FetchRejected(
+                    "failed".into(),
+                )))
+            };
+            app.handle_msg(Msg::ReplySent {
+                composer: common::drafts::DraftKey::ThreadReply(7),
+                result,
+            });
+            if !success {
+                assert!(
+                    matches!(app.screens.last(), Some(Screen::Compose(c)) if c.body == "submitted")
+                );
+            }
             assert_eq!(app.clipboard, "not submitted");
         }
         let mut app = test_app();
-        app.screens.push(Screen::NewConversation(screens::NewConversationState { body: "submitted DM".into(), busy: true, ..Default::default() }));
+        app.screens
+            .push(Screen::NewConversation(screens::NewConversationState {
+                body: "submitted DM".into(),
+                busy: true,
+                ..Default::default()
+            }));
         app.handle_paste("clipboard DM".into());
-        assert!(matches!(app.screens.last(), Some(Screen::NewConversation(c)) if c.body == "submitted DM"));
+        assert!(
+            matches!(app.screens.last(), Some(Screen::NewConversation(c)) if c.body == "submitted DM")
+        );
         assert_eq!(app.clipboard, "clipboard DM");
     }
 
@@ -12356,50 +15334,95 @@ mod tests {
         fn composer_action(state: &mut screens::ComposeState, key: KeyEvent) -> Action {
             let mut screen = Screen::Compose(std::mem::take(state));
             let action = screen.on_key(key);
-            let Screen::Compose(next) = screen else { unreachable!() };
+            let Screen::Compose(next) = screen else {
+                unreachable!()
+            };
             *state = next;
             action
         }
         for target in [
-            ComposeTarget::ThreadReply { thread_id: 7, thread_title: "thread".into() },
+            ComposeTarget::ThreadReply {
+                thread_id: 7,
+                thread_title: "thread".into(),
+            },
             ComposeTarget::NewThread { node_id: 7 },
-            ComposeTarget::EditPost { post_id: 7, thread_id: 9, thread_title: "edit".into() },
+            ComposeTarget::EditPost {
+                post_id: 7,
+                thread_id: 9,
+                thread_title: "edit".into(),
+            },
         ] {
             for has_previous in [false, true] {
                 let mut app = test_app();
                 app.screens.push(Screen::Compose(screens::ComposeState {
-                    target: Some(target.clone()), title: "title".into(), body: "body".into(),
-                    file_prompt: Some(String::new()), title_field: matches!(target, ComposeTarget::NewThread { .. }),
+                    target: Some(target.clone()),
+                    title: "title".into(),
+                    body: "body".into(),
+                    file_prompt: Some(String::new()),
+                    title_field: matches!(target, ComposeTarget::NewThread { .. }),
                     attachment_key: has_previous.then(|| "existing-key".to_owned()),
                     ..Default::default()
                 }));
                 app.clipboard = "C:/Pictures/Zoë image.png".into();
                 app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
-                let Some(Screen::Compose(c)) = app.screens.last_mut() else { panic!("composer"); };
+                let Some(Screen::Compose(c)) = app.screens.last_mut() else {
+                    panic!("composer");
+                };
                 assert_eq!(c.file_prompt.as_deref(), Some("C:/Pictures/Zoë image.png"));
-                assert_eq!(c.body, "body"); assert_eq!(c.title, "title");
-                assert!(matches!(composer_action(c, KeyEvent::from(KeyCode::Enter)), Action::UploadAttachment { path, .. } if path == "C:/Pictures/Zoë image.png"));
+                assert_eq!(c.body, "body");
+                assert_eq!(c.title, "title");
+                assert!(
+                    matches!(composer_action(c, KeyEvent::from(KeyCode::Enter)), Action::UploadAttachment { path, .. } if path == "C:/Pictures/Zoë image.png")
+                );
                 c.uploading = true;
-                assert!(matches!(composer_action(c, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)), Action::Notice(_)));
+                assert!(matches!(
+                    composer_action(c, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+                    Action::Notice(_)
+                ));
                 assert!(!c.busy);
                 let action = match target {
-                    ComposeTarget::ThreadReply { thread_id, .. } => Action::SubmitReply { thread_id, message: "body".into() },
-                    ComposeTarget::NewThread { node_id } => Action::SubmitThread { node_id, title: "title".into(), message: "body".into() },
-                    ComposeTarget::EditPost { post_id, .. } => Action::SubmitEdit { post_id, message: "body".into() },
+                    ComposeTarget::ThreadReply { thread_id, .. } => Action::SubmitReply {
+                        thread_id,
+                        message: "body".into(),
+                    },
+                    ComposeTarget::NewThread { node_id } => Action::SubmitThread {
+                        node_id,
+                        title: "title".into(),
+                        message: "body".into(),
+                    },
+                    ComposeTarget::EditPost { post_id, .. } => Action::SubmitEdit {
+                        post_id,
+                        message: "body".into(),
+                    },
                     _ => unreachable!(),
                 };
                 app.execute_action(action);
-                assert!(app.write_handles.is_empty(), "direct actions must honor the upload interlock");
-                app.handle_msg(Msg::AttachmentUploaded { composer: target.draft_key(), result: Ok(("completed-key".into(), common::models::Attachment { attachment_id: 99, ..Default::default() })) });
-                let Some(Screen::Compose(c)) = app.screens.last_mut() else { panic!("composer"); };
+                assert!(
+                    app.write_handles.is_empty(),
+                    "direct actions must honor the upload interlock"
+                );
+                app.handle_msg(Msg::AttachmentUploaded {
+                    composer: target.draft_key(),
+                    result: Ok((
+                        "completed-key".into(),
+                        common::models::Attachment {
+                            attachment_id: 99,
+                            ..Default::default()
+                        },
+                    )),
+                });
+                let Some(Screen::Compose(c)) = app.screens.last_mut() else {
+                    panic!("composer");
+                };
                 assert_eq!(c.attachment_key.as_deref(), Some("completed-key"));
                 assert!(c.body.contains("[ATTACH]99[/ATTACH]"));
-                assert!(!matches!(composer_action(c, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)), Action::Notice(_) | Action::None));
+                assert!(!matches!(
+                    composer_action(c, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+                    Action::Notice(_) | Action::None
+                ));
             }
         }
     }
-
-
 
     /// #27: the FIRST thread load arrives with `width == 0` — the view has
     /// never been on screen — so the eager layout in `ThreadLoaded` would
@@ -12412,7 +15435,10 @@ mod tests {
         let mut app = test_app();
         app.screens.clear();
         app.push_screen(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 9, ..Default::default() },
+            thread: Thread {
+                thread_id: 9,
+                ..Default::default()
+            },
             loading: true,
             ..Default::default()
         }));
@@ -12421,8 +15447,14 @@ mod tests {
             page: 1,
             load_id: 0,
             result: Ok(ThreadReply {
-                thread: Thread { thread_id: 9, ..Default::default() },
-                posts: vec![Post { post_id: 1, ..Default::default() }],
+                thread: Thread {
+                    thread_id: 9,
+                    ..Default::default()
+                },
+                posts: vec![Post {
+                    post_id: 1,
+                    ..Default::default()
+                }],
                 ..Default::default()
             }),
         });
@@ -12430,7 +15462,10 @@ mod tests {
             let Some(Screen::ThreadView(v)) = app.screens.last() else {
                 panic!("expected the ThreadView screen");
             };
-            assert_eq!(v.width, 0, "a first load must not lay out at the fallback width");
+            assert_eq!(
+                v.width, 0,
+                "a first load must not lay out at the fallback width"
+            );
             assert!(v.lines.is_empty(), "no lines before a real width is known");
         }
 
@@ -12440,7 +15475,13 @@ mod tests {
         term.draw(|f| {
             let area = f.area();
             let screen = app.screens.last_mut().expect("screen");
-            screen.render(f, area, &app.theme, &app.glyphs, &mut crate::hit::HitMap::default());
+            screen.render(
+                f,
+                area,
+                &app.theme,
+                &app.glyphs,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         {
@@ -12457,10 +15498,19 @@ mod tests {
             page: 1,
             load_id: 0,
             result: Ok(ThreadReply {
-                thread: Thread { thread_id: 9, ..Default::default() },
+                thread: Thread {
+                    thread_id: 9,
+                    ..Default::default()
+                },
                 posts: vec![
-                    Post { post_id: 1, ..Default::default() },
-                    Post { post_id: 2, ..Default::default() },
+                    Post {
+                        post_id: 1,
+                        ..Default::default()
+                    },
+                    Post {
+                        post_id: 2,
+                        ..Default::default()
+                    },
                 ],
                 ..Default::default()
             }),
@@ -12477,14 +15527,20 @@ mod tests {
     fn benchmark_large_composer_frames() {
         let mut app = test_app();
         app.screens.push(Screen::Compose(screens::ComposeState {
-            target: Some(ComposeTarget::ThreadReply { thread_id: 7, thread_title: "benchmark".into() }),
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 7,
+                thread_title: "benchmark".into(),
+            }),
             body: "a log line with details to read.\n".repeat(70_000),
             ..Default::default()
         }));
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let start = std::time::Instant::now();
-        for _ in 0..20 { terminal.draw(|frame| app.draw(frame)).unwrap(); }
+        for _ in 0..20 {
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+        }
         println!("warmed 70k-line composer frame: {:?}", start.elapsed() / 20);
     }
 
@@ -12496,14 +15552,21 @@ mod tests {
     fn benchmark_cold_wrap_first_frame() {
         let mut app = test_app();
         app.screens.push(Screen::Compose(screens::ComposeState {
-            target: Some(ComposeTarget::ThreadReply { thread_id: 7, thread_title: "benchmark".into() }),
+            target: Some(ComposeTarget::ThreadReply {
+                thread_id: 7,
+                thread_title: "benchmark".into(),
+            }),
             body: "a log line with details to read.\n".repeat(70_000),
             ..Default::default()
         }));
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
         let start = std::time::Instant::now();
         terminal.draw(|frame| app.draw(frame)).unwrap();
-        println!("cold first frame after 70k-line paste: {:?}", start.elapsed());
+        println!(
+            "cold first frame after 70k-line paste: {:?}",
+            start.elapsed()
+        );
     }
 
     /// A long thread list is the other screen a reader sits on: `render_thread_panel`
@@ -12517,7 +15580,9 @@ mod tests {
         let threads: Vec<Thread> = (0..500)
             .map(|i| Thread {
                 thread_id: i as u32 + 1,
-                title: format!("Benchmark thread {i}: Windows 11 update schedule and driver questions"),
+                title: format!(
+                    "Benchmark thread {i}: Windows 11 update schedule and driver questions"
+                ),
                 username: format!("user{}", i % 40),
                 user_id: (i % 40) as u32 + 1,
                 reply_count: (i % 97) as u64,
@@ -12527,19 +15592,23 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        app.screens.push(Screen::ThreadList(screens::ThreadListState {
-            node_id: 4,
-            title: "Windows News".into(),
-            threads,
-            page: 1,
-            last_page: 25,
-            total: 500,
-            ..Default::default()
-        }));
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        app.screens
+            .push(Screen::ThreadList(screens::ThreadListState {
+                node_id: 4,
+                title: "Windows News".into(),
+                threads,
+                page: 1,
+                last_page: 25,
+                total: 500,
+                ..Default::default()
+            }));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let start = std::time::Instant::now();
-        for _ in 0..20 { terminal.draw(|frame| app.draw(frame)).unwrap(); }
+        for _ in 0..20 {
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+        }
         println!("warmed 500-thread list frame: {:?}", start.elapsed() / 20);
     }
 
@@ -12575,26 +15644,33 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread {
-                thread_id: 101,
-                title: "Benchmark: how do I control update schedules?".into(),
-                username: "user0".into(),
-                user_id: 1,
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 101,
+                    title: "Benchmark: how do I control update schedules?".into(),
+                    username: "user0".into(),
+                    user_id: 1,
+                    ..Default::default()
+                },
+                forum_title: "Windows Help and Support".into(),
+                posts,
+                page: 1,
+                last_page: 1,
+                total: 20,
                 ..Default::default()
-            },
-            forum_title: "Windows Help and Support".into(),
-            posts,
-            page: 1,
-            last_page: 1,
-            total: 20,
-            ..Default::default()
-        }));
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+            }));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let start = std::time::Instant::now();
-        for _ in 0..20 { terminal.draw(|frame| app.draw(frame)).unwrap(); }
-        println!("warmed 20-post thread view frame: {:?}", start.elapsed() / 20);
+        for _ in 0..20 {
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+        }
+        println!(
+            "warmed 20-post thread view frame: {:?}",
+            start.elapsed() / 20
+        );
         // Ten selection steps across the page's twenty posts; each one pays
         // the full re-parse + re-wrap until selection is O(changed posts).
         let start = std::time::Instant::now();
@@ -12602,7 +15678,10 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
             terminal.draw(|frame| app.draw(frame)).unwrap();
         }
-        println!("thread view selection step (n, full rebuild): {:?}", start.elapsed() / 10);
+        println!(
+            "thread view selection step (n, full rebuild): {:?}",
+            start.elapsed() / 10
+        );
     }
 
     /// #28's checklist, each item measured in isolation at a large 200x60
@@ -12617,66 +15696,132 @@ mod tests {
         const N: u32 = 200;
         let mut app = test_app();
         let posts: Vec<Post> = (0..20)
-            .map(|i| Post { post_id: 300 + i as u32, user_id: i as u32 + 1, username: format!("user{i}"), message: bench_post_body(i), ..Default::default() })
+            .map(|i| Post {
+                post_id: 300 + i as u32,
+                user_id: i as u32 + 1,
+                username: format!("user{i}"),
+                message: bench_post_body(i),
+                ..Default::default()
+            })
             .collect();
-        app.screens.push(Screen::ThreadView(screens::ThreadViewState {
-            thread: Thread { thread_id: 101, title: "Benchmark".into(), ..Default::default() },
-            forum_title: "Windows Help and Support".into(),
-            posts, page: 1, last_page: 1, total: 20, ..Default::default()
-        }));
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 60)).unwrap();
+        app.screens
+            .push(Screen::ThreadView(screens::ThreadViewState {
+                thread: Thread {
+                    thread_id: 101,
+                    title: "Benchmark".into(),
+                    ..Default::default()
+                },
+                forum_title: "Windows Help and Support".into(),
+                posts,
+                page: 1,
+                last_page: 1,
+                total: 20,
+                ..Default::default()
+            }));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 60)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let start = std::time::Instant::now();
-        for _ in 0..N { terminal.draw(|frame| app.draw(frame)).unwrap(); }
+        for _ in 0..N {
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+        }
         let frame_cost = start.elapsed() / N;
         let mut capture = Duration::ZERO;
         for _ in 0..N {
-            terminal.draw(|frame| {
-                app.draw(frame);
-                let t = std::time::Instant::now();
-                app.capture_screen(frame);
-                capture += t.elapsed();
-            }).unwrap();
+            terminal
+                .draw(|frame| {
+                    app.draw(frame);
+                    let t = std::time::Instant::now();
+                    app.capture_screen(frame);
+                    capture += t.elapsed();
+                })
+                .unwrap();
         }
-        println!("whole 200x60 thread-view frame: {frame_cost:?}; capture_screen alone: {:?}", capture / N);
+        println!(
+            "whole 200x60 thread-view frame: {frame_cost:?}; capture_screen alone: {:?}",
+            capture / N
+        );
 
-        let crumbs: Vec<String> = ["Forums", "Windows 11", "Windows 11 Help and Support", "Drivers and Hardware", "A very long thread title about update schedules", "page 3"]
-            .iter().map(|s| s.to_string()).collect();
+        let crumbs: Vec<String> = [
+            "Forums",
+            "Windows 11",
+            "Windows 11 Help and Support",
+            "Drivers and Hardware",
+            "A very long thread title about update schedules",
+            "page 3",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let cx = crate::chrome::Chrome::builtin(&app.theme, &app.glyphs);
         let start = std::time::Instant::now();
         for _ in 0..N * 10 {
-            std::hint::black_box(crate::chrome::header_line_hits(&cx, &crumbs, Some("alice"), 5, 3, Some(812), Some("0.0.9"), 80));
+            std::hint::black_box(crate::chrome::header_line_hits(
+                &cx,
+                &crumbs,
+                Some("alice"),
+                5,
+                3,
+                Some(812),
+                Some("0.0.9"),
+                80,
+            ));
         }
-        println!("header row with 6 crumbs at 80 cols (all rungs): {:?}", start.elapsed() / (N * 10));
+        println!(
+            "header row with 6 crumbs at 80 cols (all rungs): {:?}",
+            start.elapsed() / (N * 10)
+        );
 
         #[cfg(feature = "images")]
         {
-            app.images.set_policy(crate::images::Policy { tier: crate::images::Tier::Halfblocks, font: (10, 20) });
+            app.images.set_policy(crate::images::Policy {
+                tier: crate::images::Tier::Halfblocks,
+                font: (10, 20),
+            });
             let reqs: Vec<crate::images::Request> = (0..12u16)
-                .map(|i| crate::images::Request { key: format!("https://data.example/img/{i}.png"), rect: ratatui::layout::Rect::new(2, i * 4, 30, 4), full: i % 4 == 0 })
+                .map(|i| crate::images::Request {
+                    key: format!("https://data.example/img/{i}.png"),
+                    rect: ratatui::layout::Rect::new(2, i * 4, 30, 4),
+                    full: i % 4 == 0,
+                })
                 .collect();
             let mut paint = Duration::ZERO;
             for _ in 0..N {
-                terminal.draw(|frame| {
-                    let t = std::time::Instant::now();
-                    std::hint::black_box(app.images.paint(frame, &reqs));
-                    paint += t.elapsed();
-                }).unwrap();
+                terminal
+                    .draw(|frame| {
+                        let t = std::time::Instant::now();
+                        std::hint::black_box(app.images.paint(frame, &reqs));
+                        paint += t.elapsed();
+                    })
+                    .unwrap();
             }
             println!("image paint pass, 12 requests: {:?}", paint / N);
         }
 
         let start = std::time::Instant::now();
         for _ in 0..N * 10 {
-            for y in 0..60u16 { std::hint::black_box(app.hits.at(100, y)); }
+            for y in 0..60u16 {
+                std::hint::black_box(app.hits.at(100, y));
+            }
         }
-        println!("hit-map lookup (one per row, 60 rows): {:?}", start.elapsed() / (N * 10));
+        println!(
+            "hit-map lookup (one per row, 60 rows): {:?}",
+            start.elapsed() / (N * 10)
+        );
 
         let start = std::time::Instant::now();
         for _ in 0..20 {
-            drop(tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap());
+            drop(
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            );
         }
-        println!("tokio multi-thread runtime build: {:?}", start.elapsed() / 20);
+        println!(
+            "tokio multi-thread runtime build: {:?}",
+            start.elapsed() / 20
+        );
     }
 
     /// The conversation view re-parses every message whenever the memo key
@@ -12696,21 +15841,27 @@ mod tests {
                 message_id: i as u32 + 1,
                 conversation_id: 9,
                 user_id: (i % 2) as u32 + 1,
-                username: if i % 2 == 0 { "alice".into() } else { "bob".into() },
+                username: if i % 2 == 0 {
+                    "alice".into()
+                } else {
+                    "bob".into()
+                },
                 message: dm_body.clone(),
                 ..Default::default()
             })
             .collect();
-        app.screens.push(Screen::ConversationView(screens::ConversationViewState {
-            conversation: Conversation {
-                conversation_id: 9,
-                title: "benchmark".into(),
+        app.screens
+            .push(Screen::ConversationView(screens::ConversationViewState {
+                conversation: Conversation {
+                    conversation_id: 9,
+                    title: "benchmark".into(),
+                    ..Default::default()
+                },
+                messages,
                 ..Default::default()
-            },
-            messages,
-            ..Default::default()
-        }));
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+            }));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let start = std::time::Instant::now();
         for step in 0..10 {
@@ -12720,7 +15871,10 @@ mod tests {
             s.sel_msg = (step + 1) % s.messages.len();
             terminal.draw(|frame| app.draw(frame)).unwrap();
         }
-        println!("conversation selection step (50 messages, full rebuild): {:?}", start.elapsed() / 10);
+        println!(
+            "conversation selection step (50 messages, full rebuild): {:?}",
+            start.elapsed() / 10
+        );
     }
 
     // ================= Ask the AI =================
@@ -12745,7 +15899,11 @@ mod tests {
     fn ask_app(api: &Arc<RecordingApi>) -> App {
         let mut app = test_app();
         app.api = api.clone();
-        app.me = Some(User { user_id: 7, username: "kemical".into(), ..Default::default() });
+        app.me = Some(User {
+            user_id: 7,
+            username: "kemical".into(),
+            ..Default::default()
+        });
         app.screens.push(screens::home_state(false));
         app
     }
@@ -12783,12 +15941,21 @@ mod tests {
         let a = ask_state(&app);
         assert!(a.input_mode, "the question field owns the keyboard on open");
         assert!(!a.conversation_id.is_empty());
-        assert!(app.input_active(), "so c/a/s/g type letters instead of navigating");
+        assert!(
+            app.input_active(),
+            "so c/a/s/g type letters instead of navigating"
+        );
         pump_until(&mut app, |app| ask_state(app).usage.is_some()).await;
         assert_eq!(ask_state(&app).usage.as_deref(), Some("3 of 25 left today"));
         // Opening it again on top is a no-op, not a second conversation.
         app.execute_action(Action::OpenAskAi);
-        assert_eq!(app.screens.iter().filter(|s| matches!(s, Screen::AskAi(_))).count(), 1);
+        assert_eq!(
+            app.screens
+                .iter()
+                .filter(|s| matches!(s, Screen::AskAi(_)))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -12822,8 +15989,14 @@ mod tests {
         let a = ask_state(&app);
         let turn = &a.turns[0];
         assert_eq!(turn.state, screens::AskTurnState::Done);
-        assert_eq!(turn.answer, "See [the thread](https://windowsforum.com/threads/1/)");
-        assert_eq!(turn.steps, vec![("s1".into(), "Searching WindowsForum".into(), false)]);
+        assert_eq!(
+            turn.answer,
+            "See [the thread](https://windowsforum.com/threads/1/)"
+        );
+        assert_eq!(
+            turn.steps,
+            vec![("s1".into(), "Searching WindowsForum".into(), false)]
+        );
         let conversation = a.conversation_id.clone();
 
         type_keys(&mut app, "and after that?");
@@ -12833,28 +16006,54 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].message, "why is my pc slow");
         assert!(!requests[0].has_local_history);
-        assert!(requests.iter().all(|r| r.conversation_id == conversation), "one conversation");
-        assert!(requests[1].has_local_history, "the server may ask for the transcript");
+        assert!(
+            requests.iter().all(|r| r.conversation_id == conversation),
+            "one conversation"
+        );
+        assert!(
+            requests[1].has_local_history,
+            "the server may ask for the transcript"
+        );
         assert_ne!(requests[0].turn_id, requests[1].turn_id);
 
         // Drawn, the answer's link is source [1] and `1` opens it.
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
         term.draw(|f| {
             let area = f.area();
             let screen = app.screens.last_mut().expect("screen");
-            screen.render(f, area, &app.theme, &app.glyphs, &mut crate::hit::HitMap::default());
+            screen.render(
+                f,
+                area,
+                &app.theme,
+                &app.glyphs,
+                &mut crate::hit::HitMap::default(),
+            );
         })
         .expect("draw");
         let text: String = {
             let buf = term.backend().buffer();
-            (0..24).map(|y| (0..80).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()).collect()
+            (0..24)
+                .map(|y| {
+                    (0..80)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect()
         };
         assert!(text.contains("the thread [1]"), "{text}");
-        assert!(text.contains("3 of 25 left today"), "the allowance is in the panel cap: {text}");
+        assert!(
+            text.contains("3 of 25 left today"),
+            "the allowance is in the panel cap: {text}"
+        );
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        let Some(Screen::AskAi(a)) = app.screens.last_mut() else { panic!() };
+        let Some(Screen::AskAi(a)) = app.screens.last_mut() else {
+            panic!()
+        };
         assert!(!a.input_mode);
-        match screens::Screen::AskAi(std::mem::take(a)).on_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)) {
+        match screens::Screen::AskAi(std::mem::take(a))
+            .on_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))
+        {
             Action::OpenUrl(u) => assert_eq!(u, "https://windowsforum.com/threads/1/"),
             _ => panic!("1 opens the first source"),
         }
@@ -12883,9 +16082,18 @@ mod tests {
 
         app.handle_msg(session_msg(
             app.session_generation,
-            Msg::AskAiEvent { turn, event: common::ai::AiEvent::Delta("late".into()) },
+            Msg::AskAiEvent {
+                turn,
+                event: common::ai::AiEvent::Delta("late".into()),
+            },
         ));
-        app.handle_msg(session_msg(app.session_generation, Msg::AskAiDone { turn, result: Ok(()) }));
+        app.handle_msg(session_msg(
+            app.session_generation,
+            Msg::AskAiDone {
+                turn,
+                result: Ok(()),
+            },
+        ));
         let a = ask_state(&app);
         assert_eq!(a.turns[0].answer, "See ");
         assert_eq!(a.turns[0].state, screens::AskTurnState::Cancelled);
@@ -12907,10 +16115,17 @@ mod tests {
             },
         ));
         let a = ask_state(&app);
-        assert_eq!(a.turns[0].state, screens::AskTurnState::Cancelled, "not Failed");
+        assert_eq!(
+            a.turns[0].state,
+            screens::AskTurnState::Cancelled,
+            "not Failed"
+        );
         assert_eq!(a.turns[0].answer, "See ");
         assert!(!a.busy);
-        assert!(app.ask_task.is_none(), "no resend went out for a stopped turn");
+        assert!(
+            app.ask_task.is_none(),
+            "no resend went out for a stopped turn"
+        );
 
         // An idle transcript's Esc leaves.
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -12941,7 +16156,10 @@ mod tests {
             for _ in 0..10 {
                 tokio::task::yield_now().await;
             }
-            assert!(task.is_finished(), "{how}: the stream must not keep running");
+            assert!(
+                task.is_finished(),
+                "{how}: the stream must not keep running"
+            );
         }
     }
 
@@ -12960,13 +16178,20 @@ mod tests {
             status: 409,
             max_page: None,
         };
-        api.ai_refusals.lock().expect("lock").extend([lost(), lost()]);
+        api.ai_refusals
+            .lock()
+            .expect("lock")
+            .extend([lost(), lost()]);
         type_keys(&mut app, "second");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         pump_until(&mut app, |app| !ask_state(app).busy).await;
 
         let requests = api.ai_requests.lock().expect("lock").clone();
-        assert_eq!(requests.len(), 3, "asked, refused, resent once — never a loop");
+        assert_eq!(
+            requests.len(),
+            3,
+            "asked, refused, resent once — never a loop"
+        );
         assert_eq!(requests[2].message, "second");
         assert_eq!(
             requests[2].history,
@@ -12978,7 +16203,10 @@ mod tests {
                 ),
             ]
         );
-        assert!(matches!(&ask_state(&app).turns[1].state, screens::AskTurnState::Failed(_)));
+        assert!(matches!(
+            &ask_state(&app).turns[1].state,
+            screens::AskTurnState::Failed(_)
+        ));
     }
 
     #[tokio::test]
@@ -12986,9 +16214,12 @@ mod tests {
         let api = ask_api(false);
         let mut app = ask_app(&api);
         app.execute_action(Action::OpenAskAi);
-        api.ai_refusals.lock().expect("lock").push(common::error::Error::RateLimited {
-            retry_after: Some(Duration::from_secs(9)),
-        });
+        api.ai_refusals
+            .lock()
+            .expect("lock")
+            .push(common::error::Error::RateLimited {
+                retry_after: Some(Duration::from_secs(9)),
+            });
         type_keys(&mut app, "q");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         pump_until(&mut app, |app| !ask_state(app).busy).await;
